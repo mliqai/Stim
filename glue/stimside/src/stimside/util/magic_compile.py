@@ -1992,7 +1992,6 @@ def _measure_with_readout_and_postselection(
     fixed_classical: int | None,
     zero_mass: bool,
     atol: float,
-    use_cpp_kernels: bool,
 ) -> tuple[ShotExpansion, int, bool, bool, tuple[float, float, float], bool]:
     """Unified exact Bayesian readout + postselection collapse for `M*`, `MPP`, `R*`, and `MR*`."""
     iota = 1 if invert_result else 0
@@ -2012,7 +2011,7 @@ def _measure_with_readout_and_postselection(
     if fixed_classical is None:
         m_res = _pq.measure_expansion(
             exp, obs_axis, rng=rng, requested_bit=req_q, p_flip=p, invert_result=invert_result,
-            renormalize=True, keep_rotated_frame=True, atol=atol, use_cpp_kernels=use_cpp_kernels,
+            renormalize=True, keep_rotated_frame=True, atol=atol,
         )
         post = m_res.post_state
         assert isinstance(post, ShotExpansion)
@@ -2036,15 +2035,15 @@ def _measure_with_readout_and_postselection(
         e_p_w = unit_bit_words(first_set_bit_in_words(obs_axis.a_words), exp.n_words)
         work_exp = _pq.apply_quarter_turn(
             exp, obs_axis.a_words, np.ascontiguousarray(obs_axis.b_words ^ e_p_w),
-            (obs_axis.kappa + 1) & 3, sign=1, check_unitary=True, atol=tol, use_cpp_kernels=use_cpp_kernels,
+            (obs_axis.kappa + 1) & 3, sign=1, check_unitary=True, atol=tol,
         )
         assert isinstance(work_exp, ShotExpansion)
         b_diag, sig_diag = e_p_w, 0
     else:
         work_exp, b_diag, sig_diag = exp, obs_axis.b_words, (obs_axis.kappa >> 1) & 1
 
-    exp0, z0_raw = _pq.project_diagonal(work_exp, b_diag, sig_diag, 0, use_cpp_kernels=use_cpp_kernels)
-    exp1, z1_raw = _pq.project_diagonal(work_exp, b_diag, sig_diag, 1, use_cpp_kernels=use_cpp_kernels)
+    exp0, z0_raw = _pq.project_diagonal(work_exp, b_diag, sig_diag, 0)
+    exp1, z1_raw = _pq.project_diagonal(work_exp, b_diag, sig_diag, 1)
     assert isinstance(exp0, ShotExpansion) and isinstance(exp1, ShotExpansion)
 
     scale_z = max(1.0, z_in)
@@ -2096,7 +2095,6 @@ def _execute_compiled_records(
     sweep_bits: Sequence[int | bool] | NDArray[np.bool_] | None,
     max_components: int | None,
     atol: float,
-    use_cpp_kernels: bool,
     preset_fault_choices: tuple[int, ...] | None = None,
     preset_noise_map: Mapping[int, int] | None = None,
     total_noise_channels: int | None = None,
@@ -2118,7 +2116,7 @@ def _execute_compiled_records(
     for rec in records:
         if isinstance(rec, CompiledOpenBlockRecord):
             if not zero_mass:
-                exp = apply_compiled_block(exp, rec.block, atol=atol, use_cpp_kernels=use_cpp_kernels)
+                exp = apply_compiled_block(exp, rec.block, atol=atol)
                 peak_chi, peak_d = max(peak_chi, exp.chi), max(peak_d, exp.d)
                 if max_components is not None and exp.chi > max_components:
                     raise RuntimeError(f"Trajectory exceeded max_components={max_components} (got chi={exp.chi})")
@@ -2129,9 +2127,9 @@ def _execute_compiled_records(
             if c_idx > 0 and not zero_mass:
                 fac = rec.branch_factors[c_idx - 1]
                 if fac.p0 is not None:
-                    exp = apply_pauli(exp, fac.p0, use_cpp_kernels=use_cpp_kernels)
+                    exp = apply_pauli(exp, fac.p0)
                 for r_ax in fac.r_axes:
-                    exp = apply_quarter_turn(exp, r_ax, sign=1, atol=atol, use_cpp_kernels=use_cpp_kernels)
+                    exp = apply_quarter_turn(exp, r_ax, sign=1, atol=atol)
                 if fac.v != 0 and exp.chi > 0:
                     exp.weights = np.ascontiguousarray(exp.weights * OMEGA_POWERS[fac.v])
                 peak_chi, peak_d = max(peak_chi, exp.chi), max(peak_d, exp.d)
@@ -2143,7 +2141,7 @@ def _execute_compiled_records(
             chosen_noise.append(c_n)
             recorded_noise_map[ch_idx] = c_n
             if c_n > 0 and not zero_mass:
-                exp = apply_pauli(exp, rec.branch_axes[c_n - 1], use_cpp_kernels=use_cpp_kernels)
+                exp = apply_pauli(exp, rec.branch_axes[c_n - 1])
 
         elif isinstance(rec, HeraldedNoiseRecord):
             ch_idx = rec.noise_index if rec.noise_index is not None else noise_cursor
@@ -2193,7 +2191,7 @@ def _execute_compiled_records(
             quantum_outcomes[m_idx] = int(true_h)
             readout_flips[m_idx] = False
             if c_h > 0 and rec.branch_axes[c_h - 1] is not None and not zero_mass:
-                exp = apply_pauli(exp, rec.branch_axes[c_h - 1], use_cpp_kernels=use_cpp_kernels)
+                exp = apply_pauli(exp, rec.branch_axes[c_h - 1])
 
         elif isinstance(rec, CorrelatedNoiseRecord):
             ch_idx = rec.noise_index if rec.noise_index is not None else noise_cursor
@@ -2210,7 +2208,7 @@ def _execute_compiled_records(
                 if c_corr > 0:
                     correlated_occurred = True
                     if not zero_mass:
-                        exp = apply_pauli(exp, rec.axis, use_cpp_kernels=use_cpp_kernels)
+                        exp = apply_pauli(exp, rec.axis)
             chosen_noise.append(c_corr)
             recorded_noise_map[ch_idx] = c_corr
 
@@ -2219,7 +2217,7 @@ def _execute_compiled_records(
             exp, q_out, rep_bit, flipped, born_tup, zero_mass = _measure_with_readout_and_postselection(
                 exp, rec.obs_axis, flip_prob=rec.flip_prob, invert_result=rec.invert_result, rng=rng,
                 req_q=req_q_map.get(m_idx), fixed_classical=req_c_map.get(m_idx),
-                zero_mass=zero_mass, atol=atol, use_cpp_kernels=use_cpp_kernels,
+                zero_mass=zero_mass, atol=atol,
             )
             meas_record[m_idx], quantum_outcomes[m_idx], readout_flips[m_idx] = rep_bit, q_out, flipped
             born_masses.append((m_idx, *born_tup))
@@ -2239,12 +2237,12 @@ def _execute_compiled_records(
                 invert_result=rec.invert_result, rng=rng,
                 req_q=req_r if req_r is not None else req_mq,
                 fixed_classical=req_c_map.get(m_idx) if m_idx is not None else None,
-                zero_mass=zero_mass, atol=atol, use_cpp_kernels=use_cpp_kernels,
+                zero_mass=zero_mass, atol=atol,
             )
             chosen_resets.append(q_out)
             reset_cursor += 1
             if not zero_mass and (bool(q_out) != rec.reset_flip_ref):
-                exp = apply_pauli(exp, rec.reset_kick_axis, use_cpp_kernels=use_cpp_kernels)
+                exp = apply_pauli(exp, rec.reset_kick_axis)
             if m_idx is not None:
                 meas_record[m_idx], quantum_outcomes[m_idx], readout_flips[m_idx] = rep_bit, q_out, flipped
             born_masses.append((m_idx, *born_tup))
@@ -2279,7 +2277,7 @@ def _execute_compiled_records(
             else:
                 cond = bool(sweep_bits[rec.source_index]) if (sweep_bits is not None and 0 <= rec.source_index < len(sweep_bits)) else False
             if cond and not zero_mass:
-                exp = apply_pauli(exp, rec.axis, use_cpp_kernels=use_cpp_kernels)
+                exp = apply_pauli(exp, rec.axis)
 
         elif isinstance(rec, LeakageBarrierRecord):
             raise ValueError(
@@ -2291,7 +2289,7 @@ def _execute_compiled_records(
 
     if zero_mass:
         exp = ShotExpansion.from_components(
-            [], n_qubits=exp.n_qubits, merge=False, use_cpp_kernels=use_cpp_kernels, atol=atol
+            [], n_qubits=exp.n_qubits, merge=False, atol=atol
         )
         exp.log_mass = -math.inf
 
@@ -2332,7 +2330,6 @@ def run_direct(
     sweep_bits: Sequence[int | bool] | NDArray[np.bool_] | None = None,
     max_components: int | None = None,
     atol: float = DEFAULT_ATOL,
-    use_cpp_kernels: bool = True,
 ) -> TrajectoryRunResult:
     """`A2`: Execute a `DirectPlan` trajectory."""
     f_map, n_map, r_map, c_map, q_map = _prepare_run_maps(
@@ -2341,12 +2338,12 @@ def run_direct(
         requested_quantum_outcomes=requested_quantum_outcomes,
     )
     rng_obj = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
-    exp = ShotExpansion.zero(plan.num_qubits, use_cpp_kernels=use_cpp_kernels, atol=atol)
+    exp = ShotExpansion.zero(plan.num_qubits, atol=atol)
     return _execute_compiled_records(
         exp, plan.records, plan.num_measurements, plan.final_tableau,
         rng=rng_obj, fault_map=f_map, noise_map=n_map, reset_map=r_map,
         req_c_map=c_map, req_q_map=q_map, sweep_bits=sweep_bits,
-        max_components=max_components, atol=atol, use_cpp_kernels=use_cpp_kernels,
+        max_components=max_components, atol=atol,
     )
 
 
@@ -2426,7 +2423,6 @@ def run_selector(
     sweep_bits: Sequence[int | bool] | NDArray[np.bool_] | None = None,
     max_components: int | None = None,
     atol: float = DEFAULT_ATOL,
-    use_cpp_kernels: bool = True,
     extract_data: bool = False,
 ) -> TrajectoryRunResult:
     """`B2`: Execute `SelectorPlan` via joint one-hot selector `X_s` activations at `t=0`."""
@@ -2436,19 +2432,19 @@ def run_selector(
         requested_quantum_outcomes=requested_quantum_outcomes,
     )
     rng_obj = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
-    exp = ShotExpansion.zero(plan.num_total_qubits, use_cpp_kernels=use_cpp_kernels, atol=atol)
+    exp = ShotExpansion.zero(plan.num_total_qubits, atol=atol)
     sel_bits, fault_choices, gad_noise_map = _sample_selector_activations_from_maps(plan, rng_obj, f_map, n_map)
     n_w_tot = n_words_for_qubits(plan.num_total_qubits)
     zero_w = np.zeros(n_w_tot, dtype=np.uint64)
     for j in np.flatnonzero(sel_bits):
         s_active = plan.num_data_qubits + int(j)
-        exp = apply_pauli(exp, CompiledPauliAxis(unit_bit_words(s_active, n_w_tot), zero_w, 0), use_cpp_kernels=use_cpp_kernels)
+        exp = apply_pauli(exp, CompiledPauliAxis(unit_bit_words(s_active, n_w_tot), zero_w, 0))
 
     res = _execute_compiled_records(
         exp, plan.records, plan.num_measurements, plan.final_tableau,
         rng=rng_obj, fault_map=None, noise_map=n_map, reset_map=r_map,
         req_c_map=c_map, req_q_map=q_map, sweep_bits=sweep_bits,
-        max_components=max_components, atol=atol, use_cpp_kernels=use_cpp_kernels,
+        max_components=max_components, atol=atol,
         preset_fault_choices=fault_choices,
         preset_noise_map=gad_noise_map if plan.gadgetize_pauli_noise else None,
         total_noise_channels=plan.total_noise_channels if plan.gadgetize_pauli_noise else None,
@@ -2456,7 +2452,7 @@ def run_selector(
     )
     if extract_data:
         res.final_tableau, res.expansion = extract_data_expansion(
-            plan, res.expansion, sel_bits, use_cpp_kernels=use_cpp_kernels
+            plan, res.expansion, sel_bits
         )
     return res
 
@@ -2465,13 +2461,11 @@ def _slice_expansion_to_data_qubits(
     expansion: ShotExpansion | Sequence[tuple[complex, PhaseQFEComponent]],
     n_data: int,
     sel_arr: NDArray[np.bool_],
-    *,
-    use_cpp_kernels: bool = True,
 ) -> ShotExpansion:
     """Project/verify selector bits and slice `ShotExpansion` to `0 .. n_data - 1`."""
     if not isinstance(expansion, ShotExpansion):
         expansion = ShotExpansion.from_components(
-            expansion, n_qubits=n_data + len(sel_arr), use_cpp_kernels=use_cpp_kernels
+            expansion, n_qubits=n_data + len(sel_arr)
         )
     n_total, n_sel = expansion.n_qubits, len(sel_arr)
     if n_data + n_sel != n_total:
@@ -2483,7 +2477,7 @@ def _slice_expansion_to_data_qubits(
         mismatch_h = work.chi > 0 and any(get_bit_in_words(work.h_words[c], s_q) != want_bit for c in range(work.chi))
         if has_x or mismatch_h:
             proj_exp, _ = project_diagonal(
-                work, unit_bit_words(s_q, n_w_tot), 0, want_bit, use_cpp_kernels=use_cpp_kernels
+                work, unit_bit_words(s_q, n_w_tot), 0, want_bit
             )
             assert isinstance(proj_exp, ShotExpansion)
             proj_exp.log_mass = work.log_mass
@@ -2499,7 +2493,7 @@ def _slice_expansion_to_data_qubits(
     data_exp = work.copy()
     data_exp.n_qubits, data_exp.A_words, data_exp.h_words = n_data, A_d, h_d
     data_exp._refresh_a_union()
-    return merge_frames(data_exp, use_cpp_kernels=use_cpp_kernels)  # type: ignore[return-value]
+    return merge_frames(data_exp)  # type: ignore[return-value]
 
 
 def extract_data_expansion(
@@ -2507,8 +2501,6 @@ def extract_data_expansion(
     expansion: ShotExpansion,
     n_data_or_bits: int | Sequence[int | bool] | NDArray[Any],
     selector_bits: Sequence[int | bool] | NDArray[Any] | None = None,
-    *,
-    use_cpp_kernels: bool = True,
 ) -> tuple[ReferenceCHPTableau, ShotExpansion]:
     """`B2`: Matrix-free `O(n_words * chi)` extraction of `(data_tableau, data_expansion)`."""
     plan_meta: SelectorPlan | None = None
@@ -2530,7 +2522,7 @@ def extract_data_expansion(
         raise TypeError(f"Expected SelectorPlan or ReferenceCHPTableau, got {type(plan_or_tableau)!r}")
 
     sel_arr = np.asarray(raw_bits, dtype=np.bool_).ravel()
-    data_exp = _slice_expansion_to_data_qubits(expansion, n_data, sel_arr, use_cpp_kernels=use_cpp_kernels)
+    data_exp = _slice_expansion_to_data_qubits(expansion, n_data, sel_arr)
 
     if plan_meta is not None:
         n_w_data = n_words_for_qubits(n_data)
@@ -2551,8 +2543,8 @@ def extract_data_expansion(
         odd_ph = ((w_kap - word_dot_parity(w_a, w_b)) & 1) != 0
         kap_herm = ((w_kap - 1) & 3) if odd_ph else w_kap
         if words_any_nonzero(w_a) or words_any_nonzero(w_b) or kap_herm != 0:
-            data_exp = apply_pauli(data_exp, CompiledPauliAxis(w_a, w_b, kap_herm), use_cpp_kernels=use_cpp_kernels)
-            data_exp = merge_frames(data_exp, use_cpp_kernels=use_cpp_kernels)  # type: ignore[assignment]
+            data_exp = apply_pauli(data_exp, CompiledPauliAxis(w_a, w_b, kap_herm))
+            data_exp = merge_frames(data_exp)  # type: ignore[assignment]
         if odd_ph and data_exp.chi > 0:
             data_exp.weights = np.ascontiguousarray(data_exp.weights * 1.0j)
         return clone_reference_chp(plan_meta.data_final_tableau), data_exp

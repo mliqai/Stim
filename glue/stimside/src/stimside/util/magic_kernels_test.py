@@ -72,7 +72,9 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
             assert hasattr(lib1, sym), f"Missing symbol {sym}"
         assert int(lib1.magic_abi_v1()) == 1
 
-        exp = pq.ShotExpansion.zero_state(2, use_cpp_kernels=True)
+        with pytest.raises(TypeError, match="use_cpp_kernels"):
+            pq.ShotExpansion.zero_state(2, use_cpp_kernels=False)  # type: ignore[call-arg]
+        exp = pq.ShotExpansion.zero_state(2)
         pq.apply_pauli(exp, [1, 0], [0, 0], 0)
         assert pq._CACHED_MAGIC_LIB is not None and pq._CACHED_MAGIC_LIB is lib1
 
@@ -160,7 +162,7 @@ def test_zero_size_raw_abi_contiguity_guard_and_rejection() -> None:
     lib.magic_overlap(2, 0, h0, null_u64, null_u8, null_u8, 0, h1, null_u64, null_u8, null_u8, out_ri)
     assert (out_ri[0], out_ri[1]) == (0.0, 0.0)
 
-    # Strided / int64 PhaseQFEComponent arrays handled safely via cpp_overlap and Python fallback.
+    # Strided / int64 PhaseQFEComponent arrays handled safely via cpp_overlap.
     base_c = pq.PhaseQFEComponent.from_unpacked(
         [0, 0, 1], np.array([[1, 0], [0, 1], [1, 1]], dtype=np.uint8), [1, 2], [[0, 1], [1, 0]], [0, 1]
     )
@@ -170,106 +172,131 @@ def test_zero_size_raw_abi_contiguity_guard_and_rejection() -> None:
         n_qubits=3, d=2, h_words=base_c.h_words.astype(np.int64),
         A_words=base_c.A_words, ell=strided_ell, Gamma=strided_G, pivots=base_c.pivots,
     )
-    ov_ref = pq.overlap(base_c, base_c, use_cpp_kernels=False)
-    assert abs(pq.overlap(strided_c, base_c, use_cpp_kernels=True) - ov_ref) < 1e-14
-    assert abs(pq.overlap(strided_c, base_c, use_cpp_kernels=False) - ov_ref) < 1e-14
+    ov_ref = complex(np.vdot(base_c.to_statevector(), base_c.to_statevector()))
+    assert abs(ov_ref - 1.0) < 1e-14
+    assert abs(pq.overlap(strided_c, base_c) - ov_ref) < 1e-14
 
     empty_l = np.zeros(0, dtype=np.uint8)
     empty_B = np.zeros((0, 0), dtype=np.uint8)
     for q0 in range(4):
         for scl in (-3, 0, 5):
-            vc = pq.quadratic_gauss_sum(empty_l, empty_B, c0=q0, scale_log2=scl, use_cpp_kernels=True)
-            vp = pq.quadratic_gauss_sum(empty_l, empty_B, c0=q0, scale_log2=scl, use_cpp_kernels=False)
+            vc = pq.quadratic_gauss_sum(empty_l, empty_B, c0=q0, scale_log2=scl)
+            vp = (1j ** q0) * (2.0 ** (scl / 2.0))
             assert abs(vc - vp) < 1e-15
+
+
+def _dense_pauli_apply(psi: np.ndarray, a_mask: int, b_mask: int, kappa: int) -> np.ndarray:
+    idx = np.arange(psi.shape[0], dtype=np.uint64)
+    z_par = np.bitwise_count(idx & np.uint64(b_mask)) & 1
+    phases = pq._PHASE4[(int(kappa) + (z_par << 1)) & 3]
+    out = np.empty_like(psi)
+    out[idx ^ np.uint64(a_mask)] = phases * psi
+    return out
+
+
+def _extract_active_statevector(exp: pq.ShotExpansion, qs: list[int]) -> np.ndarray:
+    k = len(qs)
+    out = np.zeros(1 << k, dtype=np.complex128)
+    comps = exp.to_components()
+    for y in range(1 << k):
+        bra = pq.PhaseQFEComponent.zero_state(exp.n_qubits)
+        hw = np.zeros(exp.n_words, dtype=np.uint64)
+        for j, q in enumerate(qs):
+            if (y >> j) & 1:
+                hw |= pq.unit_bit_words(q, exp.n_words)
+        bra.h_words = hw
+        out[y] = sum(w * pq.overlap(bra, c) for w, c in comps)
+    return out
 
 
 @pytest.mark.parametrize("n_qubits", [1, 5, 63, 64, 65, 70, 128, 129, 130])
 def test_all_eight_kernels_word_boundaries_in_place_and_log_mass(n_qubits: int) -> None:
     nw = pq.n_words_for_qubits(n_qubits)
     z0 = np.zeros(nw, dtype=np.uint64)
-    u_first = pq.unit_bit_words(0, nw)
-    u_last = pq.unit_bit_words(n_qubits - 1, nw)
-    u_mid = pq.unit_bit_words(n_qubits // 2, nw)
+    qs = sorted({0, n_qubits // 2, n_qubits - 1})
+    loc = {q: j for j, q in enumerate(qs)}
+    q_f, q_m, q_l = 0, n_qubits // 2, n_qubits - 1
+    u_first = pq.unit_bit_words(q_f, nw)
+    u_last = pq.unit_bit_words(q_l, nw)
+    u_mid = pq.unit_bit_words(q_m, nw)
+    b_f, b_m, b_l = 1 << loc[q_f], 1 << loc[q_m], 1 << loc[q_l]
 
-    cpp = pq.ShotExpansion.zero_state(n_qubits, use_cpp_kernels=True)
-    py = pq.ShotExpansion.zero_state(n_qubits, use_cpp_kernels=False)
-    cpp.log_mass = py.log_mass = -3.75
+    cpp = pq.ShotExpansion.zero_state(n_qubits)
+    cpp.log_mass = -3.75
+    psi = np.zeros(1 << len(qs), dtype=np.complex128)
+    psi[0] = 1.0
 
-    cpp_cp = pq.apply_pauli(cpp, u_last, u_first, 1 if n_qubits == 1 else 0, in_place=False)
-    py_cp = pq.apply_pauli(py, u_last, u_first, 1 if n_qubits == 1 else 0, in_place=False)
-    assert cpp_cp is not cpp
-    _assert_shot_parity(cpp_cp, py_cp)
+    kap1 = 1 if n_qubits == 1 else 0
+    cpp_cp = pq.apply_pauli(cpp, u_last, u_first, kap1, in_place=False)
+    assert cpp_cp is not cpp and cpp_cp.log_mass == -3.75
+    np.testing.assert_allclose(_extract_active_statevector(cpp_cp, qs), _dense_pauli_apply(psi, b_l, b_f, kap1), atol=1e-13)
 
     assert pq.apply_pauli(cpp, u_first, z0, 0, in_place=True) is cpp
-    pq.apply_pauli(py, u_first, z0, 0, in_place=True)
-    _assert_shot_parity(cpp, py)
+    psi = _dense_pauli_apply(psi, b_f, 0, 0)
+    np.testing.assert_allclose(_extract_active_statevector(cpp, qs), psi, atol=1e-13)
 
     # P2 rank growth, dirty pivot via P1, then H4 rank reduction.
     cpp = pq.apply_quarter_turn(cpp, u_last, z0, 0)
-    py = pq.apply_quarter_turn(py, u_last, z0, 0)
-    _assert_shot_parity(cpp, py)
+    psi = (psi + 1j * _dense_pauli_apply(psi, b_l, 0, 0)) / np.sqrt(2.0)
+    assert cpp.log_mass == -3.75
+    np.testing.assert_allclose(_extract_active_statevector(cpp, qs), psi, atol=1e-13)
 
-    pq.apply_pauli(cpp, u_last, u_first, 1 if n_qubits == 1 else 0, in_place=True)
-    pq.apply_pauli(py, u_last, u_first, 1 if n_qubits == 1 else 0, in_place=True)
+    pq.apply_pauli(cpp, u_last, u_first, kap1, in_place=True)
+    psi = _dense_pauli_apply(psi, b_l, b_f, kap1)
     cpp_inv = cpp.copy()
-    py_inv = pq.apply_quarter_turn(py, u_last, z0, 0, sign=-1, in_place=False)
     assert pq.apply_quarter_turn(cpp_inv, u_last, z0, 0, sign=-1, in_place=True) is cpp_inv
-    _assert_shot_parity(cpp_inv, py_inv)
+    psi_inv = (psi - 1j * _dense_pauli_apply(psi, b_l, 0, 0)) / np.sqrt(2.0)
+    cpp_inv.check_invariants(require_canonical_offset=True)
+    np.testing.assert_allclose(_extract_active_statevector(cpp_inv, qs), psi_inv, atol=1e-13)
 
     if n_qubits >= 2:
-        kap2 = 1 if (n_qubits // 2) in (0, n_qubits - 1) else 0
+        kap2 = 1 if q_m in (q_f, q_l) else 0
         cpp = pq.apply_quarter_turn(cpp, u_first ^ u_last, u_mid, kap2)
-        py = pq.apply_quarter_turn(py, u_first ^ u_last, u_mid, kap2)
-        _assert_shot_parity(cpp, py)
+        psi = (psi + 1j * _dense_pauli_apply(psi, b_f ^ b_l, b_m, kap2)) / np.sqrt(2.0)
 
-    cpp = pq.apply_pauli_t(cpp, u_first, u_last, 1 if n_qubits == 1 else 0, dag=False)
-    py = pq.apply_pauli_t(py, u_first, u_last, 1 if n_qubits == 1 else 0, dag=False)
-    _assert_shot_parity(cpp, py)
+    cpp = pq.apply_pauli_t(cpp, u_first, u_last, kap1, dag=False)
+    psi = pq._T_C0 * psi + pq._T_C1 * _dense_pauli_apply(psi, b_f, b_l, kap1)
     cpp = pq.apply_pauli_t(cpp, z0, u_last, 2, dag=True)
-    py = pq.apply_pauli_t(py, z0, u_last, 2, dag=True)
-    _assert_shot_parity(cpp, py)
+    psi = pq._TDAG_C0 * psi + pq._TDAG_C1 * _dense_pauli_apply(psi, 0, b_l, 2)
 
-    if n_qubits >= 3:
-        q_set = sorted({0, max(1, n_qubits // 2), n_qubits - 1})
-        if len(q_set) == 3:
-            axes = [(z0, pq.unit_bit_words(q, nw), 0) for q in q_set]
-            cpp = pq.apply_ccz(cpp, axes)
-            py = pq.apply_ccz(py, axes)
-            _assert_shot_parity(cpp, py)
+    if len(qs) == 3:
+        cpp = pq.apply_ccz(cpp, [(z0, pq.unit_bit_words(q, nw), 0) for q in qs])
+        psi = psi.copy()
+        psi[7] *= -1.0
+    cpp.check_invariants(require_canonical_offset=True)
+    assert cpp.log_mass == -3.75
+    np.testing.assert_allclose(_extract_active_statevector(cpp, qs), psi, atol=1e-12)
 
-    for b_probe in (u_last, u_mid):
+    idx_k = np.arange(psi.shape[0], dtype=np.uint64)
+    for b_probe, b_loc in ((u_last, b_l), (u_mid, b_m)):
         for sig in (0, 1):
             z_sum = 0.0
             for out_bit in (0, 1):
-                p_c, z_c = pq.project_diagonal(cpp, b_probe, sig, out_bit, use_cpp_kernels=True)
-                p_p, z_p = pq.project_diagonal(py, b_probe, sig, out_bit, use_cpp_kernels=False)
-                assert abs(z_c - z_p) < 1e-13
-                _assert_shot_parity(p_c, p_p)
+                p_c, z_c = pq.project_diagonal(cpp, b_probe, sig, out_bit)
+                p_c.check_invariants(require_canonical_offset=True)
+                keep = ((np.bitwise_count(idx_k & np.uint64(b_loc)) ^ sig) & 1) == out_bit
+                psi_proj = np.where(keep, psi, 0.0j)
+                z_ref = float(np.vdot(psi_proj, psi_proj).real)
+                assert abs(z_c - z_ref) < 1e-13
+                np.testing.assert_allclose(_extract_active_statevector(p_c, qs), psi_proj, atol=1e-12)
                 z_sum += z_c
             assert abs(z_sum - cpp.norm_sq()) < 1e-12
-
-    c_zero = pq.PhaseQFEComponent.zero_state(n_qubits)
-    comps = [c for _, c in cpp.to_components()[:3]] + [c_zero]
-    for cb in comps:
-        for ck in comps:
-            ov_c = pq.overlap(cb, ck, use_cpp_kernels=True)
-            ov_p = pq.overlap(cb, ck, use_cpp_kernels=False)
-            assert abs(ov_c - ov_p) < 1e-13
 
     rng = np.random.default_rng(1000 + n_qubits)
     for g in (1, 8, 75 if n_qubits == 130 else 17):
         l_arr = rng.integers(0, 4, size=g, dtype=np.uint8)
         u_mat = np.triu(rng.integers(0, 2, size=(g, g), dtype=np.uint8), 1)
         b_mat = np.ascontiguousarray(u_mat ^ u_mat.T)
-        gc = pq.quadratic_gauss_sum(l_arr, b_mat, c0=n_qubits & 3, scale_log2=-g, use_cpp_kernels=True)
-        gp = pq.quadratic_gauss_sum(l_arr, b_mat, c0=n_qubits & 3, scale_log2=-g, use_cpp_kernels=False)
+        gc = pq.quadratic_gauss_sum(l_arr, b_mat, c0=n_qubits & 3, scale_log2=-g)
+        nz, k2, v8 = pq.quadratic_gauss_sum_dyadic(l_arr, b_mat, c0=n_qubits & 3)
+        gp = 0.0j if not nz else complex(pq._OMEGA_POW[v8]) * (2.0 ** ((k2 - g) / 2.0))
         assert abs(gc - gp) < 1e-14 * max(1.0, abs(gp))
 
 
 def test_high_chi_k1_first_seen_order_and_exact_cancellation() -> None:
     rng = np.random.default_rng(2026)
     n_q = 8
-    base = pq.ShotExpansion.zero_state(n_q, use_cpp_kernels=False)
+    base = pq.ShotExpansion.zero_state(n_q)
     for q in (0, 3, 6):
         base = pq.apply_quarter_turn(base, pq.unit_bit_words(q, 1), np.zeros(1, dtype=np.uint64), 0)
 
@@ -282,14 +309,17 @@ def test_high_chi_k1_first_seen_order_and_exact_cancellation() -> None:
     unmerged_cpp = pq.ShotExpansion(
         n_qubits=n_q, d=base.d, A_words=base.A_words, a_union=base.a_union,
         Gamma=base.Gamma, pivots=base.pivots, weights=w_raw, h_words=h_raw,
-        ell=ell_raw, ell_odd=base.ell_odd, use_cpp_kernels=True, _is_canonical_merged=False,
+        ell=ell_raw, ell_odd=base.ell_odd, _is_canonical_merged=False,
     )
-    unmerged_py = unmerged_cpp.copy()
-    unmerged_py.use_cpp_kernels = False
+    psi_raw = sum(w * c.to_statevector() for w, c in unmerged_cpp.to_components())
 
-    m_cpp = pq.merge_frames(unmerged_cpp, use_cpp_kernels=True)
-    m_py = pq.merge_frames(unmerged_py, use_cpp_kernels=False)
-    _assert_shot_parity(m_cpp, m_py)
+    m_cpp = pq.merge_frames(unmerged_cpp)
+    assert isinstance(m_cpp, pq.ShotExpansion)
+    m_cpp.check_invariants(require_canonical_offset=True)
+    np.testing.assert_allclose(m_cpp.to_statevector(), psi_raw, atol=1e-12)
+    m_idem = pq.merge_frames(m_cpp)
+    assert isinstance(m_idem, pq.ShotExpansion)
+    _assert_shot_parity(m_cpp, m_idem)
 
     cancel_exp = pq.ShotExpansion(
         n_qubits=n_q, d=base.d, A_words=base.A_words, a_union=base.a_union,
@@ -297,9 +327,10 @@ def test_high_chi_k1_first_seen_order_and_exact_cancellation() -> None:
         weights=np.concatenate([m_cpp.weights, -m_cpp.weights]),
         h_words=np.vstack([m_cpp.h_words, m_cpp.h_words]),
         ell=np.vstack([m_cpp.ell, m_cpp.ell]),
-        ell_odd=base.ell_odd, use_cpp_kernels=True, _is_canonical_merged=False,
+        ell_odd=base.ell_odd, _is_canonical_merged=False,
     )
-    empty_cpp = pq.merge_frames(cancel_exp, use_cpp_kernels=True)
+    empty_cpp = pq.merge_frames(cancel_exp)
+    assert isinstance(empty_cpp, pq.ShotExpansion)
     assert empty_cpp.chi == 0 and empty_cpp.norm_sq() == 0.0
     u0 = pq.unit_bit_words(0, 1)
     assert pq.apply_pauli(empty_cpp, u0, u0, 1).chi == 0
@@ -307,75 +338,67 @@ def test_high_chi_k1_first_seen_order_and_exact_cancellation() -> None:
     assert pq.apply_pauli_t(empty_cpp, u0, np.zeros(1, dtype=np.uint64), 0).chi == 0
 
 
-@pytest.mark.parametrize("n_qubits", [5, 70])
-def test_measure_expansion_rng_lockstep_cpp_vs_python(n_qubits: int) -> None:
-    nw = pq.n_words_for_qubits(n_qubits)
-    z0 = np.zeros(nw, dtype=np.uint64)
-    qs = [0, 1, n_qubits // 2, n_qubits - 2, n_qubits - 1]
-    exp_c = pq.ShotExpansion.zero_state(n_qubits, use_cpp_kernels=True)
-    exp_p = pq.ShotExpansion.zero_state(n_qubits, use_cpp_kernels=False)
-    for q in qs[:3]:
-        uq = pq.unit_bit_words(q, nw)
-        exp_c = pq.apply_quarter_turn(exp_c, uq, z0, 0)
-        exp_p = pq.apply_quarter_turn(exp_p, uq, z0, 0)
-        exp_c = pq.apply_pauli_t(exp_c, z0, uq, 0)
-        exp_p = pq.apply_pauli_t(exp_p, z0, uq, 0)
+def test_measure_expansion_rng_lockstep_and_embedding_invariance() -> None:
+    def _run_meas_seq(n_qubits: int, qs: list[int], seed: int) -> tuple[list[pq.MeasurementResult], float]:
+        nw = pq.n_words_for_qubits(n_qubits)
+        z0 = np.zeros(nw, dtype=np.uint64)
+        exp = pq.ShotExpansion.zero_state(n_qubits)
+        for q in qs[:3]:
+            uq = pq.unit_bit_words(q, nw)
+            exp = pq.apply_quarter_turn(exp, uq, z0, 0)
+            exp = pq.apply_pauli_t(exp, z0, uq, 0)
+        rng = np.random.default_rng(seed)
+        out: list[pq.MeasurementResult] = []
+        for idx, q in enumerate(qs[:3]):
+            uq = pq.unit_bit_words(q, nw)
+            a_m, b_m = (uq, z0) if (idx % 2 == 0) else (z0, uq)
+            r = pq.measure_expansion(exp, a_m, b_m, 0, rng=rng, p_flip=0.2, invert_result=(idx == 1))
+            out.append(r)
+            assert isinstance(r.post_state, pq.ShotExpansion)
+            exp = r.post_state
+        return out, float(rng.random())
 
-    rng_c = np.random.default_rng(777 + n_qubits)
-    rng_p = np.random.default_rng(777 + n_qubits)
-    for idx, q in enumerate(qs[:3]):
-        uq = pq.unit_bit_words(q, nw)
-        a_m, b_m = (uq, z0) if (idx % 2 == 0) else (z0, uq)
-        rc = pq.measure_expansion(exp_c, a_m, b_m, 0, rng=rng_c, p_flip=0.2, invert_result=(idx == 1))
-        rp = pq.measure_expansion(exp_p, a_m, b_m, 0, rng=rng_p, p_flip=0.2, invert_result=(idx == 1))
-        assert (rc.outcome, rc.reported_outcome, rc.readout_flipped) == (
-            rp.outcome, rp.reported_outcome, rp.readout_flipped
+    res5, tail5 = _run_meas_seq(5, [0, 1, 2, 3, 4], 777)
+    res70, tail70 = _run_meas_seq(70, [0, 1, 35, 68, 69], 777)
+    assert tail5 == tail70
+    for r5, r70 in zip(res5, res70):
+        assert (r5.outcome, r5.reported_outcome, r5.readout_flipped) == (
+            r70.outcome, r70.reported_outcome, r70.readout_flipped
         )
-        assert abs(rc.z0 - rp.z0) < 1e-13 and abs(rc.z1 - rp.z1) < 1e-13
-        assert abs(rc.log_branch_mass - rp.log_branch_mass) < 1e-13
-        exp_c, exp_p = rc.post_state, rp.post_state  # type: ignore[assignment]
-        _assert_shot_parity(exp_c, exp_p, atol=1e-12)
-    assert rng_c.random() == rng_p.random()
+        assert abs(r5.z0 - r70.z0) < 1e-13 and abs(r5.z1 - r70.z1) < 1e-13
+        assert abs(r5.log_branch_mass - r70.log_branch_mass) < 1e-13
 
 
-@pytest.mark.parametrize("n_qubits", [4, 70])
-def test_magic_compile_direct_and_selector_cpp_vs_python_parity(n_qubits: int) -> None:
-    q0, q1, q2 = 0, n_qubits // 2, n_qubits - 1
-    circ = stim.Circuit(f"""
-        H {q0} {q1} {q2}
-        I[T] {q0} {q2}
-        X_ERROR(0.3) {q0} {q2}
-        CX {q0} {q1}
-        I[CCZ] {q0} {q1} {q2}
-        Z_ERROR(0.25) {q1}
-        I[T_DAG] {q1} {q2}
-        H {q0} {q1} {q2}
-        M {q0} {q1} {q2}
-    """)
-    cd = compile_direct(circ)
-    cs = compile_selector(circ, gadgetize_pauli_noise=True)
+def test_magic_compile_direct_vs_selector_and_word_boundary_parity() -> None:
+    def _circ(q0: int, q1: int, q2: int) -> stim.Circuit:
+        return stim.Circuit(f"""
+            H {q0} {q1} {q2}
+            I[T] {q0} {q2}
+            X_ERROR(0.3) {q0} {q2}
+            CX {q0} {q1}
+            I[CCZ] {q0} {q1} {q2}
+            Z_ERROR(0.25) {q1}
+            I[T_DAG] {q1} {q2}
+            H {q0} {q1} {q2}
+            M {q0} {q1} {q2}
+        """)
+
     noise_trace = {0: 1, 1: 1}
+    c4, c70 = _circ(0, 2, 3), _circ(0, 35, 69)
+    rd4 = run_direct(compile_direct(c4), pauli_noise_trace=noise_trace, rng=np.random.default_rng(42))
+    rd70 = run_direct(compile_direct(c70), pauli_noise_trace=noise_trace, rng=np.random.default_rng(42))
+    rs4 = run_selector(compile_selector(c4, gadgetize_pauli_noise=True), pauli_noise_trace=noise_trace, rng=np.random.default_rng(42))
+    rs70 = run_selector(compile_selector(c70, gadgetize_pauli_noise=True), pauli_noise_trace=noise_trace, rng=np.random.default_rng(42))
+    for r_other in (rd70, rs4, rs70):
+        assert np.array_equal(rd4.measurements, r_other.measurements)
+        assert abs(rd4.log_branch_mass - r_other.log_branch_mass) < 1e-12
 
-    rd_c = run_direct(cd, pauli_noise_trace=noise_trace, rng=np.random.default_rng(42), use_cpp_kernels=True)
-    rd_p = run_direct(cd, pauli_noise_trace=noise_trace, rng=np.random.default_rng(42), use_cpp_kernels=False)
-    assert np.array_equal(rd_c.measurements, rd_p.measurements)
-    assert abs(rd_c.log_branch_mass - rd_p.log_branch_mass) < 1e-12
-    _assert_shot_parity(rd_c.expansion, rd_p.expansion, atol=1e-12)
-
-    rs_c = run_selector(cs, pauli_noise_trace=noise_trace, rng=np.random.default_rng(42), use_cpp_kernels=True)
-    rs_p = run_selector(cs, pauli_noise_trace=noise_trace, rng=np.random.default_rng(42), use_cpp_kernels=False)
-    assert np.array_equal(rs_c.measurements, rs_p.measurements)
-    assert abs(rs_c.log_branch_mass - rs_p.log_branch_mass) < 1e-12
-    _assert_shot_parity(rs_c.expansion, rs_p.expansion, atol=1e-12)
-
-    if n_qubits == 4:
-        circ_open = stim.Circuit("H 0 1 2\nI[T] 0\nX_ERROR(0.2) 0\nI[CCZ] 0 1 2\nI[T_DAG] 2")
-        cs_o = compile_selector(circ_open, gadgetize_pauli_noise=True)
-        so_c = run_selector(cs_o, pauli_noise_trace={0: 1}, use_cpp_kernels=True, extract_data=True)
-        so_p = run_selector(cs_o, pauli_noise_trace={0: 1}, use_cpp_kernels=False, extract_data=True)
-        psi_c = so_c.expansion.to_statevector(ref_tableau=so_c.final_tableau)
-        psi_p = so_p.expansion.to_statevector(ref_tableau=so_p.final_tableau)
-        assert np.max(np.abs(psi_c - psi_p)) < 1e-12
+    circ_open = stim.Circuit("H 0 1 2\nI[T] 0\nX_ERROR(0.2) 0\nI[CCZ] 0 1 2\nI[T_DAG] 2")
+    so_d = run_direct(compile_direct(circ_open), pauli_noise_trace={0: 1})
+    so_s = run_selector(compile_selector(circ_open, gadgetize_pauli_noise=True), pauli_noise_trace={0: 1}, extract_data=True)
+    psi_d = so_d.expansion.to_statevector(ref_tableau=so_d.final_tableau)
+    psi_s = so_s.expansion.to_statevector(ref_tableau=so_s.final_tableau)
+    assert abs(abs(np.vdot(psi_d, psi_s)) - 1.0) < 1e-12
 
 
 @pytest.mark.parametrize(
@@ -428,6 +451,4 @@ def test_overlap_rejects_expansions_qubit_mismatch_and_malformed_shapes(case: st
         with pytest.raises(exc):
             mk.cpp_overlap(b, k)
         with pytest.raises(exc):
-            pq.overlap(b, k, use_cpp_kernels=True)
-        with pytest.raises(exc):
-            pq.overlap(b, k, use_cpp_kernels=False)
+            pq.overlap(b, k)

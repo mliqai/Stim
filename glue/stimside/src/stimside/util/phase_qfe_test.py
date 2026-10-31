@@ -1570,8 +1570,9 @@ def test_m1_p2_explicit_atol_override_precedence_all_primitives(
             apply_ccz(tgt3, ccz_e11, atol=1e-13)
         _ = apply_ccz(tgt3, ccz_e8, atol=1e-6)
 
-    # (3) apply_quarter_turn and apply_pauli_t explicit atol overrides via controlled merge_frames drift
+    # (3) apply_quarter_turn and apply_pauli_t explicit atol overrides under norm drift
     orig_merge = pq.merge_frames
+    orig_pre = pq._checked_shot_pre_norm
 
     def make_drifted_merge(delta: float):  # type: ignore[no-untyped-def]
         def _drifted_merge(expansion, **kw):  # type: ignore[no-untyped-def]
@@ -1585,17 +1586,20 @@ def test_m1_p2_explicit_atol_override_precedence_all_primitives(
         return _drifted_merge
 
     monkeypatch.setattr(pq, "merge_frames", make_drifted_merge(1e-11))
+    monkeypatch.setattr(pq, "_checked_shot_pre_norm", lambda e, c, op, _p=orig_pre: _p(e, c, op) + 1e-11)
     for tgt in (exp1, lst1):
         with pytest.raises(FloatingPointError):
-            apply_quarter_turn(tgt, [1], [0], 0, atol=1e-13, use_cpp_kernels=False)
+            apply_quarter_turn(tgt, [1], [0], 0, atol=1e-13)
         with pytest.raises(FloatingPointError):
-            apply_pauli_t(tgt, [0], [1], 0, atol=1e-13, use_cpp_kernels=False)
+            apply_pauli_t(tgt, [0], [1], 0, atol=1e-13)
 
     monkeypatch.setattr(pq, "merge_frames", make_drifted_merge(1e-8))
+    monkeypatch.setattr(pq, "_checked_shot_pre_norm", lambda e, c, op, _p=orig_pre: _p(e, c, op) + 1e-8)
     for tgt in (exp1, lst1):
-        _ = apply_quarter_turn(tgt, [1], [0], 0, atol=1e-6, use_cpp_kernels=False)
-        _ = apply_pauli_t(tgt, [0], [1], 0, atol=1e-6, use_cpp_kernels=False)
+        _ = apply_quarter_turn(tgt, [1], [0], 0, atol=1e-6)
+        _ = apply_pauli_t(tgt, [0], [1], 0, atol=1e-6)
     monkeypatch.setattr(pq, "merge_frames", orig_merge)
+    monkeypatch.setattr(pq, "_checked_shot_pre_norm", orig_pre)
 
     # (4) measure_expansion forwards explicit atol=tol to both basis-rotation apply_quarter_turn calls
     recorded_atols: list[float | None] = []
@@ -1790,18 +1794,13 @@ def test_m1_r3_component_terms_invariants_and_in_place_quarter_turn() -> None:
             apply_pauli(bad_terms, [1, 0], [0, 0], 0)  # type: ignore[arg-type]
 
     # Bug 5: in_place=True on ShotExpansion must mutate & merge `exp_ip` in-place (`ret is exp_ip`)
-    for use_cpp in (False, True):
-        exp_ip = ShotExpansion.from_components(
-            [(0.5 + 0j, c0.copy()), (0.5 + 0j, c0.copy())], merge=False
-        )
-        exp_ref = apply_quarter_turn(
-            exp_ip.copy(), [1, 0], [0, 0], 0, in_place=False, use_cpp_kernels=use_cpp
-        )
-        ret = apply_quarter_turn(
-            exp_ip, [1, 0], [0, 0], 0, in_place=True, use_cpp_kernels=use_cpp
-        )
-        assert ret is exp_ip
-        assert exp_ip._is_canonical_merged is True and exp_ip.chi == 1
-        exp_ip.check_invariants(require_canonical_offset=True)
-        assert np.max(np.abs(exp_ip.to_statevector() - exp_ref.to_statevector())) < 1e-15
+    exp_ip = ShotExpansion.from_components(
+        [(0.5 + 0j, c0.copy()), (0.5 + 0j, c0.copy())], merge=False
+    )
+    exp_ref = apply_quarter_turn(exp_ip.copy(), [1, 0], [0, 0], 0, in_place=False)
+    ret = apply_quarter_turn(exp_ip, [1, 0], [0, 0], 0, in_place=True)
+    assert ret is exp_ip
+    assert exp_ip._is_canonical_merged is True and exp_ip.chi == 1
+    exp_ip.check_invariants(require_canonical_offset=True)
+    assert np.max(np.abs(exp_ip.to_statevector() - exp_ref.to_statevector())) < 1e-15
 

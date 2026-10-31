@@ -16,8 +16,8 @@ from stimside.util.reference_chp import ReferenceCHPTableau
 
 
 def _dense_unitary_psi(circ: stim.Circuit) -> np.ndarray:
-    plan = PrepareQueries(circ, use_cpp_kernels=False)
-    res = run_direct(plan.compiled_plan, rng=0, use_cpp_kernels=False)  # type: ignore[arg-type]
+    plan = PrepareQueries(circ)
+    res = run_direct(plan.compiled_plan, rng=0)  # type: ignore[arg-type]
     return reconstruct_statevector(res, plan=plan.compiled_plan)
 
 
@@ -45,10 +45,12 @@ def test_exports_aliases_and_validation_errors() -> None:
     fc = [CliffordFaultChannel(step_index=1, branches=(FaultBranch(0.2, "S", (0,)),))]
     with pytest.raises(TypeError):
         PrepareQueries("H 0")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="use_cpp_kernels"):
+        PrepareQueries(c, use_cpp_kernels=False)  # type: ignore[call-arg]
     for bad_prep in ({"fault_mode": "BOGUS"}, {"atol": 0.0}, {"output_qubits": [0, 0]}, {"fault_mode": "SELECTOR", "fault_channels": fc, "output_qubits": [-1]}, {"fault_mode": "SELECTOR", "fault_channels": fc, "output_qubits": [2]}, {"target_spec": stim.Circuit("H 0\nM 0"), "output_qubits": [0]}):
         with pytest.raises(ValueError):
             PrepareQueries(c, **bad_prep)  # type: ignore[arg-type]
-    plan = PrepareQueries(c, fault_channels=fc, use_cpp_kernels=False)
+    plan = PrepareQueries(c, fault_channels=fc)
     for bad_eval in ({"queries": "mass"}, {"queries": ("unknown_metric",)}, {"queries": ("fidelity",)}, {"realization": {"bogus": {}}}, {"realization": {"faults": {99: 0}}}, {"realization": {"faults": {0: 5}}}, {"realization": {"measurements": {5: 0}}}, {"acceptance_spec": {5: 0}}):
         with pytest.raises(ValueError):
             EvaluateQueries(plan, **bad_eval)  # type: ignore[arg-type]
@@ -61,31 +63,30 @@ def test_exports_aliases_and_validation_errors() -> None:
 def test_empty_zero_meas_and_impossible_branch_edges(conditional: bool) -> None:
     """Verify empty circuit, 0-measurement unitary, and impossible zero-mass postselection."""
     for txt in ("", "H 0\nI[T] 0\nCX 0 1"):
-        plan = PrepareQueries(stim.Circuit(txt), use_cpp_kernels=False)
+        plan = PrepareQueries(stim.Circuit(txt))
         res = EvaluateQueries(plan, queries=("mass", "acceptance", "prefix_probs", "sample_measurements"), conditional=conditional, rng=7)
         assert isinstance(plan, PreparedQueryPlan) and isinstance(res, QueryResult) and isinstance(res.diagnostics, QueryDiagnostics)
         assert res.mass is not None and abs(res.mass - 1.0) < 1e-14 and res.acceptance_mass is not None and abs(res.acceptance_mass - 1.0) < 1e-14
         assert res.prefix_probs == [] and res.sampled_measurements is not None and res.sampled_measurements.shape == (0,)
 
-    p_imp = PrepareQueries(stim.Circuit("I[T] 0\nM 0"), target_spec=np.array([1.0 + 0.0j, 0.0j]), output_qubits=[0], acceptance_spec={0: 1}, use_cpp_kernels=False)
+    p_imp = PrepareQueries(stim.Circuit("I[T] 0\nM 0"), target_spec=np.array([1.0 + 0.0j, 0.0j]), output_qubits=[0], acceptance_spec={0: 1})
     r_imp = EvaluateQueries(p_imp, {"measurements": {0: 1}}, queries=("mass", "acceptance", "fidelity"), conditional=conditional)
     assert r_imp.mass == 0.0 and r_imp.acceptance_mass == 0.0 and r_imp.fidelity_mass == 0.0
 
 
 @pytest.mark.parametrize("fault_mode", ["DIRECT", "SELECTOR"])
-@pytest.mark.parametrize("use_cpp", [False, True])
-def test_choi_open_slot_noise_resets_and_born_partition(fault_mode: str, use_cpp: bool) -> None:
+def test_choi_open_slot_noise_resets_and_born_partition(fault_mode: str) -> None:
     """Verify open fault non-cancellation, DIRECT==SELECTOR, Pauli/herald/reset/MPAD, and sum(Z_h)==1."""
     c_open = stim.Circuit("I[T] 0\nI[CLIFFORD_FAULT: (0.5, H)] 0\nI[T_DAG] 0\nM 0")
-    p_open = PrepareQueries(c_open, fault_mode=fault_mode, use_cpp_kernels=use_cpp)
+    p_open = PrepareQueries(c_open, fault_mode=fault_mode)
     assert abs((EvaluateQueries(p_open, {"faults": {0: 0}, "measurements": {0: 0}}).mass or 0.0) - 1.0) < 1e-12
     for m_b in (0, 1):
         assert abs((EvaluateQueries(p_open, {"faults": {0: 1}, "measurements": {0: m_b}}).mass or 0.0) - 0.5) < 1e-12
 
     c_mix = stim.Circuit("H 0 1 2\nI[T] 0 1\nDEPOLARIZE1(0.15) 0\nI[CCZ] 0 1 2\nHERALDED_ERASE(0.2) 1\nMR 0\nR 2\nMPAD(0.25) 1\nH 1 2\nM(0.1) !1")
     fc = [CliffordFaultChannel(step_index=2, branches=(FaultBranch(0.2, "S", (0,)), FaultBranch(0.2, "CZ", (1, 2))))]
-    plan = PrepareQueries(c_mix, fault_mode=fault_mode, fault_channels=fc, use_cpp_kernels=use_cpp)
-    plan_dir = PrepareQueries(c_mix, fault_mode="DIRECT", fault_channels=fc, use_cpp_kernels=False)
+    plan = PrepareQueries(c_mix, fault_mode=fault_mode, fault_channels=fc)
+    plan_dir = PrepareQueries(c_mix, fault_mode="DIRECT", fault_channels=fc)
     for f_b in (0, 1, 2):
         tot = 0.0
         for bits in itertools.product((0, 1), repeat=4):
@@ -97,31 +98,32 @@ def test_choi_open_slot_noise_resets_and_born_partition(fault_mode: str, use_cpp
 
 
 @pytest.mark.parametrize("fault_mode", ["DIRECT", "SELECTOR"])
-def test_segment_tree_cache_hits_partial_invalidation_and_cpp_parity(fault_mode: str) -> None:
-    """Verify cold -> hit -> partial invalidation diagnostics and C++ vs Python lockstep."""
+def test_segment_tree_cache_hits_and_partial_invalidation(fault_mode: str) -> None:
+    """Verify cold -> hit -> partial invalidation diagnostics and exact fallback parity."""
     circ = stim.Circuit("H 0 1 2 3\nI[CCZ] 0 1 2\nI[T] 0 1 2 3\nCX 0 3 1 2\nI[CCZ] 1 2 3\nI[T_DAG] 0 2\nCX 2 0 3 1\nI[CCZ] 0 2 3\nI[T] 1 3\nH 0 1 2 3\nM 0 1")
     fcs = [CliffordFaultChannel(step_index=st, branches=(FaultBranch(0.2, g, tg),), slot_id=sid) for sid, st, g, tg in ((0, 2, "S", (0,)), (1, 4, "H", (1,)), (2, 6, "CZ", (2, 3)), (3, 8, "S_DAG", (3,)))]
-    p_py, p_cpp = PrepareQueries(circ, fault_mode=fault_mode, fault_channels=fcs, use_cpp_kernels=False), PrepareQueries(circ, fault_mode=fault_mode, fault_channels=fcs, use_cpp_kernels=True)
+    plan = PrepareQueries(circ, fault_mode=fault_mode, fault_channels=fcs)
+    plan_fb = PrepareQueries(circ, fault_mode=fault_mode, fault_channels=fcs, budget=QueryBudget(max_terms=1, on_budget_exceeded="fallback"))
     r0 = {"faults": {0: 0, 1: 0, 2: 0, 3: 0}, "measurements": {0: 0, 1: 1}}
-    c0_py, c0_cpp = EvaluateQueries(p_py, r0, queries=("mass",)), EvaluateQueries(p_cpp, r0, queries=("mass",))
-    tot_nodes = c0_py.diagnostics.node_evaluations
-    assert tot_nodes >= 2 and c0_py.diagnostics.invalidated_nodes == 0 and c0_cpp.diagnostics.node_evaluations == tot_nodes and abs((c0_py.mass or 0.0) - (c0_cpp.mass or 0.0)) < 1e-13
-    c1_py, c1_cpp = EvaluateQueries(p_py, r0, queries=("mass",)), EvaluateQueries(p_cpp, r0, queries=("mass",))
-    assert c1_py.diagnostics.cache_hits >= 1 and c1_py.diagnostics.node_evaluations == 0 and c1_py.diagnostics.invalidated_nodes == 0 and c1_cpp.diagnostics.cache_hits == c1_py.diagnostics.cache_hits
+    c0, ref0 = EvaluateQueries(plan, r0, queries=("mass",)), EvaluateQueries(plan_fb, r0, queries=("mass",))
+    tot_nodes = c0.diagnostics.node_evaluations
+    assert tot_nodes >= 2 and c0.diagnostics.invalidated_nodes == 0 and ref0.diagnostics.used_fallback and abs((c0.mass or 0.0) - (ref0.mass or 0.0)) < 1e-13
+    c1 = EvaluateQueries(plan, r0, queries=("mass",))
+    assert c1.diagnostics.cache_hits >= 1 and c1.diagnostics.node_evaluations == 0 and c1.diagnostics.invalidated_nodes == 0 and abs((c1.mass or 0.0) - (c0.mass or 0.0)) < 1e-15
     r_right = {"faults": {0: 0, 1: 0, 2: 0, 3: 1}, "measurements": {0: 0, 1: 1}}
-    c2_py, c2_cpp = EvaluateQueries(p_py, r_right, queries=("mass",)), EvaluateQueries(p_cpp, r_right, queries=("mass",))
-    assert c2_py.diagnostics.cache_hits >= 1 and 0 < c2_py.diagnostics.invalidated_nodes < tot_nodes and 0 < c2_py.diagnostics.node_evaluations < tot_nodes
-    assert c2_cpp.diagnostics.cache_hits == c2_py.diagnostics.cache_hits and c2_cpp.diagnostics.node_evaluations == c2_py.diagnostics.node_evaluations
+    c2, ref2 = EvaluateQueries(plan, r_right, queries=("mass",)), EvaluateQueries(plan_fb, r_right, queries=("mass",))
+    assert c2.diagnostics.cache_hits >= 1 and 0 < c2.diagnostics.invalidated_nodes < tot_nodes and 0 < c2.diagnostics.node_evaluations < tot_nodes
+    assert abs((c2.mass or 0.0) - (ref2.mass or 0.0)) < 1e-13
 
     r_left = {"faults": {0: 1, 1: 0, 2: 0, 3: 1}, "measurements": {0: 0, 1: 1}}
-    c3_py = EvaluateQueries(p_py, r_left, queries=("mass",))
-    assert c3_py.diagnostics.cache_hits >= 1 and 0 < c3_py.diagnostics.invalidated_nodes < tot_nodes
+    c3 = EvaluateQueries(plan, r_left, queries=("mass",))
+    assert c3.diagnostics.cache_hits >= 1 and 0 < c3.diagnostics.invalidated_nodes < tot_nodes
 
 
 def test_causal_prefix_probs_feedback_and_sampling() -> None:
     """Verify causal prefix_probs invariance under future acceptance_spec, rec/sweep feedback, and sampling."""
     circ = stim.Circuit("H 0\nI[T] 0\nH 0\nM 0\nCZ sweep[0] 0\nCX rec[-1] 1\nH 1 2\nI[CCZ] 0 1 2\nCY rec[-1] 2\nH 1 2\nM 1 2")
-    p_none, p_dict, p_fn = PrepareQueries(circ, acceptance_spec=None, use_cpp_kernels=False), PrepareQueries(circ, acceptance_spec={2: 1}, use_cpp_kernels=False), PrepareQueries(circ, acceptance_spec=lambda m: bool(m[2]), use_cpp_kernels=False)
+    p_none, p_dict, p_fn = PrepareQueries(circ, acceptance_spec=None), PrepareQueries(circ, acceptance_spec={2: 1}), PrepareQueries(circ, acceptance_spec=lambda m: bool(m[2]))
 
     exact_probs = np.zeros(8, dtype=np.float64)
     for idx in range(8):
@@ -155,7 +157,7 @@ def test_partial_trace_fidelity_all_formats_multiword_and_mc_ratio(fault_mode: s
     tgt_ket = _dense_unitary_psi(tgt_circ)
     ref_t.do_unitary("H", [0, 1])
     ref_t.do_unitary("CZ", [0, 1])
-    exp_t = apply_pauli_t(ShotExpansion.zero(2, use_cpp_kernels=False), ([1, 0], [0, 1], 0), sign=1, use_cpp_kernels=False)
+    exp_t = apply_pauli_t(ShotExpansion.zero(2), ([1, 0], [0, 1], 0), sign=1)
     assert isinstance(exp_t, ShotExpansion)
 
     psi_m0 = _dense_unitary_psi(stim.Circuit("H 0 1 2\nI[T] 0 1\nI[CCZ] 0 1 2\nCX 0 2\nH 1 2")).copy()

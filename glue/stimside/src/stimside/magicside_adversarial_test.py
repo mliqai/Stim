@@ -159,29 +159,38 @@ def test_adv_cpp_heap_fallbacks_high_nwords_and_high_dim() -> None:
     for n_q, qs in ((1030, [0, 63, 64, 512, 1024, 1029]), (264, list(range(260)))):
         nw = pq.n_words_for_qubits(n_q)
         zw = np.zeros(nw, dtype=np.uint64)
-        ec = pq.ShotExpansion.zero(n_q, use_cpp_kernels=True)
-        ep = pq.ShotExpansion.zero(n_q, use_cpp_kernels=False)
+        ec = pq.ShotExpansion.zero(n_q)
         for q in qs:
             uq = pq.unit_bit_words(q, nw)
-            ec = pq.apply_quarter_turn(ec, uq, zw, 0, use_cpp_kernels=True)
-            ep = pq.apply_quarter_turn(ep, uq, zw, 0, use_cpp_kernels=False)
+            ec = pq.apply_quarter_turn(ec, uq, zw, 0)
+        assert ec.d == len(qs) and ec.chi == 1
+        ec.check_invariants(require_canonical_offset=True)
+
         a_mix = pq.unit_bit_words(qs[0], nw) ^ pq.unit_bit_words(qs[-1], nw)
         b_mix = pq.unit_bit_words(qs[1], nw) ^ pq.unit_bit_words(qs[-2], nw)
-        ec = pq.apply_pauli_t(ec, a_mix, b_mix, 0, use_cpp_kernels=True)
-        ep = pq.apply_pauli_t(ep, a_mix, b_mix, 0, use_cpp_kernels=False)
-        mc_r = pq.measure_expansion(ec, zw, a_mix, 0, rng=np.random.default_rng(5), use_cpp_kernels=True)
-        mp_r = pq.measure_expansion(ep, zw, a_mix, 0, rng=np.random.default_rng(5), use_cpp_kernels=False)
-        sc, sp = mc_r.post_state, mp_r.post_state
-        assert isinstance(sc, pq.ShotExpansion) and isinstance(sp, pq.ShotExpansion)
-        assert abs(mc_r.z0 - mp_r.z0) < 1e-12 and np.array_equal(sc.A_words, sp.A_words)
-        assert np.array_equal(sc.Gamma, sp.Gamma) and np.allclose(sc.weights, sp.weights, atol=1e-12)
-        c0_c, c0_p = sc.to_components()[0][1], sp.to_components()[0][1]
-        assert abs(pq.overlap(c0_c, c0_p, use_cpp_kernels=True) - 1.0) < 1e-12
+        ec = pq.apply_pauli_t(ec, a_mix, b_mix, 0)
+        assert ec.chi == 2 and abs(ec.norm_sq() - 1.0) < 1e-12
+
+        uncomp = pq.apply_pauli_t(ec, a_mix, b_mix, 0, dag=True)
+        for q in reversed(qs):
+            uq = pq.unit_bit_words(q, nw)
+            uncomp = pq.apply_quarter_turn(uncomp, uq, zw, 0, sign=-1)
+        assert uncomp.d == 0 and uncomp.chi == 1
+        assert not pq.words_any_nonzero(uncomp.h_words[0])
+        assert abs(uncomp.weights[0] - 1.0) < 1e-12
+
+        mc_r = pq.measure_expansion(ec, zw, a_mix, 0, rng=np.random.default_rng(5))
+        sc = mc_r.post_state
+        assert isinstance(sc, pq.ShotExpansion)
+        assert abs(mc_r.z0 - 0.5) < 1e-12 and abs(mc_r.z1 - 0.5) < 1e-12
+        assert sc.d == len(qs) - 1 and abs(sc.norm_sq() - 1.0) < 1e-12
+        sc.check_invariants(require_canonical_offset=True)
+        c0_c = sc.to_components()[0][1]
+        assert abs(pq.overlap(c0_c, c0_c) - 1.0) < 1e-12
 
 
 @pytest.mark.parametrize("fault_mode", ["DIRECT", "SELECTOR"])
-@pytest.mark.parametrize("use_cpp", [True, False])
-def test_adv_m6_tandem_sync_and_sub_1e15_fallback_seam(fault_mode: str, use_cpp: bool) -> None:
+def test_adv_m6_tandem_sync_and_sub_1e15_fallback_seam(fault_mode: str) -> None:
     """Verify exact 0.0 log-mass cancellation and <=1e-15 pinned recovery across fallback."""
     magic_blk = "H 0 1 2 3\nI[CCZ] 0 1 2 1 2 3\nI[T] 0 1 2 3\nI[CLIFFORD_FAULT: (0.3, Z)] 0\nH 0 1 2 3"
     budget_fb = QueryBudget(max_terms=2, on_budget_exceeded="fallback")
@@ -191,7 +200,7 @@ def test_adv_m6_tandem_sync_and_sub_1e15_fallback_seam(fault_mode: str, use_cpp:
         for fp in (1e-16, 1e-15, 1e-14, 0.3, 1.0 - 1e-14, 1.0 - 1e-15, 1.0 - 1e-16):
             circ = stim.Circuit(f"MPAD({fp:.17g}) {pad_tok}\n{magic_blk}\nMPAD({fp:.17g}) {pad_tok}")
             stored_fp = float(circ[0].gate_args_copy()[0])
-            plan = PrepareQueries(circ, fault_mode=fault_mode, budget=budget_fb, use_cpp_kernels=use_cpp)
+            plan = PrepareQueries(circ, fault_mode=fault_mode, budget=budget_fb)
 
             seen_bits: set[int] = set()
             n_seeds = 16 if fp == 0.3 else 3
@@ -229,7 +238,7 @@ def test_adv_m6_tandem_sync_and_sub_1e15_fallback_seam(fault_mode: str, use_cpp:
     for ph in (1e-16, 1e-15, 1e-14, 0.3):
         circ_h = stim.Circuit(f"HERALDED_ERASE({ph:.17g}) 0\n{magic_blk}\nM({ph:.17g}) 0")
         stored_ph = float(circ_h[0].gate_args_copy()[0])
-        plan_h = PrepareQueries(circ_h, fault_mode=fault_mode, budget=budget_fb, use_cpp_kernels=use_cpp)
+        plan_h = PrepareQueries(circ_h, fault_mode=fault_mode, budget=budget_fb)
         res_h = EvaluateQueries(
             plan_h,
             {"faults": {0: 1}, "measurements": {0: 1}},
@@ -248,55 +257,47 @@ def test_adv_max_components_budget_across_stream_query_leakage_and_sampler() -> 
         "H 0 1 2 3\nI[CCZ] 0 1 2 1 2 3\nI[T] 0 1 2 3\nH 0 1 2 3\n"
         "M 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]"
     )
-    for use_cpp in (True, False):
-        with pytest.raises(QueryBudgetExceededError):
-            MagicsideSimulator(
-                circ, batch_size=2, max_components=2, on_budget_exceeded="raise", use_cpp_kernels=use_cpp
-            ).run()
+    with pytest.raises(QueryBudgetExceededError):
+        MagicsideSimulator(circ, batch_size=2, max_components=2, on_budget_exceeded="raise").run()
 
-        sim_int = MagicsideSimulator(
-            circ, batch_size=2, max_components=2, on_budget_exceeded="raise", use_cpp_kernels=use_cpp
-        )
-        with pytest.raises(QueryBudgetExceededError):
-            sim_int.interactive_do(circ)
-            sim_int.finish_interactive_run()
+    sim_int = MagicsideSimulator(circ, batch_size=2, max_components=2, on_budget_exceeded="raise")
+    with pytest.raises(QueryBudgetExceededError):
+        sim_int.interactive_do(circ)
+        sim_int.finish_interactive_run()
 
-        for fm, fr in (("SELECTOR", None), ("DIRECT", [{}])):
-            with pytest.raises(QueryBudgetExceededError):
-                MagicsideSimulator(
-                    circ,
-                    batch_size=1,
-                    fault_mode=fm,
-                    fault_realizations=fr,
-                    max_components=2,
-                    on_budget_exceeded="raise",
-                    use_cpp_kernels=use_cpp,
-                ).run()
-
+    for fm, fr in (("SELECTOR", None), ("DIRECT", [{}])):
         with pytest.raises(QueryBudgetExceededError):
             MagicsideSimulator(
                 circ,
                 batch_size=1,
-                backend="QUERY",
-                query_budget=QueryBudget(max_terms=64, on_budget_exceeded="raise"),
+                fault_mode=fm,
+                fault_realizations=fr,
                 max_components=2,
-                use_cpp_kernels=use_cpp,
+                on_budget_exceeded="raise",
             ).run()
 
-        for fm in ("DIRECT", "SELECTOR"):
-            for be in ("STREAM", "QUERY"):
-                sim_fb = MagicsideSimulator(
-                    circ,
-                    batch_size=4,
-                    seed=17,
-                    fault_mode=fm,
-                    backend=be,
-                    max_components=2,
-                    on_budget_exceeded="fallback",
-                    use_cpp_kernels=use_cpp,
-                )
-                sim_fb.run()
-                assert sim_fb.get_final_measurement_records().shape == (4, 1)
+    with pytest.raises(QueryBudgetExceededError):
+        MagicsideSimulator(
+            circ,
+            batch_size=1,
+            backend="QUERY",
+            query_budget=QueryBudget(max_terms=64, on_budget_exceeded="raise"),
+            max_components=2,
+        ).run()
+
+    for fm in ("DIRECT", "SELECTOR"):
+        for be in ("STREAM", "QUERY"):
+            sim_fb = MagicsideSimulator(
+                circ,
+                batch_size=4,
+                seed=17,
+                fault_mode=fm,
+                backend=be,
+                max_components=2,
+                on_budget_exceeded="fallback",
+            )
+            sim_fb.run()
+            assert sim_fb.get_final_measurement_records().shape == (4, 1)
 
     with pytest.raises(QueryBudgetExceededError):
         MagicsideSimulator(

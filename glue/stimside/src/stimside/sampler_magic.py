@@ -38,7 +38,7 @@ class MagicsideSampler(_CompiledSeedMixin, sinter.Sampler):
         dem_decoder: LeakageDecoderLike | sinter.Decoder | str | None = None,
         batch_size: int = 256, seed: int | None = None, *,
         fault_mode: str = "DIRECT", backend: str = "STREAM",
-        use_cpp_kernels: bool = True, m2d_reference_mode: str = "auto",
+        m2d_reference_mode: str = "auto",
         reference_sample: Sequence[int | bool] | NDArray[np.bool_] | None = None,
         fault_channels: Sequence[CliffordFaultChannel] | None = None,
         query_budget: QueryBudget | None = None, max_components: int | None = None,
@@ -53,7 +53,6 @@ class MagicsideSampler(_CompiledSeedMixin, sinter.Sampler):
         self.backend: Literal["STREAM", "QUERY"] = _parse_enum(backend, _BACKENDS, "backend")
         if (self.backend == "QUERY" or self.fault_mode == "SELECTOR") and op_handler is not None and not isinstance(op_handler, _TrivialOpHandler):
             raise ValueError(f"backend={self.backend!r}, fault_mode={self.fault_mode!r} is incompatible with non-trivial op_handler")
-        self.use_cpp_kernels = bool(use_cpp_kernels)
         self.m2d_reference_mode: Literal["auto", "magicside", "stim", "zero"] = _parse_enum(m2d_reference_mode, _M2D_MODES, "m2d_reference_mode", lower=True)
         self.reference_sample = None if reference_sample is None else np.asarray(reference_sample, dtype=np.bool_).copy()
         self.fault_channels = tuple(fault_channels) if fault_channels is not None else None
@@ -98,7 +97,7 @@ class MagicsideSampler(_CompiledSeedMixin, sinter.Sampler):
             compiled_decoder=eff_dec.compile_for_task(task),
             needs_records=eff_dec.needs_records, needs_leakage_events=eff_dec.needs_leakage_events,
             batch_size=self.batch_size, fault_mode=self.fault_mode, backend=self.backend,
-            use_cpp_kernels=self.use_cpp_kernels, seed=self._next_compiled_seed(),
+            seed=self._next_compiled_seed(),
             m2d_reference_mode=self.m2d_reference_mode, reference_sample=self.reference_sample,
             fault_channels=self.fault_channels, query_budget=self.query_budget,
             max_components=self.max_components, on_budget_exceeded=self.on_budget_exceeded, atol=self.atol,
@@ -113,7 +112,7 @@ class CompiledMagicsideSampler(sinter.CompiledSampler):
         compiled_decoder: CompiledLeakageDecoder, needs_records: bool,
         needs_leakage_events: bool = False, batch_size: int = 256,
         fault_mode: str = "DIRECT", backend: str = "STREAM",
-        use_cpp_kernels: bool = True, seed: int | None = None,
+        seed: int | None = None,
         m2d_reference_mode: str = "auto",
         reference_sample: Sequence[int | bool] | NDArray[np.bool_] | None = None,
         fault_channels: Sequence[CliffordFaultChannel] | None = None,
@@ -124,7 +123,7 @@ class CompiledMagicsideSampler(sinter.CompiledSampler):
         self.needs_records, self.needs_leakage_events = bool(needs_records), bool(needs_leakage_events)
         self.simulator = MagicsideSimulator(
             circuit=circuit, compiled_op_handler=compiled_op_handler, batch_size=self.batch_size,
-            fault_mode=fault_mode, backend=backend, use_cpp_kernels=use_cpp_kernels, seed=seed,
+            fault_mode=fault_mode, backend=backend, seed=seed,
             m2d_reference_mode=m2d_reference_mode, reference_sample=reference_sample,
             fault_channels=fault_channels, query_budget=query_budget, max_components=max_components,
             on_budget_exceeded=on_budget_exceeded, record_unleaked_to_leaked=True,

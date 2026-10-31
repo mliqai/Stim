@@ -1378,7 +1378,7 @@ def _reconstruct_5q_active_subspace_via_o1(
         bra.h_words = hw
         amp = 0.0 + 0.0j
         for w_c, d_comp in comps:
-            amp += w_c * overlap(bra, d_comp, use_cpp_kernels=False)
+            amp += w_c * overlap(bra, d_comp)
         ket5[y] = amp
 
     # Apply the 5-qubit restriction of data_frame_events using independent dense 5Q matrices

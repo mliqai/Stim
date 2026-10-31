@@ -92,7 +92,6 @@ class PreparedQueryPlan:
     num_measurements: int
     output_qubits: tuple[int, ...]
     budget: QueryBudget
-    use_cpp_kernels: bool
     atol: float
     compiled_plan: DirectPlan | SelectorPlan
     target_spec: Any
@@ -129,8 +128,8 @@ class _SegTreeNode:
         self.node_id, self.l, self.r, self.left, self.right, self.leaf, self.deps, self.last_key = nid, l, r, left, right, leaf, deps, None
 
 class _EvalCtx:
-    def __init__(self, budget: QueryBudget, use_cpp: bool, atol: float, m_act: int, faults: dict[int, int], meas: dict[int, int], sweep: dict[int, int], *, enforce_budget: bool = True, prev_diag: QueryDiagnostics | None = None) -> None:
-        self.budget, self.use_cpp, self.atol, self.m_act, self.enforce_budget = budget, use_cpp, atol, m_act, enforce_budget
+    def __init__(self, budget: QueryBudget, atol: float, m_act: int, faults: dict[int, int], meas: dict[int, int], sweep: dict[int, int], *, enforce_budget: bool = True, prev_diag: QueryDiagnostics | None = None) -> None:
+        self.budget, self.atol, self.m_act, self.enforce_budget = budget, atol, m_act, enforce_budget
         self.diagnostics = QueryDiagnostics(prev_diag.cache_hits, prev_diag.cache_misses, prev_diag.node_evaluations, prev_diag.invalidated_nodes, prev_diag.peak_terms, prev_diag.peak_dim, prev_diag.contraction_ops, True) if prev_diag is not None else QueryDiagnostics()
         self.faults, self.meas, self.sweep, self.visited = faults, meas, sweep, set()
         self.p_map, self.r_map, self.m_map, self.q_map, self.extra_cl_log = {}, {}, {}, {}, 0.0
@@ -146,8 +145,8 @@ class _EvalCtx:
         if self.enforce_budget and self.budget.max_dim is not None and d_eff > self.budget.max_dim:
             raise QueryBudgetExceededError(f"Generator dimension {d_eff} > max_dim={self.budget.max_dim}")
 
-def _empty_se(n_q: int, use_cpp: bool, atol: float) -> _ScaledExpansion:
-    return _ScaledExpansion(ShotExpansion.from_components((), n_qubits=max(1, n_q), use_cpp_kernels=use_cpp, atol=atol), 0)
+def _empty_se(n_q: int, atol: float) -> _ScaledExpansion:
+    return _ScaledExpansion(ShotExpansion.from_components((), n_qubits=max(1, n_q), atol=atol), 0)
 
 def _pad1(w: NDArray[np.uint64], nw: int) -> NDArray[np.uint64]:
     return w if w.shape[0] == nw else np.ascontiguousarray(np.pad(w, (0, nw - w.shape[0])))
@@ -181,13 +180,13 @@ def _normalize_frexp(exp: ShotExpansion, log2_scale: int) -> _ScaledExpansion:
         raise FloatingPointError("Non-finite expansion weights encountered")
     w_max = float(np.max(np.abs(exp.weights)))
     if w_max == 0.0:
-        return _empty_se(exp.n_qubits, exp.use_cpp_kernels, exp.atol)
+        return _empty_se(exp.n_qubits, exp.atol)
     shift = math.frexp(w_max)[1] - 1
     if shift:
         exp.weights = np.ascontiguousarray(exp.weights * math.ldexp(1.0, -shift))
     return _ScaledExpansion(exp, log2_scale + shift)
 
-def _tensor_pairs(L: ShotExpansion, p_L: Sequence[tuple[int, int]], R: ShotExpansion, p_R: Sequence[tuple[int, int]], n_tot: int, *, use_cpp: bool, atol: float) -> ShotExpansion:
+def _tensor_pairs(L: ShotExpansion, p_L: Sequence[tuple[int, int]], R: ShotExpansion, p_R: Sequence[tuple[int, int]], n_tot: int, *, atol: float) -> ShotExpansion:
     chi_L, chi_R, d_L, d_R, d_tot = L.chi, R.chi, L.d, R.d, L.d + R.d
     h_tot = np.repeat(_scatter_pairs(L.h_words, p_L, n_tot), chi_R, axis=0) ^ np.tile(_scatter_pairs(R.h_words, p_R, n_tot), (chi_L, 1))
     A_tot = np.vstack([_scatter_pairs(L.A_words, p_L, n_tot), _scatter_pairs(R.A_words, p_R, n_tot)])
@@ -199,7 +198,7 @@ def _tensor_pairs(L: ShotExpansion, p_L: Sequence[tuple[int, int]], R: ShotExpan
     piv_tot = np.array([m_L[int(p)] for p in L.pivots] + [m_R[int(p)] for p in R.pivots], dtype=np.int32)
     assert L.ell_odd is not None and R.ell_odd is not None
     a_un = np.bitwise_or.reduce(A_tot, axis=0) if d_tot else np.zeros(n_words_for_qubits(max(1, n_tot)), dtype=np.uint64)
-    return ShotExpansion(max(1, n_tot), d_tot, A_tot, a_un, G_tot, piv_tot, np.kron(L.weights, R.weights), h_tot, np.hstack([ell_L, ell_R]) if d_tot else ell_L, np.concatenate([L.ell_odd, R.ell_odd]), use_cpp_kernels=use_cpp, atol=atol, _is_canonical_merged=False)
+    return ShotExpansion(max(1, n_tot), d_tot, A_tot, a_un, G_tot, piv_tot, np.kron(L.weights, R.weights), h_tot, np.hstack([ell_L, ell_R]) if d_tot else ell_L, np.concatenate([L.ell_odd, R.ell_odd]), atol=atol, _is_canonical_merged=False)
 
 def _contract_choi(left_se: _ScaledExpansion, right_se: _ScaledExpansion, n_op: int, q_act: tuple[int, ...], right_is_choi: bool, ctx: _EvalCtx, *, enforce_terms: bool = True) -> _ScaledExpansion:
     ctx.bump_op()
@@ -209,21 +208,21 @@ def _contract_choi(left_se: _ScaledExpansion, right_se: _ScaledExpansion, n_op: 
     if right_is_choi:
         _check_unitary_norm(1.0, right_se.norm_sq(), ctx.atol, "_contract_choi(right)")
     if right_se.exp.chi == 0:
-        return _empty_se(n_keep, ctx.use_cpp, ctx.atol)
+        return _empty_se(n_keep, ctx.atol)
     z_rhs_rel, prod_chi = right_se.exp.norm_sq(), left_se.exp.chi * right_se.exp.chi
     if ctx.enforce_budget and enforce_terms and prod_chi > max(256, 16 * ctx.budget.max_terms):
         ctx.diagnostics.peak_terms = max(ctx.diagnostics.peak_terms, prod_chi)
         raise QueryBudgetExceededError(f"Contraction product {prod_chi} exceeds max_terms={ctx.budget.max_terms}")
     p_L = [(q, q) for q in q_act] + [(n_op + r, n_keep + r) for r in range(m)]
     p_R = [(q_act[r], n_keep + m + r) for r in range(m)] + ([(n_op + r, n_op + r) for r in range(m)] if right_is_choi else [])
-    work = _tensor_pairs(left_se.exp, p_L, right_se.exp, p_R, n_keep + 2 * m, use_cpp=ctx.use_cpp, atol=ctx.atol)
+    work = _tensor_pairs(left_se.exp, p_L, right_se.exp, p_R, n_keep + 2 * m, atol=ctx.atol)
     for j in range(m):
         qL, qR = n_keep + j, n_keep + m + j
         wL, sL, wR, sR = qL >> 6, np.uint64(qL & 63), qR >> 6, np.uint64(qR & 63)
         restrict_amplitude(work, (((work.A_words[:, wL] >> sL) ^ (work.A_words[:, wR] >> sR)) & np.uint64(1)).astype(np.uint8), (((work.h_words[:, wL] >> sL) ^ (work.h_words[:, wR] >> sR)) & np.uint64(1)).astype(np.uint8))
         if work.chi == 0:
             _check_unitary_norm(z_left * z_rhs_rel, 0.0, ctx.atol, "_contract_choi")
-            return _empty_se(n_keep, ctx.use_cpp, ctx.atol)
+            return _empty_se(n_keep, ctx.atol)
         for w, s in ((wL, sL), (wR, sR)):
             if work.d > 0:
                 work.A_words[:, w] &= ~(np.uint64(1) << s)
@@ -241,7 +240,7 @@ def _contract_choi(left_se: _ScaledExpansion, right_se: _ScaledExpansion, n_op: 
     work.h_words[:, -1] &= tm_keep
     work._refresh_a_union()
     work._is_canonical_merged = False
-    merged = merge_frames(work, use_cpp_kernels=ctx.use_cpp)
+    merged = merge_frames(work)
     assert isinstance(merged, ShotExpansion)
     if (m & 1) and merged.chi > 0:
         merged.weights = np.ascontiguousarray(merged.weights * _SQRT2)
@@ -250,7 +249,7 @@ def _contract_choi(left_se: _ScaledExpansion, right_se: _ScaledExpansion, n_op: 
     ctx.check_exp(out_se.exp, is_choi=right_is_choi, enforce_terms=enforce_terms)
     return out_se
 
-def _compile_target_spec(target_spec: Any, output_qubits: tuple[int, ...], use_cpp: bool, atol: float) -> tuple[ReferenceCHPTableau, ShotExpansion] | str | None:
+def _compile_target_spec(target_spec: Any, output_qubits: tuple[int, ...], atol: float) -> tuple[ReferenceCHPTableau, ShotExpansion] | str | None:
     if target_spec is None:
         return None
     k = len(output_qubits)
@@ -269,15 +268,15 @@ def _compile_target_spec(target_spec: Any, output_qubits: tuple[int, ...], use_c
             raise ValueError("target_spec circuit must contain only unitary Clifford and I[T]/I[T_DAG]/I[CCZ] gates")
         if k == 0:
             return "empty"
-        exp_c = ShotExpansion.zero(k, use_cpp_kernels=use_cpp, atol=atol)
+        exp_c = ShotExpansion.zero(k, atol=atol)
         for rec in t_plan.records:
             for sb in ((rec,) if isinstance(rec, CompiledOpenBlockRecord) else compile_open_block((rec,), n_qubits=k, budget=64, c2_max_rank=8)):
-                exp_c = apply_compiled_block(exp_c, sb.block, check_unitary=True, atol=atol, use_cpp_kernels=use_cpp) if isinstance(sb, CompiledOpenBlockRecord) else exp_c  # type: ignore[assignment]
+                exp_c = apply_compiled_block(exp_c, sb.block, check_unitary=True, atol=atol) if isinstance(sb, CompiledOpenBlockRecord) else exp_c  # type: ignore[assignment]
         target_spec = (t_plan.final_tableau, exp_c)
     elif isinstance(target_spec, (PhaseQFEComponent, ShotExpansion)):
         target_spec = (ReferenceCHPTableau(target_spec.n_qubits), target_spec)
     elif isinstance(target_spec, ReferenceCHPTableau):
-        target_spec = (target_spec, ShotExpansion.zero(max(1, k), use_cpp_kernels=use_cpp, atol=atol))
+        target_spec = (target_spec, ShotExpansion.zero(max(1, k), atol=atol))
     is_pair = isinstance(target_spec, tuple) and len(target_spec) == 2 and isinstance(target_spec[0], ReferenceCHPTableau)
     if isinstance(target_spec, (np.ndarray, list, tuple)) and not is_pair:
         if k > 20:
@@ -289,18 +288,18 @@ def _compile_target_spec(target_spec: Any, output_qubits: tuple[int, ...], use_c
         if k == 0:
             return "empty"
         nz = np.flatnonzero(np.abs(arr) > 1e-15 * math.sqrt(nrm2))
-        target_spec, is_pair = (ReferenceCHPTableau(k), ShotExpansion(k, 0, np.zeros((0, 1), dtype=np.uint64), np.zeros(1, dtype=np.uint64), np.zeros((0, 0), dtype=np.uint8), np.zeros(0, dtype=np.int32), np.ascontiguousarray(arr[nz] / math.sqrt(nrm2), dtype=np.complex128), np.ascontiguousarray(nz.astype(np.uint64)[:, None]), np.zeros((int(nz.shape[0]), 0), dtype=np.uint8), np.zeros(0, dtype=np.uint8), use_cpp_kernels=use_cpp, atol=atol, _is_canonical_merged=True)), True
+        target_spec, is_pair = (ReferenceCHPTableau(k), ShotExpansion(k, 0, np.zeros((0, 1), dtype=np.uint64), np.zeros(1, dtype=np.uint64), np.zeros((0, 0), dtype=np.uint8), np.zeros(0, dtype=np.int32), np.ascontiguousarray(arr[nz] / math.sqrt(nrm2), dtype=np.complex128), np.ascontiguousarray(nz.astype(np.uint64)[:, None]), np.zeros((int(nz.shape[0]), 0), dtype=np.uint8), np.zeros(0, dtype=np.uint8), atol=atol, _is_canonical_merged=True)), True
     if not is_pair:
         raise TypeError(f"Unsupported target_spec type: {type(target_spec)!r}")
     ref_t, exp_t = target_spec
-    exp_t = ShotExpansion.from_component(exp_t, use_cpp_kernels=use_cpp, atol=atol) if isinstance(exp_t, PhaseQFEComponent) else exp_t
+    exp_t = ShotExpansion.from_component(exp_t, atol=atol) if isinstance(exp_t, PhaseQFEComponent) else exp_t
     if not isinstance(exp_t, ShotExpansion):
         raise TypeError(f"Expected ShotExpansion in target_spec tuple, got {type(exp_t)!r}")
     if ref_t.num_qubits != k or (k > 0 and exp_t.n_qubits != k):
         raise ValueError(f"target_spec QFE tuple qubit mismatch vs len(output_qubits)={k}")
     if k == 0:
         return "empty"
-    merged_t = merge_frames(exp_t.copy(), use_cpp_kernels=use_cpp)
+    merged_t = merge_frames(exp_t.copy())
     assert isinstance(merged_t, ShotExpansion)
     nrm = merged_t.norm_sq()
     if not math.isfinite(nrm) or nrm <= 1e-15 or merged_t.chi == 0:
@@ -340,7 +339,7 @@ def _bell_steps_for(ref_data: ReferenceCHPTableau, rt: ReferenceCHPTableau, outp
     return bcache[key]
 
 def _compute_partial_trace_fidelity_mass(ref_data: ReferenceCHPTableau, exp_data: ShotExpansion, log2_scale: int, comp_target: tuple[ReferenceCHPTableau, ShotExpansion] | str, output_qubits: tuple[int, ...], ctx: _EvalCtx, bcache: dict[Any, Any]) -> tuple[float, int]:
-    k, use_cpp, atol = len(output_qubits), ctx.use_cpp, ctx.atol
+    k, atol = len(output_qubits), ctx.atol
     if exp_data.chi == 0 or k == 0 or comp_target == "empty":
         return _FP_ZERO if exp_data.chi == 0 else _fp(exp_data.norm_sq(), 2 * log2_scale)
     assert isinstance(comp_target, tuple)
@@ -353,15 +352,15 @@ def _compute_partial_trace_fidelity_mass(ref_data: ReferenceCHPTableau, exp_data
     conj_exp = et.copy()
     conj_exp.weights = np.ascontiguousarray(conj_exp.weights.conj())
     conj_exp.ell = np.ascontiguousarray((-conj_exp.ell) & np.uint8(3)) if (conj_exp.d > 0 and conj_exp.chi > 0) else conj_exp.ell
-    j_se = _normalize_frexp(_tensor_pairs(exp_data, [(i, i) for i in range(n)], conj_exp, [(i, n + i) for i in range(k)], n + k, use_cpp=use_cpp, atol=atol), log2_scale)
+    j_se = _normalize_frexp(_tensor_pairs(exp_data, [(i, i) for i in range(n)], conj_exp, [(i, n + i) for i in range(k)], n + k, atol=atol), log2_scale)
     ctx.check_exp(j_se.exp, is_choi=False)
     for rot_ax, (bd, sg) in _bell_steps_for(ref_data, rt, output_qubits, bcache):
         if j_se.exp.chi == 0:
             return _FP_ZERO
         ctx.bump_op()
-        w_exp = apply_quarter_turn(j_se.exp, rot_ax.a_words, rot_ax.b_words, rot_ax.kappa, sign=1, check_unitary=True, atol=atol, use_cpp_kernels=use_cpp) if rot_ax is not None else j_se.exp  # type: ignore[assignment]
+        w_exp = apply_quarter_turn(j_se.exp, rot_ax.a_words, rot_ax.b_words, rot_ax.kappa, sign=1, check_unitary=True, atol=atol) if rot_ax is not None else j_se.exp  # type: ignore[assignment]
         ctx.check_exp(w_exp, is_choi=False)
-        z_pre, (p_exp, z0_r) = w_exp.norm_sq(), project_diagonal(w_exp, bd, sg, 0, use_cpp_kernels=use_cpp)
+        z_pre, (p_exp, z0_r) = w_exp.norm_sq(), project_diagonal(w_exp, bd, sg, 0)
         z0_f, tol_z = float(z0_r), atol * max(1.0, abs(z_pre))
         if not math.isfinite(z0_f) or z0_f < -tol_z or z0_f > z_pre + tol_z:
             raise FloatingPointError(f"Bell projection norm drift: z0={z0_f}, z_pre={z_pre}, atol={atol}")
@@ -371,13 +370,13 @@ def _compute_partial_trace_fidelity_mass(ref_data: ReferenceCHPTableau, exp_data
         ctx.check_exp(j_se.exp, is_choi=False)
     return _fp(j_se.exp.norm_sq(), 2 * j_se.log2_scale + k)
 
-def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_channels: Sequence[CliffordFaultChannel] | None = None, target_spec: Any = None, output_qubits: Sequence[int] | None = None, acceptance_spec: Mapping[int, int | bool] | Callable[[NDArray[np.bool_]], bool] | None = None, budget: QueryBudget | None = None, use_cpp_kernels: bool = True, atol: float = DEFAULT_ATOL) -> PreparedQueryPlan:
+def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_channels: Sequence[CliffordFaultChannel] | None = None, target_spec: Any = None, output_qubits: Sequence[int] | None = None, acceptance_spec: Mapping[int, int | bool] | Callable[[NDArray[np.bool_]], bool] | None = None, budget: QueryBudget | None = None, atol: float = DEFAULT_ATOL) -> PreparedQueryPlan:
     """`Q1`: Compile `circuit` into a dependency-tracked QFE Choi/Ket segment-tree plan."""
     if not isinstance(circuit, stim.Circuit):
         raise TypeError(f"Expected stim.Circuit, got {type(circuit)!r}")
     if not isinstance(fault_mode, str) or fault_mode.strip().upper() not in ("DIRECT", "SELECTOR"):
         raise ValueError(f"fault_mode must be 'DIRECT' or 'SELECTOR', got {fault_mode!r}")
-    mode_norm, tol, use_cpp, eff_budget = fault_mode.strip().upper(), validate_atol(atol), bool(use_cpp_kernels), (QueryBudget() if budget is None else budget)
+    mode_norm, tol, eff_budget = fault_mode.strip().upper(), validate_atol(atol), (QueryBudget() if budget is None else budget)
     if not isinstance(eff_budget, QueryBudget):
         raise TypeError(f"Expected QueryBudget, got {type(eff_budget)!r}")
     compiled: DirectPlan | SelectorPlan = compile_direct(circuit, fault_channels=fault_channels, c2_budget=64, c2_max_rank=6) if mode_norm == "DIRECT" else compile_selector(circuit, fault_channels=fault_channels, gadgetize_pauli_noise=False, c2_budget=64, c2_max_rank=6)
@@ -388,7 +387,7 @@ def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_c
     out_qs = tuple(range(logical_nq)) if output_qubits is None else tuple(_coerce_strict_int(q, "output_qubit") for q in output_qubits)
     if any(q < 0 or q >= logical_nq for q in out_qs) or len(set(out_qs)) != len(out_qs):
         raise ValueError(f"Invalid output_qubits={list(out_qs)} for num_data_qubits={logical_nq}")
-    comp_target = _compile_target_spec(target_spec, out_qs, use_cpp, tol)
+    comp_target = _compile_target_spec(target_spec, out_qs, tol)
     _normalize_acceptance_spec(acceptance_spec, compiled.num_measurements)
     slot_id_to_idx = {i: i for i in range(len(compiled.fault_channels))} | {int(ch.slot_id): i for i, ch in enumerate(compiled.fault_channels) if ch.slot_id is not None}
     axes_of = lambda r: r.axes if isinstance(r, CompiledOpenBlockRecord) else (r.term.axes if isinstance(r, MagicTermRecord) else (
@@ -446,26 +445,26 @@ def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_c
     bcache: dict[Any, Any] = {}
     _bell_steps_for(compiled.data_final_tableau if isinstance(compiled, SelectorPlan) else compiled.final_tableau, comp_target[0], out_qs, bcache) if (isinstance(comp_target, tuple) and out_qs) else None
     st = {"target": comp_target, "bcache": bcache, "slots": slot_id_to_idx, "noise": noise_meta, "q_act": q_act, "ops": otup, "dyn": tuple(dyn), "root": root, "nodes": tuple(nodes), "lru": OrderedDict(), "bytes": 0}
-    return PreparedQueryPlan(circuit, mode_norm, logical_nq, n_data, n_op, compiled.num_measurements, out_qs, eff_budget, use_cpp, tol, compiled, target_spec, acceptance_spec, st)
+    return PreparedQueryPlan(circuit, mode_norm, logical_nq, n_data, n_op, compiled.num_measurements, out_qs, eff_budget, tol, compiled, target_spec, acceptance_spec, st)
 
 def _apply_leaf(se: _ScaledExpansion, leaf: tuple[Any, Any, Any], ctx: _EvalCtx, *, is_choi: bool, enforce_terms: bool = True) -> _ScaledExpansion:
     ctx.bump_op()
     if se.exp.chi == 0:
         return se
-    z_pre, exp, nw, use_cpp, (rec, aux, _) = se.exp.norm_sq(), se.exp.copy(), se.exp.n_words, ctx.use_cpp, leaf
+    z_pre, exp, nw, (rec, aux, _) = se.exp.norm_sq(), se.exp.copy(), se.exp.n_words, leaf
     if isinstance(rec, CompiledPauliBlock):
-        exp = apply_compiled_block(exp, aux if is_choi else rec, check_unitary=True, atol=ctx.atol, use_cpp_kernels=use_cpp)  # type: ignore[assignment]
+        exp = apply_compiled_block(exp, aux if is_choi else rec, check_unitary=True, atol=ctx.atol)  # type: ignore[assignment]
     elif isinstance(rec, DirectFaultSlotRecord) and ctx.faults.get(rec.slot_index, 0) > 0:
         fac = rec.branch_factors[ctx.faults[rec.slot_index] - 1]
         if fac.p0 is not None:
-            exp = apply_pauli(exp, *_ax_tup(fac.p0, nw), use_cpp_kernels=use_cpp)  # type: ignore[assignment]
+            exp = apply_pauli(exp, *_ax_tup(fac.p0, nw))  # type: ignore[assignment]
         for ra in fac.r_axes:
-            exp = apply_quarter_turn(exp, *_ax_tup(ra, nw), sign=1, check_unitary=True, atol=ctx.atol, use_cpp_kernels=use_cpp)  # type: ignore[assignment]
+            exp = apply_quarter_turn(exp, *_ax_tup(ra, nw), sign=1, check_unitary=True, atol=ctx.atol)  # type: ignore[assignment]
             ctx.check_exp(exp, is_choi=is_choi, enforce_terms=enforce_terms)
         if fac.v:
             exp.weights = np.ascontiguousarray(exp.weights * OMEGA_POWERS[fac.v])
     elif isinstance(rec, FeedbackPauliRecord) and (ctx.meas.get(aux, 0) if rec.source_kind == "rec" else ctx.sweep.get(aux, 0)):
-        exp = apply_pauli(exp, *_ax_tup(rec.axis, nw), use_cpp_kernels=use_cpp)  # type: ignore[assignment]
+        exp = apply_pauli(exp, *_ax_tup(rec.axis, nw))  # type: ignore[assignment]
     _check_unitary_norm(z_pre, exp.norm_sq() if exp.chi > 0 else 0.0, ctx.atol, "_apply_leaf")
     out_se = _normalize_frexp(exp, se.log2_scale)
     ctx.check_exp(out_se.exp, is_choi=is_choi, enforce_terms=enforce_terms)
@@ -502,7 +501,7 @@ def _eval_node(plan: PreparedQueryPlan, ctx: _EvalCtx, node: _SegTreeNode, *, is
             for r, q in enumerate(q_act):
                 A[r, q >> 6] ^= np.uint64(1) << np.uint64(q & 63)
                 A[r, (n_op + r) >> 6] ^= np.uint64(1) << np.uint64((n_op + r) & 63)
-            bell = _ScaledExpansion(ShotExpansion(n_op + m, m, A, np.bitwise_or.reduce(A, axis=0), np.zeros((m, m), dtype=np.uint8), np.array(q_act, dtype=np.int32), np.array([1.0 + 0.0j], dtype=np.complex128), np.zeros((1, nw), dtype=np.uint64), np.zeros((1, m), dtype=np.uint8), np.zeros(m, dtype=np.uint8), use_cpp_kernels=ctx.use_cpp, atol=ctx.atol), 0)
+            bell = _ScaledExpansion(ShotExpansion(n_op + m, m, A, np.bitwise_or.reduce(A, axis=0), np.zeros((m, m), dtype=np.uint8), np.array(q_act, dtype=np.int32), np.array([1.0 + 0.0j], dtype=np.complex128), np.zeros((1, nw), dtype=np.uint64), np.zeros((1, m), dtype=np.uint8), np.zeros(m, dtype=np.uint8), atol=ctx.atol), 0)
             se = _apply_leaf(bell, node.leaf, ctx, is_choi=True, enforce_terms=not allow_defer)
             val: Any = (node.leaf,) if (allow_defer and se.exp.chi > choi_cap) else se
         else:
@@ -516,7 +515,7 @@ def _eval_node(plan: PreparedQueryPlan, ctx: _EvalCtx, node: _SegTreeNode, *, is
                 val = (v_l if isinstance(v_l, tuple) else (v_l,)) + (v_r if isinstance(v_r, tuple) else (v_r,))
     elif node.leaf is not None:
         ctx.diagnostics.node_evaluations += 1
-        val = _apply_leaf(_ScaledExpansion(ShotExpansion.zero(n_op, use_cpp_kernels=ctx.use_cpp, atol=ctx.atol), 0), node.leaf, ctx, is_choi=False)
+        val = _apply_leaf(_ScaledExpansion(ShotExpansion.zero(n_op, atol=ctx.atol), 0), node.leaf, ctx, is_choi=False)
     else:
         assert node.left is not None and node.right is not None
         ket_l, op_r = _eval_node(plan, ctx, node.left, is_choi=False), _eval_node(plan, ctx, node.right, is_choi=True)
@@ -597,11 +596,11 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
     r_gen = (rng_obj if rng_obj is not None else np.random.default_rng()) if use_sampling else None
     faults = {i: (faults_in[i] if i in faults_in else _sample_categorical_branch([b.prob for b in ch.branches], r_gen)) for i, ch in enumerate(plan.compiled_plan.fault_channels)} if sample_mc_faults else dict(faults_in)  # type: ignore[arg-type]
     m_act, otup, dyn, nodes, root, bcache = len(plan._state["q_act"]), plan._state["ops"], plan._state["dyn"], plan._state["nodes"], plan._state["root"], plan._state["bcache"]
-    ctx = _EvalCtx(plan.budget, plan.use_cpp_kernels, plan.atol, m_act, faults, dict(meas_in), dict(sweep_in), enforce_budget=not stream_only, prev_diag=prev_diag)
+    ctx = _EvalCtx(plan.budget, plan.atol, m_act, faults, dict(meas_in), dict(sweep_in), enforce_budget=not stream_only, prev_diag=prev_diag)
     if out_ctx is not None:
         out_ctx.append(ctx)
-    init_ket, step_w = _ScaledExpansion(ShotExpansion.zero(plan.num_total_qubits, use_cpp_kernels=plan.use_cpp_kernels, atol=plan.atol), 0), [[_FP_ZERO] * plan.num_measurements, [_FP_ZERO] * plan.num_measurements]
-    totals, last_ket, last_m, m_vals = [_FP_ZERO, _FP_ZERO, _FP_ZERO], _empty_se(plan.num_total_qubits, plan.use_cpp_kernels, plan.atol), dict(meas_in), {k: {v} for k, v in meas_in.items()}
+    init_ket, step_w = _ScaledExpansion(ShotExpansion.zero(plan.num_total_qubits, atol=plan.atol), 0), [[_FP_ZERO] * plan.num_measurements, [_FP_ZERO] * plan.num_measurements]
+    totals, last_ket, last_m, m_vals = [_FP_ZERO, _FP_ZERO, _FP_ZERO], _empty_se(plan.num_total_qubits, plan.atol), dict(meas_in), {k: {v} for k, v in meas_in.items()}
     run_seg = lambda kt, cl, cr, iv: kt if cl >= cr else ((lambda out: [out := _apply_leaf(out, otup[ki], ctx, is_choi=False) for ki in range(cl, cr) if out.exp.chi > 0] and out or out)(kt) if stream_only else _apply_node_range(plan, ctx, root, cl, cr, kt, is_vacuum=iv))
     stack: list[tuple[int, int, _ScaledExpansion, tuple[float, int], dict[int, int], dict[int, int], dict[int, int]]] = [(0, 0, init_ket, (0.5, 1), dict(paulis_in), dict(resets_in), {})]
     while stack:
@@ -619,7 +618,7 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
                 if _check_acc(norm_acc, np.array([bool(m_map.get(j, 0)) for j in range(plan.num_measurements)], dtype=np.bool_)):
                     totals[1] = _fp_add(totals[1], z_b)
                     if "fidelity" in q_set and comp_target is not None:
-                        d_state = extract_data_expansion(plan.compiled_plan, ket_e.exp, _selector_bits(plan.compiled_plan, faults), use_cpp_kernels=plan.use_cpp_kernels) if isinstance(plan.compiled_plan, SelectorPlan) else (clone_reference_chp(plan.compiled_plan.final_tableau), ket_e.exp.copy())
+                        d_state = extract_data_expansion(plan.compiled_plan, ket_e.exp, _selector_bits(plan.compiled_plan, faults)) if isinstance(plan.compiled_plan, SelectorPlan) else (clone_reference_chp(plan.compiled_plan.final_tableau), ket_e.exp.copy())
                         totals[2] = _fp_add(totals[2], _fp_mul(pi_w, *_compute_partial_trace_fidelity_mass(*d_state, ket_e.log2_scale, comp_target, plan.output_qubits, ctx, bcache)))
             continue
         op_off, rec, aux = dyn[di]
@@ -665,7 +664,7 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
                 ax = (rec.branch_axes[cb - 1] if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord)) else rec.axis) if (cb is not None and cb > 0 and not isinstance(rec, MPadRecord)) else None
                 if ax is not None:
                     ctx.bump_op()
-                    sk = _normalize_frexp(apply_pauli(ket.exp.copy(), *_ax_tup(ax, ket.exp.n_words), use_cpp_kernels=ctx.use_cpp), ket.log2_scale)  # type: ignore[arg-type]
+                    sk = _normalize_frexp(apply_pauli(ket.exp.copy(), *_ax_tup(ax, ket.exp.n_words)), ket.log2_scale)  # type: ignore[arg-type]
                     ctx.check_exp(sk.exp, is_choi=False)
                 else:
                     sk = ket
@@ -675,13 +674,13 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
             ctx.bump_op()
             nw, z_in_r, work = ket.exp.n_words, ket.exp.norm_sq(), ket.exp.copy()
             if rec.rot_axis is not None:
-                work = apply_quarter_turn(work, *_ax_tup(rec.rot_axis, nw), sign=1, check_unitary=True, atol=ctx.atol, use_cpp_kernels=ctx.use_cpp)  # type: ignore[assignment]
+                work = apply_quarter_turn(work, *_ax_tup(rec.rot_axis, nw), sign=1, check_unitary=True, atol=ctx.atol)  # type: ignore[assignment]
                 ctx.check_exp(work, is_choi=False)
                 b_diag, sig = unit_bit_words(first_set_bit_in_words(rec.obs_axis.a_words), nw), 0
             else:
                 _, b_diag, kp = _ax_tup(rec.obs_axis, nw)
                 sig = (kp >> 1) & 1
-            (e0, z0_r), (e1, z1_r) = project_diagonal(work, b_diag, sig, 0, use_cpp_kernels=ctx.use_cpp), project_diagonal(work, b_diag, sig, 1, use_cpp_kernels=ctx.use_cpp)
+            (e0, z0_r), (e1, z1_r) = project_diagonal(work, b_diag, sig, 0), project_diagonal(work, b_diag, sig, 1)
             assert isinstance(e0, ShotExpansion) and isinstance(e1, ShotExpansion)
             z0_f, z1_f, tol_z, z0_c, z1_c = float(z0_r), float(z1_r), ctx.atol * max(1.0, abs(z_in_r)), max(0.0, float(z0_r)), max(0.0, float(z1_r))
             if not (math.isfinite(z0_f) and math.isfinite(z1_f) and math.isfinite(z_in_r)) or z0_f < -tol_z or z1_f < -tol_z or abs((z0_c + z1_c) - z_in_r) > tol_z:
@@ -690,12 +689,12 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
             for qb, eb, zb_c in ((0, e0, z0_c), (1, e1, z1_c)):
                 if z_in_r > 0.0 and zb_c > K1_CANCEL_REL_TOL * z_in_r and eb.chi > 0:
                     eb.weights = np.ascontiguousarray(eb.weights * (1.0 / math.sqrt(zb_c)))
-                    eb = apply_pauli(eb, *_ax_tup(rec.reset_kick_axis, nw), use_cpp_kernels=ctx.use_cpp) if (isinstance(rec, ResetRecord) and bool(qb) != rec.reset_flip_ref) else eb  # type: ignore[assignment]
+                    eb = apply_pauli(eb, *_ax_tup(rec.reset_kick_axis, nw)) if (isinstance(rec, ResetRecord) and bool(qb) != rec.reset_flip_ref) else eb  # type: ignore[assignment]
                     sk = _normalize_frexp(eb, 0)
                     ctx.check_exp(sk.exp, is_choi=False)
                     brs.append((qb, sk, zb_c / (z0_c + z1_c)))
                 else:
-                    brs.append((qb, _empty_se(ket.exp.n_qubits, ctx.use_cpp, ctx.atol), 0.0))
+                    brs.append((qb, _empty_se(ket.exp.n_qubits, ctx.atol), 0.0))
             (_, s0, pb0), (_, s1, pb1) = brs
             mi, fp, iota = rec.meas_index, (rec.flip_prob if rec.meas_index is not None else 0.0), int(rec.invert_result)
             fl_opts = ((0, 1.0),) if mi is None else ((0, 1.0 - fp), (1, fp))
@@ -758,7 +757,7 @@ def _run_stream_trajectory(plan: PreparedQueryPlan, faults: dict[int, int], meas
             p_tr[aux] = p_seed[aux] if aux in p_seed else (c_req if rec.meas_index in eff_m else (_sample_categorical_branch(rec.probs, r_gen) if use_sampling else 0))  # type: ignore[index]
     sw_m = max((k for k in plan._state["root"].deps[2] if sweep.get(k, 0)), default=-1) if (sweep and plan._state["root"]) else -1
     kw: dict[str, Any] = dict(rng=r_gen, fault_trace=f_tr, pauli_noise_trace=p_tr, reset_outcomes=rp or None, requested_outcomes=eff_m or None,
-                              requested_quantum_outcomes=qp if pctx else None, sweep_bits=([sweep.get(i, 0) for i in range(sw_m + 1)] if sw_m >= 0 else None), atol=plan.atol, use_cpp_kernels=plan.use_cpp_kernels)
+                              requested_quantum_outcomes=qp if pctx else None, sweep_bits=([sweep.get(i, 0) for i in range(sw_m + 1)] if sw_m >= 0 else None), atol=plan.atol)
     try:
         tr = _mc.run_selector(plan.compiled_plan, extract_data=extract_data, **kw) if isinstance(plan.compiled_plan, SelectorPlan) else _mc.run_direct(plan.compiled_plan, **kw)
     except ImpossiblePostselectionError:
@@ -796,7 +795,7 @@ def EvaluateQueries(plan: PreparedQueryPlan, realization: Mapping[Any, Any] | No
         raise TypeError(f"Expected PreparedQueryPlan, got {type(plan)!r}")
     if isinstance(queries, (str, bytes)) or not isinstance(queries, Sequence) or not queries or any(not isinstance(q, str) or q not in _QUERY_ALIASES for q in queries):
         raise ValueError(f"Invalid or unknown query metrics: {queries!r}")
-    q_set, cond, comp_target = frozenset(_QUERY_ALIASES[q] for q in queries), bool(conditional), (_compile_target_spec(target_spec, plan.output_qubits, plan.use_cpp_kernels, plan.atol) if target_spec is not None else plan._state["target"])
+    q_set, cond, comp_target = frozenset(_QUERY_ALIASES[q] for q in queries), bool(conditional), (_compile_target_spec(target_spec, plan.output_qubits, plan.atol) if target_spec is not None else plan._state["target"])
     if "fidelity" in q_set and comp_target is None:
         raise ValueError("target_spec must be provided when querying 'fidelity'")
     norm_acc, (faults, meas, paulis, resets, sweep) = _normalize_acceptance_spec(acceptance_spec if acceptance_spec is not None else plan.acceptance_spec, plan.num_measurements), _unpack_realization(plan, realization)
@@ -822,7 +821,7 @@ def EvaluateQueries(plan: PreparedQueryPlan, realization: Mapping[Any, Any] | No
         if tr is None or (z_fp[0] <= 0.0 and (clip or "prefix_probs" in q_set)):
             z_fp, a_fp, b_fp, acc, p_probs, m_arr, _, _, diag = _eval_via_tree(plan, f_pin, meas, paulis, resets, sweep, q_set, norm_acc, comp_target, rng_obj, sample_mc_faults=sample_mc_faults, is_mixed=is_mixed, stream_only=True, prev_diag=diag, pin=pin)
             return pack(z_fp, a_fp, b_fp, acc, p_probs, None if is_mixed else m_arr, diag)
-        acc, f_ctx = _check_acc(norm_acc, m_out), _EvalCtx(plan.budget, plan.use_cpp_kernels, plan.atol, len(plan._state["q_act"]), faults, meas, sweep, enforce_budget=False, prev_diag=diag)
+        acc, f_ctx = _check_acc(norm_acc, m_out), _EvalCtx(plan.budget, plan.atol, len(plan._state["q_act"]), faults, meas, sweep, enforce_budget=False, prev_diag=diag)
         b_fp = _fp_mul(z_fp, *_compute_partial_trace_fidelity_mass(tr.final_tableau, tr.expansion, 0, comp_target, plan.output_qubits, f_ctx, plan._state["bcache"])) if ("fidelity" in q_set and acc and z_fp[0] > 0.0 and comp_target is not None) else _FP_ZERO
         p_probs_fb: list[tuple[float, float]] | None = [(0.0, 0.0)] * plan.num_measurements if "prefix_probs" in q_set else None
         bm = {m_i: (z0, z1, zin) for m_i, z0, z1, zin in tr.born_masses if m_i is not None} if p_probs_fb is not None else {}
@@ -845,7 +844,7 @@ def run_query_shot(plan: PreparedQueryPlan, *, realization: Mapping[Any, Any] | 
     rng_obj, c_box = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(None if rng is None else _coerce_strict_int(rng, "rng seed"))), []
     def _pack_shot(zf: tuple[float, int], ma: NDArray[np.bool_], kf: _ScaledExpansion, ef: dict[int, int], dg: QueryDiagnostics) -> QueryShotTrajectory:
         sb = _selector_bits(cp, ef) if isinstance(cp, SelectorPlan) else None
-        ft, oe = (extract_data_expansion(cp, kf.exp, sb, use_cpp_kernels=plan.use_cpp_kernels) if (extract_data and isinstance(cp, SelectorPlan) and sb is not None) else (clone_reference_chp(cp.final_tableau), kf.exp.copy()))
+        ft, oe = (extract_data_expansion(cp, kf.exp, sb) if (extract_data and isinstance(cp, SelectorPlan) and sb is not None) else (clone_reference_chp(cp.final_tableau), kf.exp.copy()))
         if oe.chi > 0 and oe.norm_sq() > 0.0:
             oe.weights = np.ascontiguousarray(oe.weights / math.sqrt(oe.norm_sq()))
         return QueryShotTrajectory(ma, _ldexp(*zf), oe, ft, sb, dg)
@@ -859,7 +858,7 @@ def run_query_shot(plan: PreparedQueryPlan, *, realization: Mapping[Any, Any] | 
         if tr is None or (z_fp[0] <= 0.0 and clip):
             z_fp, _, _, _, _, m_arr, ket_f, eff_f, diag = _eval_via_tree(plan, f_pin, meas, paulis, resets, sweep, frozenset({"mass", "sample_measurements"}), ("all", None), None, rng_obj, sample_mc_faults=True, is_mixed=False, stream_only=True, prev_diag=diag, pin=pin)
             return _pack_shot(z_fp, m_arr, ket_f, eff_f, diag)
-        return QueryShotTrajectory(m_out, _ldexp(*z_fp), tr.expansion, tr.final_tableau, tr.selector_bits, diag) if z_fp[0] > 0.0 else _pack_shot(_FP_ZERO, m_out, _empty_se(plan.num_total_qubits, plan.use_cpp_kernels, plan.atol), f_pin, diag)
+        return QueryShotTrajectory(m_out, _ldexp(*z_fp), tr.expansion, tr.final_tableau, tr.selector_bits, diag) if z_fp[0] > 0.0 else _pack_shot(_FP_ZERO, m_out, _empty_se(plan.num_total_qubits, plan.atol), f_pin, diag)
 
 def run_query_batch(plan: PreparedQueryPlan, batch_size: int, *, rng: np.random.Generator | int | None = None, fault_realizations: Sequence[Mapping[Any, Any] | None] | Mapping[Any, Any] | None = None, sweep_bits: Any = None, extract_data: bool = False, retain_states: bool = True) -> tuple[NDArray[np.bool_], list[QueryShotTrajectory]]:
     """Execute `batch_size` shots reusing `plan`'s cached segment tree across the batch."""

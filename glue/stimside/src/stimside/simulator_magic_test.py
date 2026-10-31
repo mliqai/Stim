@@ -9,6 +9,7 @@ import pytest
 import stim
 
 from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+from stimside.sampler_magic import MagicsideSampler
 from stimside.simulator_magic import MagicsideSimulator
 from stimside.util.magic_compile import CliffordFaultChannel, FaultBranch
 from stimside.util.magic_query import QueryBudget, QueryBudgetExceededError
@@ -19,23 +20,22 @@ def test_statevector_and_branch_mass_across_fault_modes_and_backends() -> None:
     want = None
     for fm in ("DIRECT", "SELECTOR", "method_a", "method_b"):
         for be in ("STREAM", "QUERY", "event_stream", "q1_q2"):
-            for cpp in (True, False):
-                sim = MagicsideSimulator(circ, batch_size=1, fault_mode=fm, backend=be, use_cpp_kernels=cpp)
-                assert sim.run() is None
-                psi = sim.get_statevector(0)
-                psi_big = sim.state_vector(0, endian="big")
-                assert psi.shape == (8,) and abs(np.linalg.norm(psi) - 1.0) < 1e-12
-                assert abs(sim.get_branch_mass(0) - 1.0) < 1e-12
-                tab, exp = sim.get_qfe_expansion(0, trace_selectors=True)
-                assert tab.num_qubits == 3 and exp.n_qubits == 3
-                assert len(sim.get_state_expansions()) == 1
-                want_big = psi.reshape((2, 2, 2)).transpose((2, 1, 0)).ravel()
-                np.testing.assert_allclose(psi_big, want_big, atol=1e-12)
-                if want is None:
-                    want = psi
-                else:
-                    ov = abs(np.vdot(want, psi))
-                    assert abs(ov - 1.0) < 1e-12
+            sim = MagicsideSimulator(circ, batch_size=1, fault_mode=fm, backend=be)
+            assert sim.run() is None
+            psi = sim.get_statevector(0)
+            psi_big = sim.state_vector(0, endian="big")
+            assert psi.shape == (8,) and abs(np.linalg.norm(psi) - 1.0) < 1e-12
+            assert abs(sim.get_branch_mass(0) - 1.0) < 1e-12
+            tab, exp = sim.get_qfe_expansion(0, trace_selectors=True)
+            assert tab.num_qubits == 3 and exp.n_qubits == 3
+            assert len(sim.get_state_expansions()) == 1
+            want_big = psi.reshape((2, 2, 2)).transpose((2, 1, 0)).ravel()
+            np.testing.assert_allclose(psi_big, want_big, atol=1e-12)
+            if want is None:
+                want = psi
+            else:
+                ov = abs(np.vdot(want, psi))
+                assert abs(ov - 1.0) < 1e-12
 
 
 def test_m2d_reference_modes_handle_deterministic_magic_interference() -> None:
@@ -82,22 +82,29 @@ def test_sweep_feedback_and_correlated_error_multi_target_behavior() -> None:
     assert np.all(sim.get_observable_flips())
 
 
-def test_word_straddling_n66_cpp_matches_python_kernels_exactly() -> None:
-    circ = stim.Circuit(
-        "H 0 63 64 65\n"
-        "CX 0 63 63 64 64 65\n"
-        "I[T] 63 64\n"
-        "I[CCZ] 0 63 65\n"
-        "X_ERROR(0.2) 63 64\n"
-        "H 0 63 64 65\n"
-        "M 0 63 64 65"
-    )
+def test_word_straddling_n66_matches_small_isomorphic_circuit() -> None:
+    def _make_circ(q0: int, q1: int, q2: int, q3: int) -> stim.Circuit:
+        return stim.Circuit(
+            f"H {q0} {q1} {q2} {q3}\n"
+            f"CX {q0} {q1} {q1} {q2} {q2} {q3}\n"
+            f"I[T] {q1} {q2}\n"
+            f"I[CCZ] {q0} {q1} {q3}\n"
+            f"X_ERROR(0.2) {q1} {q2}\n"
+            f"H {q0} {q1} {q2} {q3}\n"
+            f"M {q0} {q1} {q2} {q3}"
+        )
+
+    c_big = _make_circ(0, 63, 64, 65)
+    c_ref = _make_circ(0, 1, 2, 3)
     for fm in ("DIRECT", "SELECTOR"):
-        s_cpp = MagicsideSimulator(circ, batch_size=16, seed=77, fault_mode=fm, use_cpp_kernels=True)
-        s_py = MagicsideSimulator(circ, batch_size=16, seed=77, fault_mode=fm, use_cpp_kernels=False)
-        s_cpp.run()
-        s_py.run()
-        np.testing.assert_array_equal(s_cpp.get_final_measurement_records(), s_py.get_final_measurement_records())
+        for be in ("STREAM", "QUERY"):
+            s_big = MagicsideSimulator(c_big, batch_size=16, seed=77, fault_mode=fm, backend=be)
+            s_ref = MagicsideSimulator(c_ref, batch_size=16, seed=77, fault_mode=fm, backend=be)
+            s_big.run()
+            s_ref.run()
+            np.testing.assert_array_equal(
+                s_big.get_final_measurement_records(), s_ref.get_final_measurement_records()
+            )
 
 
 def test_interactive_do_seed_stream_parity_coords_and_forced_faults() -> None:
@@ -161,6 +168,10 @@ def test_invalid_inputs_and_lifecycle_errors_raise() -> None:
     c = stim.Circuit("H 0\nM 0")
     with pytest.raises(TypeError):
         MagicsideSimulator("H 0")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="use_cpp_kernels"):
+        MagicsideSimulator(c, use_cpp_kernels=False)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="use_cpp_kernels"):
+        MagicsideSampler(dem_decoder=None, use_cpp_kernels=False)  # type: ignore[arg-type,call-arg]
     with pytest.raises(ValueError):
         MagicsideSimulator(c, batch_size=0)
     with pytest.raises(ValueError):

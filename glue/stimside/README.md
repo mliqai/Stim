@@ -117,14 +117,13 @@ Stim does not define native opcodes for non-Clifford unitaries or stochastic Cli
 - **`I[CCZ] a0 b0 c0 ...`**: Applies $\mathrm{CCZ} = \mathrm{diag}(1,1,1,1,1,1,1,-1)$ to each consecutive triple of distinct qubits `(a, b, c)` (`len(targets)` must be a multiple of 3).
 - **`I[CLIFFORD_FAULT: (p1, GATE1) (p2, GATE2) ...]`**: Stochastic Clifford fault slot executing disjoint 1Q targets (for 1Q gates) or disjoint 2Q pairs (for 2Q gates); with remaining probability $1 - \sum_k p_k$, identity is applied. Fault channels can also be supplied programmatically via `CliffordFaultChannel(step_index=..., branches=(FaultBranch(prob=..., gate_name=..., targets=(0,)), ...))` (or `targets=(0, 1)` for 2Q branches).
 
-### Execution Modes (`fault_mode` $\times$ `backend`), C++ Kernels (`use_cpp_kernels`), and Query Reuse (`PrepareQueries` / `EvaluateQueries`)
+### Execution Modes (`fault_mode` $\times$ `backend`) and Query Reuse (`PrepareQueries` / `EvaluateQueries`)
 
 `MagicsideSimulator` supports four exact execution combinations via `fault_mode` (`"DIRECT"` or `"SELECTOR"`) and `backend` (`"STREAM"` or `"QUERY"`):
 - **`fault_mode="DIRECT"`** compiles conjugated Clifford faults directly as sequential trajectory phase-rotation records without ancilla qubits.
 - **`fault_mode="SELECTOR"`** activates stochastic Clifford faults via joint one-hot selector ancillas at $t=0$ (compiling controlled-Pauli faults via exact 1-gate `CCZ` shortcuts and analytically tracing out selector ancillas at readout via `get_qfe_expansion(..., trace_selectors=True)`).
 - **`backend="STREAM"`** advances shot trajectories chronologically (supporting `fault_mode="DIRECT"` live streaming with `interactive_do(...)`, `sync_tableside_rng=True`, and `LeakageUint8Magic`, as well as compiled `"DIRECT"`/`"SELECTOR"` trajectories).
 - **`backend="QUERY"`** shares a single compiled scalar-network segment-tree plan (`Q1`/`Q2`) across a batch or across explicit fault/outcome realizations (compatible with Clifford/magic gates, Pauli measurements/resets/feedback, and Clifford/Pauli faults; combining `backend="QUERY"` or `fault_mode="SELECTOR"` with `LeakageUint8Magic`, `sync_tableside_rng=True`, or `interactive_do(...)` raises `ValueError`).
-- **`use_cpp_kernels=True` (default) vs `False`**: By default, `MagicsideSimulator`, `MagicsideSampler`, `PrepareQueries`, and `EvaluateQueries` accelerate hot Phase-QFE kernels (`P1`/`P2` quarter-turns/blocks, `K1` rank-1 cancellation, `N1`/`N2` norm and Pauli expectations, `M1` projective collapse, and `O1`/`O2` $O(1)$ overlap tables) via the compiled C++17 `ctypes` shared library `libmagic_kernels.so`. Passing `use_cpp_kernels=False` forces the exact pure-Python/NumPy reference kernels with matching distributions and amplitudes across single-word ($n \le 64$) and multi-word ($n > 64$) bit-packings.
 
 For direct query reuse and structural budget enforcement (`QueryBudget` / `QueryBudgetExceededError`), use `PrepareQueries` (`prepare_queries`) and `EvaluateQueries` (`evaluate_queries`):
 
@@ -147,7 +146,6 @@ plan = stimside.PrepareQueries(
     query_circuit,
     fault_mode="SELECTOR",
     budget=stimside.QueryBudget(max_terms=1024, on_budget_exceeded="raise"),
-    use_cpp_kernels=True,
 )
 res_clean = stimside.EvaluateQueries(
     plan,
@@ -210,7 +208,6 @@ if __name__ == "__main__":
             "magicside": stimside.MagicsideSampler(
                 op_handler=stimside.LeakageUint8Magic(),
                 dem_decoder="pymatching",
-                use_cpp_kernels=True,
             )
         },
     )
