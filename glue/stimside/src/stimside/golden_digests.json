@@ -9,7 +9,7 @@
     "magic_sq": "526bcbb257e7bd1a73d77951242e0aa3",
     "magic_ss": "72701b01c315ddb4458f75d6a1b7ebe8",
     "magic_sync": "3f9ebdd8933726cfb55dced216727250",
-    "tab_nosync": "3f9ebdd8933726cfb55dced216727250",
+    "tab_nosync": "b1048ad85af6fa5df30468f97b58d93c",
     "tab_sync": "3f9ebdd8933726cfb55dced216727250"
   },
   "c02_mpp_mxx_heralded_corr": {
@@ -22,7 +22,7 @@
     "magic_sq": "3215fade03f69a40ae7b05f1aac3bfbe",
     "magic_ss": "eb6a4c3d9490ed7a466e881b324cae4d",
     "magic_sync": "492e5c4aec8cda0fbbf09444e10b3f69",
-    "tab_nosync": "492e5c4aec8cda0fbbf09444e10b3f69",
+    "tab_nosync": "4c097b9f9b81499365cd238aefbbcdf6",
     "tab_sync": "492e5c4aec8cda0fbbf09444e10b3f69"
   },
   "c02b_spp_clifford": {
@@ -32,7 +32,7 @@
     "magic_sq": "89123eeee7d12386c3c03118ca94858d",
     "magic_ss": "2111024bd0fe0db81b7069f9b219d188",
     "magic_sync": "e1b0426620c08a80718d8eea318ebe74",
-    "tab_nosync": "e1b0426620c08a80718d8eea318ebe74",
+    "tab_nosync": "281f4b447f90714d35eaef42fedd5c64",
     "tab_sync": "e1b0426620c08a80718d8eea318ebe74"
   },
   "c03_leakage_transitions_swap_meas": {
@@ -46,13 +46,13 @@
     "tab_sync": "2f1848c052fccbc02e7ab9353cf2916e"
   },
   "c04_leakage_conditioning_and_repeated_targets": {
-    "coset_nosync_cpp": "32202a1b76c84c6b29256356f8639b71",
-    "coset_nosync_py": "32202a1b76c84c6b29256356f8639b71",
-    "coset_sync": "c9bbc1f5353c5273324b381cd613af58",
-    "magic_ds": "c3bb63b3606374c8e9c148288679cc1c",
-    "magic_sync": "c9bbc1f5353c5273324b381cd613af58",
-    "tab_nosync": "c9bbc1f5353c5273324b381cd613af58",
-    "tab_sync": "c9bbc1f5353c5273324b381cd613af58"
+    "coset_nosync_cpp": "3e7c6c9984dbc44ec95e56e9e52b373a",
+    "coset_nosync_py": "3e7c6c9984dbc44ec95e56e9e52b373a",
+    "coset_sync": "a67c7499c65c2b47bfa8e4c1f30a480e",
+    "magic_ds": "6206c720695e50d2339378302cef371d",
+    "magic_sync": "a67c7499c65c2b47bfa8e4c1f30a480e",
+    "tab_nosync": "4ccd2f37b2ce9cc3b061631935016855",
+    "tab_sync": "a67c7499c65c2b47bfa8e4c1f30a480e"
   },
   "c04b_leakage_detector_tab_coset": {
     "coset_nosync_cpp": "5601c0aee66dec8ecf9b1cacb2f65594",
@@ -77,8 +77,8 @@
     "magic_ss": "3526facf196d34618c8ef197f67be693"
   },
   "c08_magic_with_leakage": {
-    "magic_ds": "9927ce7d233915423e6d39781e73508c",
-    "magic_sync": "0b7f72d31c69ba95380ab12cb0557532"
+    "magic_ds": "dc6cdf640678596ef70fafb141696e70",
+    "magic_sync": "053296907e421b41b81ecd3a8774de2b"
   },
   "c09_multiword_70q_leakage": {
     "coset_nosync_cpp": "f3d4bed6aa3c462d40ca3753ae5c05ea",

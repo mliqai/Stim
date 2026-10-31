@@ -153,18 +153,22 @@ CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
         """
         R 0 1 2 3
         X 1
+        H 0 3
         I[LEAKAGE_TRANSITION_1: (0.4, 0-->2) (0.45, 1-->3)] 0 1
-        II[LEAKAGE_TRANSITION_2: (0.2, 0_2-->2_2) (0.2, 2_U-->0_1) (0.15, 3_U-->X_Z)] 0 2 1 3
+        II[LEAKAGE_TRANSITION_2: (0.2, 0_2-->2_2) (0.2, 2_U-->0_1) (0.15, 3_U-->X_Y)] 0 2 1 3
         H[CONDITIONED_ON_SELF: U] 0 2
+        S[CONDITIONED_ON_SELF: 1] 0 3
         X[CONDITIONED_ON_SELF: 0 1] 1 3
+        H[CONDITIONED_ON_OTHER: 0 : 1] 2
         I_ERROR[CONDITIONED_ON_SELF: U](0.25) 0 0 2
         X_ERROR[CONDITIONED_ON_SELF: 2 3](0.35) 0 0 1
         Z_ERROR[CONDITIONED_ON_OTHER: 2 3 : 0 1](0.4) 2 3 2 2
         CX[CONDITIONED_ON_PAIR: (U, U)] 0 2 1 3
         DEPOLARIZE2[CONDITIONED_ON_PAIR: (2, U) (3, U)](0.3) 0 2 1 3
-        MPAD[LEAKAGE_MEASUREMENT: (0.9, 2) (0.9, 3): 0 1] 0 0
+        I[LEAKAGE_TRANSITION_1: (0.2, 2-->0) (0.2, 3-->1)] 0 1
+        MPAD[LEAKAGE_MEASUREMENT: (0.1, 0) (0.2, 1) (0.9, 2) (0.9, 3): 0 1] 0 0
         DETECTOR rec[-1]
-        M 0 1 2 3
+        M[LEAKAGE_PROJECTION_Z: (0.05, 0) (0.9, 1) (0.85, 2) (0.95, 3)] 0 1 2 3
         DETECTOR rec[-1] rec[-2]
         OBSERVABLE_INCLUDE(0) rec[-3] rec[-4]
         """,
@@ -252,15 +256,16 @@ CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
         """
         R 0 1 2
         H 0 1 2
-        I[LEAKAGE_TRANSITION_1: (0.35, U-->2)] 0 1
         I[T] 0 1 2
+        I[LEAKAGE_TRANSITION_1: (0.3, 0-->2) (0.35, 1-->2)] 0 1
         CX[CONDITIONED_ON_PAIR: (U, U)] 0 1 1 2
         I[T_DAG] 1 2
         I[CCZ] 0 1 2
         SWAP[LEAKAGE_SWAP] 0 2
-        MPAD[LEAKAGE_MEASUREMENT: (0.9, 2): 0 1 2] 0 0 0
+        MPAD[LEAKAGE_MEASUREMENT: (0.15, U) (0.9, 2): 0 1] 0 0
+        MPAD[LEAKAGE_MEASUREMENT: (0.15, U) (0.9, 2): 0 1] 0 0
         H[CONDITIONED_ON_SELF: U] 0 1 2
-        M[LEAKAGE_PROJECTION_Z: (0.95, 2)] 0 1 2
+        M[LEAKAGE_PROJECTION_Z: (0.05, 0) (0.9, 1) (0.95, 2)] 0 1 2
         DETECTOR rec[-1] rec[-4]
         OBSERVABLE_INCLUDE(0) rec[-2] rec[-3]
         """,
@@ -353,7 +358,7 @@ def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
         )
 
     if mode in ("tab_nosync", "tab_sync"):
-        op_h = LeakageUint8Tableau() if has_leakage else _TrivialOpHandler()
+        op_h = LeakageUint8Tableau()
         if mode == "tab_sync":
             sim_t = TablesideSimulator(
                 circuit,
@@ -380,6 +385,7 @@ def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
             record_unleaked_to_leaked=rec_flag,
             record_leakage_events=rec_flag,
         )
+        assert sim_t._cpp_runner is not None
         recs, dets, obs, u2l_all, lev_all = [], [], [], [], []
         for s in range(BATCH):
             if s > 0:

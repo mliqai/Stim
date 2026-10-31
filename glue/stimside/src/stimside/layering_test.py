@@ -32,6 +32,9 @@ ALLOWLIST: set[tuple[str, str]] = {
 
 
 def _layer_of(mod: str) -> str:
+    leaf = mod.rsplit(".", 1)[-1]
+    if leaf.endswith("_test") or leaf.startswith("test_"):
+        return "tests"
     if mod == "stimside":
         return "root"
     sub = mod.removeprefix("stimside.")
@@ -75,7 +78,6 @@ def _runtime_targets(tree: ast.AST, pkg_parts: list[str]) -> set[str]:
                     base.extend(mod.split("."))
                 mod = ".".join(base)
             if mod.startswith("stimside"):
-                targets.add(mod)
                 for alias in node.names:
                     targets.add(f"{mod}.{alias.name}")
 
