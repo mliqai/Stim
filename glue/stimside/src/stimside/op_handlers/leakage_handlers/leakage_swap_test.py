@@ -46,8 +46,6 @@ PARSERS = [leakage_tag_parsing_flip.parse_leakage_tag, leakage_tag_parsing_table
 PATHS = [
     ("tableside", "cpp", 1),
     ("tableside", "cpp", 16),
-    ("tableside", "py", 1),
-    ("tableside", "py", 16),
     ("tableside", "sync", 16),
     ("tableside", "interactive", 1),
     ("cosetside", "default", 64),
@@ -201,7 +199,6 @@ def _run(path, circuit, uc=True, seed=5):
             compiled_op_handler=coh,
             batch_size=batch_size,
             seed=seed,
-            use_cpp_kernels=mode == "cpp",
             sync_tableside_rng=mode == "sync",
             record_unleaked_to_leaked=True,
             record_leakage_events=True,

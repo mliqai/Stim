@@ -89,7 +89,6 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         batch_size: int = 1,
         running_tableau: bool = True,
         construct_reference_circuit: bool = False,
-        use_cpp_kernels: bool | None = None,
         sync_tableside_rng: bool | None = None,
         record_unleaked_to_leaked: bool = False,
         record_leakage_events: bool = False,
@@ -121,10 +120,6 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self.coords_shifts: list[float] = []
 
         self._sync_tableside_rng = bool(sync_tableside_rng)
-
-        self.use_cpp_kernels = (
-            True if use_cpp_kernels is None else bool(use_cpp_kernels)
-        ) and not self._sync_tableside_rng
 
         shot_seed = derived_seed(seed, 0) if seed is not None else None
         self.np_rng = np.random.default_rng(seed=shot_seed)
@@ -169,7 +164,7 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._finished_running_circuit = False
 
         self._cpp_runner = None
-        if self.use_cpp_kernels and self._precompiled_circuit is not None:
+        if not self._sync_tableside_rng and self._precompiled_circuit is not None:
             self._cpp_runner = self._precompiled_circuit.acquire_cpp_runner(
                 seed=self._tab_seed
             )
@@ -212,17 +207,13 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         )
 
         if can_use_fast:
-            from stimside.util.tableside_kernels import (
-                run_tableside_python_v2,
-                run_tableside_sync_rng,
-            )
-
             if self._sync_tableside_rng:
+                from stimside.util.tableside_kernels import run_tableside_sync_rng
+
                 run_tableside_sync_rng(self, pre)
-            elif self.use_cpp_kernels and self._cpp_runner is not None:
-                self._cpp_runner.run(self)
             else:
-                run_tableside_python_v2(self, pre)
+                assert self._cpp_runner is not None
+                self._cpp_runner.run(self)
         else:
             self._do(self.circuit)
 

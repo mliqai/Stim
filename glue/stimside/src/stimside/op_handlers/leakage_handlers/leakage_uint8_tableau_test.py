@@ -567,7 +567,7 @@ class TestCompiledLeakageUint8:
         assert np.all(recs_rec[:, 1] == 1)
         assert np.all(recs_rec[:, 2] == 0)
 
-    def test_tableside_v2_cpp_and_python_kernels_statistical_consistency(self):
+    def test_tableside_cpp_and_sync_rng_statistical_consistency(self):
         circ = stim.Circuit(
             """
             R 0 1 2 3
@@ -585,7 +585,7 @@ class TestCompiledLeakageUint8:
         )
         det_means = {}
         leak_means = {}
-        for use_cpp in (True, False):
+        for sync_rng in (False, True):
             coh = LeakageUint8(unconditional_condition_on_U=True).compile_op_handler(
                 circuit=circ, batch_size=1
             )
@@ -594,8 +594,9 @@ class TestCompiledLeakageUint8:
                 compiled_op_handler=coh,
                 batch_size=1,
                 seed=777,
-                use_cpp_kernels=use_cpp,
+                sync_tableside_rng=sync_rng,
             )
+            assert (tss._cpp_runner is None) is sync_rng
             dets = []
             leaks = []
             for _ in range(120):
@@ -604,15 +605,14 @@ class TestCompiledLeakageUint8:
                 tss.run()
                 dets.append(float(tss.get_detector_flips()[0, 0]))
                 leaks.append(float(np.mean(coh.state >= 2)))
-            det_means[use_cpp] = np.mean(dets)
-            leak_means[use_cpp] = np.mean(leaks)
+            det_means[sync_rng] = np.mean(dets)
+            leak_means[sync_rng] = np.mean(leaks)
 
-        assert abs(det_means[True] - det_means[False]) < 0.15
-        assert abs(leak_means[True] - leak_means[False]) < 0.12
-        assert leak_means[True] > 0.05
+        assert abs(det_means[False] - det_means[True]) < 0.15
+        assert abs(leak_means[False] - leak_means[True]) < 0.12
+        assert leak_means[False] > 0.05
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
-    def test_exotic_multilevel_leakage_hierarchy_and_output_tokens(self, use_cpp: bool):
+    def test_exotic_multilevel_leakage_hierarchy_and_output_tokens(self):
         # 1. Cascaded multi-level heating & cooling chain: 0 -> 2 -> 3 -> 4 -> 5 -> 1 -> U
         c_cascade = stim.Circuit(
             """
@@ -636,7 +636,6 @@ class TestCompiledLeakageUint8:
             compiled_op_handler=coh,
             batch_size=16,
             seed=42,
-            use_cpp_kernels=use_cpp,
         )
         tss.run()
         recs = tss.get_final_measurement_records()
@@ -671,7 +670,6 @@ class TestCompiledLeakageUint8:
             compiled_op_handler=coh2,
             batch_size=128,
             seed=123,
-            use_cpp_kernels=use_cpp,
         )
         tss2.run()
         recs2 = tss2.get_final_measurement_records()
@@ -689,8 +687,7 @@ class TestCompiledLeakageUint8:
         # q5 -> 0: reset to |0>
         assert np.all(recs2[:, 5] == 0)
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
-    def test_exotic_conditional_cliffords_and_other_targets(self, use_cpp: bool):
+    def test_exotic_conditional_cliffords_and_other_targets(self):
         circuit = stim.Circuit(
             """
             R 0 1 2 3 4 5
@@ -722,7 +719,6 @@ class TestCompiledLeakageUint8:
             compiled_op_handler=coh,
             batch_size=16,
             seed=77,
-            use_cpp_kernels=use_cpp,
         )
         tss.run()
         recs = tss.get_final_measurement_records()
@@ -733,8 +729,7 @@ class TestCompiledLeakageUint8:
         assert np.all(recs[:, 1] == 1)
         assert np.all(recs[:, 2] == 1)
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
-    def test_exotic_measurements_resets_repeat_blocks_and_noise(self, use_cpp: bool):
+    def test_exotic_measurements_resets_repeat_blocks_and_noise(self):
         circuit = stim.Circuit(
             """
             RX 0
@@ -773,7 +768,6 @@ class TestCompiledLeakageUint8:
             compiled_op_handler=coh,
             batch_size=16,
             seed=99,
-            use_cpp_kernels=use_cpp,
         )
         tss.run()
         recs = tss.get_final_measurement_records()
@@ -792,10 +786,7 @@ class TestCompiledLeakageUint8:
         assert np.all(recs[:, -2] == 0)
         assert np.all(recs[:, -1] == 1)
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
-    def test_2q_single_group_conditioned_on_cartesian_and_sync_rng_other(
-        self, use_cpp: bool
-    ):
+    def test_2q_single_group_conditioned_on_cartesian_and_sync_rng_other(self):
         circuit = stim.Circuit(
             """
             R 0 1 2 3
@@ -823,7 +814,6 @@ class TestCompiledLeakageUint8:
                 compiled_op_handler=coh,
                 batch_size=8,
                 seed=123,
-                use_cpp_kernels=use_cpp,
                 sync_tableside_rng=sync_rng,
             )
             tss.run()
@@ -833,8 +823,7 @@ class TestCompiledLeakageUint8:
             # X[CONDITIONED_ON_OTHER: U : 0] 2 must be skipped because controller q0 is in state 2
             assert np.all(recs[:, 1] == 0)
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
-    def test_mpad_01_readout_collapses_and_tracks_each_shot_at_batch_size_gt_1(self, use_cpp: bool):
+    def test_mpad_01_readout_collapses_and_tracks_each_shot_at_batch_size_gt_1(self):
         """Non-sync batch_size > 1: MPAD[LEAKAGE_MEASUREMENT] with 0/1 keys Z-collapses superposed targets and reads
         each shot's own Z value (incl. Pauli-frame flips), as batch_size == 1 and Cosetside do."""
         p0, p1 = 0.1, 0.7
@@ -846,7 +835,7 @@ class TestCompiledLeakageUint8:
             for s in range(10):
                 op = LeakageUint8().compile_op_handler(circuit=c, batch_size=400)
                 sim = TablesideSimulator(
-                    circuit=c, compiled_op_handler=op, batch_size=400, seed=7 + s, use_cpp_kernels=use_cpp
+                    circuit=c, compiled_op_handler=op, batch_size=400, seed=7 + s
                 )
                 sim.run()
                 out.append(sim.get_final_measurement_records())
@@ -865,9 +854,8 @@ class TestCompiledLeakageUint8:
             for mask, p in ((~m, p0), (m, p1)):
                 assert abs(np.mean(r[mask]) - p) < 4.5 * np.sqrt(p * (1 - p) / mask.sum())
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
     @pytest.mark.parametrize("gate", ["SPP", "SPP_DAG"])
-    def test_spp_terms_on_leaked_qubits_are_skipped(self, use_cpp: bool, gate: str):
+    def test_spp_terms_on_leaked_qubits_are_skipped(self, gate: str):
         # Like a 2q pair, an SPP/SPP_DAG Pauli product term is skipped iff it touches a leaked qubit; the other
         # terms still apply. Each term appears twice, so when applied it composes to its Pauli (X3 / X4).
         circuit = stim.Circuit(
@@ -885,7 +873,6 @@ class TestCompiledLeakageUint8:
                 compiled_op_handler=coh,
                 batch_size=batch_size,
                 seed=5,
-                use_cpp_kernels=use_cpp,
                 sync_tableside_rng=sync_rng,
             )
             tss.run()
@@ -893,8 +880,7 @@ class TestCompiledLeakageUint8:
             assert np.all(recs[:, 0] == 0)
             assert np.all(recs[:, 1] == 1)
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
-    def test_correlated_error_on_a_leaked_qubit_is_skipped_like_pauli_channel_2(self, use_cpp: bool):
+    def test_correlated_error_on_a_leaked_qubit_is_skipped_like_pauli_channel_2(self):
         # E(1) X1 X3 is the same channel as PAULI_CHANNEL_2(XX=1) 1 3, so with q1 leaked it must not flip q3 either.
         # A skipped E still counts as fired, so the following ELSE_CORRELATED_ERROR stays blocked.
         pc2_xx = "PAULI_CHANNEL_2(0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) 1 3"
@@ -913,7 +899,6 @@ class TestCompiledLeakageUint8:
                     compiled_op_handler=coh,
                     batch_size=batch_size,
                     seed=5,
-                    use_cpp_kernels=use_cpp,
                     sync_tableside_rng=sync_rng,
                 )
                 tss.run()
@@ -950,7 +935,6 @@ class TestCompiledLeakageUint8:
                 compiled_op_handler=coh,
                 batch_size=batch_size,
                 seed=5,
-                use_cpp_kernels=True,
             )
             tss.run()
             assert np.all(tss.get_final_measurement_records() == expected), batch_size

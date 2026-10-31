@@ -132,8 +132,7 @@ def test_split_fused_instruction():
 
 # Paths: (simulator, handler, kwargs). Flipside does not support CONDITIONED_ON_OTHER.
 _PATHS = {
-    "tab_cpp": (TablesideSimulator, LeakageUint8Tableau, dict(use_cpp_kernels=True)),
-    "tab_py": (TablesideSimulator, LeakageUint8Tableau, dict(use_cpp_kernels=False)),
+    "tab_cpp": (TablesideSimulator, LeakageUint8Tableau, {}),
     "tab_sync": (TablesideSimulator, LeakageUint8Tableau, dict(sync_tableside_rng=True)),
     "coset": (CosetsideSimulator, LeakageUint8Coset, {}),
     "coset_sync": (CosetsideSimulator, LeakageUint8Coset, dict(sync_tableside_rng=True)),

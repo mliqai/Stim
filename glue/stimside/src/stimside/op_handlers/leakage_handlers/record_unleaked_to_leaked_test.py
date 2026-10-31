@@ -39,7 +39,6 @@ def _build_tab_sim(
     circuit: stim.Circuit,
     seed: int = 42,
     record_unleaked_to_leaked: bool = True,
-    use_cpp_kernels: bool | None = None,
     sync_tableside_rng: bool | None = None,
 ) -> TablesideSimulator:
     coh = LeakageUint8Tableau().compile_op_handler(
@@ -50,7 +49,6 @@ def _build_tab_sim(
         compiled_op_handler=coh,
         batch_size=1,
         seed=seed,
-        use_cpp_kernels=use_cpp_kernels,
         sync_tableside_rng=sync_tableside_rng,
         record_unleaked_to_leaked=record_unleaked_to_leaked,
     )
@@ -152,8 +150,7 @@ def test_only_unleaked_to_leaked_transitions_recorded() -> None:
             np.testing.assert_array_equal(arr, expected)
 
     for mode_kwargs in (
-        {"use_cpp_kernels": True},
-        {"use_cpp_kernels": False},
+        {},
         {"sync_tableside_rng": True},
     ):
         tss = _build_tab_sim(circuit, seed=7, **mode_kwargs)
@@ -215,8 +212,7 @@ def test_unrolled_instruction_indexing_with_repeat_blocks_and_metadata() -> None
             np.testing.assert_array_equal(arr, expected)
 
     for mode_kwargs in (
-        {"use_cpp_kernels": True},
-        {"use_cpp_kernels": False},
+        {},
         {"sync_tableside_rng": True},
     ):
         tss = _build_tab_sim(circuit, seed=11, **mode_kwargs)
@@ -263,8 +259,7 @@ def test_fused_mode_b_1_to_2_transition_unrolled_indexing() -> None:
             np.testing.assert_array_equal(arr, expected)
 
     for mode_kwargs in (
-        {"use_cpp_kernels": True},
-        {"use_cpp_kernels": False},
+        {},
         {"sync_tableside_rng": True},
     ):
         tss = _build_tab_sim(circuit, seed=19, **mode_kwargs)
@@ -273,7 +268,7 @@ def test_fused_mode_b_1_to_2_transition_unrolled_indexing() -> None:
         np.testing.assert_array_equal(res_tab[0], expected)
 
     # Also explicitly test the pure `_do(self.circuit)` fallback path
-    tss_fallback = _build_tab_sim(circuit, seed=19, use_cpp_kernels=False)
+    tss_fallback = _build_tab_sim(circuit, seed=19)
     tss_fallback._precompiled_circuit = None
     res_fallback = tss_fallback.run()
     assert res_fallback is not None

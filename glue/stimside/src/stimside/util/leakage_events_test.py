@@ -108,7 +108,6 @@ DETERMINISTIC_EVENTS = [
 
 TABLESIDE_PATHS = {
     "cpp": dict(batch_size=1),
-    "python_v2": dict(batch_size=1, use_cpp_kernels=False),
     "handler": dict(batch_size=1, sync_tableside_rng=True),
     "cpp_batch4": dict(batch_size=4),
     "handler_batch4": dict(batch_size=4, sync_tableside_rng=True),

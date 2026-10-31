@@ -21,10 +21,8 @@ _RANDOM_12Q = stim.Circuit(f"R {_Q}\nH {_Q}\nI[LEAKAGE_TRANSITION_1: (0.3, U-->2
 # name: (simulator, handler, batch size, kwargs, shots by which the stream of seed S + 1 led that of
 # seed S when batch (sync: shot) n was seeded with S + n)
 _PATHS = {
-    "tab_cpp_bs1": (TablesideSimulator, LeakageUint8Tableau, 1, dict(use_cpp_kernels=True), 1),
-    "tab_py_bs1": (TablesideSimulator, LeakageUint8Tableau, 1, dict(use_cpp_kernels=False), 1),
-    "tab_cpp_bs4": (TablesideSimulator, LeakageUint8Tableau, 4, dict(use_cpp_kernels=True), 4),
-    "tab_py_bs4": (TablesideSimulator, LeakageUint8Tableau, 4, dict(use_cpp_kernels=False), 4),
+    "tab_cpp_bs1": (TablesideSimulator, LeakageUint8Tableau, 1, {}, 1),
+    "tab_cpp_bs4": (TablesideSimulator, LeakageUint8Tableau, 4, {}, 4),
     "tab_sync_bs4": (TablesideSimulator, LeakageUint8Tableau, 4, dict(sync_tableside_rng=True), 1),
     "cos_cpp_bs4": (CosetsideSimulator, LeakageUint8Coset, 4, dict(use_cpp_kernels=True), 4),
     "cos_py_bs4": (CosetsideSimulator, LeakageUint8Coset, 4, dict(use_cpp_kernels=False), 4),
@@ -108,7 +106,7 @@ def test_tableside_cpp_consecutive_batches_and_seeds_are_uncorrelated():
     def make(seed):
         handler = LeakageUint8Tableau().compile_op_handler(circuit=circuit, batch_size=1)
         sim = TablesideSimulator(
-            circuit, compiled_op_handler=handler, batch_size=1, seed=seed, use_cpp_kernels=True
+            circuit, compiled_op_handler=handler, batch_size=1, seed=seed
         )
         assert sim._cpp_runner is not None
         return sim
@@ -129,12 +127,11 @@ def test_tableside_cpp_consecutive_batches_and_seeds_are_uncorrelated():
         assert abs(np.corrcoef(leaked_f[:-1], leaked_f[1:])[0, 1]) < 0.08
 
 
-@pytest.mark.parametrize("use_cpp", [True, False])
-def test_unseeded_tableside_draws_63_bit_seeds(use_cpp):
+def test_unseeded_tableside_draws_63_bit_seeds():
     circuit = stim.Circuit("H 0\nI[LEAKAGE_TRANSITION_1: (0.3, U-->2)] 0\nM 0\nDETECTOR rec[-1]")
     handler = LeakageUint8Tableau().compile_op_handler(circuit=circuit, batch_size=4)
     sim = TablesideSimulator(
-        circuit, compiled_op_handler=handler, batch_size=4, use_cpp_kernels=use_cpp
+        circuit, compiled_op_handler=handler, batch_size=4
     )
     real, highs, seeds = sim._rng, [], [sim._tab_seed]
 

@@ -422,7 +422,6 @@ _TOTAL_NEAR_1_CASES = {
 # (simulator, mode, shots)
 _SAMPLING_PATHS = [
     ("tableau", "cpp", 400),
-    ("tableau", "py", 200),
     ("tableau", "sync", 200),
     ("coset", "default", 2048),
     ("coset", "sync", 400),
@@ -450,7 +449,6 @@ def _sample_records(sim, mode, circuit, shots, seed=11):
             compiled_op_handler=coh,
             batch_size=shots if mode == "sync" else 1,
             seed=seed,
-            use_cpp_kernels=mode == "cpp",
             sync_tableside_rng=mode == "sync",
         )
         if mode == "cpp":

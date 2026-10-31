@@ -261,28 +261,33 @@ class TestFlipsideSimulator:
                 else:
                     circ.append(inst)
 
-            for use_cpp in (True, False):
-                coh = LeakageUint8(
-                    unconditional_condition_on_U=True
-                ).compile_op_handler(circuit=circ, batch_size=1)
-                tss = TablesideSimulator(
+            coh = LeakageUint8(
+                unconditional_condition_on_U=True
+            ).compile_op_handler(circuit=circ, batch_size=1)
+            tss = TablesideSimulator(
+                circuit=circ,
+                compiled_op_handler=coh,
+                batch_size=1,
+                seed=1234,
+                construct_reference_circuit=True,
+            )
+            assert tss._cpp_runner is not None
+            assert tss._running_tableau is mode_b
+            tss.run()
+            recs = tss.get_final_measurement_records()
+            dets = tss.get_detector_flips()
+            obs = tss.get_observable_flips()
+            assert recs.shape == (1, circ.num_measurements)
+            assert dets.shape == (1, circ.num_detectors)
+            assert obs.shape == (1, circ.num_observables)
+            assert len(tss._new_circuit) > 0
+            assert len(coh.state) == circ.num_qubits
+            with pytest.raises(TypeError):
+                TablesideSimulator(
                     circuit=circ,
                     compiled_op_handler=coh,
-                    batch_size=1,
-                    seed=1234,
-                    use_cpp_kernels=use_cpp,
-                    construct_reference_circuit=True,
+                    use_cpp_kernels=False,  # type: ignore[call-arg]
                 )
-                assert tss._running_tableau is mode_b
-                tss.run()
-                recs = tss.get_final_measurement_records()
-                dets = tss.get_detector_flips()
-                obs = tss.get_observable_flips()
-                assert recs.shape == (1, circ.num_measurements)
-                assert dets.shape == (1, circ.num_detectors)
-                assert obs.shape == (1, circ.num_observables)
-                assert len(tss._new_circuit) > 0
-                assert len(coh.state) == circ.num_qubits
 
 
 def test_concurrent_simulators_and_fused_mode_b_new_circuit():
@@ -306,10 +311,10 @@ def test_concurrent_simulators_and_fused_mode_b_new_circuit():
         circuit=circ, batch_size=1
     )
     sim1 = TablesideSimulator(
-        circuit=circ, compiled_op_handler=coh1, batch_size=8, seed=101, use_cpp_kernels=True
+        circuit=circ, compiled_op_handler=coh1, batch_size=8, seed=101
     )
     sim2 = TablesideSimulator(
-        circuit=circ, compiled_op_handler=coh2, batch_size=8, seed=202, use_cpp_kernels=True
+        circuit=circ, compiled_op_handler=coh2, batch_size=8, seed=202
     )
     # Concurrent instances on the same circuit must not share state buffers
     assert coh1.state is not coh2.state
@@ -321,23 +326,21 @@ def test_concurrent_simulators_and_fused_mode_b_new_circuit():
     assert list(coh2.state) == [2, 0]
 
     # Verify fused Mode B injects R and X_ERROR(1) BEFORE M in _new_circuit so all batch_size=8 shots measure [1, 0]
-    for use_cpp in (True, False):
-        coh = LeakageUint8(unconditional_condition_on_U=True).compile_op_handler(
-            circuit=circ, batch_size=1
-        )
-        sim = TablesideSimulator(
-            circuit=circ,
-            compiled_op_handler=coh,
-            batch_size=8,
-            seed=303,
-            use_cpp_kernels=use_cpp,
-        )
-        sim.run()
-        recs = sim.get_final_measurement_records()
-        assert recs.shape == (8, 2)
-        assert np.all(recs[:, 0] == True)
-        assert np.all(recs[:, 1] == False)
-        assert str(sim.peek_bloch(1)) == "+Z"
+    coh = LeakageUint8(unconditional_condition_on_U=True).compile_op_handler(
+        circuit=circ, batch_size=1
+    )
+    sim = TablesideSimulator(
+        circuit=circ,
+        compiled_op_handler=coh,
+        batch_size=8,
+        seed=303,
+    )
+    sim.run()
+    recs = sim.get_final_measurement_records()
+    assert recs.shape == (8, 2)
+    assert np.all(recs[:, 0] == True)
+    assert np.all(recs[:, 1] == False)
+    assert str(sim.peek_bloch(1)) == "+Z"
 
 
 def test_exotic_circuit_end_to_end_tableside_vs_cosetside_cross_validation():
@@ -372,21 +375,20 @@ def test_exotic_circuit_end_to_end_tableside_vs_cosetside_cross_validation():
     )
 
     for seed in (10, 20, 30):
-        for use_cpp in (True, False):
-            coh_t = LeakageUint8Tableau(
-                unconditional_condition_on_U=True
-            ).compile_op_handler(circuit=circ, batch_size=1)
-            tss = TablesideSimulator(
-                circuit=circ,
-                compiled_op_handler=coh_t,
-                batch_size=1,
-                seed=seed,
-                use_cpp_kernels=use_cpp,
-            )
-            tss.run()
-            assert tss.get_final_measurement_records().shape == (1, circ.num_measurements)
-            assert tss.get_detector_flips().shape == (1, circ.num_detectors)
-            assert tss.get_observable_flips().shape == (1, circ.num_observables)
+        coh_t = LeakageUint8Tableau(
+            unconditional_condition_on_U=True
+        ).compile_op_handler(circuit=circ, batch_size=1)
+        tss = TablesideSimulator(
+            circuit=circ,
+            compiled_op_handler=coh_t,
+            batch_size=1,
+            seed=seed,
+        )
+        assert tss._cpp_runner is not None
+        tss.run()
+        assert tss.get_final_measurement_records().shape == (1, circ.num_measurements)
+        assert tss.get_detector_flips().shape == (1, circ.num_detectors)
+        assert tss.get_observable_flips().shape == (1, circ.num_observables)
 
         coh_t_sync = LeakageUint8Tableau(
             unconditional_condition_on_U=True
@@ -451,17 +453,12 @@ def test_repeat_body_with_identical_consecutive_ops(text):
     from stimside.simulator_coset import CosetsideSimulator
 
     circ = stim.Circuit(text)
-    for kw in (
-        dict(use_cpp_kernels=True, batch_size=1),
-        dict(use_cpp_kernels=False, batch_size=1),
-        dict(use_cpp_kernels=True, batch_size=4),
-        dict(use_cpp_kernels=False, batch_size=4),
-    ):
-        coh = LeakageUint8Tableau().compile_op_handler(circuit=circ, batch_size=kw["batch_size"])
-        tss = TablesideSimulator(circuit=circ, compiled_op_handler=coh, seed=5, **kw)
+    for batch_size in (1, 4):
+        coh = LeakageUint8Tableau().compile_op_handler(circuit=circ, batch_size=batch_size)
+        tss = TablesideSimulator(circuit=circ, compiled_op_handler=coh, seed=5, batch_size=batch_size)
         tss.run()
         recs = tss.get_final_measurement_records()
-        assert recs.shape == (kw["batch_size"], circ.num_measurements)
+        assert recs.shape == (batch_size, circ.num_measurements)
         if text.startswith("H 0\nREPEAT 3 {\nMPAD"):
             # MPAD with (0, 0), (1, 1) reads out the qubit's Z value, so it matches the final M.
             assert np.all(recs[:, :3] == recs[:, 3:4])
@@ -506,13 +503,11 @@ def test_repeat_body_fusion_leak_event_op_indices():
                              record_unleaked_to_leaked=True, record_leakage_events=True)
     expected_u2l = [list(x) for x in css.run()]
     assert expected_u2l == [[3, 7, 11]]
-    for use_cpp in (True, False):
-        coh = LeakageUint8Tableau().compile_op_handler(circuit=circ, batch_size=1)
-        tss = TablesideSimulator(circuit=circ, compiled_op_handler=coh, batch_size=1, seed=1,
-                                 use_cpp_kernels=use_cpp, record_unleaked_to_leaked=True,
-                                 record_leakage_events=True)
-        assert [list(x) for x in tss.run()] == expected_u2l
-        assert tss._leakage_events == css._leakage_events
+    coh = LeakageUint8Tableau().compile_op_handler(circuit=circ, batch_size=1)
+    tss = TablesideSimulator(circuit=circ, compiled_op_handler=coh, batch_size=1, seed=1,
+                             record_unleaked_to_leaked=True, record_leakage_events=True)
+    assert [list(x) for x in tss.run()] == expected_u2l
+    assert tss._leakage_events == css._leakage_events
 
 
 def _leakage_tss(circuit: stim.Circuit, batch_size: int) -> TablesideSimulator:
@@ -597,7 +592,6 @@ def test_interactive_do_past_the_end(batch_size):
             tss.interactive_do(stim.Circuit(op))
 
 
-@pytest.mark.parametrize("use_cpp_kernels", [True, False])
 @pytest.mark.parametrize("records_first", [False, True])
 @pytest.mark.parametrize(
     "text",
@@ -611,7 +605,7 @@ def test_interactive_do_past_the_end(batch_size):
     ],
 )
 def test_batched_detection_events_are_relative_to_the_circuit_reference(
-    text, records_first, use_cpp_kernels
+    text, records_first
 ):
     from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
 
@@ -621,7 +615,6 @@ def test_batched_detection_events_are_relative_to_the_circuit_reference(
         compiled_op_handler=LeakageUint8().compile_op_handler(circuit=circuit, batch_size=4),
         batch_size=4,
         seed=0,
-        use_cpp_kernels=use_cpp_kernels,
     )
     tss.run()
     if records_first:
