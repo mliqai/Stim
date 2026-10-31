@@ -1,0 +1,99 @@
+{
+  "c01_clifford_noise_feedback": {
+    "coset_nosync_cpp": "5df818cfc45c661a615b5baf22ed917f",
+    "coset_nosync_py": "5df818cfc45c661a615b5baf22ed917f",
+    "coset_sync": "3f9ebdd8933726cfb55dced216727250",
+    "flip": "a3246418839679ad724c9df323ea7c56",
+    "magic_dq": "526bcbb257e7bd1a73d77951242e0aa3",
+    "magic_ds": "90367a90efd0919eb2eadef26d775825",
+    "magic_sq": "526bcbb257e7bd1a73d77951242e0aa3",
+    "magic_ss": "72701b01c315ddb4458f75d6a1b7ebe8",
+    "magic_sync": "3f9ebdd8933726cfb55dced216727250",
+    "tab_nosync": "3f9ebdd8933726cfb55dced216727250",
+    "tab_sync": "3f9ebdd8933726cfb55dced216727250"
+  },
+  "c02_mpp_mxx_heralded_corr": {
+    "coset_nosync_cpp": "09c4be7befce1fc959017ecfbb828d17",
+    "coset_nosync_py": "09c4be7befce1fc959017ecfbb828d17",
+    "coset_sync": "492e5c4aec8cda0fbbf09444e10b3f69",
+    "flip": "ef0663f431b7dde0d928ba1e3e45f518",
+    "magic_dq": "3215fade03f69a40ae7b05f1aac3bfbe",
+    "magic_ds": "1d999e530a7a9fb2fcec9d55dd9319a9",
+    "magic_sq": "3215fade03f69a40ae7b05f1aac3bfbe",
+    "magic_ss": "eb6a4c3d9490ed7a466e881b324cae4d",
+    "magic_sync": "492e5c4aec8cda0fbbf09444e10b3f69",
+    "tab_nosync": "492e5c4aec8cda0fbbf09444e10b3f69",
+    "tab_sync": "492e5c4aec8cda0fbbf09444e10b3f69"
+  },
+  "c02b_spp_clifford": {
+    "flip": "26439ad4ace08fa5cb520213f1bbd6c2",
+    "magic_dq": "89123eeee7d12386c3c03118ca94858d",
+    "magic_ds": "e7e17a4150366946fb26a2fdf3c48da6",
+    "magic_sq": "89123eeee7d12386c3c03118ca94858d",
+    "magic_ss": "2111024bd0fe0db81b7069f9b219d188",
+    "magic_sync": "e1b0426620c08a80718d8eea318ebe74",
+    "tab_nosync": "e1b0426620c08a80718d8eea318ebe74",
+    "tab_sync": "e1b0426620c08a80718d8eea318ebe74"
+  },
+  "c03_leakage_transitions_swap_meas": {
+    "coset_nosync_cpp": "e66208b3bde05a4eadf56cfe917510e0",
+    "coset_nosync_py": "e66208b3bde05a4eadf56cfe917510e0",
+    "coset_sync": "2f1848c052fccbc02e7ab9353cf2916e",
+    "flip": "ccc69b16d9e39a97929f23b039f6816d",
+    "magic_ds": "f846e56d7843b4c0d9dcb88b884e746e",
+    "magic_sync": "2f1848c052fccbc02e7ab9353cf2916e",
+    "tab_nosync": "a44fab1aa767babfebdf4916bc0c19a4",
+    "tab_sync": "2f1848c052fccbc02e7ab9353cf2916e"
+  },
+  "c04_leakage_conditioning_and_repeated_targets": {
+    "coset_nosync_cpp": "32202a1b76c84c6b29256356f8639b71",
+    "coset_nosync_py": "32202a1b76c84c6b29256356f8639b71",
+    "coset_sync": "c9bbc1f5353c5273324b381cd613af58",
+    "magic_ds": "c3bb63b3606374c8e9c148288679cc1c",
+    "magic_sync": "c9bbc1f5353c5273324b381cd613af58",
+    "tab_nosync": "c9bbc1f5353c5273324b381cd613af58",
+    "tab_sync": "c9bbc1f5353c5273324b381cd613af58"
+  },
+  "c04b_leakage_detector_tab_coset": {
+    "coset_nosync_cpp": "5601c0aee66dec8ecf9b1cacb2f65594",
+    "coset_nosync_py": "5601c0aee66dec8ecf9b1cacb2f65594",
+    "coset_sync": "545e05fc6901623456579785f75cca0d",
+    "tab_nosync": "90aa943d6ac295c429844231e1249673",
+    "tab_sync": "545e05fc6901623456579785f75cca0d"
+  },
+  "c05_flip_only_tags": {
+    "flip": "28fc8aae7099adfc5b6e9c1c4ba84950"
+  },
+  "c06_magic_t_ccz_clifford": {
+    "magic_dq": "0ee1df92ce9f723c232dde69b340c8f8",
+    "magic_ds": "9826a7a0706276e36c42ce2344a6922e",
+    "magic_sq": "0ee1df92ce9f723c232dde69b340c8f8",
+    "magic_ss": "fbb1017d3e33a73d886d48434937524a"
+  },
+  "c07_magic_inline_faults": {
+    "magic_dq": "0d01caa574151bc705cad15e89d6a7f9",
+    "magic_ds": "238843aa613ccfdbbbea9dbf288118aa",
+    "magic_sq": "0d01caa574151bc705cad15e89d6a7f9",
+    "magic_ss": "3526facf196d34618c8ef197f67be693"
+  },
+  "c08_magic_with_leakage": {
+    "magic_ds": "9927ce7d233915423e6d39781e73508c",
+    "magic_sync": "0b7f72d31c69ba95380ab12cb0557532"
+  },
+  "c09_multiword_70q_leakage": {
+    "coset_nosync_cpp": "f3d4bed6aa3c462d40ca3753ae5c05ea",
+    "coset_nosync_py": "f3d4bed6aa3c462d40ca3753ae5c05ea",
+    "coset_sync": "971276671649b9411a789e3168b1bd7b",
+    "flip": "33cad4944e370fd1001228af0294a9d1",
+    "magic_ds": "06500541bfd25d890bc0387185439239",
+    "magic_sync": "971276671649b9411a789e3168b1bd7b",
+    "tab_nosync": "fdbf17e5d9db4d5344d5c266f243afcc",
+    "tab_sync": "971276671649b9411a789e3168b1bd7b"
+  },
+  "c10_magic_multiword_68q": {
+    "magic_dq": "6380d2917d1f03734778182379417cae",
+    "magic_ds": "678902135cfaa8d904e1e032681357ae",
+    "magic_sq": "6380d2917d1f03734778182379417cae",
+    "magic_ss": "767e569b19be7186835e2eb3cff95e19"
+  }
+}
