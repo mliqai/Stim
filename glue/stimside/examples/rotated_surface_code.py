@@ -3,11 +3,13 @@ import dataclasses
 import stim
 import sinter
 
+from stimside.dem_generators.leakage_decoder import BaseDecoder
 from stimside.sampler_tableau import TablesideSampler
 from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
 
 DECODER_NAME = "pymatching"
-SAMPLER_NAME = "stimside:tableside:" + DECODER_NAME
+DEM_DECODER = BaseDecoder(decoder=DECODER_NAME)
+SAMPLER_NAME = DEM_DECODER.name
 
 @dataclasses.dataclass
 class TaskMetadata:
@@ -62,7 +64,7 @@ class TaskMetadata:
                         else:
                             raise ValueError(f"Do not know what to do with measurement op {op.name}")
                         
-                        # mpad_tag = "LEAKAGE_MEASUREMENT: (0.01, U) (0.99, 2):"
+                        # mpad_tag = "LEAKAGE_MEASUREMENT: (0.01, 0) (0.01, 1) (0.99, 2):"
                         # for target in op.targets_copy():
                         #     mpad_tag += " " + str(target.value)
                         # return_circuit.append(stim.CircuitInstruction("MPAD", [0 for _ in range(len(op.targets_copy()))], tag=mpad_tag))
@@ -131,5 +133,5 @@ if __name__ == '__main__':
         max_shots=max_shots,
         max_errors=max_errors,
         decoders=[DECODER_NAME], 
-        custom_decoders={SAMPLER_NAME: TablesideSampler(op_handler)}
+        custom_decoders={SAMPLER_NAME: TablesideSampler(op_handler, DEM_DECODER)}
         )

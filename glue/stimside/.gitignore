@@ -1,0 +1,9 @@
+build/
+dist/
+python_build_stimside/
+*.egg-info/
+src/*.egg-info/
+*.so
+__pycache__/
+.pytest_cache/
+.benchmarks/

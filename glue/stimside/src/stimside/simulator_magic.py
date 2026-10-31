@@ -1,0 +1,1259 @@
+"""MagicsideSimulator: non-Clifford Phase-QFE circuit simulator for stimside."""
+
+from __future__ import annotations
+
+import dataclasses
+import itertools as it
+import math
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
+
+import numpy as np
+from numpy.typing import NDArray
+import stim  # type: ignore[import-untyped]
+
+from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler, _TrivialCompiledOpHandler
+from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageConditioningParams, LeakageMeasurementParams
+from stimside.util.known_states import _replays, _unroll_circuit
+from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
+from stimside.util.magic_compile import (
+    CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis,
+    CorrelatedNoiseRecord, DirectPlan, FrameEvent, HeraldedNoiseRecord, LeftSppEvent, LeftUnitaryEvent,
+    MagicTermRecord, MeasurementRecord, OMEGA_POWERS, PauliNoiseRecord, ResetRecord, SelectorPlan,
+    _FEEDBACK_2Q_GATES, _PAULI_2Q_ORDER, _canonical_clifford_gate_name_and_arity, _canonical_gate_data,
+    _coerce_strict_int, _compile_clifford_factors, _compile_pauli_measurement_c15, _compile_reset_c15,
+    _infer_total_data_qubits, _merge_and_validate_fault_channels, _normalize_choice_map, _plan_noise_max_choices,
+    _prepare_run_maps, _reduce_pauli_product_targets, _sample_categorical_branch, _split_pauli_product_targets,
+    _validate_and_emit_magic_op, apply_spp_to_reference_chp, clone_reference_chp, compile_direct,
+    compile_open_block, compile_pauli_product, compile_selector, extract_circuit_faults, extract_data_expansion,
+    parse_clifford_fault_instruction, reconstruct_statevector, run_direct, run_selector,
+)
+from stimside.util.magic_query import (
+    PrepareQueries, PreparedQueryPlan, QueryBudget, QueryBudgetExceededError,
+    _PAULI_1Q_STR, _PAULI_2Q_STR, _PAULI_4_STR, run_query_batch,
+)
+from stimside.util.phase_qfe import (
+    DEFAULT_ATOL, ImpossiblePostselectionError, K1_CANCEL_REL_TOL, ShotExpansion, apply_compiled_block, apply_pauli,
+    apply_quarter_turn, first_set_bit_in_words, measure_expansion, pack_bit_vector, project_diagonal,
+    reference_chp_to_stim_tableau, unit_bit_words, validate_atol, word_dot_parity, words_any_nonzero,
+)
+from stimside.util.reference_chp import ReferenceCHPTableau
+from stimside.util.seeding import derived_seed
+from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
+
+_MAGIC_TAGS: frozenset[str] = frozenset({"T", "T_DAG", "CCZ"})
+_PURE_NOISE_GATES: frozenset[str] = frozenset({
+    "X_ERROR", "Y_ERROR", "Z_ERROR", "I_ERROR", "II_ERROR", "DEPOLARIZE1", "DEPOLARIZE2",
+    "PAULI_CHANNEL_1", "PAULI_CHANNEL_2", "CORRELATED_ERROR", "E", "ELSE_CORRELATED_ERROR",
+})
+_FAULT_MODES: dict[str, Literal["DIRECT", "SELECTOR"]] = {"DIRECT": "DIRECT", "METHOD_A": "DIRECT", "SELECTOR": "SELECTOR", "METHOD_B": "SELECTOR"}
+_BACKENDS: dict[str, Literal["STREAM", "QUERY"]] = {"STREAM": "STREAM", "EVENT_STREAM": "STREAM", "TRAJECTORY": "STREAM", "QUERY": "QUERY", "Q1_Q2": "QUERY"}
+_M2D_MODES: dict[str, Literal["auto", "magicside", "stim", "zero"]] = {
+    "auto": "auto", "magicside": "magicside", "magic": "magicside", "noiseless_magic": "magicside",
+    "stim": "stim", "clifford": "stim", "zero": "zero", "skip": "zero",
+}
+_REAL_KEY_MAP: dict[str, str] = {
+    "faults": "faults", "fault_trace": "faults", "measurements": "measurements", "requested_outcomes": "measurements",
+    "quantum_measurements": "quantum_measurements", "requested_quantum_outcomes": "quantum_measurements",
+    "paulis": "paulis", "pauli_noise": "paulis", "pauli_noise_trace": "paulis",
+    "resets": "resets", "reset_outcomes": "resets", "sweep": "sweep_bits", "sweep_bits": "sweep_bits",
+}
+
+
+def _resolve_budget(
+    query_budget: QueryBudget | None, max_components: int | None, on_budget_exceeded: str | None
+) -> tuple[QueryBudget | None, int | None, Literal["raise", "fallback"]]:
+    if query_budget is not None and not isinstance(query_budget, QueryBudget):
+        raise TypeError(f"Expected QueryBudget or None, got {type(query_budget).__name__}")
+    mc = None if max_components is None else _coerce_strict_int(max_components, "max_components")
+    if mc is not None and mc < 1:
+        raise ValueError(f"max_components must be >= 1, got {mc}")
+    if query_budget is None and mc is None and on_budget_exceeded is None:
+        return None, None, "raise"
+    base = QueryBudget() if query_budget is None else query_budget
+    mt = (mc if query_budget is None else min(base.max_terms, mc)) if mc is not None else base.max_terms
+    obe = base.on_budget_exceeded if on_budget_exceeded is None else on_budget_exceeded
+    eff_qb = dataclasses.replace(base, max_terms=mt, on_budget_exceeded=obe)
+    return eff_qb, mc, eff_qb.on_budget_exceeded  # type: ignore[return-value]
+
+
+def _normalize_shot_realization(
+    raw: Any, fault_max: Sequence[int], fault_id_to_slot: Mapping[int, int], num_measurements: int
+) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"Expected Mapping fault realization, got {type(raw)!r}")
+    sec: dict[str, Any] = {}
+    if any(isinstance(k, str) for k in raw):
+        for k, v in raw.items():
+            ck = _REAL_KEY_MAP.get(k) if isinstance(k, str) else None
+            if ck is None or ck in sec:
+                raise ValueError(f"Invalid or duplicate fault_realizations key {k!r}")
+            if v is not None:
+                sec[ck] = v
+    elif raw:
+        sec["faults"] = raw
+    if "faults" in sec:
+        fr = sec["faults"]
+        if isinstance(fr, Mapping):
+            fr = {
+                k: int(bool(v)) if (isinstance(v, (bool, np.bool_)) and not isinstance(k, (bool, np.bool_)) and isinstance(k, (int, np.integer)) and int(k) in fault_id_to_slot and fault_max[fault_id_to_slot[int(k)]] == 1) else v
+                for k, v in fr.items()
+            }
+        elif not isinstance(fr, (str, bytes)) and isinstance(fr, (Sequence, np.ndarray)):
+            if getattr(fr, "ndim", 1) != 1 or len(fr) != len(fault_max):
+                raise ValueError(f"Invalid faults sequence shape/length for {len(fault_max)} slots")
+            fr = [int(bool(v)) if (isinstance(v, (bool, np.bool_)) and fault_max[i] == 1) else v for i, v in enumerate(fr)]
+        sec["faults"] = _normalize_choice_map(fr, fault_max, "faults", key_to_slot=fault_id_to_slot, allow_none_zero=True)
+    for mk in ("measurements", "quantum_measurements"):
+        if mk in sec:
+            sec[mk] = _normalize_choice_map(sec[mk], (1,) * num_measurements, mk, allow_bool_values=True)
+    if "sweep_bits" in sec:
+        sw = sec["sweep_bits"]
+        w = (max(_coerce_strict_int(k, "sweep_bits key") for k in sw) + 1) if isinstance(sw, Mapping) and sw else (len(sw) if not isinstance(sw, (str, bytes, Mapping)) and hasattr(sw, "__len__") else 0)
+        sw_m = _normalize_choice_map(sw, (1,) * max(0, w), "sweep_bits", allow_bool_values=True) or {}
+        sec["sweep_bits"] = np.array([bool(sw_m.get(i, 0)) for i in range(max(sw_m) + 1)], dtype=np.bool_) if sw_m else np.zeros(0, dtype=np.bool_)
+    return sec
+
+
+def _normalize_stream_paulis(plan: DirectPlan | SelectorPlan, raw_p: Any) -> Any:
+    if not isinstance(raw_p, Mapping):
+        return raw_p
+    max_c, kinds, cur = _plan_noise_max_choices(plan), {}, 0
+    for rec in plan.records:
+        if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord, CorrelatedNoiseRecord)):
+            kinds[rec.noise_index if rec.noise_index is not None else cur] = getattr(rec, "kind", "")
+            cur += 1
+    out: dict[Any, Any] = {}
+    for k, v in raw_p.items():
+        ik = _coerce_strict_int(k, "paulis key")
+        if ik < 0 or ik >= len(max_c):
+            raise ValueError(f"Pauli slot {ik} out of range")
+        mc, kind = max_c[ik], kinds.get(ik, "")
+        if isinstance(v, str):
+            s = v.strip().upper()
+            tbl = ({"I": 0, kind[:1]: 1} if kind in ("X_ERROR", "Y_ERROR", "Z_ERROR") else {"I": 0}) if mc == 1 else {3: _PAULI_1Q_STR, 4: _PAULI_4_STR, 15: _PAULI_2Q_STR}.get(mc, {})
+            if s not in tbl:
+                raise ValueError(f"Invalid Pauli label {v!r} at slot {ik}")
+            out[ik] = tbl[s]
+        else:
+            out[ik] = int(bool(v)) if (mc == 1 and isinstance(v, (bool, np.bool_))) else v
+    return out
+
+
+def _parse_enum(val: Any, table: Mapping[str, Any], name: str, *, lower: bool = False) -> Any:
+    key = (val.strip().lower() if lower else val.strip().upper()) if isinstance(val, str) else ""
+    if key not in table:
+        raise ValueError(f"Unsupported {name}: {val!r}")
+    return table[key]
+
+
+def _normalize_sweep_matrix(sweep_bits: Any, batch_size: int) -> NDArray[np.bool_] | None:
+    if sweep_bits is None:
+        return None
+    if isinstance(sweep_bits, Mapping):
+        w = (max(int(k) for k in sweep_bits) + 1) if sweep_bits else 0
+        row = np.zeros(w, dtype=np.bool_)
+        for k, v in sweep_bits.items():
+            row[int(k)] = bool(v)
+        return np.broadcast_to(row, (batch_size, w)).copy()
+    arr = np.asarray(sweep_bits, dtype=np.bool_)
+    if arr.ndim == 1:
+        return np.broadcast_to(arr, (batch_size, arr.shape[0])).copy()
+    if arr.ndim == 2 and arr.shape[0] == batch_size:
+        return arr.copy()
+    raise ValueError(f"Invalid sweep_bits shape {arr.shape} for batch_size={batch_size}")
+
+
+def _to_forward_chp(rt: ReferenceCHPTableau) -> ReferenceCHPTableau:
+    n = rt.num_qubits
+    out = ReferenceCHPTableau(n)
+    if n == 0:
+        return out
+    ft = reference_chp_to_stim_tableau(rt)
+    for q in range(n):
+        for ax, az, ak, ps in ((out.x2x, out.x2z, out.x_kap, ft.x_output(q)), (out.z2x, out.z2z, out.z_kap, ft.z_output(q))):
+            xs, zs = ps.to_numpy()
+            ax[q], az[q] = pack_bit_vector(xs, n), pack_bit_vector(zs, n)
+            ak[q] = ((2 if ps.sign == -1 else 0) + int(np.count_nonzero(xs & zs))) & 3
+    return out
+
+
+def _strip_circuit_for_noiseless_ref(circuit: stim.Circuit) -> tuple[stim.Circuit, bool]:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import _parse_leakage_tag_magic
+    needs_leakage = False
+
+    def _strip(blk: stim.Circuit) -> stim.Circuit:
+        nonlocal needs_leakage
+        out = stim.Circuit()
+        for op in blk:
+            if isinstance(op, stim.CircuitRepeatBlock):
+                out.append(stim.CircuitRepeatBlock(op.repeat_count, _strip(op.body_copy())))
+                continue
+            tag, name, tgs = op.tag, op.name, op.targets_copy()
+            if tag.startswith(("CLIFFORD_FAULT", "LEAKAGE_TRANSITION", "LEAKAGE_CONTROLLED")):
+                continue
+            if tag == "LEAKAGE_SWAP":
+                out.append(stim.CircuitInstruction("SWAP", tgs))
+            elif tag.startswith(("LEAKAGE_MEASUREMENT", "LEAKAGE_PROJECTION_Z")):
+                params, _ = _parse_leakage_tag_magic(op)
+                assert isinstance(params, LeakageMeasurementParams)
+                is_mpad = tag.startswith("LEAKAGE_MEASUREMENT")
+                b0 = params.prob_for_input_state.get(0, 0.0) > 0.5
+                b1 = params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0) > 0.5
+                if is_mpad and b0 == b1:
+                    out.append(stim.CircuitInstruction("MPAD", [int((bool(t.value) ^ t.is_inverted_result_target) ^ b0) for t in tgs]))
+                elif not is_mpad and (b0, b1) == (False, True):
+                    out.append(stim.CircuitInstruction(name, tgs))
+                elif not is_mpad and (b0, b1) == (True, False):
+                    out.append(stim.CircuitInstruction(name, [stim.target_inv(t.qubit_value) if not t.is_inverted_result_target else t.qubit_value for t in tgs]))
+                else:
+                    sfx = f" : {' '.join(str(q) for q in (params.targets or ()))}" if is_mpad else ""
+                    out.append(stim.CircuitInstruction(name, tgs, [], tag=f"{'LEAKAGE_MEASUREMENT' if is_mpad else 'LEAKAGE_PROJECTION_Z'}: ({float(b0)}, 0) ({float(b1)}, 1){sfx}"))
+                    needs_leakage = True
+            elif tag.startswith("CONDITIONED_ON"):
+                if name in _PURE_NOISE_GATES:
+                    continue
+                params, _ = _parse_leakage_tag_magic(op)
+                assert isinstance(params, LeakageConditioningParams)
+                if len(params.args) == 1:
+                    alw = set(params.args[0])
+                    hits = 4 if ("U" in alw or (0 in alw and 1 in alw)) else (1 if (0 in alw or 1 in alw) else 0)
+                else:
+                    rules = list(zip(params.args[0], params.args[1]))
+                    hits = sum(any((a in ("U", q0)) and (b in ("U", q1)) for a, b in rules) for q0 in (0, 1) for q1 in (0, 1))
+                if hits == 4:
+                    out.append(stim.CircuitInstruction(name, tgs, op.gate_args_copy()))
+                elif hits > 0:
+                    out.append(op)
+                    needs_leakage = True
+            elif tag == "" and name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
+                out.append(stim.CircuitInstruction("MPAD", [0] * len(tgs)))
+            elif tag in _MAGIC_TAGS:
+                out.append(op)
+            elif name not in _PURE_NOISE_GATES:
+                gd = stim.gate_data("I") if name == "I_" else _canonical_gate_data(name)
+                out.append(stim.CircuitInstruction(name, tgs, [], tag=tag) if (gd.produces_measurements and op.gate_args_copy()) else op)
+        return out
+
+    return _strip(circuit), needs_leakage
+
+
+class _PauliBroadcasterProxy:
+    def __init__(self, sim: MagicsideSimulator) -> None:
+        self._sim = sim
+
+    @property
+    def batch_size(self) -> int:
+        return self._sim.batch_size
+
+    def clear(self) -> None:
+        return
+
+    def do(self, op: stim.CircuitInstruction) -> None:
+        self._sim.do_conditional_pauli_noise(op, None)
+
+    def broadcast_pauli_errors(self, *, pauli: Literal["X", "Y", "Z"], mask: NDArray[np.bool_], p: float = 1.0) -> None:
+        if p <= 0.0:
+            return
+        eff = mask
+        if p < 1.0:
+            cnt = int(np.count_nonzero(mask))
+            if cnt == 0:
+                return
+            eff = np.zeros(mask.shape, dtype=np.bool_)
+            eff[mask] = self._sim.np_rng.random(cnt) < p
+        self._sim._apply_pauli_mask(pauli, eff)
+
+
+class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixin):
+    """Non-Clifford Phase-QFE simulator compatible with CosetsideSimulator APIs."""
+
+    def __init__(
+        self, circuit: stim.Circuit, compiled_op_handler: CompiledOpHandler[Any] | None = None, *,
+        op_handler: OpHandler[Any] | None = None, batch_size: int = 1, fault_mode: str = "DIRECT",
+        backend: str = "STREAM", use_cpp_kernels: bool = True, seed: int | None = None, sweep_bits: Any = None,
+        fault_channels: Sequence[CliffordFaultChannel] | None = None, fault_realizations: Any = None,
+        query_budget: QueryBudget | None = None, max_components: int | None = None,
+        on_budget_exceeded: str | None = None, m2d_reference_mode: str = "auto",
+        reference_sample: Sequence[int | bool] | NDArray[np.bool_] | None = None,
+        record_unleaked_to_leaked: bool = False, record_leakage_events: bool = False,
+        sync_tableside_rng: bool | None = False, atol: float = DEFAULT_ATOL,
+    ) -> None:
+        if not isinstance(circuit, stim.Circuit):
+            raise TypeError(f"Expected stim.Circuit, got {type(circuit)!r}")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+        self.circuit, self.batch_size = circuit, int(batch_size)
+        self.fault_mode: Literal["DIRECT", "SELECTOR"] = _parse_enum(fault_mode, _FAULT_MODES, "fault_mode")
+        self.backend: Literal["STREAM", "QUERY"] = _parse_enum(backend, _BACKENDS, "backend")
+        self.use_cpp_kernels, self.atol = bool(use_cpp_kernels), validate_atol(atol)
+        self.m2d_reference_mode: Literal["auto", "magicside", "stim", "zero"] = _parse_enum(m2d_reference_mode, _M2D_MODES, "m2d_reference_mode", lower=True)
+        self.record_unleaked_to_leaked = bool(record_unleaked_to_leaked)
+        self.record_leakage_events = bool(record_leakage_events)
+        self.sync_tableside_rng = bool(sync_tableside_rng)
+        if seed is not None:
+            derived_seed(seed, 0)
+        self.seed = seed
+        self.query_budget, self.max_components, self.on_budget_exceeded = _resolve_budget(
+            query_budget, max_components, on_budget_exceeded
+        )
+        self._explicit_ref_sample: NDArray[np.bool_] | None = None
+        if reference_sample is not None:
+            ref_arr = np.asarray(reference_sample, dtype=np.bool_)
+            if ref_arr.ndim != 1 or ref_arr.shape[0] != circuit.num_measurements:
+                raise ValueError(f"reference_sample length {ref_arr.shape} != {circuit.num_measurements}")
+            self._explicit_ref_sample = ref_arr.copy()
+        self.num_qubits = int(circuit.num_qubits)
+        self._unrolled_ops: list[stim.CircuitInstruction] = _unroll_circuit(circuit)
+        self._eff_m2d_mode: Literal["magicside", "stim", "zero"] = ("magicside" if any(op.tag in _MAGIC_TAGS for op in self._unrolled_ops) else "stim") if self.m2d_reference_mode == "auto" else self.m2d_reference_mode
+        flat_ops, inline_faults = extract_circuit_faults(circuit)
+        self._user_fault_channels = tuple(fault_channels) if fault_channels is not None else None
+        self._prog_faults, self._inline_faults, self._all_fault_channels = _merge_and_validate_fault_channels(len(flat_ops), inline_faults, fault_channels)
+        self._logical_nq = max([self.num_qubits] + [q + 1 for ch in self._all_fault_channels for b in ch.branches for q in b.targets])
+        self._eff_nq = _infer_total_data_qubits(circuit, self._all_fault_channels)
+        self._tab_scratch_q = self.num_qubits
+        self._sweep_mat = _normalize_sweep_matrix(sweep_bits, self.batch_size)
+        self._fault_realizations = fault_realizations
+        if compiled_op_handler is None and op_handler is not None:
+            compiled_op_handler = op_handler.compile_op_handler(circuit=circuit, batch_size=self.batch_size)
+        self._compiled_op_handler: CompiledOpHandler[Any] = _TrivialCompiledOpHandler() if compiled_op_handler is None else compiled_op_handler
+        self._has_trivial_handler = isinstance(self._compiled_op_handler, _TrivialCompiledOpHandler)
+        self.compiled_op_handler = self._compiled_op_handler
+        if (self.backend == "QUERY" or self.fault_mode == "SELECTOR") and (not self._has_trivial_handler or self.sync_tableside_rng):
+            raise ValueError(f"backend={self.backend!r}, fault_mode={self.fault_mode!r} is incompatible with non-trivial op_handler or sync_tableside_rng=True")
+        self._norm_reals: list[dict[str, Any]] | None = None
+        self._has_non_fault_reals = False
+        if fault_realizations is not None:
+            if not isinstance(fault_realizations, Mapping) and (isinstance(fault_realizations, (str, bytes)) or not isinstance(fault_realizations, Sequence) or len(fault_realizations) != self.batch_size):
+                raise ValueError("fault_realizations must be a Mapping or Sequence of length batch_size")
+            f_max = [len(ch.branches) for ch in self._all_fault_channels]
+            f_id_map = {int(ch.slot_id): i for i, ch in enumerate(self._all_fault_channels)}  # type: ignore[arg-type]
+            raw_seq = [fault_realizations] if isinstance(fault_realizations, Mapping) else fault_realizations
+            parsed = [_normalize_shot_realization(r, f_max, f_id_map, int(circuit.num_measurements)) for r in raw_seq]
+            self._norm_reals = parsed * self.batch_size if isinstance(fault_realizations, Mapping) else parsed
+            self._has_non_fault_reals = any(bool(set(nr) - {"faults"}) for nr in parsed)
+            if self._has_non_fault_reals and (not self._has_trivial_handler or self.sync_tableside_rng):
+                raise ValueError("Non-fault keys in fault_realizations require trivial op_handler and sync_tableside_rng=False")
+            if self.backend == "QUERY" and any("quantum_measurements" in nr for nr in parsed):
+                raise ValueError("quantum_measurements in fault_realizations requires backend='STREAM'")
+            if any("sweep_bits" in nr for nr in parsed):
+                rows = [nr["sweep_bits"] if "sweep_bits" in nr else (self._sweep_mat[s] if self._sweep_mat is not None else ()) for s, nr in enumerate(self._norm_reals)]
+                self._sweep_mat = np.zeros((self.batch_size, max(len(r) for r in rows)), dtype=np.bool_)
+                for s, r in enumerate(rows):
+                    self._sweep_mat[s, : len(r)] = r
+        self._flip_simulator = _PauliBroadcasterProxy(self)
+        self._batches_completed = 0
+        self._compiled_stream_plan: DirectPlan | SelectorPlan | None = None
+        self._compiled_query_plan: PreparedQueryPlan | None = None
+        self._ref_sample_cache: dict[bytes, NDArray[np.bool_]] = {}
+        self._m2d_skip_conv: Any = None
+        self._m2d_stim_conv: Any = None
+        self._measurement_columns: list[NDArray[np.bool_]] = []
+        self._unleaked_to_leaked_events: list[list[int]] = []
+        self._leakage_events: list[list[LeakageEvent]] = []
+        self.clear()
+
+    def _init_rngs(self) -> None:
+        if not self.sync_tableside_rng:
+            self._shot_np_rngs: list[np.random.Generator] | None = None
+            self._tab_rngs: list[stim.TableauSimulator] | None = None
+            self._tab_rngs_x: list[stim.TableauSimulator] | None = None
+            self.np_rng = np.random.default_rng(seed=None if self.seed is None else derived_seed(self.seed, self._batches_completed))
+            return
+        base = int(np.random.default_rng().integers(0, 2**63)) if self.seed is None else self.seed
+        n0 = 0 if self.seed is None else self._batches_completed * self.batch_size
+        shot_seeds = [derived_seed(base, n0 + b) for b in range(self.batch_size)]
+        self._shot_np_rngs = [np.random.default_rng(seed=s) for s in shot_seeds]
+        self.np_rng = self._shot_np_rngs[0]
+        self._tab_rngs, self._tab_rngs_x = [], []
+        all_q = list(range(self.num_qubits))
+        for s in shot_seeds:
+            tz, tx = stim.TableauSimulator(seed=s), stim.TableauSimulator(seed=s)
+            tz.set_num_qubits(self.num_qubits + 1)
+            tx.set_num_qubits(self.num_qubits + 1)
+            if all_q:
+                tx.h(*all_q)
+            self._tab_rngs.append(tz)
+            self._tab_rngs_x.append(tx)
+
+    def _exec_tab_rng_op(self, b: int, inst: stim.CircuitInstruction, qs: Iterable[int], xm: NDArray[np.bool_] | None, zm: NDArray[np.bool_] | None, n_rec: int = 0) -> list[bool]:
+        assert self._tab_rngs is not None and self._tab_rngs_x is not None
+        tz, tx = self._tab_rngs[b], self._tab_rngs_x[b]
+        tz.do(inst)
+        tx.do(inst)
+        for q in qs:
+            if xm is not None and tz.peek_z(q) == -1:
+                xm[q, b] ^= True
+                tz.x(q)
+            if zm is not None and tx.peek_x(q) == -1:
+                zm[q, b] ^= True
+                tx.z(q)
+        return tz.current_measurement_record()[-n_rec:] if n_rec > 0 else []
+
+    def _draw_tab_rng_bit(self, b_idx: int) -> bool:
+        assert self._tab_rngs is not None and self._tab_rngs_x is not None
+        sq, tz, tx = self._tab_scratch_q, self._tab_rngs[b_idx], self._tab_rngs_x[b_idx]
+        tz.h(sq)
+        bit = bool(tz.measure(sq))
+        if bit:
+            tz.x(sq)
+        tx.h(sq)
+        if tx.measure(sq):
+            tx.x(sq)
+        return bit
+
+    def _sample_pauli_noise_via_tab_rng(self, op_name: str, targets_per_shot: Sequence[Sequence[int]], gate_args: Sequence[float]) -> None:
+        xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+        zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+        for b_idx, t_b in enumerate(targets_per_shot):
+            if t_b:
+                self._exec_tab_rng_op(b_idx, stim.CircuitInstruction(op_name, t_b, gate_args), set(t_b), xm, zm)
+        self._apply_pauli_mask("X", xm)
+        self._apply_pauli_mask("Z", zm)
+
+    def clear(self) -> None:
+        self._measurement_columns.clear()
+        self.qubit_coords: dict[int, list[float]] = {}
+        self.qubit_tags: dict[int, str] = {}
+        self.coords_shifts: list[float] = []
+        self._init_rngs()
+        self._compiled_op_handler.clear()
+        if self.record_unleaked_to_leaked:
+            self._unleaked_to_leaked_events = [[] for _ in range(self.batch_size)]
+        if self.record_leakage_events:
+            self._leakage_events = [[] for _ in range(self.batch_size)]
+        self._circuit_time = 0
+        self._step_cursor = 0
+        self._used_interactively = False
+        self._finished_running_circuit = False
+        self._live_ref_tab = ReferenceCHPTableau(self._eff_nq)
+        self._live_frame_events: list[FrameEvent] = []
+        self._live_exps: list[ShotExpansion] = [ShotExpansion.zero(self._eff_nq, use_cpp_kernels=self.use_cpp_kernels, atol=self.atol) for _ in range(self.batch_size)]
+        self._shot_tabs: list[ReferenceCHPTableau] | None = None
+        self._active_plan: DirectPlan | SelectorPlan | None = None
+        self._shot_sel_bits: list[NDArray[np.bool_] | None] | None = None
+        self._branch_masses = np.ones(self.batch_size, dtype=np.float64)
+        self._pending_magic: list[MagicTermRecord] = []
+        self._corr_occurred = np.zeros(self.batch_size, dtype=np.bool_)
+
+    @property
+    def num_measurements(self) -> int:
+        return int(self.circuit.num_measurements)
+
+    @property
+    def num_detectors(self) -> int:
+        return int(self.circuit.num_detectors)
+
+    @property
+    def num_observables(self) -> int:
+        return int(self.circuit.num_observables)
+
+    def num_qubits_in_new_circuit(self) -> int:
+        return self.num_qubits
+
+    def get_current_circuit_time(self) -> int:
+        return self._circuit_time
+
+    def run(self) -> list[np.ndarray] | None:
+        if self._used_interactively or self._circuit_time != 0 or self._finished_running_circuit:
+            raise ValueError("MagicsideSimulator is not clean; call .clear() before .run().")
+        can_use_compiled = self._has_trivial_handler and not self.sync_tableside_rng
+        if self.backend == "QUERY":
+            self._run_compiled_query()
+        elif can_use_compiled and (self.fault_mode == "SELECTOR" or self._norm_reals is not None):
+            self._run_compiled_stream()
+        else:
+            self._do(self.circuit)
+            if len(self._unrolled_ops) == 0 and 0 in self._prog_faults:
+                for slot_idx, ch in self._prog_faults[0]:
+                    self._fire_fault_channel_live(slot_idx, ch)
+            self._flush_magic()
+        self._finished_running_circuit = True
+        self._batches_completed += 1
+        return self.get_unleaked_to_leaked_records() if self.record_unleaked_to_leaked else None
+
+    def _apply_coord_op(self, op: stim.CircuitInstruction) -> None:
+        if op.name == "QUBIT_COORDS":
+            for gt in op.targets_copy():
+                self.qubit_coords[gt.qubit_value] = [c + s for c, s in zip(op.gate_args_copy(), it.chain(self.coords_shifts, it.repeat(0)))]
+                self.qubit_tags[gt.qubit_value] = op.tag
+        elif op.name == "SHIFT_COORDS":
+            for i, s in enumerate(op.gate_args_copy()):
+                if i >= len(self.coords_shifts):
+                    self.coords_shifts.append(s)
+                else:
+                    self.coords_shifts[i] += s
+
+    def _finish_compiled_batch(
+        self, cp: DirectPlan | SelectorPlan, recs: NDArray[np.bool_], tabs: list[ReferenceCHPTableau],
+        exps: list[ShotExpansion], sel_bits: list[NDArray[np.bool_] | None],
+    ) -> None:
+        self._measurement_columns = [recs[:, j].copy() for j in range(recs.shape[1])]
+        self._active_plan, self._shot_sel_bits = cp, sel_bits
+        self._live_frame_events = list(cp.frame_events)
+        self._shot_tabs = tabs
+        self._live_ref_tab = clone_reference_chp(tabs[0])
+        self._live_exps = exps
+        for op in self._unrolled_ops:
+            self._apply_coord_op(op)
+        self._circuit_time = len(self._unrolled_ops)
+
+    def _ensure_query_plan(self) -> PreparedQueryPlan:
+        if self._compiled_query_plan is None:
+            self._compiled_query_plan = PrepareQueries(
+                self.circuit, fault_mode=self.fault_mode, fault_channels=self._user_fault_channels,
+                budget=self.query_budget, use_cpp_kernels=self.use_cpp_kernels, atol=self.atol,
+            )
+        return self._compiled_query_plan
+
+    def _run_compiled_query(self) -> None:
+        qplan = self._ensure_query_plan()
+        q_reals = (
+            [{k: ({int(self._all_fault_channels[i].slot_id): v for i, v in val.items()} if k == "faults" else val) for k, val in nr.items()} for nr in self._norm_reals]  # type: ignore[arg-type]
+            if self._norm_reals is not None else None
+        )
+        recs, trajs = run_query_batch(
+            qplan, self.batch_size, rng=self.np_rng, fault_realizations=q_reals,
+            sweep_bits=self._sweep_mat, extract_data=False, retain_states=True,
+        )
+        self._branch_masses = np.array([t.branch_mass for t in trajs], dtype=np.float64)
+        self._finish_compiled_batch(
+            qplan.compiled_plan, recs, [t.final_tableau for t in trajs],  # type: ignore[misc]
+            [t.expansion for t in trajs], [t.selector_bits for t in trajs],  # type: ignore[misc]
+        )
+
+    def _presample_stream_maps(
+        self, plan: DirectPlan | SelectorPlan, f_map: dict[int, int] | None, n_map: dict[int, int] | None, c_map: Mapping[int, int]
+    ) -> tuple[dict[int, int] | None, dict[int, int] | None, float]:
+        rng = self.np_rng
+        f_arg = None if f_map is None else {
+            int(ch.slot_id): (f_map[i] if i in f_map else _sample_categorical_branch([b.prob for b in ch.branches], rng))  # type: ignore[arg-type]
+            for i, ch in enumerate(plan.fault_channels)
+        }
+        if n_map is None:
+            return f_arg, None, 1.0
+        n_arg, cur, corr_occ, mass_scale = dict(n_map), 0, False, 1.0
+        for rec in plan.records:
+            if not isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord, CorrelatedNoiseRecord)):
+                continue
+            idx = rec.noise_index if rec.noise_index is not None else cur
+            cur += 1
+            if isinstance(rec, PauliNoiseRecord):
+                if idx not in n_arg:
+                    n_arg[idx] = _sample_categorical_branch(rec.probs, rng)
+            elif isinstance(rec, HeraldedNoiseRecord):
+                if idx not in n_arg:
+                    req_h, p_h = c_map.get(rec.meas_index), min(1.0, max(0.0, float(sum(rec.probs))))
+                    if req_h is None:
+                        n_arg[idx] = _sample_categorical_branch(rec.probs, rng)
+                    elif not req_h:
+                        n_arg[idx] = 1 if 1.0 - p_h <= 1e-15 else 0
+                        mass_scale *= 0.0 if 1.0 - p_h <= 1e-15 else (1.0 - p_h)
+                    elif p_h <= 1e-15:
+                        n_arg[idx], mass_scale = 0, 0.0
+                    else:
+                        n_arg[idx] = _sample_categorical_branch([pr / p_h for pr in rec.probs], rng) or next(i + 1 for i, pr in enumerate(rec.probs) if pr > 0.0)
+                        mass_scale *= p_h
+            else:
+                if not rec.is_else:
+                    corr_occ = False
+                c_c = 0 if corr_occ else (n_arg[idx] if idx in n_arg else int(float(rng.random()) < rec.prob))
+                corr_occ = corr_occ or (c_c > 0)
+                n_arg[idx] = c_c
+        return f_arg, n_arg, mass_scale
+
+    def _run_compiled_stream(self) -> None:
+        if self._compiled_stream_plan is None:
+            fc = self._user_fault_channels
+            self._compiled_stream_plan = compile_selector(self.circuit, fault_channels=fc) if self.fault_mode == "SELECTOR" else compile_direct(self.circuit, fault_channels=fc)
+        plan = self._compiled_stream_plan
+        mc_cap = self.max_components if self.on_budget_exceeded == "raise" else None
+        recs = np.zeros((self.batch_size, plan.num_measurements), dtype=np.bool_)
+        exps, tabs, sel_bits = [], [], []
+        for s in range(self.batch_size):
+            nr = self._norm_reals[s] if self._norm_reals is not None else {}
+            f_raw = {int(plan.fault_channels[i].slot_id): v for i, v in nr["faults"].items()} if nr.get("faults") is not None else None  # type: ignore[arg-type]
+            f_map, n_map, r_map, c_map, q_map = _prepare_run_maps(
+                plan, fault_trace=f_raw, pauli_noise_trace=_normalize_stream_paulis(plan, nr.get("paulis")),
+                reset_outcomes=nr.get("resets"), requested_outcomes=nr.get("measurements"),
+                requested_quantum_outcomes=nr.get("quantum_measurements"),
+            )
+            f_arg, n_arg, mass_scale = self._presample_stream_maps(plan, f_map, n_map, c_map)
+            sw_row: Any = self._sweep_mat[s] if self._sweep_mat is not None else nr.get("sweep_bits")
+            kw: dict[str, Any] = dict(
+                rng=self.np_rng, fault_trace=f_arg, pauli_noise_trace=n_arg, reset_outcomes=r_map or None,
+                requested_outcomes=c_map or None, requested_quantum_outcomes=q_map or None, sweep_bits=sw_row,
+                max_components=mc_cap, atol=self.atol, use_cpp_kernels=self.use_cpp_kernels,
+            )
+            try:
+                res = run_selector(plan, extract_data=False, **kw) if isinstance(plan, SelectorPlan) else run_direct(plan, **kw)
+            except ImpossiblePostselectionError:
+                recs[s], self._branch_masses[s] = [bool(c_map.get(j, 0)) for j in range(plan.num_measurements)], 0.0
+                exps.append(ShotExpansion.from_components((), n_qubits=plan.final_tableau.num_qubits, merge=False, use_cpp_kernels=self.use_cpp_kernels, atol=self.atol))
+                tabs.append(clone_reference_chp(plan.final_tableau))
+                sel_bits.append(np.zeros(plan.num_selector_qubits, dtype=np.bool_) if isinstance(plan, SelectorPlan) else None)
+            except RuntimeError as exc:
+                if mc_cap is not None and "max_components" in str(exc):
+                    raise QueryBudgetExceededError(str(exc)) from exc
+                raise
+            else:
+                recs[s], self._branch_masses[s] = res.measurements, res.branch_mass * mass_scale
+                exps.append(res.expansion)
+                tabs.append(res.final_tableau)
+                sel_bits.append(res.selector_bits)
+        self._finish_compiled_batch(plan, recs, tabs, exps, sel_bits)
+
+    def _check_interactive_mode(self) -> None:
+        if self.backend == "QUERY" or self.fault_mode == "SELECTOR":
+            raise ValueError(f"Interactive execution requires backend='STREAM' and fault_mode='DIRECT' (got backend={self.backend!r}, fault_mode={self.fault_mode!r})")
+        if self._has_non_fault_reals:
+            raise ValueError("Interactive execution only supports fault-slot keys in fault_realizations")
+
+    def interactive_do(self, this: stim.Circuit | stim.CircuitInstruction | stim.CircuitRepeatBlock, /) -> None:
+        self._check_interactive_mode()
+        if self._finished_running_circuit:
+            raise RuntimeError("Cannot call interactive_do after finish_interactive_run().")
+        self._used_interactively = True
+        self._do(this)
+
+    def finish_interactive_run(self) -> None:
+        self._check_interactive_mode()
+        if not self._finished_running_circuit:
+            if self._circuit_time == 0 and len(self._unrolled_ops) == 0 and 0 in self._prog_faults:
+                for slot_idx, ch in self._prog_faults[0]:
+                    self._fire_fault_channel_live(slot_idx, ch)
+            self._flush_magic()
+            self._finished_running_circuit = True
+            self._batches_completed += 1
+
+    def _flush_magic(self) -> None:
+        if not self._pending_magic:
+            return
+        recs = compile_open_block(self._pending_magic, n_qubits=self._eff_nq)
+        self._pending_magic.clear()
+        mc_cap = self.max_components if self.on_budget_exceeded == "raise" else None
+        for rec in recs:
+            assert isinstance(rec, CompiledOpenBlockRecord)
+            for s in range(self.batch_size):
+                if self._live_exps[s].chi > 0:
+                    self._live_exps[s] = apply_compiled_block(self._live_exps[s], rec.block, check_unitary=True, atol=self.atol, use_cpp_kernels=self.use_cpp_kernels)  # type: ignore[assignment]
+                    if mc_cap is not None and self._live_exps[s].chi > mc_cap:
+                        raise QueryBudgetExceededError(f"Expansion exceeded max_components={mc_cap} (got chi={self._live_exps[s].chi})")
+
+    def _apply_pauli_mask(self, pauli: Literal["X", "Y", "Z"], mask: NDArray[np.bool_]) -> None:
+        affected = np.flatnonzero(np.any(mask[: self._eff_nq], axis=1))
+        if len(affected) == 0:
+            return
+        self._flush_magic()
+        for q_np in affected:
+            ax = compile_pauli_product(self._live_ref_tab, [(int(q_np), pauli)])
+            for b_np in np.flatnonzero(mask[int(q_np)]):
+                b = int(b_np)
+                if self._live_exps[b].chi > 0:
+                    self._live_exps[b] = apply_pauli(self._live_exps[b], ax, use_cpp_kernels=self.use_cpp_kernels)
+
+    def _apply_factor_list(self, s: int, fac: CompiledCliffordFactorList, *, inverse: bool = False) -> None:
+        exp = self._live_exps[s]
+        if exp.chi == 0:
+            return
+        if not inverse and fac.p0 is not None:
+            exp = apply_pauli(exp, fac.p0, use_cpp_kernels=self.use_cpp_kernels)
+        for ra in (reversed(fac.r_axes) if inverse else fac.r_axes):
+            exp = apply_quarter_turn(exp, ra, sign=-1 if inverse else 1, check_unitary=True, atol=self.atol, use_cpp_kernels=self.use_cpp_kernels)  # type: ignore[assignment]
+        if inverse and fac.p0 is not None:
+            exp = apply_pauli(exp, fac.p0, use_cpp_kernels=self.use_cpp_kernels)
+        if fac.v:
+            exp.weights = np.ascontiguousarray(exp.weights * OMEGA_POWERS[(-fac.v if inverse else fac.v) & 7])
+        self._live_exps[s] = exp
+
+    def _forced_fault_branch(self, s: int, slot_idx: int) -> int | None:
+        if self._norm_reals is None or slot_idx < 0:
+            return None
+        f_map = self._norm_reals[s].get("faults")
+        return f_map.get(slot_idx) if f_map is not None else None
+
+    def _fire_fault_channel_live(self, slot_idx: int, ch: CliffordFaultChannel) -> None:
+        self._flush_magic()
+        probs = [b.prob for b in ch.branches]
+        facs = [_compile_clifford_factors(self._live_ref_tab, b.gate_name, b.targets) for b in ch.branches]
+        for s in range(self.batch_size):
+            forced = self._forced_fault_branch(s, slot_idx)
+            rng_s = self._shot_np_rngs[s] if self._shot_np_rngs is not None else self.np_rng
+            c = _sample_categorical_branch(probs, rng_s) if forced is None else forced
+            if c > 0:
+                self._apply_factor_list(s, facs[c - 1])
+
+    def _next_step_meta(self, _op: stim.CircuitInstruction) -> None:
+        self._step_cursor += 1
+
+    def record_direct_measurements(self, outcomes_per_target: NDArray[np.bool_]) -> None:
+        for row in np.asarray(outcomes_per_target, dtype=np.bool_):
+            self._measurement_columns.append(row.copy())
+
+    def _check_interactive_op(self, this: stim.CircuitInstruction) -> None:
+        t, n = self._circuit_time, len(self._unrolled_ops)
+        if t < n and not _replays(this, self._unrolled_ops[t]):
+            raise ValueError(f"interactive_do: op {t} `{this}` does not match expected `{self._unrolled_ops[t]}`")
+        if t >= n:
+            if this.name in ("DETECTOR", "OBSERVABLE_INCLUDE"):
+                raise ValueError(f"interactive_do past circuit end cannot execute {this.name}")
+            if this.tag and this.tag not in _MAGIC_TAGS and not this.tag.startswith("CLIFFORD_FAULT"):
+                raise ValueError(f"interactive_do past circuit end does not support tag {this.tag!r}")
+            if this.name not in ("MPAD", "QUBIT_COORDS"):
+                for tgt in this.targets_copy():
+                    if tgt.qubit_value is not None and tgt.qubit_value >= self.num_qubits:
+                        raise ValueError(f"interactive_do qubit {tgt.qubit_value} >= num_qubits={self.num_qubits}")
+
+    def _do(self, obj: stim.Circuit | stim.CircuitInstruction | stim.CircuitRepeatBlock) -> None:
+        ops: Iterable[stim.CircuitInstruction] = (obj,) if isinstance(obj, stim.CircuitInstruction) else (_unroll_circuit(obj.body_copy()) * obj.repeat_count if isinstance(obj, stim.CircuitRepeatBlock) else _unroll_circuit(obj))
+        for op in ops:
+            if self._used_interactively:
+                self._check_interactive_op(op)
+            self._do_instruction(op)
+
+    def _do_instruction(self, op: stim.CircuitInstruction) -> None:
+        t, n = self._circuit_time, len(self._unrolled_ops)
+        if (t < n or (t == 0 and n == 0)) and t in self._prog_faults:
+            for slot_idx, ch in self._prog_faults[t]:
+                self._fire_fault_channel_live(slot_idx, ch)
+        if op.tag.startswith("CLIFFORD_FAULT"):
+            for slot_idx, ch in (self._inline_faults.get(t, ()) if t < n else ((-1, c) for c in parse_clifford_fault_instruction(op, t))):
+                self._fire_fault_channel_live(slot_idx, ch)
+        elif op.name in ("QUBIT_COORDS", "SHIFT_COORDS"):
+            self._apply_coord_op(op)
+        else:
+            self._compiled_op_handler.handle_op(op=op, sss=self)
+        self._circuit_time += 1
+        if t + 1 == n and n in self._prog_faults:
+            for slot_idx, ch in self._prog_faults[n]:
+                self._fire_fault_channel_live(slot_idx, ch)
+
+    def _do_bare_instruction(self, op: stim.Circuit | stim.CircuitInstruction) -> None:
+        if isinstance(op, stim.Circuit):
+            for sub in op:
+                self._do_bare_instruction(sub)  # type: ignore[arg-type]
+            return
+        name, tag = op.name, op.tag
+        if tag in _MAGIC_TAGS:
+            tmp: list[Any] = []
+            _validate_and_emit_magic_op(op, self._live_ref_tab, tmp)
+            self._pending_magic.extend(r for r in tmp if isinstance(r, MagicTermRecord))
+            self._next_step_meta(op)
+            return
+        if tag != "":
+            raise ValueError(f"Unrecognized instruction tag {tag!r} on {op!r}")
+        if name in ("DETECTOR", "OBSERVABLE_INCLUDE", "TICK", "BARRIER"):
+            self._next_step_meta(op)
+            return
+        if name == "MPAD":
+            self._next_step_meta(op)
+            raw = op.targets_copy()
+            for gt in raw:
+                self._measurement_columns.append(np.full(self.batch_size, bool(gt.value) ^ bool(gt.is_inverted_result_target), dtype=np.bool_))
+            args = op.gate_args_copy()
+            if raw and args and args[0] > 0.0:
+                self._apply_meas_flip_noise(float(args[0]), len(raw))
+            return
+        if name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
+            self._next_step_meta(op)
+            self._do_heralded_noise(op)
+            return
+        cname = "I" if name == "I_" else _canonical_gate_data(name).name
+        gd = stim.gate_data(cname)
+        self._next_step_meta(op)
+        if gd.is_noisy_gate and not gd.produces_measurements and not gd.is_reset:
+            self.do_conditional_pauli_noise(op, None)
+        elif cname in ("SPP", "SPP_DAG"):
+            dag = cname == "SPP_DAG"
+            for grp, inv in _split_pauli_product_targets(op):
+                red = _reduce_pauli_product_targets(grp)
+                apply_spp_to_reference_chp(self._live_ref_tab, red, negate=inv, dag=dag)
+                self._live_frame_events.append(LeftSppEvent(tuple(red), inv, dag))
+        elif gd.is_unitary:
+            self.do_conditional_clifford(op, None)
+        elif gd.produces_measurements or gd.is_reset:
+            self._do_live_meas_or_reset(op, cname, gd)
+        else:
+            raise ValueError(f"Unsupported instruction {op!r}")
+
+    def _do_heralded_noise(self, op: stim.CircuitInstruction) -> None:
+        raw = op.targets_copy()
+        if not raw:
+            return
+        self._flush_magic()
+        qs = [int(t.qubit_value) for t in raw]
+        xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+        zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+        if self._tab_rngs is not None:
+            cols = [np.zeros(self.batch_size, dtype=np.bool_) for _ in qs]
+            for b in range(self.batch_size):
+                rec = self._exec_tab_rng_op(b, op, set(qs), xm, zm, len(qs))
+                for k, v in enumerate(rec):
+                    cols[k][b] = bool(v)
+            self._measurement_columns.extend(cols)
+        elif op.name == "HERALDED_ERASE":
+            pe = float(op.gate_args_copy()[0]) if op.gate_args_copy() else 0.0
+            for q in qs:
+                hk = self.np_rng.random(self.batch_size) < pe
+                pi = self.np_rng.integers(0, 4, size=self.batch_size)
+                xm[q] ^= hk & ((pi == 1) | (pi == 2))
+                zm[q] ^= hk & ((pi == 2) | (pi == 3))
+                self._measurement_columns.append(hk)
+        else:
+            args = op.gate_args_copy()
+            p0, px, py, pz = (float(args[i]) if i < len(args) else 0.0 for i in range(4))
+            ci, cx, cy, cz = p0, p0 + px, p0 + px + py, p0 + px + py + pz
+            for q in qs:
+                r = self.np_rng.random(self.batch_size)
+                xm[q] ^= (r >= ci) & (r < cy)
+                zm[q] ^= (r >= cx) & (r < cz)
+                self._measurement_columns.append(r < cz)
+        self._apply_pauli_mask("X", xm)
+        self._apply_pauli_mask("Z", zm)
+
+    def _apply_meas_flip_noise(self, p_err: float, num_m: int) -> None:
+        if p_err <= 0.0 or num_m <= 0:
+            return
+        if self._tab_rngs is not None and self._tab_rngs_x is not None:
+            mp_op = stim.CircuitInstruction("MPAD", [0] * num_m, [p_err])
+            for b in range(self.batch_size):
+                for k, fl in enumerate(self._exec_tab_rng_op(b, mp_op, (), None, None, num_m)):
+                    if fl:
+                        self._measurement_columns[-num_m + k][b] ^= True
+        else:
+            flips = self.np_rng.random((num_m, self.batch_size)) < p_err
+            for k in range(num_m):
+                self._measurement_columns[-num_m + k] ^= flips[k]
+
+    def _obs_p1(self, exp: ShotExpansion, obs: CompiledPauliAxis) -> float:
+        if exp.chi == 0:
+            return 0.0
+        if not words_any_nonzero(obs.a_words) and exp.d == 0 and exp.chi == 1:
+            return float(((obs.kappa >> 1) ^ word_dot_parity(obs.b_words, exp.h_words[0])) & 1)
+        z_in = exp.norm_sq()
+        if z_in <= 0.0:
+            return 0.0
+        if words_any_nonzero(obs.a_words):
+            ep = unit_bit_words(first_set_bit_in_words(obs.a_words), exp.n_words)
+            work = apply_quarter_turn(exp, obs.a_words, np.ascontiguousarray(obs.b_words ^ ep), (obs.kappa + 1) & 3, sign=1, check_unitary=True, atol=self.atol, use_cpp_kernels=self.use_cpp_kernels)
+            bd, sg = ep, 0
+        else:
+            work, bd, sg = exp, obs.b_words, (obs.kappa >> 1) & 1
+        _, z1_r = project_diagonal(work, bd, sg, 1, use_cpp_kernels=self.use_cpp_kernels)
+        return min(1.0, max(0.0, float(z1_r) / z_in))
+
+    def _project_substep_batch(self, rec: MeasurementRecord | ResetRecord) -> NDArray[np.bool_]:
+        m_shots = np.zeros(self.batch_size, dtype=np.bool_)
+        obs = rec.obs_axis
+        for b in range(self.batch_size):
+            exp = self._live_exps[b]
+            if exp.chi == 0:
+                self._branch_masses[b] = 0.0
+                continue
+            if rec.rot_axis is None and exp.d == 0 and exp.chi == 1:
+                bit = ((obs.kappa >> 1) ^ word_dot_parity(obs.b_words, exp.h_words[0])) & 1
+                m_shots[b] = bool(bit)
+                if isinstance(rec, ResetRecord) and (bool(bit) != rec.reset_flip_ref):
+                    self._live_exps[b] = apply_pauli(exp, rec.reset_kick_axis, use_cpp_kernels=self.use_cpp_kernels)
+                continue
+            req_b: int | None = None
+            if self._tab_rngs is not None:
+                p1 = self._obs_p1(exp, obs)
+                req_b = 0 if p1 <= K1_CANCEL_REL_TOL else (1 if p1 >= 1.0 - K1_CANCEL_REL_TOL else (int(self._draw_tab_rng_bit(b)) if abs(p1 - 0.5) <= 1e-12 else int(self._shot_np_rngs[b].random() < p1)))  # type: ignore[index]
+            m_res = measure_expansion(exp, obs, rng=self.np_rng, requested_bit=req_b, renormalize=True, keep_rotated_frame=(rec.rot_axis is not None), atol=self.atol, use_cpp_kernels=self.use_cpp_kernels)
+            post = m_res.post_state
+            assert isinstance(post, ShotExpansion)
+            zin = m_res.z0 + m_res.z1
+            if zin > 0.0:
+                self._branch_masses[b] *= (m_res.z1 if m_res.outcome else m_res.z0) / zin
+            if isinstance(rec, ResetRecord) and (bool(m_res.outcome) != rec.reset_flip_ref):
+                post = apply_pauli(post, rec.reset_kick_axis, use_cpp_kernels=self.use_cpp_kernels)
+            m_shots[b] = bool(m_res.outcome)
+            self._live_exps[b] = post
+        return m_shots
+
+    def _do_live_meas_or_reset(self, op: stim.CircuitInstruction, cname: str, gd: stim.GateData) -> None:
+        self._flush_magic()
+        args, raw = op.gate_args_copy(), op.targets_copy()
+        p_err = float(args[0]) if (gd.produces_measurements and args) else 0.0
+        if not (math.isfinite(p_err) and 0.0 <= p_err <= 1.0):
+            raise ValueError(f"Invalid measurement flip probability {p_err!r}")
+        specs: list[tuple[set[int], Any, bool]] = []
+        if cname == "MPP":
+            for grp, inv in _split_pauli_product_targets(op):
+                red = _reduce_pauli_product_targets(grp)
+                specs.append(({q for q, _ in red}, red, inv))
+        elif cname in ("MXX", "MYY", "MZZ"):
+            pch = cname[-1]
+            for a, b_t in zip(raw[::2], raw[1::2]):
+                q0, q1 = int(a.qubit_value), int(b_t.qubit_value)
+                specs.append(({q0, q1}, [] if q0 == q1 else [(q0, pch), (q1, pch)], bool(a.is_inverted_result_target) ^ bool(b_t.is_inverted_result_target)))
+        else:
+            basis: Literal["X", "Y", "Z"] = "X" if "X" in cname else ("Y" if "Y" in cname else "Z")
+            for gt in raw:
+                q, inv = int(gt.qubit_value), bool(gt.is_inverted_result_target)
+                specs.append(({q}, (q, basis) if gd.is_reset else [(q, basis)], inv))
+        seen: set[int] = set()
+        seg_len = 0
+        for idx, (supp, payload, inv) in enumerate(specs):
+            rec: MeasurementRecord | ResetRecord = (
+                _compile_reset_c15(self._live_ref_tab, payload[0], payload[1], meas_index=0 if gd.produces_measurements else None, invert_result=inv, flip_prob=0.0, frame_events=self._live_frame_events)
+                if gd.is_reset
+                else _compile_pauli_measurement_c15(self._live_ref_tab, payload, invert_result=inv, flip_prob=0.0, meas_index=0, frame_events=self._live_frame_events)
+            )
+            m_shots = self._project_substep_batch(rec)
+            if gd.produces_measurements:
+                self._measurement_columns.append(~m_shots if inv else m_shots.copy())
+                seg_len += 1
+                seen |= supp
+                if ((idx + 1 == len(specs)) or bool(seen & specs[idx + 1][0])) and p_err > 0.0:
+                    self._apply_meas_flip_noise(p_err, seg_len)
+                    seg_len = 0
+                    seen.clear()
+
+    def _read_classical_cond(self, tgt: stim.GateTarget) -> NDArray[np.bool_]:
+        if tgt.is_measurement_record_target:
+            idx = len(self._measurement_columns) + tgt.value
+            if idx < 0 or idx >= len(self._measurement_columns):
+                raise ValueError(f"Feedback rec[{tgt.value}] out of range")
+            return self._measurement_columns[idx]
+        if tgt.is_sweep_bit_target:
+            idx = tgt.value
+            return self._sweep_mat[:, idx] if (self._sweep_mat is not None and 0 <= idx < self._sweep_mat.shape[1]) else np.zeros(self.batch_size, dtype=np.bool_)
+        raise ValueError(f"Unsupported classical target {tgt!r}")
+
+    def do_conditional_clifford(self, op: stim.CircuitInstruction, condition_met_mask: NDArray[np.bool_] | None = None, *, condition_group_fn: Callable[[int], NDArray[np.bool_]] | None = None) -> None:
+        name = "I" if op.name == "I_" else _canonical_gate_data(op.name).name
+        if name in ("I", "II"):
+            if condition_group_fn is not None:
+                arity = 1 if name == "I" else 2
+                for g_idx in range(sum(t.qubit_value is not None for t in op.targets_copy()) // arity):
+                    condition_group_fn(g_idx)
+            return
+        canon, arity = _canonical_clifford_gate_name_and_arity(name)
+        raw = op.targets_copy()
+        mask_at = lambda i: condition_group_fn(i) if condition_group_fn is not None else (condition_met_mask[i] if condition_met_mask is not None else None)
+        if arity == 2 and any(t.qubit_value is None for t in raw):
+            fb_axes = _FEEDBACK_2Q_GATES.get(op.name) or _FEEDBACK_2Q_GATES.get(canon)
+            for p_idx, (a, b_t) in enumerate(zip(raw[::2], raw[1::2])):
+                mask_g = mask_at(p_idx)
+                if a.qubit_value is not None and b_t.qubit_value is not None:
+                    self._apply_unitary_group(canon, (int(a.qubit_value), int(b_t.qubit_value)), mask_g)
+                    continue
+                if fb_axes is None or (a.qubit_value is None and b_t.qubit_value is None):
+                    raise ValueError(f"Unsupported feedback pair {(a, b_t)} in {op!r}")
+                cl_t, q_t, pch = (a, int(b_t.qubit_value), fb_axes[1]) if (a.qubit_value is None and fb_axes[0] == "Z") else ((b_t, int(a.qubit_value), fb_axes[0]) if (b_t.qubit_value is None and fb_axes[1] == "Z") else (None, -1, ""))
+                if cl_t is None:
+                    raise ValueError(f"Invalid feedback control basis in {op!r}")
+                self._flush_magic()
+                cond = self._read_classical_cond(cl_t)
+                if mask_g is not None:
+                    cond = cond & mask_g
+                if np.any(cond):
+                    ax = compile_pauli_product(self._live_ref_tab, [(q_t, pch)])
+                    for s in np.flatnonzero(cond):
+                        si = int(s)
+                        if self._live_exps[si].chi > 0:
+                            self._live_exps[si] = apply_pauli(self._live_exps[si], ax, use_cpp_kernels=self.use_cpp_kernels)
+            return
+        qs = [int(t.qubit_value) for t in raw]
+        for g_idx, off in enumerate(range(0, len(qs), arity)):
+            self._apply_unitary_group(canon, tuple(qs[off : off + arity]), mask_at(g_idx))
+
+    def _apply_unitary_group(self, canon: str, grp: tuple[int, ...], mask_g: NDArray[np.bool_] | None) -> None:
+        if mask_g is None or np.all(mask_g):
+            self._live_ref_tab.do_unitary(canon, grp)
+            self._live_frame_events.append(LeftUnitaryEvent(canon, grp))
+            return
+        n_act = int(np.count_nonzero(mask_g))
+        if n_act == 0:
+            return
+        self._flush_magic()
+        fac = _compile_clifford_factors(self._live_ref_tab, canon, grp)
+        if 2 * n_act <= self.batch_size:
+            for s in np.flatnonzero(mask_g):
+                self._apply_factor_list(int(s), fac, inverse=False)
+        else:
+            self._live_ref_tab.do_unitary(canon, grp)
+            self._live_frame_events.append(LeftUnitaryEvent(canon, grp))
+            for s in np.flatnonzero(~mask_g):
+                self._apply_factor_list(int(s), fac, inverse=True)
+
+    def do_conditional_pauli_noise(self, op: stim.CircuitInstruction, cond_mask: NDArray[np.bool_] | None = None) -> None:
+        cname = "I" if op.name == "I_" else _canonical_gate_data(op.name).name
+        if cname in ("I_ERROR", "II_ERROR", "I", "II"):
+            return
+        args = [float(a) for a in op.gate_args_copy()]
+        if cname in ("CORRELATED_ERROR", "E", "ELSE_CORRELATED_ERROR"):
+            p_c = args[0] if args else 0.0
+            raw_t = op.targets_copy()
+            xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+            zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+            if self._tab_rngs is not None:
+                for b in range(self.batch_size):
+                    t_b = raw_t if cond_mask is None else [raw_t[i] for i in range(len(raw_t)) if cond_mask[i, b]]
+                    self._exec_tab_rng_op(b, stim.CircuitInstruction(cname, t_b, [p_c]), {gt.qubit_value for gt in t_b if gt.qubit_value is not None}, xm, zm)
+            else:
+                if p_c <= 0.0:
+                    if cname != "ELSE_CORRELATED_ERROR":
+                        self._corr_occurred.fill(False)
+                    return
+                u = self.np_rng.random(self.batch_size)
+                if cname != "ELSE_CORRELATED_ERROR":
+                    occ = u < p_c
+                    self._corr_occurred[:] = occ
+                else:
+                    occ = (~self._corr_occurred) & (u < p_c)
+                    self._corr_occurred |= occ
+                if np.any(occ):
+                    for t_idx, gt in enumerate(raw_t):
+                        if gt.qubit_value is None:
+                            continue
+                        hit = occ if cond_mask is None else (occ & cond_mask[t_idx])
+                        if gt.is_x_target or gt.is_y_target:
+                            xm[int(gt.qubit_value)] ^= hit
+                        if gt.is_z_target or gt.is_y_target:
+                            zm[int(gt.qubit_value)] ^= hit
+            self._apply_pauli_mask("X", xm)
+            self._apply_pauli_mask("Z", zm)
+            return
+        raw = [int(t.qubit_value) for t in op.targets_copy()]
+        if not raw or not any(p > 0.0 for p in args):
+            return
+        arity = 2 if cname in ("DEPOLARIZE2", "PAULI_CHANNEL_2") else 1
+        groups = [raw[i : i + arity] for i in range(0, len(raw), arity)]
+        if self._tab_rngs is not None:
+            per_shot = [[q for g_i, grp in enumerate(groups) if (cond_mask is None or cond_mask[g_i, b]) for q in grp] for b in range(self.batch_size)]
+            self._sample_pauli_noise_via_tab_rng(cname, per_shot, args)
+            return
+        xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+        zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+        u = self.np_rng.random((len(groups), self.batch_size))
+        if cond_mask is not None:
+            u = np.where(cond_mask, u, 2.0)
+        if cname in ("X_ERROR", "Y_ERROR", "Z_ERROR"):
+            terms: Sequence[tuple[str, float]] = [(cname[0], args[0])]
+        elif cname in ("DEPOLARIZE1", "PAULI_CHANNEL_1"):
+            probs1 = (args[0] / 3.0,) * 3 if cname == "DEPOLARIZE1" else (args[0], args[1], args[2])
+            terms = list(zip(("X", "Y", "Z"), probs1))
+        else:
+            probs2 = (args[0] / 15.0,) * 15 if cname == "DEPOLARIZE2" else tuple(args[:15])
+            terms = list(zip(_PAULI_2Q_ORDER, probs2))
+        acc = 0.0
+        for label, pr in terms:
+            lo, acc = acc, acc + pr
+            hit = (u >= lo) & (u < acc)
+            if np.any(hit):
+                for g_i, grp in enumerate(groups):
+                    for k, pch in enumerate(label):
+                        if pch in ("X", "Y"):
+                            xm[grp[k]] ^= hit[g_i]
+                        if pch in ("Z", "Y"):
+                            zm[grp[k]] ^= hit[g_i]
+        self._apply_pauli_mask("X", xm)
+        self._apply_pauli_mask("Z", zm)
+
+    do_conditional_pauli = do_conditional_pauli_noise
+
+    def peek_pauli_born_batch(self, targets: Sequence[int] | NDArray[np.int_], pauli: Literal["X", "Y", "Z"] = "Z") -> NDArray[np.float64]:
+        self._flush_magic()
+        t_list = [int(q) for q in targets]
+        out = np.zeros((len(t_list), self.batch_size), dtype=np.float64)
+        for row_i, q in enumerate(t_list):
+            shared_obs = None if self._shot_tabs is not None else compile_pauli_product(self._live_ref_tab, [(q, pauli)])
+            for b in range(self.batch_size):
+                obs = shared_obs if shared_obs is not None else compile_pauli_product(self._shot_tabs[b], [(q, pauli)])  # type: ignore[index]
+                out[row_i, b] = self._obs_p1(self._live_exps[b], obs)
+        return out
+
+    def peek_pauli_batch(self, targets: Sequence[int] | NDArray[np.int_], pauli: Literal["X", "Y", "Z"] = "Z") -> NDArray[np.int8]:
+        p1 = self.peek_pauli_born_batch(targets, pauli)
+        res = np.zeros(p1.shape, dtype=np.int8)
+        res[p1 <= 1e-12] = 1
+        res[p1 >= 1.0 - 1e-12] = -1
+        return res
+
+    def peek_x(self, target: int) -> NDArray[np.int8]:
+        return self.peek_pauli_batch([int(target)], "X")[0]
+
+    def peek_y(self, target: int) -> NDArray[np.int8]:
+        return self.peek_pauli_batch([int(target)], "Y")[0]
+
+    def peek_z(self, target: int) -> NDArray[np.int8]:
+        return self.peek_pauli_batch([int(target)], "Z")[0]
+
+    def get_current_noisy_tableau_pauli_state(self, qubit: int, *, shot: int = 0) -> Literal["+Z", "-Z", "+X", "-X", "+Y", "-Y", "None"]:
+        q = int(qubit)
+        for p_ch in ("Z", "X", "Y"):
+            val = int(self.peek_pauli_batch([q], p_ch)[0, shot])  # type: ignore[arg-type]
+            if val != 0:
+                return f"{'+' if val == 1 else '-'}{p_ch}"  # type: ignore[return-value]
+        return "None"
+
+    def postselect_z_batch(self, q: int, flip_mask: NDArray[np.bool_], desired_bits: NDArray[np.uint8], pauli: Literal["X", "Y", "Z"] = "Z") -> None:
+        shots = np.flatnonzero(flip_mask)
+        if len(shots) == 0:
+            return
+        self._flush_magic()
+        obs = compile_pauli_product(self._live_ref_tab, [(int(q), pauli)])
+        for b_np in shots:
+            b = int(b_np)
+            if self._live_exps[b].chi == 0:
+                continue
+            m_res = measure_expansion(self._live_exps[b], obs, requested_bit=int(desired_bits[b]) & 1, renormalize=True, keep_rotated_frame=False, atol=self.atol, use_cpp_kernels=self.use_cpp_kernels)
+            assert isinstance(m_res.post_state, ShotExpansion)
+            self._live_exps[b] = m_res.post_state
+            zin = m_res.z0 + m_res.z1
+            if zin > 0.0:
+                self._branch_masses[b] *= (m_res.z1 if m_res.outcome else m_res.z0) / zin
+
+    collapse_z_batch = postselect_z_batch
+    reset_qubits_batch = postselect_z_batch
+    freeze_leaked_qubits_batch = postselect_z_batch
+
+    def do_unmatched_noisy_reset_z(self, reset_zero_mask: NDArray[np.bool_], reset_one_mask: NDArray[np.bool_], pauli: Literal["X", "Y", "Z"] = "Z", order: Sequence[int] | None = None) -> None:
+        comb = reset_zero_mask | reset_one_mask
+        if not np.any(comb):
+            return
+        self._flush_magic()
+        qs = list(dict.fromkeys(order)) if order is not None else [int(x) for x in np.flatnonzero(np.any(comb, axis=1))]
+        kick_p: Literal["X", "Z"] = "Z" if pauli == "X" else "X"
+        for q in qs:
+            shots = np.flatnonzero(comb[q])
+            if len(shots) == 0:
+                continue
+            obs = compile_pauli_product(self._live_ref_tab, [(int(q), pauli)])
+            kick = compile_pauli_product(self._live_ref_tab, [(int(q), kick_p)])
+            for b_np in shots:
+                b = int(b_np)
+                pb = self._obs_p1(self._live_exps[b], obs)
+                if pb <= 1e-12 or pb >= 1.0 - 1e-12:
+                    m_b = int(pb >= 1.0 - 1e-12)
+                else:
+                    m_b = (int(self._draw_tab_rng_bit(b)) if abs(pb - 0.5) <= 1e-12 else int(self._shot_np_rngs[b].random() < pb)) if self._tab_rngs is not None else int(float(self.np_rng.random()) < pb)  # type: ignore[index]
+                    m_res = measure_expansion(self._live_exps[b], obs, requested_bit=m_b, renormalize=True, keep_rotated_frame=False, atol=self.atol, use_cpp_kernels=self.use_cpp_kernels)
+                    assert isinstance(m_res.post_state, ShotExpansion)
+                    self._live_exps[b] = m_res.post_state
+                if m_b != int(reset_one_mask[q, b]) and self._live_exps[b].chi > 0:
+                    self._live_exps[b] = apply_pauli(self._live_exps[b], kick, use_cpp_kernels=self.use_cpp_kernels)
+
+    def current_tableau_measurement_record(self) -> NDArray[np.bool_]:
+        if not self._measurement_columns:
+            return np.zeros((0,), dtype=np.bool_)
+        mat = np.column_stack(self._measurement_columns)
+        return mat[0].copy() if self.batch_size == 1 else mat
+
+    def get_final_measurement_records(self) -> NDArray[np.bool_]:
+        if not self._finished_running_circuit:
+            raise RuntimeError("Run not finished; call run() or finish_interactive_run() first.")
+        return np.empty((self.batch_size, 0), dtype=np.bool_) if not self._measurement_columns else np.column_stack(self._measurement_columns)
+
+    def _compute_noiseless_magic_ref(self, sweep_row: NDArray[np.bool_] | None) -> NDArray[np.bool_]:
+        key = b"" if sweep_row is None else np.asarray(sweep_row, dtype=np.bool_).tobytes()
+        if key not in self._ref_sample_cache:
+            stripped, needs_leak = _strip_circuit_for_noiseless_ref(self.circuit)
+            if not needs_leak:
+                ref = run_direct(compile_direct(stripped), rng=np.random.default_rng(0), sweep_bits=sweep_row, atol=self.atol, use_cpp_kernels=self.use_cpp_kernels).measurements
+            else:
+                from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+                sub = MagicsideSimulator(stripped, op_handler=LeakageUint8Magic(), batch_size=1, seed=0, sweep_bits=sweep_row, m2d_reference_mode="zero", use_cpp_kernels=self.use_cpp_kernels, atol=self.atol)
+                sub.run()
+                ref = sub.get_final_measurement_records()[0]
+            self._ref_sample_cache[key] = ref.copy()
+        return self._ref_sample_cache[key].copy()
+
+    def get_reference_sample(self, sweep_bits: Any = None) -> NDArray[np.bool_]:
+        if self._explicit_ref_sample is not None:
+            return self._explicit_ref_sample.copy()
+        if self._eff_m2d_mode == "zero":
+            return np.zeros(self.num_measurements, dtype=np.bool_)
+        if self._eff_m2d_mode == "stim":
+            return np.asarray(self.circuit.reference_sample(), dtype=np.bool_)
+        return self._compute_noiseless_magic_ref(None if sweep_bits is None else _normalize_sweep_matrix(sweep_bits, 1)[0])  # type: ignore[index]
+
+    def _convert_m2d(self, sweep_bits: Any) -> tuple[NDArray[np.bool_], NDArray[np.bool_]]:
+        recs = self.get_final_measurement_records()
+        if recs.shape[1] != self.num_measurements:
+            raise ValueError(f"Measurement count {recs.shape[1]} != circuit.num_measurements={self.num_measurements}")
+        sw = _normalize_sweep_matrix(sweep_bits, self.batch_size) if sweep_bits is not None else self._sweep_mat
+        nsw = self.circuit.num_sweep_bits
+        sw = (sw[:, :nsw] if sw.shape[1] >= nsw else np.pad(sw, ((0, 0), (0, nsw - sw.shape[1])))) if (sw is not None and sw.shape[1] > 0 and nsw > 0) else None
+        if self._explicit_ref_sample is None and self._eff_m2d_mode == "stim":
+            if self._m2d_stim_conv is None:
+                self._m2d_stim_conv = self.circuit.compile_m2d_converter()
+            kw: dict[str, Any] = {"separate_observables": True}
+            if sw is not None:
+                kw["sweep_bits"] = sw
+            return self._m2d_stim_conv.convert(measurements=recs, **kw)  # type: ignore[no-any-return]
+        if self._m2d_skip_conv is None:
+            self._m2d_skip_conv = self.circuit.compile_m2d_converter(skip_reference_sample=True)
+        if self._explicit_ref_sample is not None:
+            xor_recs = np.ascontiguousarray(recs ^ self._explicit_ref_sample[None, :])
+        elif self._eff_m2d_mode == "zero":
+            xor_recs = np.ascontiguousarray(recs)
+        elif sw is None:
+            xor_recs = np.ascontiguousarray(recs ^ self._compute_noiseless_magic_ref(None)[None, :])
+        else:
+            xor_recs = np.ascontiguousarray(recs ^ np.stack([self._compute_noiseless_magic_ref(sw[s]) for s in range(self.batch_size)], axis=0))
+        return self._m2d_skip_conv.convert(measurements=xor_recs, separate_observables=True)  # type: ignore[no-any-return]
+
+    def get_detector_flips(self, *, append_observables: bool = False, sweep_bits: Any = None) -> NDArray[np.bool_]:
+        dets, obs = self._convert_m2d(sweep_bits)
+        return np.hstack([dets, obs]) if append_observables else dets
+
+    def get_observable_flips(self, *, sweep_bits: Any = None) -> NDArray[np.bool_]:
+        return self._convert_m2d(sweep_bits)[1]
+
+    def _validate_shot_idx(self, shot: int) -> int:
+        s = int(shot) + (self.batch_size if int(shot) < 0 else 0)
+        if s < 0 or s >= self.batch_size:
+            raise IndexError(f"shot {shot} out of range for batch_size={self.batch_size}")
+        return s
+
+    def _resolve_shot_state(self, s: int, trace_selectors: bool) -> tuple[ReferenceCHPTableau, ShotExpansion, Sequence[FrameEvent]]:
+        tab = self._shot_tabs[s] if self._shot_tabs is not None else self._live_ref_tab
+        exp, cp = self._live_exps[s], self._active_plan
+        if isinstance(cp, SelectorPlan) and self._shot_sel_bits is not None:
+            sb = self._shot_sel_bits[s]
+            if trace_selectors and sb is not None:
+                tab, exp = extract_data_expansion(cp, exp, sb, use_cpp_kernels=self.use_cpp_kernels)
+                return tab, exp, cp.data_frame_events
+            return tab, exp, cp.frame_events
+        return tab, exp, self._live_frame_events
+
+    def get_qfe_expansion(self, shot: int = 0, *, trace_selectors: bool = True) -> tuple[ReferenceCHPTableau, ShotExpansion]:
+        self._flush_magic()
+        tab, exp, _ = self._resolve_shot_state(self._validate_shot_idx(shot), bool(trace_selectors))
+        return _to_forward_chp(tab), exp.copy()
+
+    def get_state_expansions(self, *, trace_selectors: bool = True) -> list[tuple[ReferenceCHPTableau, ShotExpansion]]:
+        self._flush_magic()
+        return [self.get_qfe_expansion(s, trace_selectors=trace_selectors) for s in range(self.batch_size)]
+
+    def get_branch_mass(self, shot: int = 0) -> float:
+        self._flush_magic()
+        return float(self._branch_masses[self._validate_shot_idx(shot)])
+
+    def state_vector(
+        self, shot: int = 0, *, endian: Literal["little", "big"] = "little", trace_selectors: bool = True, normalize: bool = True,
+    ) -> NDArray[np.complex128]:
+        self._flush_magic()
+        s = self._validate_shot_idx(shot)
+        if endian not in ("little", "big"):
+            raise ValueError(f"endian must be 'little' or 'big', got {endian!r}")
+        scale = 1.0 if normalize else math.sqrt(max(0.0, float(self._branch_masses[s])))
+        if self._logical_nq == 0:
+            return np.array([complex(scale)], dtype=np.complex128)
+        tab, exp, fevs = self._resolve_shot_state(s, bool(trace_selectors))
+        nq = exp.n_qubits
+        if nq > 26:
+            raise ValueError(f"state_vector requires num_qubits <= 26, got {nq}")
+        psi = reconstruct_statevector(tab, exp, frame_events=fevs)
+        if not normalize:
+            psi = np.ascontiguousarray(psi * scale)
+        if endian == "big" and nq > 1:
+            psi = np.ascontiguousarray(psi.reshape((2,) * nq).transpose(tuple(range(nq - 1, -1, -1))).ravel())
+        return psi
+
+    get_statevector = state_vector

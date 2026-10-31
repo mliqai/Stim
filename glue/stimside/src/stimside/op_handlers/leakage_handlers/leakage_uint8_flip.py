@@ -1,5 +1,5 @@
 import dataclasses
-import itertools as it
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -12,13 +12,16 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageTransition1Params,
     LeakageTransition2Params,
     LeakageTransitionZParams,
-    LeakageMeasurementParams
+    LeakageMeasurementParams,
+    LeakageSwapParams,
 )
 from stimside.op_handlers.leakage_handlers.leakage_tag_parsing_flip import (
     parse_leakage_in_circuit,
 )
+from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
 from stimside.simulator_flip import FlipsideSimulator
 from stimside.util.numpy_types import Bool2DArray
+from stimside.util.stim_workarounds import split_fused_instruction
 
 
 @dataclasses.dataclass
@@ -27,7 +30,7 @@ class LeakageUint8(OpHandler[FlipsideSimulator]):
 
     Basically, we store the leakage state as an int for each qubit.
     Pro: hard to mess up
-        Supports leakage states up to 255
+        Supports leakage states up to 9 (tags with higher states are rejected)
         Easy to store and work with using numpy
     Con: probably not as fast as using a bool array for each leakage level we care about
         We spend a reasonable amount of time computing masks like state>=2
@@ -41,12 +44,45 @@ class LeakageUint8(OpHandler[FlipsideSimulator]):
             ) -> "CompiledLeakageUint8":
 
         parsed_ops = parse_leakage_in_circuit(circuit)
+        check_tag_qubits(parsed_ops, circuit.num_qubits)
 
         return CompiledLeakageUint8(
             num_qubits=circuit.num_qubits,
             batch_size=batch_size,
             ops_to_params=parsed_ops,
         )
+
+
+_DEPOLARIZE_AFTER_OPS: frozenset[str] = frozenset(
+    {
+        "M",
+        "MZ",
+        "MX",
+        "MY",
+        "R",
+        "RZ",
+        "RX",
+        "RY",
+        "MR",
+        "MRZ",
+        "MRX",
+        "MRY",
+    }
+)
+
+
+def _reset_value(s_in: object, s_out: object) -> int | None:
+    """Z value an s_in-->s_out transition resets a qubit to (as in Tableside/Cosetside), else None.
+
+    -->0 / -->1 reset to |0> / |1>; a leaked qubit going to X/Y/Z is reset to |0> before the Pauli.
+    """
+    if s_out == s_in:
+        return None
+    if isinstance(s_out, int) and s_out in (0, 1):
+        return s_out
+    if s_out in ("X", "Y", "Z") and isinstance(s_in, int) and s_in >= 2:
+        return 0
+    return None
 
 
 @dataclasses.dataclass
@@ -67,6 +103,15 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
     _depolarize_on_leak: bool = True
 
     def __post_init__(self):
+        self._op_targets_cache: dict[stim.CircuitInstruction, np.ndarray] = {}
+        self._op_pair_targets_cache: dict[
+            stim.CircuitInstruction, tuple[np.ndarray, np.ndarray]
+        ] = {}
+        # id(LEAKAGE_TRANSITION_1/2 params) -> per leg: (has 0/1 input keys, can reset to |0>/|1>)
+        self._z_legs_cache: dict[int, tuple[tuple[bool, bool], ...]] = {}
+        self._repeat_free_pieces_cache: dict[
+            stim.CircuitInstruction, list[stim.CircuitInstruction]
+        ] = {}
         self.clear()
 
     def clear(self):
@@ -76,11 +121,36 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
         """
         self.state = np.zeros(shape=(self.num_qubits, self.batch_size), dtype=np.uint8)
 
+    def _get_target_indices(self, op: stim.CircuitInstruction) -> np.ndarray:
+        cached = self._op_targets_cache.get(op)
+        if cached is not None:
+            return cached
+        indices = np.fromiter(
+            (
+                t.qubit_value if t.qubit_value is not None else t.value
+                for t in op.targets_copy()
+            ),
+            dtype=np.intp,
+        )
+        self._op_targets_cache[op] = indices
+        return indices
+
+    def _get_pair_target_indices(
+        self, op: stim.CircuitInstruction
+    ) -> tuple[np.ndarray, np.ndarray]:
+        cached = self._op_pair_targets_cache.get(op)
+        if cached is not None:
+            return cached
+        indices = self._get_target_indices(op)
+        pairs = (indices[::2], indices[1::2])
+        self._op_pair_targets_cache[op] = pairs
+        return pairs
+
     def make_target_mask(self, op: stim.CircuitInstruction) -> Bool2DArray:
         """return a bool mask that is true if this qubit is in the op targets."""
-        target_indices = [t.value for t in op.targets_copy()]
+        target_indices = self._get_target_indices(op)
         target_mask = np.zeros_like(self.state, dtype=bool)
-        target_mask[target_indices, :] = 1
+        target_mask[target_indices, :] = True
         return target_mask
 
     def make_pair_target_masks(
@@ -94,26 +164,162 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
         even_target_mask[target_indices[1::2], :] = 1
         return odd_target_mask, even_target_mask
 
-    def handle_op(self, op: stim.CircuitInstruction, sss: FlipsideSimulator):
+    def mpad_z_collapse_targets(self, op: stim.CircuitInstruction) -> list[int] | None:
+        """Qubits a MPAD[LEAKAGE_MEASUREMENT] with 0/1 keys Z-collapses (else None).
 
-        if op not in self.ops_to_params:
-            sss.do_on_flip_simulator(op)
-            if self._depolarize_on_leak and op.name in [
-                "M",
-                "MX",
-                "MY",
-                "R",
-                "RX",
-                "RY",
-                "MR",
-                "MRX",
-                "MRY",
-            ]:
-                # if we're depolarizing on leak, these instructions undo that error, so we re-depolarize
-                self._depolarize_leaked_qubits(fss=sss, op=op)
+        Read by FlipsideSimulator's reference walk, which collapses them in the reference.
+        """
+        params = self.ops_to_params.get(op)
+        if (
+            op.name == "MPAD"
+            and isinstance(params, LeakageMeasurementParams)
+            and params.targets is not None
+            and (0 in params.prob_for_input_state or 1 in params.prob_for_input_state)
+        ):
+            return [int(q) for q in params.targets]
+        return None
+
+    def _z_legs(
+        self, params: LeakageTransition1Params | LeakageTransition2Params
+    ) -> tuple[tuple[bool, bool], ...]:
+        """Per leg (1 for LEAKAGE_TRANSITION_1, 2 for _2): (has 0/1 input keys, can reset to |0>/|1>)."""
+        cached = self._z_legs_cache.get(id(params))
+        if cached is not None:
+            return cached
+        items: list = [  # (input states, output states) per transition, one entry per leg
+            ((s_in,), (s_out,)) if isinstance(params, LeakageTransition1Params) else (s_in, s_out)
+            for s_in, transitions in params.args_by_input_state.items()
+            for s_out, _ in transitions
+        ]
+        n_legs = 1 if isinstance(params, LeakageTransition1Params) else 2
+        legs = tuple(
+            (
+                any(s_in[k] in (0, 1) for s_in, _ in items),
+                any(_reset_value(s_in[k], s_out[k]) is not None for s_in, s_out in items),
+            )
+            for k in range(n_legs)
+        )
+        self._z_legs_cache[id(params)] = legs
+        return legs
+
+    def op_z_collapse_targets(
+        self, op: stim.CircuitInstruction
+    ) -> tuple[list[int], list[int]] | None:
+        """(qubits a LEAKAGE_TRANSITION_1/2 reads the Z value of, qubits it may reset), else None.
+
+        Read by FlipsideSimulator's reference walk: it Z-collapses superposed read qubits (0/1 input
+        keys) and records the reference Z value of every listed qubit (None if superposed).
+        """
+        params = self.ops_to_params.get(op)
+        if not isinstance(params, (LeakageTransition1Params, LeakageTransition2Params)):
+            return None
+        z_legs = self._z_legs(params)
+        if not any(r or s for r, s in z_legs):
+            return None
+        leg_qs = (
+            (self._get_target_indices(op),)
+            if isinstance(params, LeakageTransition1Params)
+            else self._get_pair_target_indices(op)
+        )
+        reads: list[int] = []
+        resets: list[int] = []
+        for (r, s), qs in zip(z_legs, leg_qs):
+            if r:
+                reads += qs.tolist()
+            if s:
+                resets += qs.tolist()
+        return reads, resets
+
+    def _reference_z(
+        self, op: stim.CircuitInstruction, fss: FlipsideSimulator, qubits: np.ndarray
+    ) -> tuple[NDArray[np.bool_], list[int]]:
+        """Reference walk's Z value of each of `qubits` at this op, and the qubits it collapsed here.
+
+        self.state never stores 1, so 0/1 states are read as reference Z value XOR X frame (superposed
+        read targets are Z-collapsed by the reference walk, as for 0/1-keyed MPAD).
+        """
+        fss._precompute_sync_reference()
+        t = fss.get_current_circuit_time()
+        entry = fss._op_ref_z.get(t)
+        if (
+            entry is None
+            or fss._unrolled_ops[t].name != op.name
+            or any(int(q) not in entry[0] for q in qubits)
+        ):
+            raise ValueError(
+                f"{op} has 0/1 input or output states, which FlipsideSimulator resolves from its "
+                f"reference walk of the circuit, but the op at circuit time {t} doesn't match it "
+                "(interactive_do with a different op sequence?). Run the circuit with run()."
+            )
+        ref_z, collapsed = entry
+        rz = np.empty(len(qubits), dtype=np.bool_)
+        for k, q in enumerate(qubits.tolist()):
+            v = ref_z[q]
+            if v is None:
+                raise ValueError(
+                    f"{op} can reset qubit {q} to |0> or |1>, but FlipsideSimulator can only do that "
+                    "where the qubit's Z value is definite in the noiseless circuit, or where the op "
+                    "also has a 0/1 input key on it (which Z-collapses it). Use TablesideSimulator or "
+                    "CosetsideSimulator."
+                )
+            rz[k] = v
+        return rz, collapsed
+
+    def _collapse_back_action(
+        self, fss: FlipsideSimulator, collapsed: list[int], qubits: np.ndarray
+    ) -> None:
+        """Randomize the Z frame of the `qubits` that the reference walk Z-collapsed at this op."""
+        hit = sorted(set(collapsed) & set(qubits.tolist()))
+        if hit:
+            mask = np.zeros_like(self.state, dtype=bool)
+            mask[hit, :] = True
+            fss.broadcast_pauli_errors(error_mask=mask, pauli="Z", p=0.5)
+
+    def _apply_resets(
+        self,
+        fss: FlipsideSimulator,
+        to_reset: Bool2DArray,
+        reset_to_one: Bool2DArray,
+        z_ref: NDArray[np.bool_],
+    ) -> None:
+        """Reset the to_reset entries to |0> (|1> where reset_to_one), as Tableside/Cosetside R (+X).
+
+        X-flip where the shot's Z value (reference Z value XOR X frame) is wrong, then randomize the
+        phase, as R does. No depolarization.
+        """
+        xs, _, _, _, _ = fss._flip_simulator.to_numpy(output_xs=True, output_zs=False)
+        flip = to_reset & (z_ref[:, None] ^ xs ^ reset_to_one)
+        fss.broadcast_pauli_errors(error_mask=flip, pauli="X", p=1.0)
+        fss.broadcast_pauli_errors(error_mask=to_reset, pauli="Z", p=0.5)
+
+    def handle_op(self, op: stim.CircuitInstruction, sss: FlipsideSimulator):
+        params = self.ops_to_params.get(op)
+        if params is None:
+            if self._depolarize_on_leak and op.name in _DEPOLARIZE_AFTER_OPS:
+                # Depolarize after each repeat-free piece, so a qubit the op repeats (e.g. stim-fused
+                # `M 0` lines) is re-scrambled between its occurrences, as with separate instructions.
+                for piece in self._repeat_free_pieces(op):
+                    sss.do_on_flip_simulator(piece)
+                    self._depolarize_leaked_qubits(fss=sss, op=piece)
+            else:
+                sss.do_on_flip_simulator(op)
             return
 
-        params = self.ops_to_params[op]
+        if sss.record_unleaked_to_leaked and isinstance(
+            params,
+            (
+                LeakageTransition1Params,
+                LeakageTransitionZParams,
+                LeakageTransition2Params,
+                LeakageSwapParams,
+            ),
+        ):
+            target_indices = np.unique(self._get_target_indices(op))
+            was_unleaked = (self.state[target_indices, :] < 2).copy()
+        else:
+            target_indices = None
+            was_unleaked = None
+
         match params:
             case LeakageControlledErrorParams():
                 self.leakage_controlled_error(op=op, fss=sss, params=params)
@@ -125,18 +331,64 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
                 self.leakage_transition_2(op=op, fss=sss, params=params)
             case LeakageMeasurementParams():
                 self.leakage_projection_Z(op=op, fss=sss, params=params)
+            case LeakageSwapParams():
+                self.leakage_swap(op=op, fss=sss)
             case _:
                 raise ValueError(f"Unrecognised LEAKAGE params: {params}")
+
+        if was_unleaked is not None and target_indices is not None:
+            now_leaked = self.state[target_indices, :] >= 2
+            counts = np.count_nonzero(was_unleaked & now_leaked, axis=0)
+            sss._record_unleaked_to_leaked_counts(counts, sss._circuit_time)
+
+    def leakage_swap(self, op: stim.CircuitInstruction, fss: FlipsideSimulator):
+        """SWAP[LEAKAGE_SWAP]: SWAP the qubits' frames, then their leakage states, pair by pair
+        from left to right.
+        """
+        fss.do_on_flip_simulator(op)
+        q0s, q1s = self._get_pair_target_indices(op)
+        for q0, q1 in zip(q0s.tolist(), q1s.tolist()):
+            self.state[[q0, q1], :] = self.state[[q1, q0], :]
+
+    def _repeat_free_pieces(
+        self, op: stim.CircuitInstruction
+    ) -> list[stim.CircuitInstruction]:
+        """`op` split into consecutive pieces that repeat no qubit ([op] if it repeats none)."""
+        pieces = self._repeat_free_pieces_cache.get(op)
+        if pieces is None:
+            chunks: list[list[stim.GateTarget]] = [[]]
+            seen: set[int] = set()
+            for t in op.targets_copy():
+                if t.qubit_value in seen:
+                    chunks.append([])
+                    seen.clear()
+                chunks[-1].append(t)
+                seen.add(t.qubit_value)
+            pieces = (
+                [op]
+                if len(chunks) == 1
+                else [
+                    stim.CircuitInstruction(op.name, c, op.gate_args_copy(), tag=op.tag)
+                    for c in chunks
+                ]
+            )
+            self._repeat_free_pieces_cache[op] = pieces
+        return pieces
 
     def _depolarize_leaked_qubits(
         self, op: stim.CircuitInstruction, fss: FlipsideSimulator
     ):
-        """Fully depolarize qubits that are leaked."""
-        target_mask = self.make_target_mask(op)
-        mask = np.logical_and(target_mask, self.state >= 2)  # in leakage state
+        """Fully depolarize qubits that are leaked (post-gate)."""
+        target_indices = self._get_target_indices(op)
+        if len(target_indices) == 0:
+            return
+        sub_leaked = self.state[target_indices, :] >= 2
+        if not np.any(sub_leaked):
+            return
+        mask = np.zeros_like(self.state, dtype=bool)
+        mask[target_indices, :] = sub_leaked
         fss.broadcast_pauli_errors(error_mask=mask, p=0.5, pauli="X")
         fss.broadcast_pauli_errors(error_mask=mask, p=0.5, pauli="Z")
-        fss.do_on_flip_simulator(op)
 
     def leakage_controlled_error(
         self,
@@ -149,20 +401,71 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
         gate targets implicitly come in pairs t0 t1,
         if t0 is in the given leakage state, t1 has a Pauli error applied to it
         """
-
-        # controller state is an array where each qubit has the leakage state
-        # of the qubit controlling it (or 0 if it's not being targeted)
-        controller_state = np.zeros_like(self.state, dtype=np.uint8)
-        targets = [t.value for t in op.targets_copy()]
-        for t0, t1 in it.batched(targets, 2):
-            controller_state[t1, :] = self.state[t0, :]
-
-        for p, s0, pauli in params.args:
-            assert s0 != 0  # 0 is reserved for qubits not in the targets list
-            # but the parsing should already have checked that s0 isn't 0 or 1
-            mask = controller_state == s0  # correct state
-            fss.broadcast_pauli_errors(error_mask=mask, p=p)  # error with probability
+        t0_arr, t1_arr = self._get_pair_target_indices(op)
+        if len(t0_arr) == 0:
             fss.do_on_flip_simulator(op)
+            return
+
+        ctrl_states = self.state[t0_arr, :]
+        if not np.any(ctrl_states >= 2):
+            fss.do_on_flip_simulator(op)
+            return
+
+        fss.do_on_flip_simulator(op)
+
+        has_dup_t1 = len(set(t1_arr.tolist())) != len(t1_arr)
+
+        for s0, branches in params.args_by_input_state.items():
+            assert s0 != 0
+            active_pairs = ctrl_states == s0
+            n_active = int(np.count_nonzero(active_pairs))
+            if n_active == 0:
+                continue
+
+            if len(branches) == 1 and not has_dup_t1:
+                pauli, p = branches[0]
+                if p <= 0.0:
+                    continue
+                mask = np.zeros_like(self.state, dtype=bool)
+                mask[t1_arr, :] = active_pairs
+                fss.broadcast_pauli_errors(error_mask=mask, p=p, pauli=pauli)
+            else:
+                total_p = sum(p for _, p in branches)
+                if total_p <= 0.0:
+                    continue
+                n_hits = (
+                    n_active
+                    if total_p >= 1.0 - 1e-12
+                    else int(fss.np_rng.binomial(n_active, total_p))
+                )
+                if n_hits == 0:
+                    continue
+                elig_p, elig_b = np.where(active_pairs)
+                if n_hits < n_active:
+                    chosen = fss.np_rng.choice(n_active, size=n_hits, replace=False)
+                    hit_p, hit_b = elig_p[chosen], elig_b[chosen]
+                else:
+                    hit_p, hit_b = elig_p, elig_b
+                hit_t1 = t1_arr[hit_p]
+
+                if len(branches) == 1:
+                    pauli = branches[0][0]
+                    mask = np.zeros_like(self.state, dtype=bool)
+                    np.logical_xor.at(mask, (hit_t1, hit_b), True)
+                    fss.broadcast_pauli_errors(error_mask=mask, p=1.0, pauli=pauli)
+                else:
+                    cond_probs = [p / total_p for _, p in branches]
+                    br_idx = fss.np_rng.choice(
+                        len(branches), size=n_hits, p=cond_probs
+                    )
+                    for b_i, (pauli, _) in enumerate(branches):
+                        sel = br_idx == b_i
+                        if np.any(sel):
+                            mask = np.zeros_like(self.state, dtype=bool)
+                            np.logical_xor.at(mask, (hit_t1[sel], hit_b[sel]), True)
+                            fss.broadcast_pauli_errors(
+                                error_mask=mask, p=1.0, pauli=pauli
+                            )
 
     def leakage_transition_1(
         self,
@@ -174,43 +477,138 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
 
         when a qubit transitions to the unknown unleaked state U, we fully depolarize it.
         """
+        target_indices = self._get_target_indices(op)
+        num_targets = len(target_indices)
+        if num_targets == 0:
+            fss.do_on_flip_simulator(op)
+            return
+        if num_targets > 1 and len(set(target_indices.tolist())) < num_targets:
+            for t in op.targets_copy():
+                sub_op = stim.CircuitInstruction(
+                    op.name, [t], op.gate_args_copy()
+                )
+                self.leakage_transition_1(sub_op, fss, params)
+            return
 
-        target_mask = self.make_target_mask(op)
+        initial_state = (
+            self.state.copy()
+            if len(params.args_by_input_state) > 1
+            else self.state
+        )
+        sub_state = initial_state[target_indices, :]
+        reads_z, resets_z = self._z_legs(params)[0]
+        z_ref: NDArray[np.bool_] | None = None
+        if reads_z or resets_z:
+            rz, collapsed = self._reference_z(op, fss, target_indices)
+            z_ref = np.zeros(self.num_qubits, dtype=np.bool_)
+            z_ref[target_indices] = rz
+            if reads_z:
+                # Mark |1> rows in the local copy only (self.state never stores 1).
+                xs, _, _, _, _ = fss._flip_simulator.to_numpy(output_xs=True, output_zs=False)
+                sub_state[(sub_state < 2) & (rz[:, None] ^ xs[target_indices, :])] = 1
+                self._collapse_back_action(fss, collapsed, target_indices)
+        any_initially_leaked = bool(np.any(sub_state >= 2))
 
-        to_depolarize = np.zeros_like(self.state, dtype=bool)
+        to_depolarize: Bool2DArray | None = None
+        to_reset: Bool2DArray | None = None
+        reset_to_one: Bool2DArray | None = None
 
-        for input_state in params.args_by_input_state.keys():
-
-            if input_state == "U":
-                input_state_mask = self.state < 2
-            else:
-                input_state_mask = self.state == input_state
-
-            overwrite_mask = np.logical_and(target_mask, input_state_mask)
-
-            samples_to_take = np.count_nonzero(overwrite_mask)
-            if samples_to_take == 0:
+        for input_state, transitions in params.args_by_input_state.items():
+            total_p = sum(p for _, p in transitions)
+            if total_p <= 0.0:
                 continue
 
-            output_states = params.sample_transitions_from_state(
-                input_state=input_state, num_samples=samples_to_take, np_rng=fss.np_rng
-            )
-
-            was_unleaked = output_states == "U"
-            output_states[was_unleaked] = 0
-            output_states = output_states.astype(np.uint8)
-            # output_states now all ints
-
-            self.state[overwrite_mask] = output_states
-
-            if self._depolarize_on_leak:
-                was_leaked = output_states >= 2
-                to_depolarize[overwrite_mask] = np.logical_or(was_leaked, was_unleaked)
+            if input_state == "U" and not any_initially_leaked:
+                M = num_targets * self.batch_size
+                n_hits = (
+                    M
+                    if total_p >= 1.0 - 1e-12
+                    else int(fss.np_rng.binomial(M, total_p))
+                )
+                if n_hits == 0:
+                    continue
+                if n_hits == M:
+                    row_idx = np.repeat(
+                        np.arange(num_targets, dtype=np.intp), self.batch_size
+                    )
+                    b_idx = np.tile(
+                        np.arange(self.batch_size, dtype=np.intp), num_targets
+                    )
+                else:
+                    flat_idx = fss.np_rng.choice(M, size=n_hits, replace=False)
+                    row_idx = flat_idx // self.batch_size
+                    b_idx = flat_idx % self.batch_size
             else:
-                to_depolarize[overwrite_mask] = was_unleaked
+                if input_state != "U" and not any_initially_leaked and isinstance(input_state, int) and input_state >= 2:
+                    continue
+                in_mask = (
+                    (sub_state < 2)
+                    if input_state == "U"
+                    else (sub_state == input_state)
+                )
+                M = int(np.count_nonzero(in_mask))
+                if M == 0:
+                    continue
+                n_hits = (
+                    M
+                    if total_p >= 1.0 - 1e-12
+                    else int(fss.np_rng.binomial(M, total_p))
+                )
+                if n_hits == 0:
+                    continue
+                elig_rows, elig_bs = np.where(in_mask)
+                if n_hits == M:
+                    row_idx, b_idx = elig_rows, elig_bs
+                else:
+                    chosen = fss.np_rng.choice(M, size=n_hits, replace=False)
+                    row_idx = elig_rows[chosen]
+                    b_idx = elig_bs[chosen]
 
-        fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="Z", p=0.5)
-        fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="X", p=0.5)
+            q_all = target_indices[row_idx]
+
+            if len(transitions) == 1:
+                branch_groups = [(transitions[0][0], q_all, b_idx)]
+            else:
+                cond_probs = [p / total_p for _, p in transitions]
+                br_idx = fss.np_rng.choice(
+                    len(transitions), size=n_hits, p=cond_probs
+                )
+                branch_groups = []
+                for b_i, (out_st, _) in enumerate(transitions):
+                    sel = br_idx == b_i
+                    if np.any(sel):
+                        branch_groups.append((out_st, q_all[sel], b_idx[sel]))
+
+            for out_st, q_hit, b_hit in branch_groups:
+                if out_st == input_state:
+                    continue
+                if out_st == "U":
+                    self.state[q_hit, b_hit] = 0
+                    if to_depolarize is None:
+                        to_depolarize = np.zeros_like(self.state, dtype=bool)
+                    to_depolarize[q_hit, b_hit] = True
+                else:
+                    out_int = int(out_st)
+                    self.state[q_hit, b_hit] = 0 if out_int < 2 else out_int
+                    if out_int < 2:
+                        if to_reset is None or reset_to_one is None:
+                            to_reset = np.zeros_like(self.state, dtype=bool)
+                            reset_to_one = np.zeros_like(self.state, dtype=bool)
+                        to_reset[q_hit, b_hit] = True
+                        if out_int == 1:
+                            reset_to_one[q_hit, b_hit] = True
+                    elif self._depolarize_on_leak and input_state in ("U", 0, 1):
+                        if to_depolarize is None:
+                            to_depolarize = np.zeros_like(self.state, dtype=bool)
+                        to_depolarize[q_hit, b_hit] = True
+
+        if to_reset is not None and reset_to_one is not None:
+            assert z_ref is not None
+            self._apply_resets(fss, to_reset, reset_to_one, z_ref)
+        if to_depolarize is not None:
+            fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="Z", p=0.5)
+            fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="X", p=0.5)
+
         fss.do_on_flip_simulator(op)
 
     def leakage_transition_Z(
@@ -224,27 +622,43 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
         When a qubit transitions to a computational state (0, 1) we prepare it in that Z eigenstate.
         When any qubit changes state, we randomize its phase by applying a Z flip with 50% probability.
         """
+        target_indices = self._get_target_indices(op)
+        if len(target_indices) > 1 and len(set(target_indices.tolist())) < len(
+            target_indices
+        ):
+            for t in op.targets_copy():
+                sub_op = stim.CircuitInstruction(
+                    op.name, [t], op.gate_args_copy()
+                )
+                self.leakage_transition_Z(sub_op, fss, params)
+            return
+        is_reset = op.name in ("R", "RZ")
 
-        targets = [t.value for t in op.targets_copy()]
+        if is_reset:
+            fss.do_on_flip_simulator(op)
+            eval_time = fss.get_current_circuit_time() + 1
+        else:
+            eval_time = fss.get_current_circuit_time()
 
-        if not fss._all_targets_in_known_state(targets=targets, pauli="Z"):
+        if not fss._all_targets_in_known_state(
+            targets=target_indices, pauli="Z", circuit_time=eval_time
+        ):
             raise ValueError(
                 f"{op} has the tag LEAKAGE_TRANSITIONS_Z that demands known Z states, but targets aren't in known Z states."
             )
 
         state_before_op = self.state.copy()
-        # so we don't accidentally chain together transitions as we're altering self.state
-
         target_mask = self.make_target_mask(op)
-        in_0_mask, in_1_mask = fss._get_current_known_state_masks(pauli="Z")
+        raw_in_0_mask, raw_in_1_mask = fss._get_current_known_state_masks(
+            pauli="Z", circuit_time=eval_time
+        )
+        unleaked_mask = state_before_op < 2
+        in_0_mask = np.logical_and(raw_in_0_mask, unleaked_mask)
+        in_1_mask = np.logical_and(raw_in_1_mask, unleaked_mask)
 
-        # for accumulating which qubits to invert the computational Z state
         flip_Z_state = np.zeros_like(self.state, dtype=bool)
-        # for accumulating which qubits need to have their phase randomized
         randomize_phase = np.zeros_like(self.state, dtype=bool)
-
-        if self._depolarize_on_leak:
-            to_depolarize = np.zeros_like(self.state, dtype=bool)
+        to_depolarize = np.zeros_like(self.state, dtype=bool)
 
         for input_state in params.args_by_input_state.keys():
             if input_state == 0:
@@ -255,51 +669,55 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
                 in_state_mask = state_before_op == input_state
 
             overwrite_mask = np.logical_and(target_mask, in_state_mask)
-            # this is a mask that is true for target qubits in the correct state
-
-            samples_to_take = np.count_nonzero(overwrite_mask)
+            samples_to_take = int(np.count_nonzero(overwrite_mask))
             if samples_to_take == 0:
                 continue
 
             output_states = params.sample_transitions_from_state(
-                input_state=input_state, num_samples=samples_to_take, np_rng=fss.np_rng
+                input_state=input_state,
+                num_samples=samples_to_take,
+                np_rng=fss.np_rng,
             )
 
-            # find qubits inside the overwrite mask that aren't in the correct Z state
-            # ie where in_0/in_1 disagrees with the newly sampled output_state
+            changed = output_states != input_state
+            if not np.any(changed):
+                continue
+
             output_1_and_in_0 = np.logical_and(
-                in_0_mask[overwrite_mask], (output_states == 1)
+                raw_in_0_mask[overwrite_mask], (output_states == 1) & changed
             )
             output_0_and_in_1 = np.logical_and(
-                in_1_mask[overwrite_mask], (output_states == 0)
+                raw_in_1_mask[overwrite_mask], (output_states == 0) & changed
             )
             in_wrong_z_state = np.logical_or(output_1_and_in_0, output_0_and_in_1)
-            flip_Z_state[overwrite_mask] = in_wrong_z_state
+            flip_Z_state[overwrite_mask] |= in_wrong_z_state
 
-            # randomize the phase of any qubit that changed state
-            randomize_phase[overwrite_mask] = output_states != input_state
+            randomize_phase[overwrite_mask] |= changed
 
             if input_state <= 1 and self._depolarize_on_leak:
-                to_depolarize[overwrite_mask] = output_states >= 2
+                to_depolarize[overwrite_mask] |= (output_states >= 2) & changed
 
-            output_states[output_states == 1] = (
-                0  # don't pollute the state array with 1s
-            )
-            self.state[overwrite_mask] = (
-                output_states  # put the new leakage states in self.state
-            )
+            new_st = output_states.copy()
+            new_st[new_st == 1] = 0
+            # Only overwrite entries that actually transitioned (or keep existing state)
+            cur_vals = self.state[overwrite_mask]
+            cur_vals[changed] = new_st[changed].astype(np.uint8)
+            self.state[overwrite_mask] = cur_vals
 
-        # use broadcast error to invert the qubits that need to change computational state
-        fss.broadcast_pauli_errors(error_mask=flip_Z_state, pauli="X", p=1)
-        # also broadcast errors to randomize the phase of qubits in fixed Z states
-        fss.broadcast_pauli_errors(error_mask=randomize_phase, pauli="Z", p=0.5)
+        if is_reset and self._depolarize_on_leak:
+            # Since R cleared Pauli flips on all targets, re-depolarize any target that remains leaked
+            to_depolarize |= np.logical_and(target_mask, self.state >= 2)
 
-        if self._depolarize_on_leak:
-            if np.count_nonzero(to_depolarize):
-                fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="Z", p=0.5)
-                fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="X", p=0.5)
+        if np.any(flip_Z_state):
+            fss.broadcast_pauli_errors(error_mask=flip_Z_state, pauli="X", p=1)
+        if np.any(randomize_phase):
+            fss.broadcast_pauli_errors(error_mask=randomize_phase, pauli="Z", p=0.5)
+        if self._depolarize_on_leak and np.any(to_depolarize):
+            fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="Z", p=0.5)
+            fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="X", p=0.5)
 
-        fss.do_on_flip_simulator(op)
+        if not is_reset:
+            fss.do_on_flip_simulator(op)
 
     def leakage_transition_2(
         self,
@@ -313,88 +731,191 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
         or from an unknown unleaked state U to a different unknown unleaked state V,
         we fully depolarize it.
         """
+        all_indices = self._get_target_indices(op)
+        if len(all_indices) > 2 and len(set(all_indices.tolist())) < len(
+            all_indices
+        ):
+            for grp in op.target_groups():
+                sub_op = stim.CircuitInstruction(
+                    op.name, grp, op.gate_args_copy()
+                )
+                self.leakage_transition_2(sub_op, fss, params)
+            return
+        even_targets, odd_targets = self._get_pair_target_indices(op)
+        num_pairs = len(even_targets)
+        if num_pairs == 0:
+            fss.do_on_flip_simulator(op)
+            return
 
-        # odd_target_mask, even_target_mask = self.make_pair_target_masks(op)
-        targets_list = [t.value for t in op.targets_copy()]
-        even_targets_list = targets_list[::2]
-        odd_targets_list = targets_list[1::2]
+        initial_state = (
+            self.state.copy()
+            if len(params.args_by_input_state) > 1
+            else self.state
+        )
+        even_target_states = initial_state[even_targets, :]
+        odd_target_states = initial_state[odd_targets, :]
+        z_legs = self._z_legs(params)
+        z_ref: NDArray[np.bool_] | None = None
+        if any(r or s for r, s in z_legs):
+            leg_qs = (even_targets, odd_targets)
+            z_qs = np.concatenate([qs for (r, s), qs in zip(z_legs, leg_qs) if r or s])
+            rz, collapsed = self._reference_z(op, fss, z_qs)
+            z_ref = np.zeros(self.num_qubits, dtype=np.bool_)
+            z_ref[z_qs] = rz
+            if z_legs[0][0] or z_legs[1][0]:
+                # Mark |1> rows in the local copies only (self.state never stores 1).
+                xs, _, _, _, _ = fss._flip_simulator.to_numpy(output_xs=True, output_zs=False)
+                for (r, _), qs, leg_states in zip(
+                    z_legs, leg_qs, (even_target_states, odd_target_states)
+                ):
+                    if r:
+                        leg_states[(leg_states < 2) & (z_ref[qs][:, None] ^ xs[qs, :])] = 1
+                        self._collapse_back_action(fss, collapsed, qs)
+        any_initially_leaked = bool(
+            np.any(even_target_states >= 2) or np.any(odd_target_states >= 2)
+        )
 
-        # extract out the states on just the targets in order
-        # a 2D array sliced by a list compiles an array for just those rows
-        even_target_states = self.state[even_targets_list]
-        odd_target_states = self.state[odd_targets_list]
-        # these are shape (#target_pairs, batch_size)
+        to_depolarize: Bool2DArray | None = None
+        to_pauli_X: Bool2DArray | None = None
+        to_pauli_Y: Bool2DArray | None = None
+        to_pauli_Z: Bool2DArray | None = None
+        to_reset: Bool2DArray | None = None
+        reset_to_one: Bool2DArray | None = None
 
-        to_depolarize = np.zeros_like(self.state, dtype=bool)
+        for input_state, transitions in params.args_by_input_state.items():
+            total_p = sum(p for _, p in transitions)
+            if total_p <= 0.0:
+                continue
 
-        for input_state in params.args_by_input_state.keys():
-
-            # we need to find pairs where the whole pair is in the right state
-            if input_state[0] == "U":
-                even_target_state_checks = even_target_states < 2
+            if input_state == ("U", "U") and not any_initially_leaked:
+                M = num_pairs * self.batch_size
+                n_hits = (
+                    M
+                    if total_p >= 1.0 - 1e-12
+                    else int(fss.np_rng.binomial(M, total_p))
+                )
+                if n_hits == 0:
+                    continue
+                if n_hits == M:
+                    pair_idx = np.repeat(
+                        np.arange(num_pairs, dtype=np.intp), self.batch_size
+                    )
+                    b_idx = np.tile(
+                        np.arange(self.batch_size, dtype=np.intp), num_pairs
+                    )
+                else:
+                    flat_idx = fss.np_rng.choice(M, size=n_hits, replace=False)
+                    pair_idx = flat_idx // self.batch_size
+                    b_idx = flat_idx % self.batch_size
             else:
-                even_target_state_checks = even_target_states == input_state[0]
+                if not any_initially_leaked and (
+                    (isinstance(input_state[0], int) and input_state[0] >= 2)
+                    or (isinstance(input_state[1], int) and input_state[1] >= 2)
+                ):
+                    continue
+                check_0 = (
+                    (even_target_states < 2)
+                    if input_state[0] == "U"
+                    else (even_target_states == input_state[0])
+                )
+                check_1 = (
+                    (odd_target_states < 2)
+                    if input_state[1] == "U"
+                    else (odd_target_states == input_state[1])
+                )
+                target_state_mask = np.logical_and(check_0, check_1)
+                M = int(np.count_nonzero(target_state_mask))
+                if M == 0:
+                    continue
+                n_hits = (
+                    M
+                    if total_p >= 1.0 - 1e-12
+                    else int(fss.np_rng.binomial(M, total_p))
+                )
+                if n_hits == 0:
+                    continue
+                elig_pairs, elig_bs = np.where(target_state_mask)
+                if n_hits == M:
+                    pair_idx, b_idx = elig_pairs, elig_bs
+                else:
+                    chosen = fss.np_rng.choice(M, size=n_hits, replace=False)
+                    pair_idx = elig_pairs[chosen]
+                    b_idx = elig_bs[chosen]
 
-            if input_state[1] == "U":
-                odd_target_state_checks = odd_target_states < 2
+            q0_all = even_targets[pair_idx]
+            q1_all = odd_targets[pair_idx]
+
+            if len(transitions) == 1:
+                branch_groups = [(transitions[0][0], q0_all, q1_all, b_idx)]
             else:
-                odd_target_state_checks = odd_target_states == input_state[1]
+                cond_probs = [p / total_p for _, p in transitions]
+                br_idx = fss.np_rng.choice(
+                    len(transitions), size=n_hits, p=cond_probs
+                )
+                branch_groups = []
+                for b_i, (out_pair, _) in enumerate(transitions):
+                    sel = br_idx == b_i
+                    if np.any(sel):
+                        branch_groups.append(
+                            (out_pair, q0_all[sel], q1_all[sel], b_idx[sel])
+                        )
 
-            target_state_mask = np.logical_and(
-                even_target_state_checks, odd_target_state_checks
-            )
-            # this is shape (#pair_targets, batch_size),
-            # and is true if this pair in this batch is in the correct state
+            for out_pair, q0_hit, q1_hit, b_hit in branch_groups:
+                for leg_in, leg_out, q_hit in (
+                    (input_state[0], out_pair[0], q0_hit),
+                    (input_state[1], out_pair[1], q1_hit),
+                ):
+                    if leg_out == leg_in:
+                        continue
+                    reset_val = _reset_value(leg_in, leg_out)
+                    if reset_val is not None:
+                        if to_reset is None or reset_to_one is None:
+                            to_reset = np.zeros_like(self.state, dtype=bool)
+                            reset_to_one = np.zeros_like(self.state, dtype=bool)
+                        to_reset[q_hit, b_hit] = True
+                        if reset_val == 1:
+                            reset_to_one[q_hit, b_hit] = True
+                    if leg_out in ("U", "V", "D"):
+                        self.state[q_hit, b_hit] = 0
+                        if to_depolarize is None:
+                            to_depolarize = np.zeros_like(self.state, dtype=bool)
+                        to_depolarize[q_hit, b_hit] = True
+                    elif leg_out == "X":
+                        self.state[q_hit, b_hit] = 0
+                        if to_pauli_X is None:
+                            to_pauli_X = np.zeros_like(self.state, dtype=bool)
+                        np.logical_xor.at(to_pauli_X, (q_hit, b_hit), True)
+                    elif leg_out == "Y":
+                        self.state[q_hit, b_hit] = 0
+                        if to_pauli_Y is None:
+                            to_pauli_Y = np.zeros_like(self.state, dtype=bool)
+                        np.logical_xor.at(to_pauli_Y, (q_hit, b_hit), True)
+                    elif leg_out == "Z":
+                        self.state[q_hit, b_hit] = 0
+                        if to_pauli_Z is None:
+                            to_pauli_Z = np.zeros_like(self.state, dtype=bool)
+                        np.logical_xor.at(to_pauli_Z, (q_hit, b_hit), True)
+                    else:
+                        out_int = int(leg_out)
+                        self.state[q_hit, b_hit] = 0 if out_int < 2 else out_int
+                        if out_int >= 2 and self._depolarize_on_leak and leg_in in ("U", 0, 1):
+                            if to_depolarize is None:
+                                to_depolarize = np.zeros_like(self.state, dtype=bool)
+                            to_depolarize[q_hit, b_hit] = True
 
-            # make overwrite masks, showing where in self.states we need to put new samples
-            odd_overwrite_mask = np.zeros_like(self.state, dtype=bool)
-            odd_overwrite_mask[odd_targets_list] = target_state_mask
+        if to_reset is not None and reset_to_one is not None:
+            assert z_ref is not None
+            self._apply_resets(fss, to_reset, reset_to_one, z_ref)
+        if to_depolarize is not None:
+            fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="Z", p=0.5)
+            fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="X", p=0.5)
+        if to_pauli_X is not None:
+            fss.broadcast_pauli_errors(error_mask=to_pauli_X, pauli="X", p=1.0)
+        if to_pauli_Y is not None:
+            fss.broadcast_pauli_errors(error_mask=to_pauli_Y, pauli="Y", p=1.0)
+        if to_pauli_Z is not None:
+            fss.broadcast_pauli_errors(error_mask=to_pauli_Z, pauli="Z", p=1.0)
 
-            even_overwrite_mask = np.zeros_like(self.state, dtype=bool)
-            even_overwrite_mask[even_targets_list] = target_state_mask
-
-            samples_to_take = np.count_nonzero(target_state_mask)
-            # we take a sample for each pair of targets in the right state
-
-            # actually do the alias sampling
-            output_states = params.sample_transitions_from_state(
-                input_state=input_state, num_samples=samples_to_take, np_rng=fss.np_rng
-            )
-            # output_states has shape=(samples_to_take, 2={even, odd})
-
-            # now we handle the various unleaked states, U and V
-            # if a qubit went U-->V, or L-->U we need to depolarize it
-            # (We're already banned L-->V at the parsing stage)
-            # if it went L-->L or U-->U we do not depolarize it
-            if input_state[0] == "U":
-                depolarize_even_qubit = output_states[:, 0] == "V"
-            else:  # Leaked
-                depolarize_even_qubit = output_states[:, 0] == "U"
-
-            if input_state[1] == "U":
-                depolarize_odd_qubit = output_states[:, 1] == "V"
-            else:  # Leaked
-                depolarize_odd_qubit = output_states[:, 1] == "U"
-
-            # actually overwrite the leakage states
-            output_states[output_states == "U"] = 0
-            output_states[output_states == "V"] = 0
-            output_states = output_states.astype(np.uint8)
-            self.state[even_overwrite_mask] = output_states[:, 0]
-            self.state[odd_overwrite_mask] = output_states[:, 1]
-
-            if self._depolarize_on_leak:
-                # output_states have already been cleared out to 0s
-                if input_state[0] == "U":
-                    depolarize_odd_qubit[output_states[:, 0] >= 2] = True
-                if input_state[1] == "U":
-                    depolarize_even_qubit[output_states[:, 1] >= 2] = True
-
-            to_depolarize[odd_overwrite_mask] = depolarize_odd_qubit
-            to_depolarize[even_overwrite_mask] = depolarize_even_qubit
-
-        fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="Z", p=0.5)
-        fss.broadcast_pauli_errors(error_mask=to_depolarize, pauli="X", p=0.5)
         fss.do_on_flip_simulator(op)
 
     def leakage_projection_Z(
@@ -403,69 +924,198 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
         fss: FlipsideSimulator,
         params: LeakageMeasurementParams,
     ):
-        """Implement measurement projections for qubits in known Z eigenstates.
+        """Implement measurement projections for qubits in known eigenstates."""
+        if params.targets:
+            copies = split_fused_instruction(op, len(params.targets))
+            if len(copies) > 1:
+                for sub_op in copies:
+                    self.leakage_projection_Z(sub_op, fss, params)
+                return
+        is_mpad = params.targets is not None
+        raw_op_targets = op.targets_copy()
 
-        This behaviour fully replaces the operation of an M gate, including
-        appending to the measurement record and randomizing the phase of all target qubits.
+        pauli: Literal["X", "Y", "Z"] = (
+            "X"
+            if op.name in ("MX", "MRX")
+            else ("Y" if op.name in ("MY", "MRY") else "Z")
+        )
+        is_reset = op.name in ("MR", "MRZ", "MRX", "MRY")
 
-        This behaviour does not change the leakage states of the qubits.
-        """
+        p0 = params.prob_for_input_state.get(0, 0.0)
+        p1 = params.prob_for_input_state.get(1, 1.0)
 
-        targets = np.array([t.value for t in op.targets_copy()])
-        target_mask = np.zeros_like(self.state, dtype=bool)
-        target_mask[targets, :] = True
+        if is_mpad:
+            assert params.targets is not None
+            targets = np.asarray(params.targets, dtype=np.intp)
+            if len(raw_op_targets) != len(targets):
+                raise ValueError(
+                    "The number of targets in the MPAD operation with a LEAKAGE_MEASUREMENT tag "
+                    "does not equal the number of targets specified in the tag."
+                )
+            if op.name != "MPAD":
+                raise ValueError(
+                    f"LEAKAGE_MEASUREMENT is only implemented for 'MPAD' operations, got {op}"
+                )
+        else:
+            targets = self._get_target_indices(op)
+            if op.name not in ("M", "MZ", "MR", "MRZ", "MX", "MY", "MRX", "MRY"):
+                raise ValueError(
+                    f"LEAKAGE_PROJECTION_Z is only implemented for M/MZ/MR/MRZ/MX/MY/MRX/MRY operations, got {op}"
+                )
+            if not np.isclose(p0, 1.0 - p1) and not fss._all_targets_in_known_state(
+                targets=targets, pauli=pauli
+            ):
+                raise ValueError(
+                    f"{op} has a LEAKAGE_PROJECTION_Z tag that demands known {pauli} states, but targets aren't in known {pauli} states."
+                )
 
-        if op.name != "M":
-            raise ValueError(
-                f"LEAKAGE_PROJECTION_Z is only implemented for 'M' operations, got {op}"
-            )
+        m_idx = fss._flip_simulator.num_measurements
+        ref_slice = fss.ref_measurements[m_idx : m_idx + len(targets)]
 
-        if not fss._all_targets_in_known_state(targets=targets, pauli="Z"):
-            raise ValueError(
-                f"{op} has a LEAKAGE_PROJECTION_Z tag that demands known Z states, but targets aren't in known Z states."
-            )
+        if is_mpad:
+            mpad_ref = fss._mpad_ref_z.get(m_idx)
+            if mpad_ref is not None:
+                # 0/1-keyed: the reference walk Z-collapsed superposed targets; each shot's Z value is
+                # its reference Z value XOR its X frame bit.
+                xs, _, _, _, _ = fss._flip_simulator.to_numpy(
+                    output_xs=True, output_zs=False
+                )
+                target_computational_states = mpad_ref[0][:, None] ^ xs[targets, :]
+            # For MPAD, if targets are in known Z states, use their Z state; otherwise use xs flip state
+            elif fss._all_targets_in_known_state(targets=targets, pauli="Z"):
+                _, known_state_mask = fss._get_current_known_state_masks(pauli="Z")
+                target_computational_states = known_state_mask[targets, :]
+            else:
+                xs, _, _, _, _ = fss._flip_simulator.to_numpy(
+                    output_xs=True, output_zs=False
+                )
+                target_computational_states = xs[targets, :]
+            inv_arr = np.array(
+                [
+                    bool(t.value) ^ bool(t.is_inverted_result_target)
+                    for t in raw_op_targets
+                ],
+                dtype=bool,
+            )[:, None]
+        else:
+            inv_arr = np.array(
+                [bool(t.is_inverted_result_target) for t in raw_op_targets],
+                dtype=bool,
+            )[:, None]
+            clean_plus, clean_minus = fss._get_clean_known_states(pauli=pauli)
+            is_known = (clean_plus | clean_minus)[targets]
+            _, known_state_mask = fss._get_current_known_state_masks(pauli=pauli)
+            if np.all(is_known):
+                target_computational_states = known_state_mask[targets, :].copy()
+            else:
+                xs, zs, _, _, _ = fss._flip_simulator.to_numpy(
+                    output_xs=True, output_zs=True
+                )
+                if pauli == "X":
+                    basis_flips = zs[targets, :]
+                elif pauli == "Y":
+                    basis_flips = xs[targets, :] ^ zs[targets, :]
+                else:
+                    basis_flips = xs[targets, :]
+                ref_states = (ref_slice[:, None] ^ inv_arr) ^ basis_flips
+                target_computational_states = np.where(
+                    is_known[:, None], known_state_mask[targets, :], ref_states
+                ).copy()
+            if len(set(int(q) for q in targets)) < len(targets):
+                first_occ_f: dict[int, int] = {}
+                for k_i, q_np in enumerate(targets):
+                    q_int = int(q_np)
+                    if q_int in first_occ_f:
+                        target_computational_states[k_i, :] = (
+                            False
+                            if is_reset
+                            else target_computational_states[
+                                first_occ_f[q_int], :
+                            ]
+                        )
+                    else:
+                        first_occ_f[q_int] = k_i
 
-        # get actual qubit states
-        _, known_state_mask = fss._get_current_known_state_masks(pauli="Z")
-        # known_state_mask is true when the qubit is in -Z ie the 1 state
-        # targets that are not in -Z are in +Z because we checked they're all in known Z states
-        # TODO don't do the all_targets_in_known_state check and then remake the known_state_mask
-        # pull the get_current_known_state_masks and check the targets are known yourself
-
-        target_computational_states = known_state_mask[targets, :]
         target_leakage_state = self.state[targets, :]
-
         target_is_not_leaked = target_leakage_state < 2
-
         target_outcomes = np.zeros_like(target_computational_states, dtype=bool)
 
-        target_states_0_mask = np.logical_and(
-            target_computational_states == 0, target_is_not_leaked
-        )
-        target_outcomes[target_states_0_mask] = params.sample_projections(
-            state=0,
-            num_samples=np.count_nonzero(target_states_0_mask),
-            np_rng=fss.np_rng,
-        )
-
-        target_states_1_mask = np.logical_and(
-            target_computational_states == 1, target_is_not_leaked
-        )
-        target_outcomes[target_states_1_mask] = params.sample_projections(
-            state=1,
-            num_samples=np.count_nonzero(target_states_1_mask),
-            np_rng=fss.np_rng,
-        )
-
-        for n in range(2, np.max(target_leakage_state) + 1):
-            target_state_mask = target_leakage_state == n
-            target_outcomes[target_state_mask] = params.sample_projections(
-                state=n,
-                num_samples=np.count_nonzero(target_state_mask),
-                np_rng=fss.np_rng,
+        if p0 > 0.0:
+            target_states_0_mask = np.logical_and(
+                target_computational_states == 0, target_is_not_leaked
             )
+            n0 = int(np.count_nonzero(target_states_0_mask))
+            if n0 > 0:
+                target_outcomes[target_states_0_mask] = (
+                    True if p0 >= 1.0 else (fss.np_rng.random(n0) < p0)
+                )
 
-        # implement the measurement gate:
-        fss.append_measurement_flips(measurement_flip_data=target_outcomes)
-        # randomize the non-commuting basis
-        fss.broadcast_pauli_errors(error_mask=target_mask, pauli="X", p=0.5)
+        p1 = params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0)
+        if p1 > 0.0:
+            target_states_1_mask = np.logical_and(
+                target_computational_states == 1, target_is_not_leaked
+            )
+            n1 = int(np.count_nonzero(target_states_1_mask))
+            if n1 > 0:
+                target_outcomes[target_states_1_mask] = (
+                    True if p1 >= 1.0 else (fss.np_rng.random(n1) < p1)
+                )
+
+        max_leak = int(np.max(target_leakage_state)) if len(targets) > 0 else 0
+        for n in range(2, max_leak + 1):
+            p_n = params.prob_for_input_state.get(n, 0.0)
+            if p_n > 0.0:
+                target_state_mask = target_leakage_state == n
+                nn = int(np.count_nonzero(target_state_mask))
+                if nn > 0:
+                    target_outcomes[target_state_mask] = (
+                        True if p_n >= 1.0 else (fss.np_rng.random(nn) < p_n)
+                    )
+
+        final_outcomes = np.logical_xor(target_outcomes, inv_arr)
+        measurement_flips = np.logical_xor(final_outcomes, ref_slice[:, None])
+        fss.append_measurement_flips(measurement_flip_data=measurement_flips)
+
+        if is_mpad and mpad_ref is not None and np.any(mpad_ref[1]):
+            # Collapse back-action (as from CX onto a fresh ancilla that is then measured): randomize
+            # the Z frame of the targets the reference walk collapsed.
+            collapse_mask = np.zeros_like(self.state, dtype=bool)
+            collapse_mask[targets[mpad_ref[1]], :] = True
+            fss.broadcast_pauli_errors(error_mask=collapse_mask, pauli="Z", p=0.5)
+
+        if not is_mpad:
+            target_mask = np.zeros_like(self.state, dtype=bool)
+            target_mask[targets, :] = True
+            unleaked_targets_mask = np.logical_and(target_mask, self.state < 2)
+            leaked_targets_mask = np.logical_and(target_mask, self.state >= 2)
+
+            if is_reset:
+                xs, zs, _, _, _ = fss._flip_simulator.to_numpy(
+                    output_xs=True, output_zs=True
+                )
+                reset_flip_x = np.logical_and(unleaked_targets_mask, xs)
+                reset_flip_z = np.logical_and(unleaked_targets_mask, zs)
+                if np.any(reset_flip_x):
+                    fss.broadcast_pauli_errors(
+                        error_mask=reset_flip_x, pauli="X", p=1.0
+                    )
+                if np.any(reset_flip_z):
+                    fss.broadcast_pauli_errors(
+                        error_mask=reset_flip_z, pauli="Z", p=1.0
+                    )
+                fss.broadcast_pauli_errors(
+                    error_mask=unleaked_targets_mask, pauli=pauli, p=0.5
+                )
+            else:
+                fss.broadcast_pauli_errors(
+                    error_mask=unleaked_targets_mask, pauli=pauli, p=0.5
+                )
+
+            if np.any(leaked_targets_mask):
+                fss.broadcast_pauli_errors(
+                    error_mask=leaked_targets_mask, pauli="Z", p=0.5
+                )
+                fss.broadcast_pauli_errors(
+                    error_mask=leaked_targets_mask, pauli="X", p=0.5
+                )
+

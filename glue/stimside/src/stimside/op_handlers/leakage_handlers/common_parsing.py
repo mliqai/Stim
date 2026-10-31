@@ -6,6 +6,9 @@ from typing import Literal
 # Matches "LEAKAGE_NAME: (arg1) (arg2)"
 LEAKAGE_TAG_MATCH = re.compile(r"(?P<name>LEAKAGE_\w+):(?P<args>.+)")
 
+# Matches "LEAKAGE_SWAP" (the only leakage tag without arguments)
+LEAKAGE_SWAP_TAG_MATCH = re.compile(r"(?P<name>LEAKAGE_SWAP)")
+
 # Matches "CONDITIONED_ON_NAME: args : targets"
 CONDITION_TAG_MATCH = re.compile(
     r"(?P<name>CONDITIONED_ON_[A-Z]+)\s*:(?P<args>[^:]+):*(?P<targets>.+)*"
@@ -21,9 +24,9 @@ LEAKAGE_TRANSITIONS_1_MATCH = re.compile(
 )
 
 # Matches "state_state-->state_state"
-# Allows states: digits, U, V, D, X, Y, Z
+# Allows multi-digit states (validated to 0..9 by the params), U, V, D, X, Y, Z
 LEAKAGE_TRANSITIONS_2_MATCH = re.compile(
-    r"(?P<s0>[\dU])_(?P<s1>[\dU])(?P<direction>[-<]->)(?P<s2>[\dUVDXYZ])_(?P<s3>[\dUVDXYZ])"
+    r"(?P<s0>\d+|U)_(?P<s1>\d+|U)(?P<direction>[-<]->)(?P<s2>\d+|[UVDXYZ])_(?P<s3>\d+|[UVDXYZ])"
 )
 
 

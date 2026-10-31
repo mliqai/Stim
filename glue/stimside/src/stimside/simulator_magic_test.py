@@ -1,0 +1,422 @@
+"""Unit tests for MagicsideSimulator."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pytest
+import stim
+
+from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+from stimside.simulator_magic import MagicsideSimulator
+from stimside.util.magic_compile import CliffordFaultChannel, FaultBranch
+from stimside.util.magic_query import QueryBudget, QueryBudgetExceededError
+
+
+def test_statevector_and_branch_mass_across_fault_modes_and_backends() -> None:
+    circ = stim.Circuit("H 0 1 2\nI[T] 0\nI[T_DAG] 1\nI[CCZ] 0 1 2\nCX 0 2")
+    want = None
+    for fm in ("DIRECT", "SELECTOR", "method_a", "method_b"):
+        for be in ("STREAM", "QUERY", "event_stream", "q1_q2"):
+            for cpp in (True, False):
+                sim = MagicsideSimulator(circ, batch_size=1, fault_mode=fm, backend=be, use_cpp_kernels=cpp)
+                assert sim.run() is None
+                psi = sim.get_statevector(0)
+                psi_big = sim.state_vector(0, endian="big")
+                assert psi.shape == (8,) and abs(np.linalg.norm(psi) - 1.0) < 1e-12
+                assert abs(sim.get_branch_mass(0) - 1.0) < 1e-12
+                tab, exp = sim.get_qfe_expansion(0, trace_selectors=True)
+                assert tab.num_qubits == 3 and exp.n_qubits == 3
+                assert len(sim.get_state_expansions()) == 1
+                want_big = psi.reshape((2, 2, 2)).transpose((2, 1, 0)).ravel()
+                np.testing.assert_allclose(psi_big, want_big, atol=1e-12)
+                if want is None:
+                    want = psi
+                else:
+                    ov = abs(np.vdot(want, psi))
+                    assert abs(ov - 1.0) < 1e-12
+
+
+def test_m2d_reference_modes_handle_deterministic_magic_interference() -> None:
+    circ = stim.Circuit(
+        "H 0\nI[T] 0\nI[T] 0\nI[T] 0\nI[T] 0\nH 0\nM 0\n"
+        "DETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]"
+    )
+    for mode in ("auto", "magicside"):
+        sim = MagicsideSimulator(circ, batch_size=8, seed=11, m2d_reference_mode=mode)
+        sim.run()
+        assert np.all(sim.get_final_measurement_records())
+        np.testing.assert_array_equal(sim.get_reference_sample(), np.array([True]))
+        assert not np.any(sim.get_detector_flips(append_observables=True))
+        assert not np.any(sim.get_observable_flips())
+
+    sim_zero = MagicsideSimulator(circ, batch_size=4, seed=11, m2d_reference_mode="zero")
+    sim_zero.run()
+    assert np.all(sim_zero.get_detector_flips())
+    assert np.all(sim_zero.get_observable_flips())
+
+    sim_exp = MagicsideSimulator(circ, batch_size=4, seed=11, reference_sample=[1])
+    sim_exp.run()
+    assert not np.any(sim_exp.get_detector_flips())
+
+
+def test_sweep_feedback_and_correlated_error_multi_target_behavior() -> None:
+    circ = stim.Circuit(
+        "CX sweep[0] 0\n"
+        "H 1\n"
+        "CORRELATED_ERROR(1.0) X0 Z1\n"
+        "ELSE_CORRELATED_ERROR(1.0) X1\n"
+        "H 1\n"
+        "M 0 1\n"
+        "DETECTOR rec[-2]\nOBSERVABLE_INCLUDE(0) rec[-1]"
+    )
+    sw = np.array([[False], [True], [False], [True]], dtype=np.bool_)
+    sim = MagicsideSimulator(circ, batch_size=4, seed=21, sweep_bits=sw)
+    sim.run()
+    recs = sim.get_final_measurement_records()
+    want = np.array([[True, True], [False, True], [True, True], [False, True]], dtype=np.bool_)
+    np.testing.assert_array_equal(recs, want)
+    # Correlated error flipped both X0 and Z1 -> both detector and observable flip relative to noiseless sweep ref
+    assert np.all(sim.get_detector_flips())
+    assert np.all(sim.get_observable_flips())
+
+
+def test_word_straddling_n66_cpp_matches_python_kernels_exactly() -> None:
+    circ = stim.Circuit(
+        "H 0 63 64 65\n"
+        "CX 0 63 63 64 64 65\n"
+        "I[T] 63 64\n"
+        "I[CCZ] 0 63 65\n"
+        "X_ERROR(0.2) 63 64\n"
+        "H 0 63 64 65\n"
+        "M 0 63 64 65"
+    )
+    for fm in ("DIRECT", "SELECTOR"):
+        s_cpp = MagicsideSimulator(circ, batch_size=16, seed=77, fault_mode=fm, use_cpp_kernels=True)
+        s_py = MagicsideSimulator(circ, batch_size=16, seed=77, fault_mode=fm, use_cpp_kernels=False)
+        s_cpp.run()
+        s_py.run()
+        np.testing.assert_array_equal(s_cpp.get_final_measurement_records(), s_py.get_final_measurement_records())
+
+
+def test_interactive_do_seed_stream_parity_coords_and_forced_faults() -> None:
+    circ = stim.Circuit(
+        "QUBIT_COORDS[data](1, 2) 0\n"
+        "SHIFT_COORDS(3, 0)\n"
+        "QUBIT_COORDS(1, 2) 1\n"
+        "H 0\n"
+        "I[CLIFFORD_FAULT: (0.5, S)] 0\n"
+        "I[T] 0\n"
+        "I[T] 0\n"
+        "H 0\n"
+        "M 0"
+    )
+    sim_i = MagicsideSimulator(circ, batch_size=4, seed=99)
+    sim_b = MagicsideSimulator(circ, batch_size=4, seed=99)
+    assert sim_i.current_tableau_measurement_record().shape == (0,)
+    for batch_idx in range(2):
+        for op in circ:
+            sim_i.interactive_do(op)
+        sim_i.finish_interactive_run()
+        sim_b.run()
+        np.testing.assert_array_equal(
+            sim_i.get_final_measurement_records(),
+            sim_b.get_final_measurement_records(),
+            err_msg=f"batch {batch_idx}",
+        )
+        assert sim_i.qubit_coords == {0: [1.0, 2.0], 1: [4.0, 2.0]}
+        assert sim_i.qubit_tags[0] == "data"
+        assert sim_i.get_current_circuit_time() == len(circ)
+        sim_i.clear()
+        sim_b.clear()
+
+    # Forced inline fault slot realization in interactive mode + post-end magic extension
+    sim_f = MagicsideSimulator(stim.Circuit("H 0\nI[CLIFFORD_FAULT: (0.5, S)] 0"), batch_size=1, fault_realizations=[{0: 1}])
+    sim_f.interactive_do(stim.Circuit("H 0\nI[CLIFFORD_FAULT: (0.5, S)] 0"))
+    sim_f.interactive_do(stim.Circuit("S 0\nH 0\nM 0"))
+    sim_f.finish_interactive_run()
+    assert bool(sim_f.get_final_measurement_records()[0, 0]) is True
+
+
+def test_programmatic_clifford_fault_channels_and_budget_enforcement() -> None:
+    ch = CliffordFaultChannel(step_index=1, branches=(FaultBranch(prob=1.0, gate_name="Z", targets=(0,)),), slot_id=7)
+    circ = stim.Circuit("H 0\nTICK\nH 0\nM 0")
+    for be in ("STREAM", "QUERY"):
+        sim = MagicsideSimulator(circ, batch_size=2, seed=5, backend=be, fault_channels=[ch], fault_realizations={7: 1})
+        sim.run()
+        assert np.all(sim.get_final_measurement_records())
+
+    hard = stim.Circuit("H 0 1 2\nI[CCZ] 0 1 2\nH 0 1 2\nM 0")
+    tight = QueryBudget(max_terms=1, on_budget_exceeded="raise")
+    sim_err = MagicsideSimulator(hard, backend="QUERY", query_budget=tight)
+    with pytest.raises(QueryBudgetExceededError):
+        sim_err.run()
+    sim_fb = MagicsideSimulator(hard, batch_size=4, seed=3, backend="QUERY", query_budget=tight, on_budget_exceeded="fallback")
+    sim_fb.run()
+    assert sim_fb.get_final_measurement_records().shape == (4, 1)
+
+
+def test_invalid_inputs_and_lifecycle_errors_raise() -> None:
+    c = stim.Circuit("H 0\nM 0")
+    with pytest.raises(TypeError):
+        MagicsideSimulator("H 0")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        MagicsideSimulator(c, batch_size=0)
+    with pytest.raises(ValueError):
+        MagicsideSimulator(c, batch_size=True)
+    with pytest.raises(ValueError):
+        MagicsideSimulator(c, fault_mode="BAD")
+    with pytest.raises(ValueError):
+        MagicsideSimulator(c, backend="BAD")
+    with pytest.raises(ValueError):
+        MagicsideSimulator(c, m2d_reference_mode="BAD")
+    with pytest.raises(ValueError):
+        MagicsideSimulator(c, on_budget_exceeded="ignore")
+    with pytest.raises(ValueError):
+        MagicsideSimulator(c, reference_sample=[0, 1])
+
+    sim = MagicsideSimulator(c, batch_size=2, seed=1)
+    with pytest.raises(RuntimeError):
+        sim.get_final_measurement_records()
+    sim.run()
+    with pytest.raises(ValueError):
+        sim.run()
+    with pytest.raises(IndexError):
+        sim.get_qfe_expansion(2)
+    with pytest.raises(ValueError):
+        sim.get_statevector(0, endian="middle")  # type: ignore[arg-type]
+    sim.clear()
+    with pytest.raises(ValueError):
+        sim.interactive_do(stim.CircuitInstruction("X", [0]))
+    sim.clear()
+    sim.interactive_do(c)
+    with pytest.raises(ValueError):
+        sim.interactive_do(stim.CircuitInstruction("X", [1]))
+    with pytest.raises(ValueError):
+        sim.interactive_do(stim.CircuitInstruction("DETECTOR", [stim.target_rec(-1)]))
+    sim.finish_interactive_run()
+    with pytest.raises(RuntimeError):
+        sim.interactive_do(stim.CircuitInstruction("I", [0]))
+
+
+def test_incompatible_modes_realization_validation_and_stream_pinning() -> None:
+    c = stim.Circuit("H 0\nM 0")
+    lh = LeakageUint8Magic()
+    clh = lh.compile_op_handler(circuit=c, batch_size=2)
+    for kw in (
+        {"backend": "QUERY", "op_handler": lh},
+        {"backend": "QUERY", "compiled_op_handler": clh},
+        {"backend": "QUERY", "sync_tableside_rng": True},
+        {"fault_mode": "SELECTOR", "op_handler": lh},
+        {"fault_mode": "SELECTOR", "compiled_op_handler": clh},
+        {"fault_mode": "SELECTOR", "sync_tableside_rng": True},
+    ):
+        with pytest.raises(ValueError):
+            MagicsideSimulator(c, batch_size=2, **kw)  # type: ignore[arg-type]
+
+    for kw_i in ({"backend": "QUERY"}, {"fault_mode": "SELECTOR"}):
+        sim_i = MagicsideSimulator(c, batch_size=2, **kw_i)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            sim_i.interactive_do(stim.CircuitInstruction("H", [0]))
+        with pytest.raises(ValueError):
+            sim_i.finish_interactive_run()
+
+    for bad_real in ({"measurements": {0: 1}}, {"paulis": {0: 1}}, {"resets": {0: 1}}, {"bogus": 1}):
+        with pytest.raises(ValueError):
+            MagicsideSimulator(c, batch_size=1, op_handler=lh, fault_realizations=bad_real)
+    with pytest.raises(ValueError):
+        MagicsideSimulator(c, batch_size=1, backend="QUERY", fault_realizations={"quantum_measurements": {0: 1}})
+    sim_ir = MagicsideSimulator(c, batch_size=1, fault_realizations={"measurements": {0: 1}})
+    with pytest.raises(ValueError):
+        sim_ir.interactive_do(c)
+
+    cpin = stim.Circuit("H 0\nDEPOLARIZE1(0.3) 1\nM 0 1")
+    for real in (
+        {"measurements": {0: 1, 1: 1}, "paulis": {0: 1}},
+        {"measurements": [0, 1], "paulis": {0: "X"}},
+    ):
+        want_r = np.array([[real["measurements"][0] == 1, True]] * 2, dtype=np.bool_)  # type: ignore[index]
+        ref_m = None
+        for fm, be in (("DIRECT", "STREAM"), ("SELECTOR", "STREAM"), ("DIRECT", "QUERY"), ("SELECTOR", "QUERY")):
+            sp = MagicsideSimulator(cpin, batch_size=2, fault_mode=fm, backend=be, fault_realizations=real)
+            sp.run()
+            np.testing.assert_array_equal(sp.get_final_measurement_records(), want_r)
+            m0 = sp.get_branch_mass(0)
+            if ref_m is None:
+                ref_m = m0
+                assert abs(m0 - 0.5) < 1e-12
+            else:
+                assert abs(m0 - ref_m) < 1e-12
+
+
+def test_trace_selectors_normalize_unleaked_records_and_statevector_cap() -> None:
+    circ = stim.Circuit("H 0\nI[CLIFFORD_FAULT: (0.4, X)] 1")
+    for be in ("STREAM", "QUERY"):
+        sim = MagicsideSimulator(
+            circ,
+            batch_size=2,
+            fault_mode="SELECTOR",
+            backend=be,
+            fault_realizations={0: 1},
+            record_unleaked_to_leaked=True,
+        )
+        assert sim.num_qubits_in_new_circuit() == 2
+        u2l = sim.run()
+        assert u2l is not None and len(u2l) == 2 and all(len(a) == 0 for a in u2l)
+        tab_t, exp_t = sim.get_qfe_expansion(0, trace_selectors=True)
+        tab_f, exp_f = sim.get_qfe_expansion(0, trace_selectors=False)
+        assert tab_t.num_qubits == 2 and exp_t.n_qubits == 2
+        assert tab_f.num_qubits == 3 and exp_f.n_qubits == 3
+        assert len(sim.get_state_expansions(trace_selectors=False)) == 2
+        psi_t = sim.get_statevector(0, trace_selectors=True)
+        psi_f = sim.get_statevector(0, trace_selectors=False)
+        assert psi_t.shape == (4,) and psi_f.shape == (8,)
+        assert abs(np.linalg.norm(psi_f) - 1.0) < 1e-12
+        np.testing.assert_allclose(psi_f[:4], np.zeros(4), atol=1e-12)
+        assert abs(abs(np.vdot(psi_t, psi_f[4:])) - 1.0) < 1e-12
+
+    sn = MagicsideSimulator(stim.Circuit("H 0\nM 0"), batch_size=1, fault_realizations={"measurements": {0: 1}})
+    sn.run()
+    psi_u = sn.get_statevector(0, normalize=False)
+    psi_n = sn.get_statevector(0, normalize=True)
+    assert abs(float(np.vdot(psi_u, psi_u).real) - 0.5) < 1e-12
+    assert abs(float(np.vdot(psi_n, psi_n).real) - 1.0) < 1e-12
+
+    big_sel = stim.Circuit("H 0 25\nI[CLIFFORD_FAULT: (0.2, Z)] 0\nI[CLIFFORD_FAULT: (0.2, Z)] 1")
+    sim_cap = MagicsideSimulator(big_sel, batch_size=1, fault_mode="SELECTOR")
+    sim_cap.run()
+    with pytest.raises(ValueError):
+        sim_cap.get_statevector(0, trace_selectors=False)
+
+
+def test_fault_channels_beyond_circuit_qubits_and_heralded_invert_ignored() -> None:
+    ch = CliffordFaultChannel(step_index=0, branches=(FaultBranch(prob=1.0, gate_name="X", targets=(2,)),))
+    for base, want_nq in ((stim.Circuit(), 0), (stim.Circuit("I 0"), 1)):
+        for fm in ("DIRECT", "SELECTOR"):
+            for be in ("STREAM", "QUERY"):
+                sim = MagicsideSimulator(base, batch_size=1, fault_mode=fm, backend=be, fault_channels=[ch])
+                assert sim.num_qubits == want_nq
+                sim.run()
+                psi = sim.get_statevector(0)
+                assert psi.shape == (8,) and abs(abs(psi[4]) - 1.0) < 1e-12
+
+    hc = stim.Circuit(
+        "HERALDED_ERASE(0.0) 0 !1\n"
+        "HERALDED_ERASE(1.0) 2 !3\n"
+        "HERALDED_PAULI_CHANNEL_1(0, 0, 0, 0) 0 !1\n"
+        "HERALDED_PAULI_CHANNEL_1(0.25, 0.25, 0.25, 0.25) 2 !3\n"
+        "DETECTOR rec[-8]\nDETECTOR rec[-7]\nDETECTOR rec[-6]\nDETECTOR rec[-5]\n"
+        "DETECTOR rec[-4]\nDETECTOR rec[-3]\nDETECTOR rec[-2]\nDETECTOR rec[-1]"
+    )
+    stim_recs = hc.compile_sampler(seed=1).sample(shots=8)
+    stim_dets = hc.compile_m2d_converter().convert(measurements=stim_recs, separate_observables=False)
+    for kw in (
+        {"fault_mode": "DIRECT", "backend": "STREAM"},
+        {"fault_mode": "SELECTOR", "backend": "STREAM"},
+        {"fault_mode": "DIRECT", "backend": "QUERY"},
+        {"fault_mode": "SELECTOR", "backend": "QUERY"},
+        {"sync_tableside_rng": True},
+        {"op_handler": LeakageUint8Magic(), "sync_tableside_rng": False},
+        {"op_handler": LeakageUint8Magic(), "sync_tableside_rng": True},
+    ):
+        sh = MagicsideSimulator(hc, batch_size=8, seed=19, **kw)  # type: ignore[arg-type]
+        sh.run()
+        np.testing.assert_array_equal(sh.get_final_measurement_records(), stim_recs)
+        np.testing.assert_array_equal(sh.get_detector_flips(), stim_dets)
+
+    sh_i = MagicsideSimulator(hc, batch_size=8, seed=19)
+    for op in hc:
+        sh_i.interactive_do(op)
+    sh_i.finish_interactive_run()
+    np.testing.assert_array_equal(sh_i.get_final_measurement_records(), stim_recs)
+    np.testing.assert_array_equal(sh_i.get_detector_flips(), stim_dets)
+
+
+def test_partial_realizations_custom_slot_ids_empty_circuit_and_max_components() -> None:
+    cp = stim.Circuit("I[CLIFFORD_FAULT: (0.9, X)] 0\nI[CLIFFORD_FAULT: (0.5, X)] 1\nX_ERROR(0.9) 2\nX_ERROR(0.5) 3\nM 0 1 2 3")
+    for kw_p in (
+        {"fault_mode": "DIRECT", "backend": "STREAM", "fault_realizations": {"faults": {0: 0}, "paulis": {0: 0}}},
+        {"fault_mode": "SELECTOR", "backend": "STREAM", "fault_realizations": {"faults": {0: 0}, "paulis": {0: 0}}},
+        {"op_handler": LeakageUint8Magic(), "fault_realizations": {0: 0}},
+    ):
+        sp = MagicsideSimulator(cp, batch_size=128, seed=31, **kw_p)  # type: ignore[arg-type]
+        sp.run()
+        rp = sp.get_final_measurement_records()
+        assert not np.any(rp[:, 0]) and 0.25 < float(np.mean(rp[:, 1])) < 0.75
+        if "op_handler" not in kw_p:
+            assert not np.any(rp[:, 2]) and 0.25 < float(np.mean(rp[:, 3])) < 0.75
+
+    chs = [
+        CliffordFaultChannel(step_index=0, branches=(FaultBranch(1.0, "X", (0,)),), slot_id=10),
+        CliffordFaultChannel(step_index=0, branches=(FaultBranch(1.0, "X", (1,)),), slot_id=20),
+    ]
+    cs = stim.Circuit("M 0 1")
+    for kw_s in ({"backend": "STREAM"}, {"backend": "QUERY"}, {"op_handler": LeakageUint8Magic()}):
+        ss = MagicsideSimulator(
+            cs, batch_size=2, fault_channels=chs, fault_realizations=[None, {10: 0, 20: 1}], **kw_s  # type: ignore[arg-type]
+        )
+        ss.run()
+        np.testing.assert_array_equal(ss.get_final_measurement_records(), np.array([[True, True], [False, True]]))
+        with pytest.raises(ValueError):
+            MagicsideSimulator(cs, batch_size=1, fault_channels=chs, fault_realizations={999: 1}, **kw_s)  # type: ignore[arg-type]
+
+    fc0 = [CliffordFaultChannel(step_index=0, branches=(FaultBranch(1.0, "X", (0,)),))]
+    se = MagicsideSimulator(stim.Circuit(), batch_size=1, op_handler=LeakageUint8Magic(), fault_channels=fc0)
+    se.run()
+    assert abs(abs(se.get_statevector(0)[1]) - 1.0) < 1e-12
+    se_i = MagicsideSimulator(stim.Circuit(), batch_size=1, fault_channels=fc0)
+    se_i.finish_interactive_run()
+    assert abs(abs(se_i.get_statevector(0)[1]) - 1.0) < 1e-12
+
+    hard = stim.Circuit("H 0 1 2\nI[CCZ] 0 1 2\nH 0 1 2\nM 0")
+    for kw_m in (
+        {"fault_mode": "DIRECT", "backend": "STREAM"},
+        {"fault_mode": "SELECTOR", "backend": "STREAM"},
+        {"fault_mode": "DIRECT", "backend": "QUERY"},
+        {"op_handler": LeakageUint8Magic()},
+    ):
+        with pytest.raises(QueryBudgetExceededError):
+            MagicsideSimulator(hard, batch_size=2, max_components=1, on_budget_exceeded="error", **kw_m).run()  # type: ignore[arg-type]
+    sf = MagicsideSimulator(hard, batch_size=2, backend="QUERY", max_components=1, on_budget_exceeded="fallback_stream")
+    sf.run()
+    assert sf.get_final_measurement_records().shape == (2, 1)
+
+
+def test_zero_born_reset_and_quantum_measurement_stream_parity() -> None:
+    c_det = stim.Circuit("I[CLIFFORD_FAULT: (0.2, Z)] 0\nX_ERROR(0.2) 0\nR 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    c_mr, c_qm = stim.Circuit("H 0\nM(0.15) 0\nR 0\nM 0"), stim.Circuit("M(0.25) 0\nDETECTOR rec[-1]")
+    for fm in ("DIRECT", "SELECTOR"):
+        for be in ("STREAM", "QUERY"):
+            sd = MagicsideSimulator(c_det, batch_size=2, fault_mode=fm, backend=be, fault_realizations=[{"faults": {0: 0}, "paulis": {0: 0}, "resets": {0: 1}}, {"faults": {0: 0}, "paulis": {0: 0}, "resets": {0: 0}}], seed=0)
+            sd.run()
+            assert [sd.get_branch_mass(0), sd.get_branch_mass(1)] == [0.0, 1.0] and sd.state_vector(0).shape == (2,) and not np.any(sd.state_vector(0))
+            assert np.allclose(sd.peek_pauli_born_batch([0], "X"), [0.0, 0.5]) and not np.any(sd.get_detector_flips(append_observables=True))
+        for seed, exp_m in ((0, 0.0), (12, 0.5)):
+            runs = [MagicsideSimulator(c_mr, fault_mode=fm, backend=be, seed=seed, fault_realizations=[{"measurements": {0: 0}, "resets": {0: 1}}]) for be in ("STREAM", "QUERY")]
+            for s_run in runs:
+                s_run.run()
+            assert all(abs(s_run.get_branch_mass(0) - exp_m) < 1e-12 for s_run in runs)
+            np.testing.assert_array_equal(runs[0].get_final_measurement_records(), runs[1].get_final_measurement_records())
+        sqm = MagicsideSimulator(c_qm, fault_mode=fm, backend="STREAM", fault_realizations=[{"quantum_measurements": {0: 1}}])
+        sqm.run()
+        assert sqm.get_branch_mass(0) == 0.0 and not np.any(sqm.state_vector(0))
+
+
+def test_m2d_per_shot_fault_realization_sweep_bits_and_override() -> None:
+    c_sw = stim.Circuit("CX sweep[0] 0\nCX sweep[1] 1\nM 0 1\nDETECTOR rec[-2]\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-2]")
+    cases = ((None, [{"sweep_bits": [1]}, {"sweep_bits": [0]}], [[True, False], [False, False]]), ([0, 1], [{"sweep_bits": [1]}, {}, {"sweep_bits": {1: 0, 3: 1}}], [[True, False], [False, True], [False, False]]))
+    for ctor_sw, reals, exp_r in cases:
+        for mode in ("auto", "stim", "magicside"):
+            for be in ("STREAM", "QUERY"):
+                sm = MagicsideSimulator(c_sw, batch_size=len(reals), backend=be, m2d_reference_mode=mode, sweep_bits=ctor_sw, fault_realizations=reals)
+                sm.run()
+                np.testing.assert_array_equal(sm.get_final_measurement_records(), exp_r)
+                assert not np.any(sm.get_detector_flips()) and not np.any(sm.get_observable_flips())
+    c_magic_sw = stim.Circuit("CX sweep[0] 0\nH 0\nI[T] 0\nI[T] 0\nS_DAG 0\nH 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    for fm in ("DIRECT", "SELECTOR"):
+        for be in ("STREAM", "QUERY"):
+            sm_m = MagicsideSimulator(c_magic_sw, batch_size=2, fault_mode=fm, backend=be, fault_realizations=[{"sweep_bits": [0]}, {"sweep_bits": [1]}], seed=1)
+            sm_m.run()
+            np.testing.assert_array_equal(sm_m.get_final_measurement_records(), [[False], [True]])
+            assert not np.any(sm_m.get_detector_flips()) and not np.any(sm_m.get_observable_flips())

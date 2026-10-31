@@ -14,6 +14,10 @@ The leakage tags follow the general form:
 
 Each argument contains comma separated fields depending on the leakage tag.
 
+Leakage states are integers: `0` and `1` are the computational states of an unleaked qubit and
+`2` to `9` are the leaked states (`U` is any unleaked state). A tag with a state above `9` raises
+`ValueError` when it is parsed.
+
 The leakage tags are as follows:
 
 #### LEAKAGE_CONTROLLED_ERROR - if first qubit is leaked, apply an error to second qubit
@@ -22,7 +26,7 @@ Arguments look like:
 
     (p, 2-->X) = if first qubit is in 2, do X_ERROR(p) to the second qubit
 
-The controlling leakage state must be an integer greater than 2.
+The controlling leakage state must be a leaked state, an integer from 2 to 9.
 
 #### LEAKAGE_TRANSITION_1
 Apply transitions from single qubit leakage states to other single qubit leakage states
@@ -33,15 +37,16 @@ Arguments look like:
 
 There is a quick syntactic sugar for symmetric processes:
 
-    (p, 2<->3) = (p:2-->3) (p:3-->2)
+    (p, 2<->3) = (p, 2-->3) (p, 3-->2)
 
 You can specify an unleaked state using `U`
 
     (p, U-->2) (p, 2-->U)
 
-An unleaked qubit, regardless of computational state, will undergo the transition with probability `p`.
-As such, you may need to re-express more specific processes.
-For instance, you can include `(p, U-->2)` where `p` is the average of the probability for the more
+With a `U` input, an unleaked qubit, regardless of computational state, will undergo the transition with probability `p`.
+`0` and `1` are also accepted as inputs (the transition only fires in that Z state, collapsing superpositions)
+and as outputs (resetting the qubit into that Z state without depolarizing it); see the notes at the end.
+If you don't want the collapse, you can include `(p, U-->2)` where `p` is the average of the probability for the more
 specific matching processes `(p0, 0-->2)` and `(p1, 1-->2)`.
 
 #### LEAKAGE_TRANSITION_Z
@@ -79,7 +84,9 @@ Computational states are handled similarly to `LEAKAGE_TRANSITION_1`
     (p, U_2-->3_U) =    if the first qubit is unleaked and the second qubit is in 2,
                         with probability p, leak the first qubit to 3 and unleak the second qubit.
 
-A qubit that transitions from a leaked to an unleaked state is always fully depolarized.
+A qubit that transitions from a leaked state to `U` (or `V`) is always fully depolarized.
+A `0` or `1` output instead resets the qubit into that Z state without depolarizing it (whatever its input),
+and a leaked qubit transitioning to `X`, `Y` or `Z` is reset to `0` before that Pauli is applied.
 
 On the output side, you can also use `V` to indicate an unleaked state that is not the same
 the input unleaked state. A qubit that selects to transition `U --> U` is left alone, but one
@@ -88,23 +95,30 @@ that transitions `U --> V` is fully depolarized.
     (p, U_2-->V_3) =    if the first qubit is unleaked and the second qubit is in 2,
                         with probability p, depolarize the first qubit and transition the second qubit to 3.
 
-Any unleaked input state matches to `U`, so you should re-express more specific processes.
-For instance, you can include `(p, U_2 --> 2_2)` where `p` is the average of the probability for the more
-specific matching processes `(p0, 0_2 --> 2_2)` and `(p1, 1_2 --> 2_2)`.
+`D` is another unleaked output: the qubit is fully depolarized without being reset (from a leaked
+input, `D` acts like `U`).
+
+    (p, 2_U-->2_D) =    if the first qubit is in 2 and the second qubit is unleaked,
+                        with probability p, depolarize the second qubit.
+
+Any unleaked input state matches to `U`. As with `LEAKAGE_TRANSITION_1`, each leg also accepts `0`/`1`
+(e.g. `(p0, 0_2-->2_2)`), which collapses that qubit's superpositions. To avoid the collapse,
+you can include `(p, U_2-->2_2)` where `p` is the average of the probability for the more
+specific matching processes `(p0, 0_2-->2_2)` and `(p1, 1_2-->2_2)`.
 
 If you have a strong desire for new instructions supporting known or partially known pair states,
 like `LEAKAGE_TRANSITIONS_UZ` or `LEAKAGE_TRANSITIONS_ZZ`, reach out.
 
 #### LEAKAGE_PROJECTION_Z
 
-This tag can only be applied to `MZ` gates, and determines the classical outcome of the measurement.
+This tag can be applied to `M`/`MZ`, `MR`/`MRZ`, `MX`, `MY`, `MRX` and `MRY` gates, and determines the classical outcome of the measurement.
 In particular, it does not change the leakage state of involved qubits.
 
 Arguments look like:
 
     (p, 2) = if the qubit is in 2,  the measurement is set to 1 with probability p, else set to 0
 
-Similar to `LEAKAGE_TRANSISION_Z`, we accept argument that depend on the known Z state as well:
+Similar to `LEAKAGE_TRANSITION_Z`, we accept argument that depend on the known Z state as well:
 
     (p, 1) = if the qubit is in 1,  the measurement is set to 1 with probability p, else set to 0
     (p, 0) = if the qubit is in 0,  the measurement is set to 1 with probability p, else set to 0
@@ -112,27 +126,43 @@ Similar to `LEAKAGE_TRANSISION_Z`, we accept argument that depend on the known Z
 Notice that the `p` in `(p, 1)` is the probability that a qubit in 1 is read out correctly,
 and the `p` in `(p, 0)` is the probability that a qubit in 0 is readout incorrectly.
 
-Included probabilities must be disjoint (i.e. sum to less than or equal to 1).
-If they sum to less than 1, the remaining probability leaves the qubit state alone.
-If the qubit is leaked, it will ahve been depolarized and this likely means it will return a random measurement value.
+Each `(p, s)` is the probability that a target in state `s` reads `1` (for `MX`, `MY`, `MRX` and `MRY`, `0` and `1`
+are the outcomes in that basis), so the probabilities need not sum to 1, e.g. `(0.0, 0) (1.0, 1) (0.8, 2)`.
+An unleaked target whose state isn't listed is read correctly, and a readout error changes only the recorded bit, not the qubit.
+A leaked qubit reports `1` with the probability listed for its state (`0` if its state isn't listed), whatever its computational state.
 
 The general unleaked state `U` is not a valid argument.
 
-This tag also implements the `LEAKAGE_DEPOLARIZE_1` behaviour on all qubits immediately after measurement.
+After the measurement, the leaked targets are fully depolarized.
+
+#### LEAKAGE_SWAP
+
+`SWAP[LEAKAGE_SWAP] 0 1` is a `SWAP` that also swaps the leakage states of each target pair, pair by pair from left
+to right. Unlike the other leakage tags it takes no arguments (`LEAKAGE_SWAP`, not `LEAKAGE_SWAP: ...`), and it is
+only allowed on `SWAP`. An untagged `SWAP` never moves leakage states.
+
+`TablesideSimulator` and `CosetsideSimulator` apply the computational `SWAP` to every pair, leaked qubits included
+(whatever `unconditional_condition_on_U` is), so a leaked qubit's frozen computational state moves with it.
+`FlipsideSimulator` swaps the Pauli frames. The qubit that receives a leak counts as an unleaked-to-leaked transition,
+so `get_unleaked_to_leaked_records()` over-counts moved leaks. `MarginalLeakageDemGenerator` does not model moved
+leakage: it and the decoders built on it raise `NotImplementedError` for circuits with this tag, except the loss oracle
+(`loss_oracle=True`), which treats it as a plain `SWAP`, with a warning. See "`SWAP[LEAKAGE_SWAP]`" in the top-level
+README.
 
 
-#### LEAKAGE_DEPOLARIZE_1
-Fully depolarizes a qubit if it is leaked.
+#### Untagged gates on leaked qubits
+`FlipsideSimulator` fully depolarizes a qubit when it leaks and again right after any `M`, `MX`, `MY`, `MR`, `MRX`,
+`MRY`, `R`, `RX` or `RY` on it (not after `MPP`, `MXX`, `MYY` or `MZZ`), and applies untagged gates to it as usual
+("scrambled, then applied"). `TablesideSimulator` and `CosetsideSimulator` freeze its computational state when it
+leaks. By default (`unconditional_condition_on_U=True`) untagged unitary gates and non-heralded noise then skip it
+("skipped"); with `unconditional_condition_on_U=False` they apply to the frozen state ("frozen, then applied").
+There is no `LEAKAGE_DEPOLARIZE_1` tag. In `TablesideSimulator` and `CosetsideSimulator`,
+`DEPOLARIZE1[CONDITIONED_ON_SELF: 2](0.75) q` fully depolarizes `q` in the shots where it is in state 2;
+`FlipsideSimulator` doesn't support `CONDITIONED_ON_SELF`.
+See "Untagged Instructions on Leaked Qubits" in the top-level README for the details.
 
-By default, the qubit state in the underlying simulator is fully depolarized when it leaks.
-However, if a qubit is leaked and goes through an M or R instruction, it is
-polarized (or un-de-polarized) and prepared into a known computational state,
-even though it should be leaked. By default, the leakage parsing adds the
-`LEAKAGE_DEPOLARIZE_1` behaviour right after M and R gates to avoid confusion.
+#### Important Behavioral Notes
 
-You are free to include this in the circuit by hand.
-If you have turned off the default scrambling behaviour, it is on you to
-insert these appropriately to ensure your simulation is valid.
-
-Arguments are empty.
-
+* **State Collapse When Conditioning on `0` or `1`**: Conditioning on computational basis states `0` or `1` (in `CONDITIONED_ON_SELF` / `CONDITIONED_ON_OTHER` / `CONDITIONED_ON_PAIR`, `LEAKAGE_TRANSITION_1`, `LEAKAGE_TRANSITION_2`, `LEAKAGE_PROJECTION_Z`, or `LEAKAGE_MEASUREMENT`) in `TablesideSimulator` and `CosetsideSimulator` projectively collapses any $Z$-basis superposition on the inspected unleaked qubit(s) into `|0>` or `|1>` before evaluating the condition or transition. Use `U` to condition on the unleaked subspace without collapsing superpositions.
+* **`0`/`1` in `LEAKAGE_TRANSITION_1`/`LEAKAGE_TRANSITION_2` on `FlipsideSimulator`**: an input `0`/`1` is matched against the noiseless reference Z value XOR the shot's X frame. A target that is superposed in the noiseless reference is collapsed to `0` there, and each shot gets a 50% Z kick (the measurement back-action). An output `0`/`1` resets the qubit (X frame set so the value is right, plus a 50% Z kick, like `R`). This needs the target's reference Z value to be definite, or collapsed by a `0`/`1` input key of the same instruction; otherwise a `ValueError` is raised.
+* **Repeated Qubit Targets**: Any instruction referencing the same qubit multiple times (such as `CX 0 1 1 0` or `I[LEAKAGE_TRANSITION_1: (p, U-->2)] 0 0`) is processed sequentially in left-to-right target order, matching Stim. Exception: in `CosetsideSimulator`, the `0`/`1` conditions of a conditioned noise channel (e.g. `X_ERROR[CONDITIONED_ON_SELF: 0](p) 0 0`) are checked once, for all targets, before the noise is applied, so a repeated qubit does not see the noise applied to its earlier copy; `TablesideSimulator` checks them target group by target group. Separate the copies with `TICK` (stim fuses identical consecutive instructions) to get sequential semantics in both.

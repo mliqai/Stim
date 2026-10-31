@@ -5,6 +5,7 @@ import stimside.op_handlers.leakage_handlers.leakage_tag_parsing_unified as ltp
 
 from stimside.op_handlers.leakage_handlers.common_parsing import (
     LEAKAGE_TAG_MATCH,
+    LEAKAGE_SWAP_TAG_MATCH,
     CONDITION_TAG_MATCH,
     MEASURE_TAG_MATCH,
 )
@@ -33,6 +34,18 @@ class TagDef:
             )
 
         gd = stim.gate_data(op.name)
+
+        if self.name.startswith("CONDITIONED_ON") and gd.produces_measurements:
+            raise ValueError(
+                f"Tag '{self.name}' cannot be attached to '{op.name}', which produces "
+                "measurement results: a conditioned instruction would drop its results "
+                "in the shots where its condition fails."
+            )
+        if self.name.startswith("CONDITIONED_ON") and gd.is_reset:
+            raise ValueError(
+                f"Tag '{self.name}' cannot be attached to '{op.name}', which is a reset: "
+                "conditioned resets are not supported."
+            )
         
         if self.allowed_arity == 1 and not gd.is_single_qubit_gate:
             raise ValueError(f"1Q leakage tag '{op.tag}' attached to not-1Q stim gate '{op.name}'.")
@@ -90,13 +103,19 @@ TAG_REGISTRY: dict[str, TagDef] = {
     "LEAKAGE_PROJECTION_Z": TagDef(
         name="LEAKAGE_PROJECTION_Z",
         allowed_arity=1,
-        allowed_gates=("M",),
+        allowed_gates=("M", "MZ", "MR", "MRZ", "MX", "MY", "MRX", "MRY"),
         parser_func=ltp._parse_projection_z
     ),
     "LEAKAGE_MEASUREMENT": TagDef(
         name="LEAKAGE_MEASUREMENT",
         allowed_gates=("MPAD",),
         parser_func=ltp._parse_measurement
+    ),
+    "LEAKAGE_SWAP": TagDef(
+        name="LEAKAGE_SWAP",
+        allowed_arity=2,
+        allowed_gates=("SWAP",),
+        parser_func=ltp._parse_swap
     ),
     "CONDITIONED_ON_SELF": TagDef(
         name="CONDITIONED_ON_SELF",
@@ -137,6 +156,8 @@ def parse_leakage_tag(op: stim.CircuitInstruction, simulator: Literal["flip", "t
         match = CONDITION_TAG_MATCH.fullmatch(tag)
     elif tag.startswith("LEAKAGE_MEASUREMENT"):
         match = MEASURE_TAG_MATCH.fullmatch(tag)
+    elif tag == "LEAKAGE_SWAP":
+        match = LEAKAGE_SWAP_TAG_MATCH.fullmatch(tag)
     else:
         match = LEAKAGE_TAG_MATCH.fullmatch(tag)
         
@@ -172,3 +193,16 @@ def _parse_leakage_in_circuit_recurse(
                 parsed_tags[op] = parsed
 
     return parsed_tags
+
+
+def check_tag_qubits(
+    ops_to_params: dict[stim.CircuitInstruction, LeakageParams], num_qubits: int
+) -> None:
+    """Raise ValueError if a tag lists a qubit index >= the circuit's ``num_qubits``."""
+    for op, params in ops_to_params.items():
+        qubits = getattr(params, "targets", None) or ()
+        if any(q >= num_qubits for q in qubits):
+            raise ValueError(
+                f"{op} lists qubit {max(qubits)} in its tag, but the circuit has "
+                f"num_qubits={num_qubits}."
+            )
