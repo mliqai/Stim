@@ -947,18 +947,8 @@ class TestCompiledLeakageUint8Coset:
         assert res_anticomm == [0]
 
     @pytest.mark.parametrize("batch_size", [1, 64])
-    def test_cpp_vs_python_bit_for_bit_equivalence(self, batch_size: int) -> None:
-        """Verify use_cpp_kernels=True and use_cpp_kernels=False are bit-for-bit identical."""
-        raw = stim.Circuit.generated(
-            "surface_code:rotated_memory_z",
-            distance=5,
-            rounds=4,
-            after_clifford_depolarization=0.002,
-            before_round_data_depolarization=0.002,
-            before_measure_flip_probability=0.002,
-            after_reset_flip_probability=0.002,
-        )
-
+    def test_cpp_engine_determinism_and_sync_equivalence(self, batch_size: int) -> None:
+        """Verify C++ engine determinism on d=5 surface code and bit-exact sync lockstep on d=3."""
         def _build_leakage_circuit(circ: stim.Circuit) -> stim.Circuit:
             out = stim.Circuit()
             p = 0.015
@@ -1001,47 +991,110 @@ class TestCompiledLeakageUint8Coset:
                         out += body
             return out
 
+        raw = stim.Circuit.generated(
+            "surface_code:rotated_memory_z",
+            distance=5,
+            rounds=4,
+            after_clifford_depolarization=0.002,
+            before_round_data_depolarization=0.002,
+            before_measure_flip_probability=0.002,
+            after_reset_flip_probability=0.002,
+        )
         mod_circ = _build_leakage_circuit(raw)
-        for seed in (42, 314159):
-            op_cpp = LeakageUint8Coset(
-                unconditional_condition_on_U=True
-            ).compile_op_handler(circuit=mod_circ, batch_size=batch_size)
-            sim_cpp = CosetsideSimulator(
+        with pytest.raises(TypeError):
+            CosetsideSimulator(  # type: ignore[call-arg]
                 circuit=mod_circ,
-                compiled_op_handler=op_cpp,
+                compiled_op_handler=LeakageUint8Coset().compile_op_handler(
+                    circuit=mod_circ, batch_size=batch_size
+                ),
                 batch_size=batch_size,
-                seed=seed,
-                use_cpp_kernels=True,
-            )
-            sim_cpp.run()
-
-            op_py = LeakageUint8Coset(
-                unconditional_condition_on_U=True
-            ).compile_op_handler(circuit=mod_circ, batch_size=batch_size)
-            sim_py = CosetsideSimulator(
-                circuit=mod_circ,
-                compiled_op_handler=op_py,
-                batch_size=batch_size,
-                seed=seed,
                 use_cpp_kernels=False,
             )
-            sim_py.run()
 
-            np.testing.assert_array_equal(
-                sim_cpp.get_final_measurement_records(),
-                sim_py.get_final_measurement_records(),
-            )
-            np.testing.assert_array_equal(
-                sim_cpp.get_detector_flips(),
-                sim_py.get_detector_flips(),
-            )
-            np.testing.assert_array_equal(
-                sim_cpp.get_observable_flips(),
-                sim_py.get_observable_flips(),
-            )
-            np.testing.assert_array_equal(op_cpp.state, op_py.state)
+        op_a = LeakageUint8Coset(
+            unconditional_condition_on_U=True
+        ).compile_op_handler(circuit=mod_circ, batch_size=batch_size)
+        sim_a = CosetsideSimulator(
+            circuit=mod_circ,
+            compiled_op_handler=op_a,
+            batch_size=batch_size,
+            seed=42,
+        )
+        assert sim_a._cpp_lib is not None and sim_a._cpp_eng is not None
+        sim_a.run()
 
-    def test_cpp_vs_python_multiword_over_512_qubits_and_active_shots_sync(
+        op_b = LeakageUint8Coset(
+            unconditional_condition_on_U=True
+        ).compile_op_handler(circuit=mod_circ, batch_size=batch_size)
+        sim_b = CosetsideSimulator(
+            circuit=mod_circ,
+            compiled_op_handler=op_b,
+            batch_size=batch_size,
+            seed=42,
+        )
+        sim_b.run()
+
+        np.testing.assert_array_equal(
+            sim_a.get_final_measurement_records(),
+            sim_b.get_final_measurement_records(),
+        )
+        np.testing.assert_array_equal(
+            sim_a.get_detector_flips(),
+            sim_b.get_detector_flips(),
+        )
+        np.testing.assert_array_equal(
+            sim_a.get_observable_flips(),
+            sim_b.get_observable_flips(),
+        )
+        np.testing.assert_array_equal(op_a.state, op_b.state)
+
+        if batch_size == 1:
+            small_circ = _build_leakage_circuit(
+                stim.Circuit.generated(
+                    "surface_code:rotated_memory_z",
+                    distance=3,
+                    rounds=2,
+                    after_clifford_depolarization=0.002,
+                    before_round_data_depolarization=0.002,
+                )
+            )
+            op_cos = LeakageUint8Coset(
+                unconditional_condition_on_U=True
+            ).compile_op_handler(circuit=small_circ, batch_size=8)
+            sim_cos = CosetsideSimulator(
+                circuit=small_circ,
+                compiled_op_handler=op_cos,
+                batch_size=8,
+                seed=314159,
+                sync_tableside_rng=True,
+            )
+            sim_cos.run()
+            op_tab = LeakageUint8Tableau(
+                unconditional_condition_on_U=True
+            ).compile_op_handler(circuit=small_circ, batch_size=8)
+            sim_tab = TablesideSimulator(
+                circuit=small_circ,
+                compiled_op_handler=op_tab,
+                batch_size=8,
+                seed=314159,
+                sync_tableside_rng=True,
+            )
+            sim_tab.run()
+            np.testing.assert_array_equal(
+                sim_cos.get_final_measurement_records(),
+                sim_tab.get_final_measurement_records(),
+            )
+            np.testing.assert_array_equal(
+                sim_cos.get_detector_flips(),
+                sim_tab.get_detector_flips(),
+            )
+            np.testing.assert_array_equal(
+                sim_cos.get_observable_flips(),
+                sim_tab.get_observable_flips(),
+            )
+            np.testing.assert_array_equal(op_cos.state[:, -1], op_tab.state)
+
+    def test_cpp_multiword_over_512_qubits_and_active_shots_sync(
         self,
     ) -> None:
         """Verify >512 qubits (W=9 words) and bidirectional active_shots synchronization."""
@@ -1063,73 +1116,86 @@ class TestCompiledLeakageUint8Coset:
         batch_size = 48
         seed = 20260920
 
-        op_cpp = LeakageUint8Coset(
+        op_ref = LeakageUint8Coset(
             unconditional_condition_on_U=True
         ).compile_op_handler(circuit=circuit, batch_size=batch_size)
-        sim_cpp = CosetsideSimulator(
+        sim_ref = CosetsideSimulator(
             circuit=circuit,
-            compiled_op_handler=op_cpp,
+            compiled_op_handler=op_ref,
             batch_size=batch_size,
             seed=seed,
-            use_cpp_kernels=True,
         )
+        sim_ref.run()
 
-        op_py = LeakageUint8Coset(
+        op_rt = LeakageUint8Coset(
             unconditional_condition_on_U=True
         ).compile_op_handler(circuit=circuit, batch_size=batch_size)
-        sim_py = CosetsideSimulator(
+        sim_rt = CosetsideSimulator(
             circuit=circuit,
-            compiled_op_handler=op_py,
+            compiled_op_handler=op_rt,
             batch_size=batch_size,
             seed=seed,
-            use_cpp_kernels=False,
         )
 
+        op_mut = LeakageUint8Coset(
+            unconditional_condition_on_U=True
+        ).compile_op_handler(circuit=circuit, batch_size=batch_size)
+        sim_mut = CosetsideSimulator(
+            circuit=circuit,
+            compiled_op_handler=op_mut,
+            batch_size=batch_size,
+            seed=seed,
+        )
+
+        b0 = -1
         for idx, inst in enumerate(circuit):
-            sim_cpp.interactive_do(inst)
-            sim_py.interactive_do(inst)
+            sim_rt.interactive_do(inst)
+            sim_mut.interactive_do(inst)
             if idx == 4:
                 # Inspect active_shots mid-circuit to trigger _sync_cpp_to_py and _sync_py_to_cpp
-                assert set(sim_cpp.active_shots.keys()) == set(
-                    sim_py.active_shots.keys()
+                assert len(sim_rt.active_shots) > 0
+                assert set(sim_rt.active_shots.keys()) == set(
+                    sim_mut.active_shots.keys()
                 )
-                for b_idx in sim_py.active_shots:
-                    assert (
-                        sim_cpp.active_shots[b_idx].d
-                        == sim_py.active_shots[b_idx].d
-                    )
-                    np.testing.assert_array_equal(
-                        sim_cpp.active_shots[b_idx].h_words,
-                        sim_py.active_shots[b_idx].h_words,
-                    )
-                if sim_py.active_shots:
-                    b0 = sorted(sim_py.active_shots.keys())[0]
-                    st_cpp = sim_cpp.active_shots[b0]
-                    st_py = sim_py.active_shots[b0]
-                    # Trigger a read-only peek_z and then mutate the held MRQFState in-place
-                    _ = sim_cpp.peek_z(0)
-                    _ = sim_py.peek_z(0)
-                    st_cpp.h_words[0] ^= np.uint64(1)
-                    st_py.h_words[0] ^= np.uint64(1)
-                    st_cpp.A_words[0, 0] ^= np.uint64(1)
-                    st_py.A_words[0, 0] ^= np.uint64(1)
+                for b_idx, st_rt in sim_rt.active_shots.items():
+                    assert st_rt.h_words.shape == (9,)
+                    st_mut = sim_mut.active_shots[b_idx]
+                    assert st_rt.d == st_mut.d
+                    np.testing.assert_array_equal(st_rt.h_words, st_mut.h_words)
+                b0 = sorted(sim_rt.active_shots.keys())[0]
+                _ = sim_rt.peek_z(0)
+                _ = sim_mut.peek_z(0)
+                st_rt0 = sim_rt.active_shots[b0]
+                st_rt0.h_words[0] ^= np.uint64(0)  # touch while leaving unchanged
+                st_mut0 = sim_mut.active_shots[b0]
+                st_mut0.h_words[0] ^= np.uint64(1)
+                st_mut0.A_words[0, 0] ^= np.uint64(1)
 
-        sim_cpp.finish_interactive_run()
-        sim_py.finish_interactive_run()
+        sim_rt.finish_interactive_run()
+        sim_mut.finish_interactive_run()
 
+        # Round-trip without mutation matches direct C++ run bit-for-bit across all 48 shots.
         np.testing.assert_array_equal(
-            sim_cpp.get_final_measurement_records(),
-            sim_py.get_final_measurement_records(),
+            sim_rt.get_final_measurement_records(),
+            sim_ref.get_final_measurement_records(),
         )
         np.testing.assert_array_equal(
-            sim_cpp.get_detector_flips(),
-            sim_py.get_detector_flips(),
+            sim_rt.get_detector_flips(),
+            sim_ref.get_detector_flips(),
         )
         np.testing.assert_array_equal(
-            sim_cpp.get_observable_flips(),
-            sim_py.get_observable_flips(),
+            sim_rt.get_observable_flips(),
+            sim_ref.get_observable_flips(),
         )
-        np.testing.assert_array_equal(op_cpp.state, op_py.state)
+        np.testing.assert_array_equal(op_rt.state, op_ref.state)
+
+        # In-place mutation on shot b0 leaves every untouched shot untouched.
+        assert b0 >= 0
+        other = np.arange(batch_size) != b0
+        np.testing.assert_array_equal(
+            sim_mut.get_final_measurement_records()[other],
+            sim_ref.get_final_measurement_records()[other],
+        )
 
     def test_exotic_multilevel_transitions_and_v_d_xyz_tokens_cross_validation(
         self,
@@ -1152,29 +1218,27 @@ class TestCompiledLeakageUint8Coset:
             """
         )
         batch_size = 256
-        for use_cpp in (True, False):
-            coh = LeakageUint8Coset(
-                unconditional_condition_on_U=True
-            ).compile_op_handler(circuit=circuit, batch_size=batch_size)
-            sim = CosetsideSimulator(
-                circuit=circuit,
-                compiled_op_handler=coh,
-                batch_size=batch_size,
-                seed=2026,
-                use_cpp_kernels=use_cpp,
-            )
-            sim.run()
-            recs = sim.get_final_measurement_records()
-            assert np.all(coh.state == 0)
-            # q0 (from U->V), q4 (from U->D), q6 (from 2->U), q7 (from U->V) must be 50/50 randomized, NOT deterministic 1!
-            for q_rand in (0, 4, 6, 7):
-                assert 0.35 < np.mean(recs[:, q_rand]) < 0.65
-            # q1 (from 3->Y) -> |1>
-            assert np.all(recs[:, 1] == 1)
-            # q2 (from 1->X) -> |0>, q3 (from 2->Z) -> |0>, q5 (from 2->0) -> |0>
-            assert np.all(recs[:, 2] == 0)
-            assert np.all(recs[:, 3] == 0)
-            assert np.all(recs[:, 5] == 0)
+        coh = LeakageUint8Coset(
+            unconditional_condition_on_U=True
+        ).compile_op_handler(circuit=circuit, batch_size=batch_size)
+        sim = CosetsideSimulator(
+            circuit=circuit,
+            compiled_op_handler=coh,
+            batch_size=batch_size,
+            seed=2026,
+        )
+        sim.run()
+        recs = sim.get_final_measurement_records()
+        assert np.all(coh.state == 0)
+        # q0 (from U->V), q4 (from U->D), q6 (from 2->U), q7 (from U->V) must be 50/50 randomized, NOT deterministic 1!
+        for q_rand in (0, 4, 6, 7):
+            assert 0.35 < np.mean(recs[:, q_rand]) < 0.65
+        # q1 (from 3->Y) -> |1>
+        assert np.all(recs[:, 1] == 1)
+        # q2 (from 1->X) -> |0>, q3 (from 2->Z) -> |0>, q5 (from 2->0) -> |0>
+        assert np.all(recs[:, 2] == 0)
+        assert np.all(recs[:, 3] == 0)
+        assert np.all(recs[:, 5] == 0)
 
         # Shot-for-shot equivalence with TablesideSimulator when sync_tableside_rng=True
         for seed in (11, 22, 33):
@@ -1257,32 +1321,10 @@ class TestCompiledLeakageUint8Coset:
             compiled_op_handler=op_cpp,
             batch_size=batch_size,
             seed=555,
-            use_cpp_kernels=True,
         )
         sim_cpp.run()
 
-        op_py = LeakageUint8Coset(
-            unconditional_condition_on_U=True
-        ).compile_op_handler(circuit=circuit, batch_size=batch_size)
-        sim_py = CosetsideSimulator(
-            circuit=circuit,
-            compiled_op_handler=op_py,
-            batch_size=batch_size,
-            seed=555,
-            use_cpp_kernels=False,
-        )
-        sim_py.run()
-
         recs = sim_cpp.get_final_measurement_records()
-        np.testing.assert_array_equal(
-            recs, sim_py.get_final_measurement_records()
-        )
-        np.testing.assert_array_equal(
-            sim_cpp.get_detector_flips(), sim_py.get_detector_flips()
-        )
-        np.testing.assert_array_equal(
-            sim_cpp.get_observable_flips(), sim_py.get_observable_flips()
-        )
         # Verify MX 0 == 0, MY 1 == 0
         assert np.all(recs[:, 0] == 0)
         assert np.all(recs[:, 1] == 0)
@@ -1302,9 +1344,8 @@ class TestCompiledLeakageUint8Coset:
         assert np.all(recs[:, 10] == 1)
         assert np.all(recs[:, 11] == 1)
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
     def test_bell_state_peek_z_projection_and_readout_noise_shot_for_shot_lockstep(
-        self, use_cpp: bool
+        self,
     ) -> None:
         """Verify Bell-pair collapse under mid-circuit 1-->2 transitions, classical readout noise non-backaction, and shot-for-shot lockstep."""
         # 1. Mid-circuit 1-->2 transition on an entangled Bell pair must collapse Z0=Z1 coherently
@@ -1327,7 +1368,6 @@ class TestCompiledLeakageUint8Coset:
             compiled_op_handler=op_cos,
             batch_size=batch_size,
             seed=777,
-            use_cpp_kernels=use_cpp,
             sync_tableside_rng=True,
         )
         sim_cos.run()
@@ -1366,7 +1406,6 @@ class TestCompiledLeakageUint8Coset:
                 compiled_op_handler=op_nb,
                 batch_size=16,
                 seed=42,
-                use_cpp_kernels=use_cpp,
                 sync_tableside_rng=sync_mode,
             )
             sim_nb.run()
@@ -1397,7 +1436,6 @@ class TestCompiledLeakageUint8Coset:
             compiled_op_handler=op_ls_cos,
             batch_size=n_shots,
             seed=900,
-            use_cpp_kernels=use_cpp,
             sync_tableside_rng=True,
         )
         sim_ls_cos.run()
@@ -1416,8 +1454,7 @@ class TestCompiledLeakageUint8Coset:
         sim_ls_tab.run()
         np.testing.assert_array_equal(ls_cos_recs, sim_ls_tab.get_final_measurement_records())
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
-    def test_sync_tableside_rng_mpad_equal_01_readout_lockstep(self, use_cpp: bool):
+    def test_sync_tableside_rng_mpad_equal_01_readout_lockstep(self) -> None:
         """MPAD[LEAKAGE_MEASUREMENT] with explicit equal (p, 0), (p, 1) must match Tableside shot-for-shot."""
         circuit = stim.Circuit(
             """
@@ -1437,7 +1474,6 @@ class TestCompiledLeakageUint8Coset:
             compiled_op_handler=op_cos,
             batch_size=n_shots,
             seed=900,
-            use_cpp_kernels=use_cpp,
             sync_tableside_rng=True,
         )
         sim_cos.run()
@@ -1456,8 +1492,7 @@ class TestCompiledLeakageUint8Coset:
             sim_cos.get_final_measurement_records(), sim_tab.get_final_measurement_records()
         )
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
-    def test_mpad_01_readout_collapses_superposition_like_tableside(self, use_cpp: bool):
+    def test_mpad_01_readout_collapses_superposition_like_tableside(self) -> None:
         """Non-sync Coset: MPAD[LEAKAGE_MEASUREMENT] with 0/1 keys Z-collapses a superposed qubit, as Tableside bs=1 does."""
         p0, p1 = 0.1, 0.7
         tag = "(0.1, 0), (0.7, 1), (0.9, 2) : 0"
@@ -1468,7 +1503,7 @@ class TestCompiledLeakageUint8Coset:
         def cos_records(circuit: stim.Circuit, n: int) -> np.ndarray:
             op = LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=n)
             sim = CosetsideSimulator(
-                circuit=circuit, compiled_op_handler=op, batch_size=n, seed=11, use_cpp_kernels=use_cpp
+                circuit=circuit, compiled_op_handler=op, batch_size=n, seed=11
             )
             sim.run()
             return np.asarray(sim.get_final_measurement_records(), dtype=bool)
@@ -1641,8 +1676,7 @@ class TestCompiledLeakageUint8Coset:
         with pytest.raises(NotImplementedError, match=f"does not support {gate} "):
             tss.interactive_do(stim.Circuit(f"{gate} Z0*Y1"))
 
-    @pytest.mark.parametrize("use_cpp", [True, False])
-    def test_correlated_error_on_a_leaked_qubit_is_skipped_like_pauli_channel_2(self, use_cpp: bool) -> None:
+    def test_correlated_error_on_a_leaked_qubit_is_skipped_like_pauli_channel_2(self) -> None:
         # E(1) X1 X3 is the same channel as PAULI_CHANNEL_2(XX=1) 1 3, so in the shots where q1 is leaked it must not
         # flip q3 either. A skipped E still counts as fired, so the following ELSE_CORRELATED_ERROR stays blocked.
         leak = "I[LEAKAGE_TRANSITION_1: (0.5, U-->2)] 1\nMPAD[LEAKAGE_MEASUREMENT: (1.0, 2) : 1] 0"
@@ -1657,7 +1691,7 @@ class TestCompiledLeakageUint8Coset:
             circuit = stim.Circuit(f"R 1 3 4\n{leak}\n{noise}\nM 3 4")
             op = LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=64)
             sim = CosetsideSimulator(
-                circuit=circuit, compiled_op_handler=op, batch_size=64, seed=5, use_cpp_kernels=use_cpp
+                circuit=circuit, compiled_op_handler=op, batch_size=64, seed=5
             )
             sim.run()
             recs = np.asarray(sim.get_final_measurement_records(), dtype=bool)

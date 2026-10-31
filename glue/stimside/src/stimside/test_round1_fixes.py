@@ -16,7 +16,6 @@ from stimside.simulator_flip import FlipsideSimulator
 from stimside.simulator_tableau import TablesideSimulator
 
 
-@pytest.mark.parametrize("use_cpp", [True, False])
 @pytest.mark.parametrize("sync_rng", [False, True])
 @pytest.mark.parametrize(
     "prep_ops,reset_op,meas_op,expected_meas",
@@ -30,7 +29,6 @@ from stimside.simulator_tableau import TablesideSimulator
     ],
 )
 def test_coset_resets_when_m_ref_is_one(
-    use_cpp: bool,
     sync_rng: bool,
     prep_ops: str,
     reset_op: str,
@@ -48,7 +46,6 @@ def test_coset_resets_when_m_ref_is_one(
         compiled_op_handler=handler,
         batch_size=batch_size,
         seed=123,
-        use_cpp_kernels=use_cpp,
         sync_tableside_rng=sync_rng,
     )
     sim.run()
@@ -58,8 +55,7 @@ def test_coset_resets_when_m_ref_is_one(
         assert np.all(records[:, idx] == bool(exp_val))
 
 
-@pytest.mark.parametrize("use_cpp", [True, False])
-def test_coset_resets_when_m_ref_is_one_with_active_mrqf(use_cpp: bool):
+def test_coset_resets_when_m_ref_is_one_with_active_mrqf():
     """Verify resets when m_ref == 1 and shots have active MRQF states (d >= 1)."""
     circuit = stim.Circuit(
         """
@@ -80,7 +76,6 @@ def test_coset_resets_when_m_ref_is_one_with_active_mrqf(use_cpp: bool):
         compiled_op_handler=handler,
         batch_size=batch_size,
         seed=42,
-        use_cpp_kernels=use_cpp,
     )
     sim.run()
     records = sim.get_final_measurement_records()
@@ -126,23 +121,21 @@ def test_conditioning_on_0_or_1_collapses_superposition(tagged_op: str):
         f"Expected ~0.5 after Z-collapse of |+> in Tableside for {tagged_op}, got {tab_rate}"
     )
 
-    # CosetsideSimulator (both C++ and Python paths)
-    for use_cpp in (True, False):
-        cos_handler = LeakageUint8Coset().compile_op_handler(
-            circuit=circuit, batch_size=num_shots
-        )
-        cos_sim = CosetsideSimulator(
-            circuit,
-            compiled_op_handler=cos_handler,
-            batch_size=num_shots,
-            seed=777,
-            use_cpp_kernels=use_cpp,
-        )
-        cos_sim.run()
-        cos_rate = float(np.mean(cos_sim.get_final_measurement_records()[:, -1]))
-        assert 0.3 < cos_rate < 0.7, (
-            f"Expected ~0.5 after Z-collapse of |+> in Cosetside (cpp={use_cpp}) for {tagged_op}, got {cos_rate}"
-        )
+    # CosetsideSimulator
+    cos_handler = LeakageUint8Coset().compile_op_handler(
+        circuit=circuit, batch_size=num_shots
+    )
+    cos_sim = CosetsideSimulator(
+        circuit,
+        compiled_op_handler=cos_handler,
+        batch_size=num_shots,
+        seed=777,
+    )
+    cos_sim.run()
+    cos_rate = float(np.mean(cos_sim.get_final_measurement_records()[:, -1]))
+    assert 0.3 < cos_rate < 0.7, (
+        f"Expected ~0.5 after Z-collapse of |+> in Cosetside for {tagged_op}, got {cos_rate}"
+    )
 
 
 def test_seed_none_is_random_each_run():
@@ -306,22 +299,20 @@ def test_conditioning_01_with_repeated_targets():
         M 0
         """
     )
-    for use_cpp in (True, False):
-        handler = LeakageUint8Coset().compile_op_handler(
-            circuit=c2, batch_size=64
-        )
-        sim = CosetsideSimulator(
-            c2,
-            compiled_op_handler=handler,
-            batch_size=64,
-            seed=123,
-            use_cpp_kernels=use_cpp,
-        )
-        sim.run()
-        recs = sim.get_final_measurement_records()[:, 0]
-        assert np.any(recs == False) and np.any(recs == True), (
-            f"Expected non-deterministic outcome for H[CONDITIONED_ON_SELF: 1] 0 0 (use_cpp={use_cpp})"
-        )
+    handler = LeakageUint8Coset().compile_op_handler(
+        circuit=c2, batch_size=64
+    )
+    sim = CosetsideSimulator(
+        c2,
+        compiled_op_handler=handler,
+        batch_size=64,
+        seed=123,
+    )
+    sim.run()
+    recs = sim.get_final_measurement_records()[:, 0]
+    assert np.any(recs == False) and np.any(recs == True), (
+        "Expected non-deterministic outcome for H[CONDITIONED_ON_SELF: 1] 0 0"
+    )
 
     # 3. CONDITIONED_ON_OTHER with overlapping targets across groups
     c3 = stim.Circuit(

@@ -1,7 +1,6 @@
 {
   "c01_clifford_noise_feedback": {
     "coset_nosync_cpp": "5df818cfc45c661a615b5baf22ed917f",
-    "coset_nosync_py": "5df818cfc45c661a615b5baf22ed917f",
     "coset_sync": "3f9ebdd8933726cfb55dced216727250",
     "flip": "a3246418839679ad724c9df323ea7c56",
     "magic_dq": "526bcbb257e7bd1a73d77951242e0aa3",
@@ -14,7 +13,6 @@
   },
   "c02_mpp_mxx_heralded_corr": {
     "coset_nosync_cpp": "09c4be7befce1fc959017ecfbb828d17",
-    "coset_nosync_py": "09c4be7befce1fc959017ecfbb828d17",
     "coset_sync": "492e5c4aec8cda0fbbf09444e10b3f69",
     "flip": "ef0663f431b7dde0d928ba1e3e45f518",
     "magic_dq": "3215fade03f69a40ae7b05f1aac3bfbe",
@@ -37,7 +35,6 @@
   },
   "c03_leakage_transitions_swap_meas": {
     "coset_nosync_cpp": "e66208b3bde05a4eadf56cfe917510e0",
-    "coset_nosync_py": "e66208b3bde05a4eadf56cfe917510e0",
     "coset_sync": "2f1848c052fccbc02e7ab9353cf2916e",
     "flip": "ccc69b16d9e39a97929f23b039f6816d",
     "magic_ds": "f846e56d7843b4c0d9dcb88b884e746e",
@@ -47,7 +44,6 @@
   },
   "c04_leakage_conditioning_and_repeated_targets": {
     "coset_nosync_cpp": "3e7c6c9984dbc44ec95e56e9e52b373a",
-    "coset_nosync_py": "3e7c6c9984dbc44ec95e56e9e52b373a",
     "coset_sync": "a67c7499c65c2b47bfa8e4c1f30a480e",
     "magic_ds": "6206c720695e50d2339378302cef371d",
     "magic_sync": "a67c7499c65c2b47bfa8e4c1f30a480e",
@@ -56,7 +52,6 @@
   },
   "c04b_leakage_detector_tab_coset": {
     "coset_nosync_cpp": "5601c0aee66dec8ecf9b1cacb2f65594",
-    "coset_nosync_py": "5601c0aee66dec8ecf9b1cacb2f65594",
     "coset_sync": "545e05fc6901623456579785f75cca0d",
     "tab_nosync": "90aa943d6ac295c429844231e1249673",
     "tab_sync": "545e05fc6901623456579785f75cca0d"
@@ -82,7 +77,6 @@
   },
   "c09_multiword_70q_leakage": {
     "coset_nosync_cpp": "f3d4bed6aa3c462d40ca3753ae5c05ea",
-    "coset_nosync_py": "f3d4bed6aa3c462d40ca3753ae5c05ea",
     "coset_sync": "971276671649b9411a789e3168b1bd7b",
     "flip": "33cad4944e370fd1001228af0294a9d1",
     "magic_ds": "06500541bfd25d890bc0387185439239",

@@ -668,7 +668,6 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         batch_size: int = 1,
         compiled_ref: CompiledReferenceCircuit | None = None,
         sync_tableside_rng: bool | None = None,
-        use_cpp_kernels: bool = True,
         record_unleaked_to_leaked: bool = False,
         record_leakage_events: bool = False,
     ) -> None:
@@ -689,7 +688,6 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             [[] for _ in range(batch_size)] if self.record_leakage_events else []
         )
         self.sync_tableside_rng = bool(sync_tableside_rng)
-        self.use_cpp_kernels = bool(use_cpp_kernels)
         self._n_words = max(1, (self.num_qubits + 63) // 64)
         self._batches_completed = 0
         self._tab_scratch_q = self.num_qubits
@@ -708,7 +706,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._any_z_c = ctypes.c_int(0)
         self._init_rngs()
 
-        self._use_cpp = self.use_cpp_kernels and (self._tab_rngs is None)
+        self._use_cpp = self._tab_rngs is None
         if self._use_cpp:
             self._cpp_lib = get_coset_kernels_lib()
             cpp_seed = (
@@ -2263,30 +2261,13 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             )
             return
 
-        active_indices_arr: NDArray[np.intp] | None = None
-        active_mrqfs_list: list[MRQFState] = []
-        h_mat_mixed: NDArray[np.uint64] | None = None
-        au_mat_mixed: NDArray[np.uint64] | None = None
-        if self._active_shots and self._tab_rngs is None:
-            active_indices_list = list(self._active_shots.keys())
-            active_indices_arr = np.asarray(active_indices_list, dtype=np.intp)
-            active_mrqfs_list = [
-                self._active_shots[b] for b in active_indices_list
-            ]
-            h_mat_mixed = np.stack(
-                [m.h_words for m in active_mrqfs_list], axis=0
-            )
-            au_mat_mixed = np.stack(
-                [m.a_union for m in active_mrqfs_list], axis=0
-            )
-
+        assert self._tab_rngs is not None
         eff_op_name = (
             op_override.name if op_override is not None else step_meta.op.name
         )
         seg_end_to_len: dict[int, int] = {}
         if (
-            self._tab_rngs is not None
-            and step_meta.produces_measurements
+            step_meta.produces_measurements
             and eff_op_name in ("MXX", "MYY", "MZZ", "MPP")
             and len(substeps) > 1
         ):
@@ -2328,23 +2309,13 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 m_shots = f_q_shots ^ bool(m_ref)
                 if self._active_shots:
                     b_words = meta.beta_Z_words
-                    if (
-                        active_indices_arr is not None
-                        and h_mat_mixed is not None
-                        and au_mat_mixed is not None
-                    ):
-                        xor_bh_sub = h_mat_mixed[:, 0] & b_words[0]
-                        ov_sub = au_mat_mixed[:, 0] & b_words[0]
-                        for w in range(1, self._n_words):
-                            xor_bh_sub ^= h_mat_mixed[:, w] & b_words[w]
-                            ov_sub |= au_mat_mixed[:, w] & b_words[w]
-                        m_shots[active_indices_arr] ^= (
-                            np.bitwise_count(xor_bh_sub) & 1
-                        ).astype(np.bool_)
-                        for a_idx_np in np.flatnonzero(ov_sub != 0):
-                            a_idx = int(a_idx_np)
-                            b_idx = int(active_indices_arr[a_idx])
-                            mrqf = active_mrqfs_list[a_idx]
+                    for b_idx, mrqf in self._active_shots.items():
+                        if mrqf.d == 0 or not _words_any_overlap(
+                            b_words, mrqf.a_union
+                        ):
+                            if _word_dot_parity(b_words, mrqf.h_words):
+                                m_shots[b_idx] = not m_shots[b_idx]
+                        else:
                             sigma = (int(f_q_shots[b_idx]) ^ int(m_ref)) & 1
                             m_val, _ = mrqf.p3_measure_diagonal(
                                 b_words,
@@ -2354,91 +2325,30 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                                 ),
                             )
                             m_shots[b_idx] = bool(m_val)
-                            h_mat_mixed[a_idx] = mrqf.h_words
-                            au_mat_mixed[a_idx] = mrqf.a_union
-                    else:
-                        for b_idx, mrqf in self._active_shots.items():
-                            if mrqf.d == 0 or not _words_any_overlap(
-                                b_words, mrqf.a_union
-                            ):
-                                if _word_dot_parity(b_words, mrqf.h_words):
-                                    m_shots[b_idx] = not m_shots[b_idx]
-                            else:
-                                sigma = (int(f_q_shots[b_idx]) ^ int(m_ref)) & 1
-                                m_val, _ = mrqf.p3_measure_diagonal(
-                                    b_words,
-                                    sigma,
-                                    draw_bit_fn=lambda b=b_idx: int(
-                                        self._draw_tab_rng_bit(b)
-                                    ),
-                                )
-                                m_shots[b_idx] = bool(m_val)
             else:
                 p = meta.p
                 p_word = p >> 6
                 p_bit = p & 63
                 p_mask = np.uint64(1 << p_bit)
-                if self._tab_rngs is not None:
-                    m_shots = np.zeros(self.batch_size, dtype=np.bool_)
-                    delta_shots = np.zeros(self.batch_size, dtype=np.bool_)
-                    for b_idx in range(self.batch_size):
-                        mrqf = self._active_shots.get(b_idx)
-                        if mrqf is not None:
-                            if not bool(mrqf.a_union[p_word] & p_mask):
-                                m_b = self._draw_tab_rng_bit(b_idx)
-                                m_shots[b_idx] = m_b
-                                h_p = bool(
-                                    (int(mrqf.h_words[p_word]) >> p_bit) & 1
-                                )
-                                delta_shots[b_idx] = (
-                                    m_b
-                                    ^ bool(f_q_shots[b_idx])
-                                    ^ h_p
-                                    ^ bool(m_ref)
-                                )
-                            else:
-                                f_q_b = int(f_q_shots[b_idx])
-                                mrqf.p2_apply_quarter_turn(
-                                    meta.a_words,
-                                    meta.b_rot_words,
-                                    meta.kappa_rot,
-                                )
-                                m_eff, _ = mrqf.p3_measure_diagonal(
-                                    meta.e_p_words,
-                                    0,
-                                    draw_bit_fn=lambda b=b_idx, fq=f_q_b: int(
-                                        self._draw_tab_rng_bit(b)
-                                    )
-                                    ^ fq,
-                                )
-                                m_shots[b_idx] = bool(m_eff ^ f_q_b)
-                                delta_shots[b_idx] = False
-                        else:
-                            m_shots[b_idx] = self._draw_tab_rng_bit(b_idx)
-                            delta_shots[b_idx] = (
-                                m_shots[b_idx] ^ f_q_shots[b_idx] ^ bool(m_ref)
+                m_shots = np.zeros(self.batch_size, dtype=np.bool_)
+                delta_shots = np.zeros(self.batch_size, dtype=np.bool_)
+                for b_idx in range(self.batch_size):
+                    mrqf = self._active_shots.get(b_idx)
+                    if mrqf is not None:
+                        if not bool(mrqf.a_union[p_word] & p_mask):
+                            m_b = self._draw_tab_rng_bit(b_idx)
+                            m_shots[b_idx] = m_b
+                            h_p = bool(
+                                (int(mrqf.h_words[p_word]) >> p_bit) & 1
                             )
-                else:
-                    m_shots = self.np_rng.integers(
-                        0, 2, size=self.batch_size, dtype=np.bool_
-                    )
-                    delta_shots = m_shots ^ f_q_shots ^ bool(m_ref)
-                    if (
-                        active_indices_arr is not None
-                        and h_mat_mixed is not None
-                        and au_mat_mixed is not None
-                    ):
-                        delta_shots[active_indices_arr] ^= (
-                            h_mat_mixed[:, p_word] & p_mask
-                        ) != 0
-                        for a_idx_np in np.flatnonzero(
-                            (au_mat_mixed[:, p_word] & p_mask) != 0
-                        ):
-                            a_idx = int(a_idx_np)
-                            b_idx = int(active_indices_arr[a_idx])
-                            mrqf = active_mrqfs_list[a_idx]
+                            delta_shots[b_idx] = (
+                                m_b
+                                ^ bool(f_q_shots[b_idx])
+                                ^ h_p
+                                ^ bool(m_ref)
+                            )
+                        else:
                             f_q_b = int(f_q_shots[b_idx])
-                            delta_shots[b_idx] = False
                             mrqf.p2_apply_quarter_turn(
                                 meta.a_words,
                                 meta.b_rot_words,
@@ -2448,13 +2358,17 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                                 meta.e_p_words,
                                 0,
                                 draw_bit_fn=lambda b=b_idx, fq=f_q_b: int(
-                                    m_shots[b]
+                                    self._draw_tab_rng_bit(b)
                                 )
                                 ^ fq,
                             )
                             m_shots[b_idx] = bool(m_eff ^ f_q_b)
-                            h_mat_mixed[a_idx] = mrqf.h_words
-                            au_mat_mixed[a_idx] = mrqf.a_union
+                            delta_shots[b_idx] = False
+                    else:
+                        m_shots[b_idx] = self._draw_tab_rng_bit(b_idx)
+                        delta_shots[b_idx] = (
+                            m_shots[b_idx] ^ f_q_shots[b_idx] ^ bool(m_ref)
+                        )
 
                 if np.any(delta_shots):
                     if len(meta.G_x_indices) > 0:

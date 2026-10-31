@@ -59,7 +59,6 @@ def _build_coset_sim(
     batch_size: int = 4,
     seed: int = 42,
     record_unleaked_to_leaked: bool = True,
-    use_cpp_kernels: bool = True,
     sync_tableside_rng: bool = False,
 ) -> CosetsideSimulator:
     coh = LeakageUint8Coset().compile_op_handler(
@@ -70,7 +69,6 @@ def _build_coset_sim(
         compiled_op_handler=coh,
         batch_size=batch_size,
         seed=seed,
-        use_cpp_kernels=use_cpp_kernels,
         sync_tableside_rng=sync_tableside_rng,
         record_unleaked_to_leaked=record_unleaked_to_leaked,
     )
@@ -140,14 +138,11 @@ def test_only_unleaked_to_leaked_transitions_recorded() -> None:
         assert arr.dtype == np.int64
         np.testing.assert_array_equal(arr, expected)
 
-    for use_cpp in (True, False):
-        css = _build_coset_sim(
-            circuit, batch_size=3, seed=7, use_cpp_kernels=use_cpp
-        )
-        res_coset = css.run()
-        assert res_coset is not None and len(res_coset) == 3
-        for arr in res_coset:
-            np.testing.assert_array_equal(arr, expected)
+    css = _build_coset_sim(circuit, batch_size=3, seed=7)
+    res_coset = css.run()
+    assert res_coset is not None and len(res_coset) == 3
+    for arr in res_coset:
+        np.testing.assert_array_equal(arr, expected)
 
     for mode_kwargs in (
         {},
@@ -202,14 +197,11 @@ def test_unrolled_instruction_indexing_with_repeat_blocks_and_metadata() -> None
     for arr in res_flip:
         np.testing.assert_array_equal(arr, expected)
 
-    for use_cpp in (True, False):
-        css = _build_coset_sim(
-            circuit, batch_size=2, seed=11, use_cpp_kernels=use_cpp
-        )
-        res_coset = css.run()
-        assert res_coset is not None
-        for arr in res_coset:
-            np.testing.assert_array_equal(arr, expected)
+    css = _build_coset_sim(circuit, batch_size=2, seed=11)
+    res_coset = css.run()
+    assert res_coset is not None
+    for arr in res_coset:
+        np.testing.assert_array_equal(arr, expected)
 
     for mode_kwargs in (
         {},
@@ -224,7 +216,7 @@ def test_unrolled_instruction_indexing_with_repeat_blocks_and_metadata() -> None
 def test_fused_mode_b_1_to_2_transition_unrolled_indexing() -> None:
     """Verify OP_FUSED_TRANS1_MEAS (1-->2 followed by M[LEAKAGE_PROJECTION_Z: (1.0, 2)])
     records the exact unrolled instruction index of the transition op across all
-    TablesideSimulator tiers (C++ FastEngine, Python v2, sync_rng, fallback) and CosetsideSimulator.
+    TablesideSimulator tiers (C++ FastEngine, sync_rng, fallback) and CosetsideSimulator.
     """
     circuit = stim.Circuit(
         """
@@ -249,14 +241,11 @@ def test_fused_mode_b_1_to_2_transition_unrolled_indexing() -> None:
     )
     assert len(expected) == 3
 
-    for use_cpp in (True, False):
-        css = _build_coset_sim(
-            circuit, batch_size=2, seed=19, use_cpp_kernels=use_cpp
-        )
-        res_coset = css.run()
-        assert res_coset is not None
-        for arr in res_coset:
-            np.testing.assert_array_equal(arr, expected)
+    css = _build_coset_sim(circuit, batch_size=2, seed=19)
+    res_coset = css.run()
+    assert res_coset is not None
+    for arr in res_coset:
+        np.testing.assert_array_equal(arr, expected)
 
     for mode_kwargs in (
         {},

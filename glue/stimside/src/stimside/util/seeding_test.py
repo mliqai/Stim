@@ -24,8 +24,7 @@ _PATHS = {
     "tab_cpp_bs1": (TablesideSimulator, LeakageUint8Tableau, 1, {}, 1),
     "tab_cpp_bs4": (TablesideSimulator, LeakageUint8Tableau, 4, {}, 4),
     "tab_sync_bs4": (TablesideSimulator, LeakageUint8Tableau, 4, dict(sync_tableside_rng=True), 1),
-    "cos_cpp_bs4": (CosetsideSimulator, LeakageUint8Coset, 4, dict(use_cpp_kernels=True), 4),
-    "cos_py_bs4": (CosetsideSimulator, LeakageUint8Coset, 4, dict(use_cpp_kernels=False), 4),
+    "cos_cpp_bs4": (CosetsideSimulator, LeakageUint8Coset, 4, {}, 4),
     "cos_sync_bs4": (CosetsideSimulator, LeakageUint8Coset, 4, dict(sync_tableside_rng=True), 1),
 }
 
@@ -64,8 +63,7 @@ def test_sync_shot_seeds_follow_the_shot_index_in_the_run():
             np.testing.assert_array_equal(recs, ref, err_msg=f"{path} {bs}x{num_batches}")
 
 
-@pytest.mark.parametrize("use_cpp", [True, False])
-def test_cosetside_tie_break_bits_are_not_replayed(use_cpp):
+def test_cosetside_tie_break_bits_are_not_replayed():
     # Each pair's readouts come from a tie-break bit. With seed + n seeding, the 2nd bit of batch k
     # (or of seed S) was the 1st bit of batch k + 1 (or of seed S + 1).
     circuit = stim.Circuit(
@@ -76,7 +74,7 @@ def test_cosetside_tie_break_bits_are_not_replayed(use_cpp):
     def make(seed):
         handler = LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=1)
         return CosetsideSimulator(
-            circuit, compiled_op_handler=handler, batch_size=1, seed=seed, use_cpp_kernels=use_cpp
+            circuit, compiled_op_handler=handler, batch_size=1, seed=seed
         )
 
     def run(sim):

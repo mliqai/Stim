@@ -32,7 +32,6 @@ _ALL_STD = (
     "tab_nosync",
     "tab_sync",
     "coset_nosync_cpp",
-    "coset_nosync_py",
     "coset_sync",
     "magic_ds",
     "magic_dq",
@@ -44,7 +43,6 @@ _LEAK_NO_FLIP_TAGS = (
     "tab_nosync",
     "tab_sync",
     "coset_nosync_cpp",
-    "coset_nosync_py",
     "coset_sync",
     "magic_ds",
     "magic_sync",
@@ -175,7 +173,7 @@ CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
     ),
     (
         "c04b_leakage_detector_tab_coset",
-        ("tab_nosync", "tab_sync", "coset_nosync_cpp", "coset_nosync_py", "coset_sync"),
+        ("tab_nosync", "tab_sync", "coset_nosync_cpp", "coset_sync"),
         True,
         """
         R 0 1
@@ -413,7 +411,6 @@ def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
             batch_size=BATCH,
             seed=SEED,
             sync_tableside_rng=(mode == "coset_sync"),
-            use_cpp_kernels=(mode != "coset_nosync_py"),
             record_unleaked_to_leaked=rec_flag,
             record_leakage_events=rec_flag,
         )
