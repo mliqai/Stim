@@ -9,9 +9,9 @@ import numpy as np
 import pytest
 import stim  # type: ignore[import-untyped]
 
-from stimside.util.magic_compile import OMEGA, CliffordFaultChannel, FaultBranch, reconstruct_statevector, run_direct
-from stimside.util.magic_query import EvaluateQueries, PreparedQueryPlan, PrepareQueries, QueryBudget, QueryBudgetExceededError, QueryDiagnostics, QueryResult, evaluate_queries, prepare_queries, run_query_batch, run_query_shot
-from stimside.util.phase_qfe import ShotExpansion, apply_pauli_t
+from stimside._magic.compile import OMEGA, CliffordFaultChannel, FaultBranch, reconstruct_statevector, run_direct
+from stimside._magic.query import EvaluateQueries, PreparedQueryPlan, PrepareQueries, QueryBudget, QueryBudgetExceededError, QueryDiagnostics, QueryResult, evaluate_queries, prepare_queries, run_query_batch, run_query_shot
+from stimside._magic.phase_qfe import ShotExpansion, apply_pauli_t
 from stimside.util.reference_chp import ReferenceCHPTableau
 
 
@@ -217,8 +217,8 @@ def test_budget_raise_fallback_and_m4_batch_hooks() -> None:
 
 def test_runtime_atol_enforcement_and_no_hidden_stream_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify runtime atol drift raises FloatingPointError and non-fallback paths never call run_direct/run_selector."""
-    import stimside.util.magic_compile as mc
-    import stimside.util.magic_query as mq
+    import stimside._magic.compile as mc
+    import stimside._magic.query as mq
 
     orig_pd, orig_acb = mq.project_diagonal, mq.apply_compiled_block
     for bad_z in (0.1, float("nan")):
@@ -354,7 +354,7 @@ def test_deep_log_mass_fallback_and_sweep_mapping_normalization(fault_mode: str)
 @pytest.mark.parametrize("fault_mode", ["DIRECT", "SELECTOR"])
 def test_fallback_zero_mass_unbiasedness_pinning_and_sub15_exactness(fault_mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify unbiased zero-mass fallback MC, Markov stopping-time independence, sub-1e-15 exactness, D3/D4, and 1x exit."""
-    import stimside.util.magic_query as mq
+    import stimside._magic.query as mq
     fb1, fb2, hdr, n_mc = QueryBudget(max_terms=1, on_budget_exceeded="fallback"), QueryBudget(max_terms=2, on_budget_exceeded="fallback"), "H 2 3 4\nI[CCZ] 2 3 4\n", 400
     cases = ((f"{hdr}M 0\nX_ERROR(0.3) 1\nM 1", fb1, {"measurements": {1: 1}}, 0.30, True), (f"{hdr}M 0\nI[CLIFFORD_FAULT: (0.3, X)] 1\nM 1", fb1, {"measurements": {1: 1}}, 0.30, False),
              ("H 0 1 2\nI[CCZ] 0 1 2\nHERALDED_PAULI_CHANNEL_1(0.0, 0.1, 0.2, 0.3) 3\nM 3", fb1, {"measurements": {0: 1, 1: 0}}, 0.30, True),
@@ -421,7 +421,7 @@ def test_correlated_chain_interleaving_and_mpad_ulp_fallback_parity(fault_mode: 
 @pytest.mark.parametrize("fault_mode", ["DIRECT", "SELECTOR"])
 def test_quantum_measurements_query_and_fallback_stream_parity(fault_mode: str) -> None:
     """Verify `quantum_measurements` in `EvaluateQueries`, `run_query_shot`, and STREAM fallback matches `STREAM`."""
-    from stimside.util.magic_compile import compile_direct, compile_selector, run_direct, run_selector
+    from stimside._magic.compile import compile_direct, compile_selector, run_direct, run_selector
 
     hdr, fb1 = "H 2 3 4\nI[CCZ] 2 3 4\n", QueryBudget(max_terms=1, on_budget_exceeded="fallback")
     c_two = stim.Circuit(f"{hdr}H 0\nM(0.25) 0\nCX rec[-1] 1\nM 0 1")
@@ -471,8 +471,8 @@ def test_quantum_measurements_query_and_fallback_stream_parity(fault_mode: str) 
 
 
 def test_query_born_split_rejects_negative_mass_matching_magic_compile(monkeypatch: pytest.MonkeyPatch) -> None:
-    import stimside.util.magic_query as mq
-    from stimside.util.phase_qfe import project_diagonal as real_pd
+    import stimside._magic.query as mq
+    from stimside._magic.phase_qfe import project_diagonal as real_pd
 
     plan = PrepareQueries(stim.Circuit("H 0\nI[T] 0\nM 0"), atol=1e-2)
     monkeypatch.setattr(

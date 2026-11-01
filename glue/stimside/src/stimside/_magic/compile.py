@@ -34,8 +34,8 @@ from stimside.util.bitwords import (
     word_dot_parity_batch,
     words_any_nonzero,
 )
-import stimside.util.phase_qfe as _pq
-from stimside.util.phase_qfe import (
+import stimside._magic.phase_qfe as _pq
+from stimside._magic.phase_qfe import (
     DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep,
     ImpossiblePostselectionError, ShotExpansion,
     _apply_local_unitary_c128, apply_compiled_block, apply_pauli, apply_quarter_turn,

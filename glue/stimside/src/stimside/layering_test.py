@@ -19,14 +19,6 @@ ALLOWED_LAYER_DEPS: dict[str, set[str]] = {
 
 # Pre-existing runtime layering violations; shrinks monotonically to empty by end of Phase 4.
 ALLOWLIST: set[tuple[str, str]] = {
-    ("stimside.op_handlers.leakage_handlers.leakage_uint8_coset", "stimside.simulator_coset"),
-    ("stimside.op_handlers.leakage_handlers.leakage_uint8_flip", "stimside.simulator_flip"),
-    ("stimside.op_handlers.leakage_handlers.leakage_uint8_magic", "stimside.simulator_magic"),
-    ("stimside.op_handlers.leakage_handlers.leakage_uint8_tableau", "stimside.simulator_tableau"),
-    ("stimside.util.magic_compile", "stimside.op_handlers.leakage_handlers.common_parsing"),
-    ("stimside.util.magic_compile", "stimside.op_handlers.leakage_handlers.leakage_parameters"),
-    ("stimside.util.magic_compile", "stimside.op_handlers.leakage_handlers.tag_registry"),
-    ("stimside.util.phase_qfe", "stimside._native.magic_kernels"),
     ("stimside.util.tableside_kernels", "stimside._native.tableside_kernels"),
     ("stimside.util.tableside_kernels", "stimside.op_handlers.leakage_handlers.leakage_parameters"),
     ("stimside.util.tableside_kernels", "stimside.op_handlers.leakage_handlers.tag_registry"),

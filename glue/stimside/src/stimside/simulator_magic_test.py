@@ -8,16 +8,16 @@ import numpy as np
 import pytest
 import stim
 
-from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
-from stimside.sampler_magic import MagicsideSampler
-from stimside.simulator_magic import MagicsideSimulator
-from stimside.util.magic_compile import CliffordFaultChannel, FaultBranch
-from stimside.util.magic_query import (
+from stimside._magic.compile import CliffordFaultChannel, FaultBranch
+from stimside._magic.query import (
     EvaluateQueries,
     PrepareQueries,
     QueryBudget,
     QueryBudgetExceededError,
 )
+from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+from stimside.sampler_magic import MagicsideSampler
+from stimside.simulator_magic import MagicsideSimulator
 
 
 def test_statevector_and_branch_mass_across_fault_modes_and_backends() -> None:
@@ -449,7 +449,7 @@ def test_m2d_per_shot_fault_realization_sweep_bits_and_override() -> None:
 def test_noiseless_ref_conditioning_collapse_semantics() -> None:
     from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
     from stimside.simulator_coset import CosetsideSimulator
-    from stimside.simulator_magic import _strip_circuit_for_noiseless_ref
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import _strip_circuit_for_noiseless_ref
 
     for cond_op in (
         "I[CONDITIONED_ON_SELF: 0 1] 0",

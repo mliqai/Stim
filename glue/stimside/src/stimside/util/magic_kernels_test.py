@@ -11,14 +11,14 @@ import numpy as np
 import pytest
 import stim
 
-from stimside._native import magic_kernels as mk
-from stimside.util import phase_qfe as pq
-from stimside.util.magic_compile import (
+from stimside._magic import phase_qfe as pq
+from stimside._magic.compile import (
     compile_direct,
     compile_selector,
     run_direct,
     run_selector,
 )
+from stimside._native import magic_kernels as mk
 
 EXPECTED_SYMBOLS = (
     "magic_abi_v1",

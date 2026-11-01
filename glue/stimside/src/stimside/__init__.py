@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+from stimside._magic.compile import CliffordFaultChannel, FaultBranch
+from stimside._magic.query import (
+    EvaluateQueries,
+    PrepareQueries,
+    PreparedQueryPlan,
+    QueryBudget,
+    QueryBudgetExceededError,
+    QueryDiagnostics,
+    QueryResult,
+    evaluate_queries,
+    prepare_queries,
+)
 from stimside.dem_generators.bnb_decoder import BranchAndBoundDecoder
 from stimside.dem_generators.dem_generator_marginal import MarginalLeakageDemGenerator
 from stimside.dem_generators.leakage_decoder import (
@@ -20,18 +32,6 @@ from stimside.simulator_coset import CosetsideSimulator
 from stimside.simulator_flip import FlipsideSimulator
 from stimside.simulator_magic import MagicsideSimulator
 from stimside.simulator_tableau import TablesideSimulator
-from stimside.util.magic_compile import CliffordFaultChannel, FaultBranch
-from stimside.util.magic_query import (
-    EvaluateQueries,
-    PrepareQueries,
-    PreparedQueryPlan,
-    QueryBudget,
-    QueryBudgetExceededError,
-    QueryDiagnostics,
-    QueryResult,
-    evaluate_queries,
-    prepare_queries,
-)
 
 __version__ = "0.1.0"
 

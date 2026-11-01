@@ -78,7 +78,7 @@ def test_top_level_stimside_exports() -> None:
         assert hasattr(stimside, sym), f"Missing top-level export {sym}"
     from stimside.op_handlers.leakage_handlers import leakage_uint8_magic
     from stimside import sampler_magic, simulator_magic
-    from stimside.util import magic_compile, magic_query
+    from stimside._magic import compile as magic_compile, query as magic_query
 
     assert stimside.MagicsideSimulator is simulator_magic.MagicsideSimulator
     assert stimside.MagicsideSampler is sampler_magic.MagicsideSampler

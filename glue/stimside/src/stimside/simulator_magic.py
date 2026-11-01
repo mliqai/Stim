@@ -10,20 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler, _TrivialCompiledOpHandler
-from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageConditioningParams, LeakageMeasurementParams
-from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS
-from stimside.util.bitwords import (
-    OMEGA_POWERS,
-    first_set_bit_in_words,
-    unit_bit_words,
-    word_dot_parity,
-    words_any_nonzero,
-)
-from stimside.util.circuit import apply_coords_op
-from stimside.util.known_states import _replays, _unroll_circuit
-from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
-from stimside.util.magic_compile import (
+from stimside._magic.compile import (
     CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis,
     CorrelatedNoiseRecord, DirectPlan, FrameEvent, HeraldedNoiseRecord, LeftSppEvent, LeftUnitaryEvent,
     MagicTermRecord, MeasurementRecord, PauliNoiseRecord, ResetRecord, SelectorPlan,
@@ -35,22 +22,31 @@ from stimside.util.magic_compile import (
     compile_open_block, compile_pauli_product, compile_selector, extract_circuit_faults, extract_data_expansion,
     parse_clifford_fault_instruction, reconstruct_statevector, run_direct, run_selector,
 )
-from stimside.util.magic_query import (
-    PrepareQueries, PreparedQueryPlan, QueryBudget, QueryBudgetExceededError,
-    _PAULI_1Q_STR, _PAULI_2Q_STR, _PAULI_4_STR, run_query_batch,
-)
-from stimside.util.phase_qfe import (
+from stimside._magic.phase_qfe import (
     DEFAULT_ATOL, ImpossiblePostselectionError, K1_CANCEL_REL_TOL, ShotExpansion, apply_compiled_block, apply_pauli,
     apply_quarter_turn, measure_expansion, project_diagonal, reference_chp_to_stim_tableau, validate_atol,
 )
+from stimside._magic.query import (
+    PrepareQueries, PreparedQueryPlan, QueryBudget, QueryBudgetExceededError,
+    _PAULI_1Q_STR, _PAULI_2Q_STR, _PAULI_4_STR, run_query_batch,
+)
+from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler, _TrivialCompiledOpHandler
+from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic, _strip_circuit_for_noiseless_ref
+from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS
+from stimside.util.bitwords import (
+    OMEGA_POWERS,
+    first_set_bit_in_words,
+    unit_bit_words,
+    word_dot_parity,
+    words_any_nonzero,
+)
+from stimside.util.circuit import apply_coords_op
+from stimside.util.known_states import _replays, _unroll_circuit
+from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.reference_chp import ReferenceCHPTableau
 from stimside.util.seeding import derived_seed
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
 
-_PURE_NOISE_GATES: frozenset[str] = frozenset({
-    "X_ERROR", "Y_ERROR", "Z_ERROR", "I_ERROR", "II_ERROR", "DEPOLARIZE1", "DEPOLARIZE2",
-    "PAULI_CHANNEL_1", "PAULI_CHANNEL_2", "CORRELATED_ERROR", "E", "ELSE_CORRELATED_ERROR",
-})
 _FAULT_MODES: dict[str, Literal["DIRECT", "SELECTOR"]] = {"DIRECT": "DIRECT", "SELECTOR": "SELECTOR"}
 _BACKENDS: dict[str, Literal["STREAM", "QUERY"]] = {"STREAM": "STREAM", "QUERY": "QUERY"}
 _M2D_MODES: dict[str, Literal["auto", "magicside", "stim", "zero"]] = {
@@ -166,64 +162,6 @@ def _normalize_sweep_matrix(sweep_bits: Any, batch_size: int) -> NDArray[np.bool
     if arr.ndim == 2 and arr.shape[0] == batch_size:
         return arr.copy()
     raise ValueError(f"Invalid sweep_bits shape {arr.shape} for batch_size={batch_size}")
-
-
-def _strip_circuit_for_noiseless_ref(circuit: stim.Circuit) -> tuple[stim.Circuit, bool]:
-    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import _parse_leakage_tag_magic
-    needs_leakage = False
-
-    def _strip(blk: stim.Circuit) -> stim.Circuit:
-        nonlocal needs_leakage
-        out = stim.Circuit()
-        for op in blk:
-            if isinstance(op, stim.CircuitRepeatBlock):
-                out.append(stim.CircuitRepeatBlock(op.repeat_count, _strip(op.body_copy())))
-                continue
-            tag, name, tgs = op.tag, op.name, op.targets_copy()
-            if tag.startswith(("CLIFFORD_FAULT", "LEAKAGE_TRANSITION", "LEAKAGE_CONTROLLED")):
-                continue
-            if tag == "LEAKAGE_SWAP":
-                out.append(stim.CircuitInstruction("SWAP", tgs))
-            elif tag.startswith(("LEAKAGE_MEASUREMENT", "LEAKAGE_PROJECTION_Z")):
-                params, _ = _parse_leakage_tag_magic(op)
-                assert isinstance(params, LeakageMeasurementParams)
-                is_mpad = tag.startswith("LEAKAGE_MEASUREMENT")
-                b0 = params.prob_for_input_state.get(0, 0.0) > 0.5
-                b1 = params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0) > 0.5
-                if is_mpad and b0 == b1:
-                    out.append(stim.CircuitInstruction("MPAD", [int((bool(t.value) ^ t.is_inverted_result_target) ^ b0) for t in tgs]))
-                elif not is_mpad and (b0, b1) == (False, True):
-                    out.append(stim.CircuitInstruction(name, tgs))
-                elif not is_mpad and (b0, b1) == (True, False):
-                    out.append(stim.CircuitInstruction(name, [stim.target_inv(t.qubit_value) if not t.is_inverted_result_target else t.qubit_value for t in tgs]))
-                else:
-                    sfx = f" : {' '.join(str(q) for q in (params.targets or ()))}" if is_mpad else ""
-                    out.append(stim.CircuitInstruction(name, tgs, [], tag=f"{'LEAKAGE_MEASUREMENT' if is_mpad else 'LEAKAGE_PROJECTION_Z'}: ({float(b0)}, 0) ({float(b1)}, 1){sfx}"))
-                    needs_leakage = True
-            elif tag.startswith("CONDITIONED_ON"):
-                if name in _PURE_NOISE_GATES:
-                    continue
-                params, _ = _parse_leakage_tag_magic(op)
-                assert isinstance(params, LeakageConditioningParams)
-                has_comp_proj = any(0 in g or 1 in g for g in params.args) or (
-                    len(params.args) == 1
-                    and any(tok in ("0", "1") for tok in (params.from_tag or ":").split(":")[1].split())
-                )
-                if has_comp_proj:
-                    out.append(op)
-                    needs_leakage = True
-                elif ("U",) * len(params.args) in zip(*params.args):
-                    out.append(stim.CircuitInstruction(name, tgs, op.gate_args_copy()))
-            elif tag == "" and name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
-                out.append(stim.CircuitInstruction("MPAD", [0] * len(tgs)))
-            elif tag in _MAGIC_TAGS:
-                out.append(op)
-            elif name not in _PURE_NOISE_GATES:
-                gd = _canonical_gate_data(name)
-                out.append(stim.CircuitInstruction(name, tgs, [], tag=tag) if (gd.produces_measurements and op.gate_args_copy()) else op)
-        return out
-
-    return _strip(circuit), needs_leakage
 
 
 class _PauliBroadcasterProxy:
@@ -1117,7 +1055,6 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             if not needs_leak:
                 ref = run_direct(compile_direct(stripped), rng=np.random.default_rng(0), sweep_bits=sweep_row, atol=self.atol).measurements
             else:
-                from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
                 sub = MagicsideSimulator(stripped, op_handler=LeakageUint8Magic(), batch_size=1, seed=0, sweep_bits=sweep_row, m2d_reference_mode="zero", atol=self.atol)
                 sub.run()
                 ref = sub.get_final_measurement_records()[0]

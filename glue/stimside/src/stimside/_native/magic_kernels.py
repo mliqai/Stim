@@ -93,7 +93,7 @@ def get_magic_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
 
     if force_recompile:
         _LIB_INSTANCE = None
-        pq_mod = sys.modules.get("stimside.util.phase_qfe")
+        pq_mod = sys.modules.get("stimside._magic.phase_qfe")
         if pq_mod is not None and hasattr(pq_mod, "_reset_cpp_kernel_cache"):
             pq_mod._reset_cpp_kernel_cache()
 

@@ -13,7 +13,7 @@ from stimside.dem_generators.dem_generator_marginal import MarginalLeakageDemGen
 from stimside.dem_generators.leakage_decoder import BaseDecoder, CallableDecoder, MarginalDecoder
 from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
 from stimside.sampler_magic import CompiledMagicsideSampler, MagicsideSampler
-from stimside.util.magic_query import QueryBudget, QueryBudgetExceededError
+from stimside._magic.query import QueryBudget, QueryBudgetExceededError
 
 
 def test_compiled_sampler_counts_and_custom_counts_are_counter() -> None:

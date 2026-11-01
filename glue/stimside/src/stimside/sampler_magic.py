@@ -12,15 +12,15 @@ from numpy.typing import NDArray
 import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
+from stimside._magic.compile import CliffordFaultChannel
+from stimside._magic.phase_qfe import DEFAULT_ATOL, validate_atol
+from stimside._magic.query import QueryBudget
 from stimside.dem_generators.leakage_decoder import (
     BaseDecoder, CompiledLeakageDecoder, LeakageDecoder, LeakageDecoderLike, as_leakage_decoder,
 )
 from stimside.op_handlers.abstract_op_handler import OpHandler, _TrivialOpHandler
 from stimside.sampler_tableau import _CompiledSeedMixin
 from stimside.simulator_magic import MagicsideSimulator, _BACKENDS, _FAULT_MODES, _M2D_MODES, _parse_enum, _resolve_budget
-from stimside.util.magic_compile import CliffordFaultChannel
-from stimside.util.magic_query import QueryBudget
-from stimside.util.phase_qfe import DEFAULT_ATOL, validate_atol
 from stimside.util.seeding import derived_seed
 
 

@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 import stim
 
-from stimside.util import phase_qfe as pq
-from stimside.util.phase_qfe import (
+from stimside._magic import phase_qfe as pq
+from stimside._magic.phase_qfe import (
     CompiledPauliBlock,
     CompiledPauliBlockStep,
     ImpossiblePostselectionError,

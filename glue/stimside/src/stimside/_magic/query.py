@@ -11,7 +11,9 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside.util import magic_compile as _mc
+from stimside._magic import compile as _mc
+from stimside._magic.compile import CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _sample_categorical_branch, clone_reference_chp, compile_direct, compile_open_block, compile_selector, extract_data_expansion
+from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, stim_tableau_to_reference_chp, validate_atol
 from stimside.util.bitwords import (
     OMEGA_POWERS,
     SQRT2 as _SQRT2,
@@ -20,8 +22,6 @@ from stimside.util.bitwords import (
     tail_mask,
     unit_bit_words,
 )
-from stimside.util.magic_compile import CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _sample_categorical_branch, clone_reference_chp, compile_direct, compile_open_block, compile_selector, extract_data_expansion
-from stimside.util.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, stim_tableau_to_reference_chp, validate_atol
 from stimside.util.reference_chp import ReferenceCHPTableau
 
 __all__ = ["QueryBudgetExceededError", "QueryBudget", "QueryDiagnostics", "QueryResult", "PreparedQueryPlan", "PrepareQueries", "EvaluateQueries", "prepare_queries", "evaluate_queries", "QueryShotTrajectory", "run_query_shot", "run_query_batch"]

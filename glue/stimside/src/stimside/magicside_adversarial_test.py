@@ -19,8 +19,8 @@ from stimside import (
     QueryBudget,
     QueryBudgetExceededError,
 )
-from stimside.util import magic_compile as mc
-from stimside.util import phase_qfe as pq
+from stimside._magic import compile as mc
+from stimside._magic import phase_qfe as pq
 
 
 def _axis_1q(q: int, pauli: str, n_qubits: int, neg: bool = False) -> mc.CompiledPauliAxis:

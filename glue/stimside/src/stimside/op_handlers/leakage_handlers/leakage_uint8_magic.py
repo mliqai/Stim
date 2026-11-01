@@ -3,22 +3,90 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 import warnings
 
 import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageParams
+from stimside.op_handlers.leakage_handlers.leakage_parameters import (
+    LeakageConditioningParams,
+    LeakageMeasurementParams,
+    LeakageParams,
+)
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import CompiledLeakageUint8Coset, LeakageUint8Coset, _do_copies_on_fused_step
 from stimside.op_handlers.leakage_handlers.tag_registry import (
     MAGIC_TAGS as _MAGIC_TAGS,
     check_tag_qubits,
     parse_leakage_tag_magic as _parse_leakage_tag_magic,
 )
-from stimside.simulator_magic import MagicsideSimulator
 from stimside.util.stim_workarounds import split_fused_instruction
+
+if TYPE_CHECKING:
+    from stimside.simulator_magic import MagicsideSimulator
+
+_PURE_NOISE_GATES: frozenset[str] = frozenset({
+    "X_ERROR", "Y_ERROR", "Z_ERROR", "I_ERROR", "II_ERROR", "DEPOLARIZE1", "DEPOLARIZE2",
+    "PAULI_CHANNEL_1", "PAULI_CHANNEL_2", "CORRELATED_ERROR", "E", "ELSE_CORRELATED_ERROR",
+})
+
+
+def _strip_circuit_for_noiseless_ref(circuit: stim.Circuit) -> tuple[stim.Circuit, bool]:
+    needs_leakage = False
+
+    def _strip(blk: stim.Circuit) -> stim.Circuit:
+        nonlocal needs_leakage
+        out = stim.Circuit()
+        for op in blk:
+            if isinstance(op, stim.CircuitRepeatBlock):
+                out.append(stim.CircuitRepeatBlock(op.repeat_count, _strip(op.body_copy())))
+                continue
+            tag, name, tgs = op.tag, op.name, op.targets_copy()
+            if tag.startswith(("CLIFFORD_FAULT", "LEAKAGE_TRANSITION", "LEAKAGE_CONTROLLED")):
+                continue
+            if tag == "LEAKAGE_SWAP":
+                out.append(stim.CircuitInstruction("SWAP", tgs))
+            elif tag.startswith(("LEAKAGE_MEASUREMENT", "LEAKAGE_PROJECTION_Z")):
+                params, _ = _parse_leakage_tag_magic(op)
+                assert isinstance(params, LeakageMeasurementParams)
+                is_mpad = tag.startswith("LEAKAGE_MEASUREMENT")
+                b0 = params.prob_for_input_state.get(0, 0.0) > 0.5
+                b1 = params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0) > 0.5
+                if is_mpad and b0 == b1:
+                    out.append(stim.CircuitInstruction("MPAD", [int((bool(t.value) ^ t.is_inverted_result_target) ^ b0) for t in tgs]))
+                elif not is_mpad and (b0, b1) == (False, True):
+                    out.append(stim.CircuitInstruction(name, tgs))
+                elif not is_mpad and (b0, b1) == (True, False):
+                    out.append(stim.CircuitInstruction(name, [stim.target_inv(t.qubit_value) if not t.is_inverted_result_target else t.qubit_value for t in tgs]))
+                else:
+                    sfx = f" : {' '.join(str(q) for q in (params.targets or ()))}" if is_mpad else ""
+                    out.append(stim.CircuitInstruction(name, tgs, [], tag=f"{'LEAKAGE_MEASUREMENT' if is_mpad else 'LEAKAGE_PROJECTION_Z'}: ({float(b0)}, 0) ({float(b1)}, 1){sfx}"))
+                    needs_leakage = True
+            elif tag.startswith("CONDITIONED_ON"):
+                if name in _PURE_NOISE_GATES:
+                    continue
+                params, _ = _parse_leakage_tag_magic(op)
+                assert isinstance(params, LeakageConditioningParams)
+                has_comp_proj = any(0 in g or 1 in g for g in params.args) or (
+                    len(params.args) == 1
+                    and any(tok in ("0", "1") for tok in (params.from_tag or ":").split(":")[1].split())
+                )
+                if has_comp_proj:
+                    out.append(op)
+                    needs_leakage = True
+                elif ("U",) * len(params.args) in zip(*params.args):
+                    out.append(stim.CircuitInstruction(name, tgs, op.gate_args_copy()))
+            elif tag == "" and name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
+                out.append(stim.CircuitInstruction("MPAD", [0] * len(tgs)))
+            elif tag in _MAGIC_TAGS:
+                out.append(op)
+            elif name not in _PURE_NOISE_GATES:
+                gd = stim.gate_data(name)
+                out.append(stim.CircuitInstruction(name, tgs, [], tag=tag) if (gd.produces_measurements and op.gate_args_copy()) else op)
+        return out
+
+    return _strip(circuit), needs_leakage
 
 
 def _validate_magic_instruction(op: stim.CircuitInstruction, num_qubits: int) -> list[int]:

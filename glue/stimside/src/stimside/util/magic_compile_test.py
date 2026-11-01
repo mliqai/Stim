@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 import stim
 
-from stimside.util.magic_compile import (
+from stimside._magic.compile import (
     CONTROLLED_PAULI_2Q_AXES,
     CliffordFaultChannel,
     CompiledOpenBlockRecord,
@@ -55,7 +55,7 @@ from stimside.util.magic_compile import (
     run_selector,
     sample_selector_activations,
 )
-from stimside.util.phase_qfe import (
+from stimside._magic.phase_qfe import (
     PhaseQFEComponent,
     ShotExpansion,
     apply_pauli,
@@ -977,7 +977,7 @@ def test_v1_4_selector_all_40_controlled_quarter_turns() -> None:
                     n_qubits=2,
                     merge=True,
                 )
-                from stimside.util.phase_qfe import apply_compiled_block
+                from stimside._magic.phase_qfe import apply_compiled_block
                 from stimside.util.reference_chp import ReferenceCHPTableau
 
                 out_aug = apply_compiled_block(init_exp, recs[0].block)
@@ -992,7 +992,7 @@ def test_v1_4_selector_all_40_controlled_quarter_turns() -> None:
     #    psi_in_2q = (I_0 tensor T_1) CZ_{0,1} (T_0 tensor S_1) H^{\otimes 2} |00>
     c_in2 = stim.Circuit("H 0 1\nI[T] 0\nS 1\nCZ 0 1\nI[T] 1\nCX 1 0")
     psi_in_2q = reconstruct_statevector(run_direct(compile_direct(c_in2)))
-    from stimside.util.phase_qfe import apply_compiled_block
+    from stimside._magic.phase_qfe import apply_compiled_block
     from stimside.util.reference_chp import ReferenceCHPTableau
 
     count_2q = 0
@@ -1164,7 +1164,7 @@ def test_v1_4_selector_all_9_controlled_paulis_and_clifford_phases() -> None:
 
 def test_v1_4_direct_vs_selector_binary_and_categorical_circuits() -> None:
     """`V1.4`: 40 random 3-4Q circuits with binary & multi-branch categorical faults + `gadgetize_pauli_noise`."""
-    from stimside.util.phase_qfe import project_diagonal
+    from stimside._magic.phase_qfe import project_diagonal
 
     rng = np.random.default_rng(20261030)
     cat_1q_templates = (
@@ -1595,7 +1595,7 @@ def test_malformed_magic_and_clifford_fault_tags_raise(bad_circuit_text: str) ->
 
 def test_malformed_gate_args_and_programmatic_channels_raise() -> None:
     """Verify non-empty `gate_args` on `I[T]`/`I[CLIFFORD_FAULT]` and bad `CliffordFaultChannel` raise `ValueError`."""
-    from stimside.util.magic_compile import (
+    from stimside._magic.compile import (
         _validate_and_emit_magic_op,
         parse_clifford_fault_instruction,
     )
@@ -1662,7 +1662,7 @@ def test_malformed_gate_args_and_programmatic_channels_raise() -> None:
             run_selector(sp_ok, atol=bad_atol)
 
     # compile_open_block accepts CoordinateCompilation directly or explicit n_qubits
-    from stimside.util.phase_qfe import apply_compiled_block
+    from stimside._magic.phase_qfe import apply_compiled_block
 
     c_3q = stim.Circuit("H 0 1 2\nI[T] 0 1\nI[CCZ] 0 1 2")
     coord_3q = compile_coordinates(c_3q)
@@ -1879,7 +1879,7 @@ def test_m1_r2_leakage_tag_barriers_and_unknown_tag_validation() -> None:
 
 def test_m1_r2_sample_selector_activations_public_api() -> None:
     """Verify public `sample_selector_activations` one-hot invariants, trace overrides, and seed reproducibility."""
-    import stimside.util.magic_compile as mc_mod
+    import stimside._magic.compile as mc_mod
 
     assert "sample_selector_activations" in mc_mod.__all__
     assert "LeakageBarrierRecord" in mc_mod.__all__
@@ -2281,7 +2281,7 @@ def test_m1_r3_noisy_readout_and_conflicting_postselection(
 
 def test_m1_r3_superposition_posterior_and_postselection_conflicts() -> None:
     """Finding 1: Superposition Bayesian collapse (`P(Q|C)`) and conflicting `(q, rep)` postselection."""
-    from stimside.util.phase_qfe import ImpossiblePostselectionError
+    from stimside._magic.phase_qfe import ImpossiblePostselectionError
 
     # Superposition Bayesian posterior on H 0 -> M(0.25) 0 -> I[T] 0 -> H 0 (P(Q=0|C=0)=0.75, P(Q=1|C=0)=0.25)
     dp_post = compile_direct(stim.Circuit("H 0\nM(0.25) 0\nI[T] 0\nH 0"))

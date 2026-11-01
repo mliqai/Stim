@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import dataclasses
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -19,13 +21,15 @@ from stimside.op_handlers.leakage_handlers.leakage_tag_parsing_flip import (
     parse_leakage_in_circuit,
 )
 from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
-from stimside.simulator_flip import FlipsideSimulator
 from stimside.util.numpy_types import Bool2DArray
 from stimside.util.stim_workarounds import split_fused_instruction
 
+if TYPE_CHECKING:
+    from stimside.simulator_flip import FlipsideSimulator
+
 
 @dataclasses.dataclass
-class LeakageUint8(OpHandler[FlipsideSimulator]):
+class LeakageUint8(OpHandler["FlipsideSimulator"]):
     """Implementing leakage using an array of 8bit Uints.
 
     Basically, we store the leakage state as an int for each qubit.
@@ -86,7 +90,7 @@ def _reset_value(s_in: object, s_out: object) -> int | None:
 
 
 @dataclasses.dataclass
-class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
+class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
 
     num_qubits: int
     batch_size: int

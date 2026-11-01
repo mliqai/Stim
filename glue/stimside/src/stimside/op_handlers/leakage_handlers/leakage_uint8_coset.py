@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable, Literal, Sequence, cast
+from typing import TYPE_CHECKING, Callable, Literal, Sequence, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -20,8 +20,10 @@ from stimside.op_handlers.leakage_handlers.leakage_tag_parsing_tableau import (
     parse_leakage_in_circuit,
 )
 from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
-from stimside.simulator_coset import CosetsideSimulator
 from stimside.util.stim_workarounds import broadcast_pauli_errors, split_fused_instruction
+
+if TYPE_CHECKING:
+    from stimside.simulator_coset import CosetsideSimulator
 
 
 def _do_copies_on_fused_step(
@@ -44,7 +46,7 @@ def _do_copies_on_fused_step(
 
 
 @dataclasses.dataclass
-class LeakageUint8Coset(OpHandler[CosetsideSimulator]):
+class LeakageUint8Coset(OpHandler["CosetsideSimulator"]):
     """Batched uint8 leakage OpHandler for CosetsideSimulator reusing tableside tag parsers.
 
     Args:
@@ -74,7 +76,7 @@ class LeakageUint8Coset(OpHandler[CosetsideSimulator]):
 
 
 @dataclasses.dataclass
-class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
+class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
     """Compiled batched uint8 leakage OpHandler for CosetsideSimulator."""
 
     num_qubits: int
