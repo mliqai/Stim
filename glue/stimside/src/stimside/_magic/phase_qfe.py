@@ -15,6 +15,7 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
+from stimside._native.magic_kernels import get_magic_kernels_lib as _get_cpp_lib
 from stimside.util.bitwords import (
     I_POWERS_ARR as _PHASE4,
     INV_SQRT2 as _INV_SQRT2,
@@ -52,12 +53,11 @@ __all__ = [
     "first_set_bit_in_words", "pauli_multiply", "validate_hermitian_pauli",
     "PhaseQFEComponent", "ShotExpansion",
     "MeasurementResult", "CompiledPauliBlockStep", "CompiledPauliBlock",
-    "reference_chp_to_stim_tableau", "stim_tableau_to_reference_chp",
     "apply_reference_tableau_to_statevector",
     "drop_variable", "add_column", "make_principal", "restrict_amplitude",
     "eliminate_zero_amplitude", "apply_pauli", "apply_quarter_turn",
     "merge_frames", "apply_pauli_t", "apply_ccz",
-    "apply_compiled_block", "project_diagonal", "measure_expansion",
+    "apply_compiled_block", "project_diagonal", "born_split_expansion", "measure_expansion",
     "validate_atol",
 ]
 
@@ -124,29 +124,6 @@ def _check_unitary_norm(pre_norm: float, post_norm: float, atol: float, op_name:
             f"{op_name} unitary norm conservation violated: "
             f"before={pre_norm!r}, after={post_norm!r}, atol={tol!r}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Lazy optional M2 C++17 shared-library dispatch hook (`magic_kernels.py`)
-# ---------------------------------------------------------------------------
-
-_CACHED_MAGIC_LIB: ctypes.CDLL | None = None
-
-
-def _reset_cpp_kernel_cache() -> None:
-    """Reset cached M2 C++ kernel library handle."""
-    global _CACHED_MAGIC_LIB
-    _CACHED_MAGIC_LIB = None
-
-
-def _get_cpp_lib() -> ctypes.CDLL:
-    global _CACHED_MAGIC_LIB
-    if _CACHED_MAGIC_LIB is not None:
-        return _CACHED_MAGIC_LIB
-    from stimside._native import magic_kernels as mk
-
-    _CACHED_MAGIC_LIB = mk.get_magic_kernels_lib()
-    return _CACHED_MAGIC_LIB
 
 
 def _unpack_pauli_args(
@@ -603,16 +580,6 @@ _C128_CX: NDArray[np.complex128] = np.array(
 )
 
 
-def reference_chp_to_stim_tableau(ref_chp: ReferenceCHPTableau) -> stim.Tableau:
-    """Convert `ReferenceCHPTableau` inverse symplectic tables into forward `stim.Tableau`."""
-    return ref_chp.to_stim_tableau()
-
-
-def stim_tableau_to_reference_chp(tab: stim.Tableau) -> ReferenceCHPTableau:
-    """Convert forward `stim.Tableau` into inverse-convention `ReferenceCHPTableau`."""
-    return ReferenceCHPTableau.from_stim_tableau(tab)
-
-
 def _apply_local_unitary_c128(
     psi: NDArray[np.complex128],
     U_le: NDArray[np.complex128],
@@ -639,7 +606,7 @@ def apply_reference_tableau_to_statevector(
     endian: Literal["little", "big"] = "little",
 ) -> NDArray[np.complex128]:
     """Transform `psi_ref` from reference coordinates to physical coordinates in `complex128`."""
-    tab = reference_chp_to_stim_tableau(ref_tableau) if isinstance(ref_tableau, ReferenceCHPTableau) else ref_tableau
+    tab = ref_tableau.to_stim_tableau() if isinstance(ref_tableau, ReferenceCHPTableau) else ref_tableau
     n = len(tab)
     psi = np.ascontiguousarray(psi_ref, dtype=np.complex128).copy()
     if n == 0:
@@ -1423,6 +1390,51 @@ def project_diagonal(
     return exp, float(out_z.value)
 
 
+def born_split_expansion(
+    expansion: ShotExpansion,
+    a_w: NDArray[np.uint64],
+    b_w: NDArray[np.uint64],
+    kap: int,
+    *,
+    atol: float,
+    z_in: float | None = None,
+    project_fn: Any = None,
+) -> tuple[
+    ShotExpansion, float, ShotExpansion, float, float, ShotExpansion,
+    tuple[NDArray[np.uint64], NDArray[np.uint64], int] | None,
+]:
+    """Rotate if needed, project onto both outcomes, and verify Born mass conservation."""
+    z = expansion.norm_sq() if z_in is None else z_in
+    if not (math.isfinite(z) and z >= 0.0):
+        raise FloatingPointError(f"Invalid pre-measurement norm squared z={z!r}")
+    if words_any_nonzero(a_w):
+        e_p_w = unit_bit_words(first_set_bit_in_words(a_w), expansion.n_words)
+        rot: tuple[NDArray[np.uint64], NDArray[np.uint64], int] | None = (
+            a_w, np.ascontiguousarray(b_w ^ e_p_w), (kap + 1) & 3
+        )
+        work_exp = apply_quarter_turn(expansion, *rot, sign=1, check_unitary=True, atol=atol)
+        b_diag, sig_diag = e_p_w, 0
+    else:
+        rot = None
+        work_exp, b_diag, sig_diag = expansion, b_w, (kap >> 1) & 1
+
+    proj = project_diagonal if project_fn is None else project_fn
+    exp0, z0_raw = proj(work_exp, b_diag, sig_diag, 0)
+    exp1, z1_raw = proj(work_exp, b_diag, sig_diag, 1)
+    scale_z = max(1.0, z)
+    if not (math.isfinite(z0_raw) and math.isfinite(z1_raw)):
+        raise FloatingPointError(f"Non-finite projected Born masses: z0={z0_raw!r}, z1={z1_raw!r}")
+    if z0_raw < -1e-12 * scale_z or z1_raw < -1e-12 * scale_z:
+        raise FloatingPointError(f"Significantly negative projected Born mass: z0={z0_raw!r}, z1={z1_raw!r}, z={z!r}")
+    z0, z1 = max(0.0, float(z0_raw)), max(0.0, float(z1_raw))
+    if not (abs((z0 + z1) - z) <= atol * scale_z):
+        raise FloatingPointError(
+            f"M2 Born mass conservation violated: z0={z0:.16e}, z1={z1:.16e}, "
+            f"z0+z1={z0 + z1:.16e}, z={z:.16e}, tol={atol:.3e}"
+        )
+    return exp0, z0, exp1, z1, z, work_exp, rot
+
+
 def measure_expansion(
     expansion: ShotExpansion,
     a: Any,
@@ -1448,10 +1460,7 @@ def measure_expansion(
 
     n_q = expansion.n_qubits
     tol = validate_atol(expansion.atol if atol is None else atol)
-    z = expansion.norm_sq()
     in_log_mass = expansion.log_mass
-    if not (math.isfinite(z) and z >= 0.0):
-        raise FloatingPointError(f"Invalid pre-measurement norm squared z={z!r}")
 
     if b is None and sigma is not None:
         if sigma not in (0, 1):
@@ -1463,33 +1472,7 @@ def measure_expansion(
         a_w, b_w, kap = _unpack_pauli_args(a, b, kappa, n_q)
         kap = validate_hermitian_pauli(a_w, b_w, kap)
 
-    rotated = words_any_nonzero(a_w)
-    if rotated:
-        e_p_w = unit_bit_words(first_set_bit_in_words(a_w), n_words_for_qubits(n_q))
-        a_rot, b_rot, kap_rot = a_w, np.ascontiguousarray(b_w ^ e_p_w), (kap + 1) & 3
-        work_exp = apply_quarter_turn(
-            expansion, a_rot, b_rot, kap_rot, sign=1, check_unitary=True, atol=tol
-        )
-        b_diag, sig_diag = e_p_w, 0
-    else:
-        a_rot, b_rot, kap_rot = a_w, b_w, 0
-        work_exp, b_diag, sig_diag = expansion, b_w, (kap >> 1) & 1
-
-    exp0, z0_raw = project_diagonal(work_exp, b_diag, sig_diag, 0)
-    exp1, z1_raw = project_diagonal(work_exp, b_diag, sig_diag, 1)
-
-    scale_z = max(1.0, z)
-    if not (math.isfinite(z0_raw) and math.isfinite(z1_raw)):
-        raise FloatingPointError(f"Non-finite projected Born masses: z0={z0_raw!r}, z1={z1_raw!r}")
-    if z0_raw < -1e-12 * scale_z or z1_raw < -1e-12 * scale_z:
-        raise FloatingPointError(f"Significantly negative projected Born mass: z0={z0_raw!r}, z1={z1_raw!r}, z={z!r}")
-    z0 = 0.0 if z0_raw < 0.0 else float(z0_raw)
-    z1 = 0.0 if z1_raw < 0.0 else float(z1_raw)
-    if not (abs((z0 + z1) - z) <= tol * scale_z):
-        raise FloatingPointError(
-            f"M2 Born mass conservation violated: z0={z0:.16e}, z1={z1:.16e}, "
-            f"z0+z1={z0 + z1:.16e}, z={z:.16e}, tol={tol:.3e}"
-        )
+    exp0, z0, exp1, z1, z, _, rot = born_split_expansion(expansion, a_w, b_w, kap, atol=tol)
 
     zero_floor = K1_CANCEL_REL_TOL * z
     if requested_bit is not None:
@@ -1520,10 +1503,8 @@ def measure_expansion(
         readout_flipped = False
     reported_outcome = outcome ^ (1 if invert_result else 0) ^ (1 if readout_flipped else 0)
 
-    if rotated and not keep_rotated_frame:
-        chosen_exp = apply_quarter_turn(
-            chosen_exp, a_rot, b_rot, kap_rot, sign=-1, check_unitary=True, atol=tol
-        )
+    if rot is not None and not keep_rotated_frame:
+        chosen_exp = apply_quarter_turn(chosen_exp, *rot, sign=-1, check_unitary=True, atol=tol)
 
     if renormalize:
         chosen_exp.weights = np.ascontiguousarray(chosen_exp.weights * (1.0 / math.sqrt(chosen_z)))

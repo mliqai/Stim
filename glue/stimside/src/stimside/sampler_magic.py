@@ -48,20 +48,26 @@ class MagicsideSampler(CompiledSeedMixin, sinter.Sampler):
         if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
             raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
         self.op_handler, self.dem_decoder, self.batch_size = op_handler, _coerce_magic_decoder(dem_decoder), int(batch_size)
-        self.fault_mode: Literal["DIRECT", "SELECTOR"] = _parse_enum(fault_mode, _FAULT_MODES, "fault_mode")
-        self.backend: Literal["STREAM", "QUERY"] = _parse_enum(backend, _BACKENDS, "backend")
-        if (self.backend == "QUERY" or self.fault_mode == "SELECTOR") and op_handler is not None and not isinstance(op_handler, TrivialOpHandler):
-            raise ValueError(f"backend={self.backend!r}, fault_mode={self.fault_mode!r} is incompatible with non-trivial op_handler")
-        self.m2d_reference_mode: Literal["auto", "magicside", "stim", "zero"] = _parse_enum(m2d_reference_mode, _M2D_MODES, "m2d_reference_mode", lower=True)
-        self.reference_sample = None if reference_sample is None else np.asarray(reference_sample, dtype=np.bool_).copy()
-        self.fault_channels = tuple(fault_channels) if fault_channels is not None else None
-        self.atol = validate_atol(atol)
+        fm: Literal["DIRECT", "SELECTOR"] = _parse_enum(fault_mode, _FAULT_MODES, "fault_mode")
+        be: Literal["STREAM", "QUERY"] = _parse_enum(backend, _BACKENDS, "backend")
+        if (be == "QUERY" or fm == "SELECTOR") and op_handler is not None and not isinstance(op_handler, TrivialOpHandler):
+            raise ValueError(f"backend={be!r}, fault_mode={fm!r} is incompatible with non-trivial op_handler")
         if seed is not None:
             derived_seed(seed, 0)
         self.seed = seed
-        self.query_budget, self.max_components, self.on_budget_exceeded = _resolve_budget(
-            query_budget, max_components, on_budget_exceeded
-        )
+        qb, mc, obe = _resolve_budget(query_budget, max_components, on_budget_exceeded)
+        self._sim_kwargs: dict[str, Any] = {
+            "batch_size": self.batch_size,
+            "fault_mode": fm,
+            "backend": be,
+            "m2d_reference_mode": _parse_enum(m2d_reference_mode, _M2D_MODES, "m2d_reference_mode", lower=True),
+            "reference_sample": None if reference_sample is None else np.asarray(reference_sample, dtype=np.bool_).copy(),
+            "fault_channels": tuple(fault_channels) if fault_channels is not None else None,
+            "query_budget": qb,
+            "max_components": mc,
+            "on_budget_exceeded": obe,
+            "atol": validate_atol(atol),
+        }
         self._init_pid, self._compile_count = os.getpid(), 0
         self._spawn_count, self._worker_index = 0, None
 
@@ -95,11 +101,7 @@ class MagicsideSampler(CompiledSeedMixin, sinter.Sampler):
             circuit=task.circuit, compiled_op_handler=compiled_handler,
             compiled_decoder=eff_dec.compile_for_task(task),
             needs_records=eff_dec.needs_records, needs_leakage_events=eff_dec.needs_leakage_events,
-            batch_size=self.batch_size, fault_mode=self.fault_mode, backend=self.backend,
-            seed=self._next_compiled_seed(),
-            m2d_reference_mode=self.m2d_reference_mode, reference_sample=self.reference_sample,
-            fault_channels=self.fault_channels, query_budget=self.query_budget,
-            max_components=self.max_components, on_budget_exceeded=self.on_budget_exceeded, atol=self.atol,
+            seed=self._next_compiled_seed(), **self._sim_kwargs,
         )
 
 
@@ -110,23 +112,14 @@ class CompiledMagicsideSampler(sinter.CompiledSampler):
         self, *, circuit: stim.Circuit, compiled_op_handler: Any,
         compiled_decoder: CompiledLeakageDecoder, needs_records: bool,
         needs_leakage_events: bool = False, batch_size: int = 256,
-        fault_mode: str = "DIRECT", backend: str = "STREAM",
-        seed: int | None = None,
-        m2d_reference_mode: str = "auto",
-        reference_sample: Sequence[int | bool] | NDArray[np.bool_] | None = None,
-        fault_channels: Sequence[CliffordFaultChannel] | None = None,
-        query_budget: QueryBudget | None = None, max_components: int | None = None,
-        on_budget_exceeded: str | None = None, atol: float = DEFAULT_ATOL,
+        seed: int | None = None, **sim_kwargs: Any,
     ) -> None:
         self.batch_size, self.compiled_decoder = int(batch_size), compiled_decoder
         self.needs_records, self.needs_leakage_events = bool(needs_records), bool(needs_leakage_events)
         self.simulator = MagicsideSimulator(
             circuit=circuit, compiled_op_handler=compiled_op_handler, batch_size=self.batch_size,
-            fault_mode=fault_mode, backend=backend, seed=seed,
-            m2d_reference_mode=m2d_reference_mode, reference_sample=reference_sample,
-            fault_channels=fault_channels, query_budget=query_budget, max_components=max_components,
-            on_budget_exceeded=on_budget_exceeded, record_unleaked_to_leaked=True,
-            record_leakage_events=self.needs_leakage_events, atol=atol,
+            seed=seed, record_unleaked_to_leaked=True, record_leakage_events=self.needs_leakage_events,
+            **sim_kwargs,
         )
 
     def sample(self, suggested_shots: int) -> sinter.AnonTaskStats:
@@ -137,8 +130,9 @@ class CompiledMagicsideSampler(sinter.CompiledSampler):
             assert u2l_list is not None
             records = self.simulator.get_final_measurement_records() if self.needs_records else None
             leakage_events = self.simulator.get_leakage_events() if self.needs_leakage_events else None
-            packed_dets = np.packbits(self.simulator.get_detector_flips(), axis=1, bitorder="little")
-            packed_obs = np.packbits(self.simulator.get_observable_flips(), axis=1, bitorder="little")
+            dets, obs = self.simulator._convert_m2d(None)
+            packed_dets = np.packbits(dets, axis=1, bitorder="little")
+            packed_obs = np.packbits(obs, axis=1, bitorder="little")
             packed_preds = self.compiled_decoder.decode_shots_bit_packed(
                 bit_packed_detection_event_data=packed_dets, records=records, leakage_events=leakage_events,
             )

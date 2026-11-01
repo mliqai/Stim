@@ -60,7 +60,6 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
     lib1: ctypes.CDLL | None = None
     try:
         mk._LIB_INSTANCE = None
-        pq._reset_cpp_kernel_cache()
         with mock.patch.object(subprocess, "run", side_effect=AssertionError("unexpected compile")):
             lib1 = mk.get_magic_kernels_lib(force_recompile=False)
             lib2 = mk.get_magic_kernels_lib(force_recompile=False)
@@ -73,7 +72,7 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
             pq.ShotExpansion.zero(2, use_cpp_kernels=False)  # type: ignore[call-arg]
         exp = pq.ShotExpansion.zero(2)
         pq.apply_pauli(exp, [1, 0], [0, 0], 0)
-        assert pq._CACHED_MAGIC_LIB is not None and pq._CACHED_MAGIC_LIB is lib1
+        assert mk._LIB_INSTANCE is lib1
 
         tmp_native = tmp_path / "rebuild_pkg" / "src" / "stimside" / "_native"
         tmp_native.mkdir(parents=True)
@@ -92,10 +91,8 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
             assert rebuilt is not lib1 and rebuilt._handle != lib1._handle
             assert mk._LIB_INSTANCE is rebuilt
             assert int(rebuilt.magic_abi_v1()) == 1
-            assert pq._CACHED_MAGIC_LIB is None
     finally:
         mk._LIB_INSTANCE = lib1 if lib1 is not None else orig_lib
-        pq._reset_cpp_kernel_cache()
 
     assert (so_path.stat().st_ino, so_path.stat().st_mtime_ns) == live_stat
 

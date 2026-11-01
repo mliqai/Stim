@@ -16,9 +16,9 @@ from stimside._magic.compile import (
     MagicTermRecord, MeasurementRecord, PauliNoiseRecord, ResetRecord, SelectorPlan,
     _FEEDBACK_2Q_GATES, _PAULI_2Q_ORDER, _canonical_clifford_gate_name_and_arity, _canonical_gate_data,
     _coerce_strict_int, _compile_clifford_factors, _compile_pauli_measurement_c15, _compile_reset_c15,
-    _infer_total_data_qubits, _merge_and_validate_fault_channels, _normalize_choice_map,
-    _prepare_run_maps, _reduce_pauli_product_targets, _sample_categorical_branch, _split_pauli_product_targets,
-    _validate_and_emit_magic_op, compile_direct,
+    _emit_magic_terms, _infer_total_data_qubits, _merge_and_validate_fault_channels, _normalize_choice_map,
+    _normalize_pauli_slot_map, _prepare_run_maps, _reduce_pauli_product_targets, _sample_categorical_branch,
+    _split_pauli_product_targets, _split_realization_sections, apply_clifford_factors, compile_direct,
     compile_open_block, compile_pauli_product, compile_selector, extract_circuit_faults, extract_data_expansion,
     parse_clifford_fault_instruction, reconstruct_statevector, run_direct, run_selector,
 )
@@ -27,14 +27,12 @@ from stimside._magic.phase_qfe import (
     apply_quarter_turn, measure_expansion, project_diagonal, validate_atol,
 )
 from stimside._magic.query import (
-    PrepareQueries, PreparedQueryPlan, QueryBudget, QueryBudgetExceededError,
-    _PAULI_1Q_STR, _PAULI_2Q_STR, _PAULI_4_STR, run_query_batch,
+    PrepareQueries, PreparedQueryPlan, QueryBudget, QueryBudgetExceededError, run_query_batch,
 )
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler, _TrivialCompiledOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic, _strip_circuit_for_noiseless_ref
-from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS
+from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS, validate_magic_op
 from stimside.util.bitwords import (
-    OMEGA_POWERS,
     first_set_bit_in_words,
     unit_bit_words,
     word_dot_parity,
@@ -60,10 +58,6 @@ _BACKENDS: dict[str, Literal["STREAM", "QUERY"]] = {"STREAM": "STREAM", "QUERY":
 _M2D_MODES: dict[str, Literal["auto", "magicside", "stim", "zero"]] = {
     "auto": "auto", "magicside": "magicside", "magic": "magicside", "noiseless_magic": "magicside",
     "stim": "stim", "clifford": "stim", "zero": "zero", "skip": "zero",
-}
-_REAL_KEY_MAP: dict[str, str] = {
-    "faults": "faults", "measurements": "measurements", "quantum_measurements": "quantum_measurements",
-    "paulis": "paulis", "pauli_noise": "paulis", "resets": "resets", "sweep": "sweep_bits", "sweep_bits": "sweep_bits",
 }
 
 
@@ -91,28 +85,12 @@ def _normalize_shot_realization(
         return {}
     if not isinstance(raw, Mapping):
         raise ValueError(f"Expected Mapping fault realization, got {type(raw)!r}")
-    sec: dict[str, Any] = {}
-    if any(isinstance(k, str) for k in raw):
-        for k, v in raw.items():
-            ck = _REAL_KEY_MAP.get(k) if isinstance(k, str) else None
-            if ck is None or ck in sec:
-                raise ValueError(f"Invalid or duplicate fault_realizations key {k!r}")
-            if v is not None:
-                sec[ck] = v
-    elif raw:
-        sec["faults"] = raw
+    sec = _split_realization_sections(raw)
     if "faults" in sec:
-        fr = sec["faults"]
-        if isinstance(fr, Mapping):
-            fr = {
-                k: int(bool(v)) if (isinstance(v, (bool, np.bool_)) and not isinstance(k, (bool, np.bool_)) and isinstance(k, (int, np.integer)) and int(k) in fault_id_to_slot and fault_max[fault_id_to_slot[int(k)]] == 1) else v
-                for k, v in fr.items()
-            }
-        elif not isinstance(fr, (str, bytes)) and isinstance(fr, (Sequence, np.ndarray)):
-            if getattr(fr, "ndim", 1) != 1 or len(fr) != len(fault_max):
-                raise ValueError(f"Invalid faults sequence shape/length for {len(fault_max)} slots")
-            fr = [int(bool(v)) if (isinstance(v, (bool, np.bool_)) and fault_max[i] == 1) else v for i, v in enumerate(fr)]
-        sec["faults"] = _normalize_choice_map(fr, fault_max, "faults", key_to_slot=fault_id_to_slot, allow_none_zero=True)
+        sec["faults"] = _normalize_choice_map(
+            sec["faults"], fault_max, "faults",
+            key_to_slot=fault_id_to_slot, allow_none_zero=True, allow_binary_bool=True, strict_length=True,
+        )
     for mk in ("measurements", "quantum_measurements"):
         if mk in sec:
             sec[mk] = _normalize_choice_map(sec[mk], (1,) * num_measurements, mk, allow_bool_values=True)
@@ -127,25 +105,12 @@ def _normalize_shot_realization(
 def _normalize_stream_paulis(plan: DirectPlan | SelectorPlan, raw_p: Any) -> Any:
     if not isinstance(raw_p, Mapping):
         return raw_p
-    max_c, kinds = plan.noise_channel_max_choices, {}
-    for rec in plan.records:
-        if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord, CorrelatedNoiseRecord)):
-            kinds[rec.noise_index] = getattr(rec, "kind", "")
-    out: dict[Any, Any] = {}
-    for k, v in raw_p.items():
-        ik = _coerce_strict_int(k, "paulis key")
-        if ik < 0 or ik >= len(max_c):
-            raise ValueError(f"Pauli slot {ik} out of range")
-        mc, kind = max_c[ik], kinds.get(ik, "")
-        if isinstance(v, str):
-            s = v.strip().upper()
-            tbl = ({"I": 0, kind[:1]: 1} if kind in ("X_ERROR", "Y_ERROR", "Z_ERROR") else {"I": 0}) if mc == 1 else {3: _PAULI_1Q_STR, 4: _PAULI_4_STR, 15: _PAULI_2Q_STR}.get(mc, {})
-            if s not in tbl:
-                raise ValueError(f"Invalid Pauli label {v!r} at slot {ik}")
-            out[ik] = tbl[s]
-        else:
-            out[ik] = int(bool(v)) if (mc == 1 and isinstance(v, (bool, np.bool_))) else v
-    return out
+    kinds = {
+        rec.noise_index: getattr(rec, "kind", "")
+        for rec in plan.records
+        if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord, CorrelatedNoiseRecord))
+    }
+    return _normalize_pauli_slot_map(raw_p, plan.noise_channel_max_choices, kinds)
 
 
 def _parse_enum(val: Any, table: Mapping[str, Any], name: str, *, lower: bool = False) -> Any:
@@ -522,18 +487,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._apply_pauli_mask(pauli, eff)
 
     def _apply_factor_list(self, s: int, fac: CompiledCliffordFactorList, *, inverse: bool = False) -> None:
-        exp = self._live_exps[s]
-        if exp.chi == 0:
-            return
-        if not inverse and fac.p0 is not None:
-            exp = apply_pauli(exp, fac.p0)
-        for ra in (reversed(fac.r_axes) if inverse else fac.r_axes):
-            exp = apply_quarter_turn(exp, ra, sign=-1 if inverse else 1, check_unitary=True, atol=self.atol)
-        if inverse and fac.p0 is not None:
-            exp = apply_pauli(exp, fac.p0)
-        if fac.v:
-            exp.weights = np.ascontiguousarray(exp.weights * OMEGA_POWERS[(-fac.v if inverse else fac.v) & 7])
-        self._live_exps[s] = exp
+        self._live_exps[s] = apply_clifford_factors(
+            self._live_exps[s], fac, inverse=inverse, check_unitary=True, atol=self.atol
+        )
 
     def _forced_fault_branch(self, s: int, slot_idx: int) -> int | None:
         if self._norm_reals is None or slot_idx < 0:
@@ -609,6 +565,12 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             for slot_idx, ch in self._prog_faults[n]:
                 self._fire_fault_channel_live(slot_idx, ch)
 
+    def _emit_magic_op(self, op: stim.CircuitInstruction, qs: Sequence[int] | None = None) -> None:
+        tmp: list[Any] = []
+        _emit_magic_terms(op.tag, validate_magic_op(op) if qs is None else qs, self._live_ref_tab, tmp)
+        self._pending_magic.extend(r for r in tmp if isinstance(r, MagicTermRecord))
+        self._next_step_meta(op)
+
     def _do_bare_instruction(self, op: stim.Circuit | stim.CircuitInstruction) -> None:
         if isinstance(op, stim.Circuit):
             for sub in op:
@@ -616,10 +578,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             return
         name, tag = op.name, op.tag
         if tag in _MAGIC_TAGS:
-            tmp: list[Any] = []
-            _validate_and_emit_magic_op(op, self._live_ref_tab, tmp)
-            self._pending_magic.extend(r for r in tmp if isinstance(r, MagicTermRecord))
-            self._next_step_meta(op)
+            self._emit_magic_op(op)
             return
         if tag != "":
             raise ValueError(f"Unrecognized instruction tag {tag!r} on {op!r}")

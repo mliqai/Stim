@@ -12,10 +12,9 @@ from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 from stimside._magic import compile as _mc
-from stimside._magic.compile import CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _sample_categorical_branch, compile_direct, compile_open_block, compile_selector, extract_data_expansion
-from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, validate_atol
+from stimside._magic.compile import CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _normalize_pauli_slot_map, _sample_categorical_branch, _split_realization_sections, apply_clifford_factors, compile_direct, compile_open_block, compile_selector, extract_data_expansion, fault_selector_bits
+from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, born_split_expansion, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, validate_atol
 from stimside.util.bitwords import (
-    OMEGA_POWERS,
     SQRT2 as _SQRT2,
     first_set_bit_in_words,
     n_words_for_qubits,
@@ -27,10 +26,7 @@ from stimside.util.reference_chp import ReferenceCHPTableau
 __all__ = ["QueryBudgetExceededError", "QueryBudget", "QueryDiagnostics", "QueryResult", "PreparedQueryPlan", "PrepareQueries", "EvaluateQueries", "prepare_queries", "evaluate_queries", "QueryShotTrajectory", "run_query_shot", "run_query_batch"]
 
 _EMPTY_DEPS = ((), (), ())
-_PAULI_1Q_STR, _PAULI_4_STR = {"I": 0, "X": 1, "Y": 2, "Z": 3}, {"I": 0, "X": 2, "Y": 3, "Z": 4}
-_PAULI_2Q_STR = {a + b: i for i, (a, b) in enumerate((p, q) for p in "IXYZ" for q in "IXYZ")}
 _VALID_QUERIES = frozenset({"mass", "acceptance", "fidelity", "prefix_probs", "sample_measurements"})
-_VALID_REAL_KEYS = frozenset({"faults", "measurements", "quantum_measurements", "paulis", "pauli_noise", "resets", "sweep", "sweep_bits"})
 
 class QueryBudgetExceededError(RuntimeError):
     """Raised when `Q1`/`Q2` contraction exceeds `QueryBudget` with `on_budget_exceeded == 'raise'`."""
@@ -462,14 +458,11 @@ def _apply_leaf(se: _ScaledExpansion, leaf: tuple[Any, Any, Any], ctx: _EvalCtx,
     if isinstance(rec, CompiledPauliBlock):
         exp = apply_compiled_block(exp, aux if is_choi else rec, check_unitary=True, atol=ctx.atol)
     elif isinstance(rec, DirectFaultSlotRecord) and ctx.faults.get(rec.slot_index, 0) > 0:
-        fac = rec.branch_factors[ctx.faults[rec.slot_index] - 1]
-        if fac.p0 is not None:
-            exp = apply_pauli(exp, *_ax_tup(fac.p0, nw))
-        for ra in fac.r_axes:
-            exp = apply_quarter_turn(exp, *_ax_tup(ra, nw), sign=1, check_unitary=True, atol=ctx.atol)
-            ctx.check_exp(exp, is_choi=is_choi, enforce_terms=enforce_terms)
-        if fac.v:
-            exp.weights = np.ascontiguousarray(exp.weights * OMEGA_POWERS[fac.v])
+        exp = apply_clifford_factors(
+            exp, rec.branch_factors[ctx.faults[rec.slot_index] - 1],
+            check_unitary=True, atol=ctx.atol, n_words=nw,
+            on_step=lambda e: ctx.check_exp(e, is_choi=is_choi, enforce_terms=enforce_terms),
+        )
     elif isinstance(rec, FeedbackPauliRecord) and (ctx.meas.get(aux, 0) if rec.source_kind == "rec" else ctx.sweep.get(aux, 0)):
         exp = apply_pauli(exp, *_ax_tup(rec.axis, nw))
     _check_unitary_norm(z_pre, exp.norm_sq() if exp.chi > 0 else 0.0, ctx.atol, "_apply_leaf")
@@ -544,13 +537,6 @@ def _apply_node_range(plan: PreparedQueryPlan, ctx: _EvalCtx, u: _SegTreeNode | 
         return _eval_node(plan, ctx, u, is_choi=False) if (is_vacuum and u.l == 0 and ql == 0) else (_apply_op_to_ket(plan, ctx, _eval_node(plan, ctx, u, is_choi=True), ket) if ket.exp.chi > 0 else ket)
     return _apply_node_range(plan, ctx, u.right, ql, qr, _apply_node_range(plan, ctx, u.left, ql, qr, ket, is_vacuum=is_vacuum), is_vacuum=False)
 
-def _selector_bits(plan: SelectorPlan, faults: Mapping[int, int]) -> NDArray[np.bool_]:
-    sel = np.zeros(plan.num_selector_qubits, dtype=np.bool_)
-    for s_idx, s_grp in enumerate(plan.fault_selector_groups):
-        if faults.get(s_idx, 0) > 0:
-            sel[s_grp[faults[s_idx] - 1] - plan.num_data_qubits] = True
-    return sel
-
 def _norm_sweep(raw_s: Any) -> dict[int, int]:
     if raw_s is not None and not isinstance(raw_s, Mapping) and (isinstance(raw_s, (str, bytes, bytearray, memoryview)) or (raw_s.ndim != 1 if isinstance(raw_s, np.ndarray) else not isinstance(raw_s, Sequence))):
         raise ValueError(f"Invalid sweep_bits container: {type(raw_s)!r}")
@@ -564,37 +550,16 @@ def _unpack_realization(plan: PreparedQueryPlan, realization: Mapping[Any, Any] 
         raise TypeError(f"Expected PreparedQueryPlan and Mapping|None realization, got {type(plan)!r}, {type(realization)!r}")
     if not realization:
         return {}, {}, {}, {}, {}, {}
-    if any(isinstance(k, str) for k in realization):
-        if set(realization) - _VALID_REAL_KEYS:
-            raise ValueError(f"Unknown realization keys: {sorted(map(str, set(realization) - _VALID_REAL_KEYS))}")
-        raw_f, raw_m, raw_qm = realization.get("faults"), realization.get("measurements"), realization.get("quantum_measurements")
-        raw_p, raw_r = realization.get("paulis", realization.get("pauli_noise")), realization.get("resets")
-        raw_s = realization.get("sweep_bits", realization.get("sweep"))
-    else:
-        raw_f, raw_m, raw_qm, raw_p, raw_r, raw_s = realization, None, None, None, None, None
-    cp, n_meta, max_c = plan.compiled_plan, plan._state["noise"], plan.compiled_plan.noise_channel_max_choices
-    if isinstance(raw_p, Mapping):
-        conv_p: dict[Any, Any] = {}
-        for k, v in raw_p.items():
-            ik = _coerce_strict_int(k, "paulis key")
-            if ik < 0 or ik >= len(max_c):
-                raise ValueError(f"Pauli slot {ik} out of range")
-            mc, kind = max_c[ik], n_meta.get(ik, "")
-            if isinstance(v, str):
-                s, tbl = v.strip().upper(), (({"I": 0, kind[:1]: 1} if kind in ("X_ERROR", "Y_ERROR", "Z_ERROR") else {"I": 0}) if mc == 1 else ({3: _PAULI_1Q_STR, 4: _PAULI_4_STR, 15: _PAULI_2Q_STR}.get(mc, {})))
-                if s not in tbl:
-                    raise ValueError(f"Invalid Pauli label {v!r} at slot {ik}")
-                conv_p[ik] = tbl[s]
-            else:
-                conv_p[ik] = int(bool(v)) if (mc == 1 and isinstance(v, (bool, np.bool_))) else v
-        raw_p = conv_p
+    sec = _split_realization_sections(realization)
+    cp, max_c = plan.compiled_plan, plan.compiled_plan.noise_channel_max_choices
+    raw_p = _normalize_pauli_slot_map(sec.get("paulis"), max_c, plan._state["noise"])
     f_max = [len(ch.branches) for ch in cp.fault_channels]
-    raw_f = ({k: (int(bool(v)) if (isinstance(v, (bool, np.bool_)) and not isinstance(k, (bool, np.bool_)) and isinstance(k, (int, np.integer)) and int(k) in plan._state["slots"] and f_max[plan._state["slots"][int(k)]] == 1) else v) for k, v in raw_f.items()} if isinstance(raw_f, Mapping) else ([(int(bool(v)) if (isinstance(v, (bool, np.bool_)) and i < len(f_max) and f_max[i] == 1) else v) for i, v in enumerate(raw_f)] if ((isinstance(raw_f, Sequence) and not isinstance(raw_f, (str, bytes))) or (isinstance(raw_f, np.ndarray) and raw_f.ndim == 1)) else raw_f))
-    faults = _normalize_choice_map(raw_f, f_max, "faults", key_to_slot=plan._state["slots"], allow_none_zero=True) or {}
-    meas = _normalize_choice_map(raw_m, (1,) * plan.num_measurements, "measurements", allow_bool_values=True) or {}
-    qmeas = _normalize_choice_map(raw_qm, (1,) * plan.num_measurements, "quantum_measurements", allow_bool_values=True) or {}
-    paulis, resets = (_normalize_choice_map(raw_p, max_c, "paulis") or {}), (_normalize_choice_map(raw_r, (1,) * cp.num_resets, "resets", allow_bool_values=True) or {})
-    return faults, meas, qmeas, paulis, resets, _norm_sweep(raw_s)
+    faults = _normalize_choice_map(sec.get("faults"), f_max, "faults", key_to_slot=plan._state["slots"], allow_none_zero=True, allow_binary_bool=True) or {}
+    meas = _normalize_choice_map(sec.get("measurements"), (1,) * plan.num_measurements, "measurements", allow_bool_values=True) or {}
+    qmeas = _normalize_choice_map(sec.get("quantum_measurements"), (1,) * plan.num_measurements, "quantum_measurements", allow_bool_values=True) or {}
+    paulis = _normalize_choice_map(raw_p, max_c, "paulis") or {}
+    resets = _normalize_choice_map(sec.get("resets"), (1,) * cp.num_resets, "resets", allow_bool_values=True) or {}
+    return faults, meas, qmeas, paulis, resets, _norm_sweep(sec.get("sweep_bits"))
 
 def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: dict[int, int], qmeas_in: dict[int, int], paulis_in: dict[int, int], resets_in: dict[int, int], sweep_in: dict[int, int],
                    q_set: frozenset[str], norm_acc: tuple[str, Any], comp_target: Any, rng_obj: np.random.Generator | None, *, sample_mc_faults: bool, is_mixed: bool,
@@ -626,7 +591,7 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
                 if _check_acc(norm_acc, np.array([bool(m_map.get(j, 0)) for j in range(plan.num_measurements)], dtype=np.bool_)):
                     totals[1] = _fp_add(totals[1], z_b)
                     if "fidelity" in q_set and comp_target is not None:
-                        d_state = extract_data_expansion(plan.compiled_plan, ket_e.exp, _selector_bits(plan.compiled_plan, faults)) if isinstance(plan.compiled_plan, SelectorPlan) else (plan.compiled_plan.final_tableau.copy(), ket_e.exp.copy())
+                        d_state = extract_data_expansion(plan.compiled_plan, ket_e.exp, fault_selector_bits(plan.compiled_plan, faults)) if isinstance(plan.compiled_plan, SelectorPlan) else (plan.compiled_plan.final_tableau.copy(), ket_e.exp.copy())
                         totals[2] = _fp_add(totals[2], _fp_mul(pi_w, *_compute_partial_trace_fidelity_mass(*d_state, ket_e.log2_scale, comp_target, plan.output_qubits, ctx, bcache)))
             continue
         op_off, rec, aux = dyn[di]
@@ -680,24 +645,12 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
         else:
             assert isinstance(rec, (MeasurementRecord, ResetRecord))
             ctx.bump_op()
-            nw, z_in_r, work = ket.exp.n_words, ket.exp.norm_sq(), ket.exp.copy()
+            nw = ket.exp.n_words
+            e0, z0_c, e1, z1_c, z_in_r, work, _ = born_split_expansion(
+                ket.exp, *_ax_tup(rec.obs_axis, nw), atol=ctx.atol, project_fn=project_diagonal
+            )
             if rec.rot_axis is not None:
-                work = apply_quarter_turn(work, *_ax_tup(rec.rot_axis, nw), sign=1, check_unitary=True, atol=ctx.atol)
                 ctx.check_exp(work, is_choi=False)
-                b_diag, sig = unit_bit_words(first_set_bit_in_words(rec.obs_axis.a_words), nw), 0
-            else:
-                _, b_diag, kp = _ax_tup(rec.obs_axis, nw)
-                sig = (kp >> 1) & 1
-            (e0, z0_r), (e1, z1_r) = project_diagonal(work, b_diag, sig, 0), project_diagonal(work, b_diag, sig, 1)
-            z0_f, z1_f = float(z0_r), float(z1_r)
-            if not (math.isfinite(z0_f) and math.isfinite(z1_f) and math.isfinite(z_in_r)):
-                raise FloatingPointError(f"Non-finite projected Born masses: z0={z0_f!r}, z1={z1_f!r}, z_in={z_in_r!r}")
-            scale_z = max(1.0, z_in_r)
-            if z0_f < -1e-12 * scale_z or z1_f < -1e-12 * scale_z:
-                raise FloatingPointError(f"Significantly negative projected Born mass: z0={z0_f!r}, z1={z1_f!r}")
-            z0_c, z1_c = max(0.0, z0_f), max(0.0, z1_f)
-            if abs((z0_c + z1_c) - z_in_r) > ctx.atol * scale_z:
-                raise FloatingPointError(f"Born mass conservation violated: z0={z0_c}, z1={z1_c}, z_in={z_in_r}, atol={ctx.atol}")
             brs = []
             for qb, eb, zb_c in ((0, e0, z0_c), (1, e1, z1_c)):
                 if z_in_r > 0.0 and zb_c > K1_CANCEL_REL_TOL * z_in_r and eb.chi > 0:
@@ -856,7 +809,7 @@ def run_query_shot(plan: PreparedQueryPlan, *, realization: Mapping[Any, Any] | 
     sweep, cp = (_norm_sweep(sweep_bits) if sweep_bits is not None else r_sweep), plan.compiled_plan
     rng_obj, c_box = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(None if rng is None else _coerce_strict_int(rng, "rng seed"))), []
     def _pack_shot(zf: tuple[float, int], ma: NDArray[np.bool_], kf: _ScaledExpansion, ef: dict[int, int], dg: QueryDiagnostics) -> QueryShotTrajectory:
-        sb = _selector_bits(cp, ef) if isinstance(cp, SelectorPlan) else None
+        sb = fault_selector_bits(cp, ef) if isinstance(cp, SelectorPlan) else None
         ft, oe = (extract_data_expansion(cp, kf.exp, sb) if (extract_data and isinstance(cp, SelectorPlan) and sb is not None) else (cp.final_tableau.copy(), kf.exp.copy()))
         if oe.chi > 0 and oe.norm_sq() > 0.0:
             oe.weights = np.ascontiguousarray(oe.weights / math.sqrt(oe.norm_sq()))

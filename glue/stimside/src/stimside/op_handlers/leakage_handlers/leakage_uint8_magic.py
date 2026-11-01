@@ -19,6 +19,7 @@ from stimside.op_handlers.leakage_handlers.tag_registry import (
     MAGIC_TAGS as _MAGIC_TAGS,
     check_tag_qubits,
     parse_leakage_tag_magic as _parse_leakage_tag_magic,
+    validate_magic_op,
 )
 from stimside.util.stim_workarounds import split_fused_instruction
 
@@ -85,27 +86,20 @@ def _strip_circuit_for_noiseless_ref(circuit: stim.Circuit) -> tuple[stim.Circui
     return _strip(circuit), needs_leakage
 
 
-def _validate_magic_instruction(op: stim.CircuitInstruction, num_qubits: int) -> list[int]:
-    if op.name != "I" or op.gate_args_copy():
-        raise ValueError(f"Magic gate I[{op.tag}] must be gate 'I' with no gate_args, got {op!r}")
-    qs = [int(t.qubit_value) if (t.is_qubit_target and not t.is_inverted_result_target and 0 <= int(t.qubit_value) < num_qubits) else -1 for t in op.targets_copy()]
-    if any(q < 0 for q in qs):
-        raise ValueError(f"Invalid target in magic gate I[{op.tag}] for num_qubits={num_qubits}: {op!r}")
-    if op.tag == "CCZ" and (len(qs) % 3 != 0 or any(len(set(qs[i : i + 3])) != 3 for i in range(0, len(qs), 3))):
-        raise ValueError(f"I[CCZ] requires distinct triples of targets, got {qs}")
-    return qs
-
-
-def _parse_leakage_in_circuit_magic(circuit: stim.Circuit, num_qubits: int) -> tuple[dict[stim.CircuitInstruction, LeakageParams], set[stim.CircuitInstruction]]:
+def _parse_leakage_in_circuit_magic(
+    circuit: stim.Circuit, num_qubits: int
+) -> tuple[dict[stim.CircuitInstruction, LeakageParams], set[stim.CircuitInstruction], dict[stim.CircuitInstruction, list[int]]]:
     ops_to_params: dict[stim.CircuitInstruction, LeakageParams] = {}
     u_meas_ops: set[stim.CircuitInstruction] = set()
+    magic_ops: dict[stim.CircuitInstruction, list[int]] = {}
 
     def _walk(blk: stim.Circuit) -> None:
         for item in blk:
             if isinstance(item, stim.CircuitRepeatBlock):
                 _walk(item.body_copy())
             elif item.tag in _MAGIC_TAGS:
-                _validate_magic_instruction(item, num_qubits)
+                if item not in magic_ops:
+                    magic_ops[item] = validate_magic_op(item, num_qubits)
             elif item.tag != "":
                 parsed, is_u = _parse_leakage_tag_magic(item)
                 if parsed is None:
@@ -119,7 +113,7 @@ def _parse_leakage_in_circuit_magic(circuit: stim.Circuit, num_qubits: int) -> t
 
     _walk(circuit)
     check_tag_qubits(ops_to_params, num_qubits)
-    return ops_to_params, u_meas_ops
+    return ops_to_params, u_meas_ops, magic_ops
 
 
 @dataclasses.dataclass
@@ -127,8 +121,12 @@ class LeakageUint8Magic(LeakageUint8Coset):
     """Batched uint8 leakage OpHandler for MagicsideSimulator."""
 
     def compile_op_handler(self, *, circuit: stim.Circuit, batch_size: int) -> CompiledLeakageUint8Magic:
-        ops_to_params, u_meas_ops = _parse_leakage_in_circuit_magic(circuit, circuit.num_qubits)
-        return CompiledLeakageUint8Magic(num_qubits=circuit.num_qubits, batch_size=batch_size, unconditional_condition_on_U=self.unconditional_condition_on_U, ops_to_params=ops_to_params, u_measurement_ops=u_meas_ops)
+        ops_to_params, u_meas_ops, magic_ops = _parse_leakage_in_circuit_magic(circuit, circuit.num_qubits)
+        return CompiledLeakageUint8Magic(
+            num_qubits=circuit.num_qubits, batch_size=batch_size,
+            unconditional_condition_on_U=self.unconditional_condition_on_U,
+            ops_to_params=ops_to_params, u_measurement_ops=u_meas_ops, magic_ops=magic_ops,
+        )
 
 
 @dataclasses.dataclass
@@ -136,15 +134,19 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
     """Compiled batched uint8 leakage OpHandler for MagicsideSimulator."""
 
     u_measurement_ops: set[stim.CircuitInstruction] = dataclasses.field(default_factory=set)
+    magic_ops: dict[stim.CircuitInstruction, list[int]] = dataclasses.field(default_factory=dict)
 
     def handle_op(self, op: stim.CircuitInstruction, sss: MagicsideSimulator) -> None:  # type: ignore[override]
         self._ensure_batch_size(sss.batch_size)
         if op.tag in _MAGIC_TAGS:
-            qs = _validate_magic_instruction(op, sss.num_qubits)
+            qs = self.magic_ops.get(op)
+            if qs is None:
+                qs = validate_magic_op(op, sss.num_qubits)
+                self.magic_ops[op] = qs
             for grp in ([qs[i : i + 3] for i in range(0, len(qs), 3)] if op.tag == "CCZ" else [[q] for q in qs]):
                 if np.any(self._state[grp, :] >= 2):
                     warnings.warn(f"Magic gate I[{op.tag}] applied to leaked group {tuple(grp)}", UserWarning, stacklevel=2)
-            sss._do_bare_instruction(op)
+            sss._emit_magic_op(op, qs)
             return
         if op.tag != "" and op not in self.ops_to_params and not op.tag.startswith("CLIFFORD_FAULT"):
             parsed, is_u = _parse_leakage_tag_magic(op)

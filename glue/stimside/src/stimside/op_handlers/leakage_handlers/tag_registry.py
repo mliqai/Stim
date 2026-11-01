@@ -72,6 +72,23 @@ class TagDef:
 
 MAGIC_TAGS: frozenset[str] = frozenset({"T", "T_DAG", "CCZ"})
 
+
+def validate_magic_op(op: stim.CircuitInstruction, num_qubits: int | None = None) -> list[int]:
+    """Validate an `I[T]`, `I[T_DAG]`, or `I[CCZ]` instruction and return its plain qubit targets."""
+    if op.tag not in MAGIC_TAGS or op.name != "I" or op.gate_args_copy():
+        raise ValueError(f"Invalid magic carrier/tag/args on {op!r}")
+    qs: list[int] = []
+    for t in op.targets_copy():
+        if not t.is_qubit_target or t.is_inverted_result_target:
+            raise ValueError(f"Magic gate I[{op.tag}] requires plain qubit targets, got {t!r}")
+        q = int(t.qubit_value)
+        if q < 0 or (num_qubits is not None and q >= num_qubits):
+            raise ValueError(f"Invalid target {q} in magic gate I[{op.tag}] for num_qubits={num_qubits}: {op!r}")
+        qs.append(q)
+    if op.tag == "CCZ" and (len(qs) % 3 != 0 or any(len(set(qs[i : i + 3])) != 3 for i in range(0, len(qs), 3))):
+        raise ValueError(f"I[CCZ] requires distinct triples (multiple of 3 targets), got {qs}")
+    return qs
+
 TAG_REGISTRY: dict[str, TagDef] = {
     "LEAKAGE_CONTROLLED_ERROR": TagDef(
         name="LEAKAGE_CONTROLLED_ERROR",

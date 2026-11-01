@@ -6,9 +6,9 @@ moving-reference lowering (`C1`/`C1.5`), commuting phase-block compilation (`C2`
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
-from typing import Any, Literal, Mapping, Sequence, TypeAlias
+from typing import Any, Callable, Literal, Mapping, Sequence, TypeAlias
 
 import numpy as np
 from numpy.typing import NDArray
@@ -16,7 +16,11 @@ import stim  # type: ignore[import-untyped]
 
 from stimside.op_handlers.leakage_handlers.common_parsing import split_arguments
 from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageParams
-from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits, parse_leakage_tag_magic
+from stimside.op_handlers.leakage_handlers.tag_registry import (
+    check_tag_qubits,
+    parse_leakage_tag_magic,
+    validate_magic_op,
+)
 from stimside.util.bitwords import (
     I_POWERS_ARR as _PHASE4_ARR,
     INV_SQRT2 as _INV_SQRT2,
@@ -39,7 +43,7 @@ from stimside._magic.phase_qfe import (
     DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep,
     ImpossiblePostselectionError, ShotExpansion,
     _apply_local_unitary_c128, apply_compiled_block, apply_pauli, apply_quarter_turn,
-    apply_reference_tableau_to_statevector, merge_frames, project_diagonal, validate_atol,
+    apply_reference_tableau_to_statevector, born_split_expansion, merge_frames, project_diagonal, validate_atol,
 )
 from stimside.util.reference_chp import DetMeasMeta, RandMeasMeta, ReferenceCHPTableau
 
@@ -51,11 +55,11 @@ __all__ = [
     "MeasurementRecord", "ResetRecord", "MPadRecord", "FeedbackPauliRecord", "LeakageBarrierRecord",
     "CompiledRecord", "LeftUnitaryEvent", "LeftSppEvent", "LeftResetXEvent", "RightRotEvent",
     "FrameEvent", "CoordinateCompilation", "DirectPlan", "SelectorPlan", "TrajectoryRunResult",
-    "clone_reference_chp", "decompose_clifford_exact", "eval_decomposition_unitary_le",
+    "decompose_clifford_exact", "eval_decomposition_unitary_le", "apply_clifford_factors",
     "parse_clifford_fault_tag", "parse_clifford_fault_instruction",
-    "extract_circuit_faults", "compile_pauli_product", "apply_spp_to_reference_chp",
+    "extract_circuit_faults", "compile_pauli_product",
     "compile_coordinates", "compile_open_block", "compile_direct", "run_direct",
-    "compile_selector", "sample_selector_activations", "run_selector",
+    "compile_selector", "fault_selector_bits", "sample_selector_activations", "run_selector",
     "extract_data_expansion", "reconstruct_statevector",
 ]
 
@@ -662,26 +666,9 @@ class RightRotEvent:
 FrameEvent: TypeAlias = LeftUnitaryEvent | LeftSppEvent | LeftResetXEvent | RightRotEvent
 
 
-@dataclass
-class CoordinateCompilation:
-    num_qubits: int
-    num_measurements: int
-    raw_records: tuple[CompiledRecord, ...]
-    final_tableau: ReferenceCHPTableau
-    frame_events: tuple[FrameEvent, ...]
-    fault_channels: tuple[CliffordFaultChannel, ...]
-    noise_channel_max_choices: tuple[int, ...] = ()
-    num_resets: int = 0
-
-
 # ---------------------------------------------------------------------------
 # ReferenceCHPTableau Helpers, C1 & C1.5
 # ---------------------------------------------------------------------------
-
-
-def clone_reference_chp(ref_chp: ReferenceCHPTableau) -> ReferenceCHPTableau:
-    """Deep-copy `ReferenceCHPTableau`."""
-    return ref_chp.copy()
 
 
 def compile_pauli_product(
@@ -719,6 +706,43 @@ def _compile_clifford_factors(
         for r_neg, r_terms in (_spec_terms(r_sp, targets) for r_sp in dec.r_specs)
     )
     return CompiledCliffordFactorList(v=dec.v, p0=p0_axis, r_axes=r_axes)
+
+
+def apply_clifford_factors(
+    exp: ShotExpansion,
+    fac: CompiledCliffordFactorList,
+    *,
+    inverse: bool = False,
+    check_unitary: bool = False,
+    atol: float = DEFAULT_ATOL,
+    n_words: int | None = None,
+    on_step: Callable[[ShotExpansion], None] | None = None,
+) -> ShotExpansion:
+    """Apply `CompiledCliffordFactorList` (or its inverse) to `exp`."""
+    if exp.chi == 0:
+        return exp
+
+    def _unpack(ax: CompiledPauliAxis) -> tuple[Any, ...]:
+        if n_words is None or ax.a_words.shape[0] == n_words:
+            return (ax,)
+        pad = (0, n_words - ax.a_words.shape[0])
+        return (
+            np.ascontiguousarray(np.pad(ax.a_words, pad)),
+            np.ascontiguousarray(np.pad(ax.b_words, pad)),
+            int(ax.kappa) & 3,
+        )
+
+    if not inverse and fac.p0 is not None:
+        exp = apply_pauli(exp, *_unpack(fac.p0))
+    for r_ax in (reversed(fac.r_axes) if inverse else fac.r_axes):
+        exp = apply_quarter_turn(exp, *_unpack(r_ax), sign=-1 if inverse else 1, check_unitary=check_unitary, atol=atol)
+        if on_step is not None:
+            on_step(exp)
+    if inverse and fac.p0 is not None:
+        exp = apply_pauli(exp, *_unpack(fac.p0))
+    if fac.v and exp.chi > 0:
+        exp.weights = np.ascontiguousarray(exp.weights * OMEGA_POWERS[(-fac.v if inverse else fac.v) & 7])
+    return exp
 
 
 def _split_pauli_product_targets(
@@ -770,24 +794,6 @@ def _reduce_pauli_product_targets(
     return [(q_c, "IZXY"[(xc << 1) | zc]) for q_c, (xc, zc) in phys_map.items() if (xc or zc)]
 
 
-def apply_spp_to_reference_chp(
-    ref_chp: ReferenceCHPTableau,
-    terms: Sequence[tuple[int, str]],
-    *,
-    negate: bool = False,
-    dag: bool = False,
-) -> None:
-    """Update `ref_chp` in `O(|supp| * n_words)` under `SPP` / `SPP_DAG`."""
-    ref_chp.do_spp(terms, negate=negate, dag=dag)
-
-
-def _apply_right_rot_to_ref_chp(
-    ref_chp: ReferenceCHPTableau, rot_axis: CompiledPauliAxis
-) -> None:
-    """Apply `B_t <- B_t * R(-rot_axis)` in-place via vectorized rank-1 transvection."""
-    ref_chp.apply_right_rot(rot_axis.a_words, rot_axis.b_words, (rot_axis.kappa + 1) & 3)
-
-
 def _compile_pauli_measurement_c15(
     ref_chp: ReferenceCHPTableau,
     terms: Sequence[tuple[int, str]],
@@ -802,7 +808,7 @@ def _compile_pauli_measurement_c15(
         return MeasurementRecord(meas_index, flip_prob, invert_result, False, bar_M, None)
     e_p = unit_bit_words(first_set_bit_in_words(bar_M.a_words), ref_chp.n_words)
     rot_axis = CompiledPauliAxis(bar_M.a_words.copy(), np.ascontiguousarray(bar_M.b_words ^ e_p), (bar_M.kappa + 1) & 3)
-    _apply_right_rot_to_ref_chp(ref_chp, rot_axis)
+    ref_chp.apply_right_rot(rot_axis.a_words, rot_axis.b_words, (rot_axis.kappa + 1) & 3)
     if frame_events is not None:
         frame_events.append(RightRotEvent(rot_axis=rot_axis))
     return MeasurementRecord(meas_index, flip_prob, invert_result, True, bar_M, rot_axis)
@@ -869,28 +875,28 @@ _CAT_NOISE_META: dict[str, tuple[int, int]] = {
 }
 
 
-def _validate_and_emit_magic_op(
-    op: stim.CircuitInstruction,
+def _emit_magic_terms(
+    tag: str,
+    qs: Sequence[int],
     ref_chp: ReferenceCHPTableau,
     out_records: list[CompiledRecord],
 ) -> None:
-    tag = op.tag
-    if tag not in ("T", "T_DAG", "CCZ") or op.name != "I" or op.gate_args_copy():
-        raise ValueError(f"Invalid magic carrier/tag/args on {op!r}")
-    qs = _plain_qubits(op.targets_copy(), f"Magic gate I[{tag}]")
     if tag in ("T", "T_DAG"):
         eps = 1 if tag == "T" else -1
         for q in qs:
             out_records.append(MagicTermRecord(MagicPhaseTerm((compile_pauli_product(ref_chp, [(q, "Z")]),), "T", eps)))
     else:
-        if (len(qs) % 3) != 0:
-            raise ValueError(f"I[CCZ] requires a multiple of 3 targets, got {len(qs)}")
         for off in range(0, len(qs), 3):
-            triple = (qs[off], qs[off + 1], qs[off + 2])
-            if len(set(triple)) != 3:
-                raise ValueError(f"I[CCZ] targets in each triple must be distinct, got {triple}")
-            axes = tuple(compile_pauli_product(ref_chp, [(q, "Z")]) for q in triple)
+            axes = tuple(compile_pauli_product(ref_chp, [(q, "Z")]) for q in qs[off : off + 3])
             out_records.append(MagicTermRecord(MagicPhaseTerm(axes=axes, kind="CCZ")))
+
+
+def _validate_and_emit_magic_op(
+    op: stim.CircuitInstruction,
+    ref_chp: ReferenceCHPTableau,
+    out_records: list[CompiledRecord],
+) -> None:
+    _emit_magic_terms(op.tag, validate_magic_op(op), ref_chp, out_records)
 
 
 def _infer_total_data_qubits(
@@ -1050,13 +1056,34 @@ def _emit_selector_clifford_branch(
         raw_records.append(MagicTermRecord(MagicPhaseTerm(axes=(bar_Zs,), kind=kind, epsilon=eps)))
 
 
+@dataclass(frozen=True)
+class _CircuitPassResult:
+    n_data: int
+    n_sel: int
+    n_total: int
+    num_measurements: int
+    raw_records: tuple[CompiledRecord, ...]
+    final_tableau: ReferenceCHPTableau
+    frame_events: tuple[FrameEvent, ...]
+    fault_channels: tuple[CliffordFaultChannel, ...]
+    fault_sel_groups: tuple[tuple[int, ...], ...]
+    noise_sel_groups: tuple[tuple[str, tuple[float, ...], tuple[int, ...]], ...]
+    noise_sel_ch_indices: tuple[int, ...]
+    total_noise_channels: int
+    noise_max_choices: tuple[int, ...]
+    num_resets: int
+    gauge_steps: tuple[tuple[int, CompiledPauliAxis], ...]
+    data_frame_events: tuple[FrameEvent, ...] = ()
+    data_final_tableau: ReferenceCHPTableau | None = None
+
+
 def _compile_circuit_pass(
     circuit: stim.Circuit,
     fault_channels: Sequence[CliffordFaultChannel] | None = None,
     *,
     selector_mode: bool = False,
     gadgetize_pauli_noise: bool = False,
-) -> dict[str, Any]:
+) -> _CircuitPassResult:
     """Shared single-pass lowering for `compile_coordinates`, `compile_direct`, and `compile_selector`."""
     flat_ops, inline_faults = extract_circuit_faults(circuit)
     prog_by_step, inline_by_step, all_channels = _merge_and_validate_fault_channels(
@@ -1295,14 +1322,8 @@ def _compile_circuit_pass(
         _emit_fault_slots(prog_by_step[len(flat_ops)])
 
     frame_tup = tuple(frame_events)
-    out: dict[str, Any] = {
-        "n_data": n_data, "n_sel": n_sel, "n_total": n_total, "num_measurements": next_meas_idx,
-        "raw_records": tuple(raw_records), "final_tableau": ref_chp, "frame_events": frame_tup,
-        "fault_channels": all_channels, "fault_sel_groups": tuple(fault_sel_groups),
-        "noise_sel_groups": tuple(noise_sel_groups), "noise_sel_ch_indices": tuple(noise_sel_ch_indices),
-        "total_noise_channels": next_noise_idx, "noise_max_choices": tuple(noise_max_choices),
-        "num_resets": num_resets, "gauge_steps": tuple(gauge_steps),
-    }
+    data_events: tuple[FrameEvent, ...] = ()
+    data_tab: ReferenceCHPTableau | None = None
     if selector_mode:
         data_events = tuple(
             RightRotEvent(_slice_axis_to_qubits(ev.rot_axis, n_data)) if isinstance(ev, RightRotEvent) else ev
@@ -1310,20 +1331,22 @@ def _compile_circuit_pass(
             if not (isinstance(ev, LeftUnitaryEvent) and any(q >= n_data for q in ev.targets))
         )
         data_tab = _restrict_tableau_to_data(ref_chp, n_data)
-        out["data_frame_events"] = data_events
-        out["data_final_tableau"] = data_tab
-    return out
+    return _CircuitPassResult(
+        n_data, n_sel, n_total, next_meas_idx, tuple(raw_records), ref_chp, frame_tup,
+        all_channels, tuple(fault_sel_groups), tuple(noise_sel_groups), tuple(noise_sel_ch_indices),
+        next_noise_idx, tuple(noise_max_choices), num_resets, tuple(gauge_steps), data_events, data_tab,
+    )
 
 
 def compile_coordinates(
     circuit: stim.Circuit,
     fault_channels: Sequence[CliffordFaultChannel] | None = None,
-) -> CoordinateCompilation:
+) -> DirectPlan:
     """`C1` + `C1.5`: Compile circuit into moving-reference records and `ReferenceCHPTableau`."""
     res = _compile_circuit_pass(circuit, fault_channels=fault_channels, selector_mode=False)
-    return CoordinateCompilation(
-        res["n_data"], res["num_measurements"], res["raw_records"], res["final_tableau"],
-        res["frame_events"], res["fault_channels"], res["noise_max_choices"], res["num_resets"],
+    return DirectPlan(
+        res.n_data, res.num_measurements, res.raw_records, res.final_tableau,
+        res.frame_events, res.fault_channels, res.raw_records, res.noise_max_choices, res.num_resets,
     )
 
 
@@ -1438,7 +1461,7 @@ def _walsh_expand_subblock(
 
 
 def compile_open_block(
-    records: Sequence[CompiledRecord] | CoordinateCompilation,
+    records: Sequence[CompiledRecord] | DirectPlan,
     *,
     n_qubits: int | None = None,
     budget: int = 64,
@@ -1449,14 +1472,14 @@ def compile_open_block(
     if budget < 1:
         raise ValueError(f"budget must be >= 1, got {budget}")
 
-    if isinstance(records, CoordinateCompilation):
+    if isinstance(records, DirectPlan):
         if n_qubits is None:
             n_qubits = records.num_qubits
         rec_seq: Sequence[CompiledRecord] = records.raw_records
     else:
         rec_seq = records
     if n_qubits is None:
-        raise ValueError("compile_open_block requires explicit n_qubits when records is not CoordinateCompilation")
+        raise ValueError("compile_open_block requires explicit n_qubits when records is not DirectPlan")
     n_q = int(n_qubits)
 
     out_records: list[CompiledRecord] = []
@@ -1614,6 +1637,9 @@ class DirectPlan:
     num_resets: int = 0
 
 
+CoordinateCompilation = DirectPlan
+
+
 @dataclass
 class SelectorPlan:
     num_data_qubits: int
@@ -1672,14 +1698,9 @@ def compile_direct(
     """`A1`: Compile `circuit` for zero-branching `DIRECT` trajectory execution."""
     coord = compile_coordinates(circuit, fault_channels=fault_channels)
     records = compile_open_block(
-        coord.raw_records, n_qubits=coord.num_qubits,
-        budget=c2_budget, c2_max_rank=c2_max_rank, c2_max_poly_terms=c2_max_poly_terms,
+        coord, budget=c2_budget, c2_max_rank=c2_max_rank, c2_max_poly_terms=c2_max_poly_terms,
     )
-    return DirectPlan(
-        coord.num_qubits, coord.num_measurements, records, coord.final_tableau,
-        coord.frame_events, coord.fault_channels, coord.raw_records,
-        coord.noise_channel_max_choices, coord.num_resets,
-    )
+    return replace(coord, records=records)
 
 
 def compile_selector(
@@ -1695,17 +1716,68 @@ def compile_selector(
     res = _compile_circuit_pass(
         circuit, fault_channels=fault_channels, selector_mode=True, gadgetize_pauli_noise=gadgetize_pauli_noise
     )
+    assert res.data_final_tableau is not None
     records = compile_open_block(
-        res["raw_records"], n_qubits=res["n_total"],
+        res.raw_records, n_qubits=res.n_total,
         budget=c2_budget, c2_max_rank=c2_max_rank, c2_max_poly_terms=c2_max_poly_terms,
     )
     return SelectorPlan(
-        res["n_data"], res["n_sel"], res["n_total"], res["num_measurements"], records,
-        res["final_tableau"], res["data_final_tableau"], res["frame_events"], res["data_frame_events"],
-        res["fault_channels"], res["fault_sel_groups"], res["noise_sel_groups"], gadgetize_pauli_noise,
-        res["raw_records"], res["noise_sel_ch_indices"], res["total_noise_channels"],
-        res["noise_max_choices"], res["num_resets"], res["gauge_steps"],
+        res.n_data, res.n_sel, res.n_total, res.num_measurements, records,
+        res.final_tableau, res.data_final_tableau, res.frame_events, res.data_frame_events,
+        res.fault_channels, res.fault_sel_groups, res.noise_sel_groups, gadgetize_pauli_noise,
+        res.raw_records, res.noise_sel_ch_indices, res.total_noise_channels,
+        res.noise_max_choices, res.num_resets, res.gauge_steps,
     )
+
+
+_REAL_KEY_MAP: dict[str, str] = {
+    "faults": "faults", "measurements": "measurements", "quantum_measurements": "quantum_measurements",
+    "paulis": "paulis", "pauli_noise": "paulis", "resets": "resets", "sweep": "sweep_bits", "sweep_bits": "sweep_bits",
+}
+_PAULI_1Q_STR: dict[str, int] = {"I": 0, "X": 1, "Y": 2, "Z": 3}
+_PAULI_4_STR: dict[str, int] = {"I": 0, "X": 2, "Y": 3, "Z": 4}
+_PAULI_2Q_STR: dict[str, int] = {a + b: i for i, (a, b) in enumerate((p, q) for p in "IXYZ" for q in "IXYZ")}
+
+
+def _split_realization_sections(raw: Mapping[Any, Any]) -> dict[str, Any]:
+    if not raw:
+        return {}
+    if not any(isinstance(k, str) for k in raw):
+        return {"faults": raw}
+    sec: dict[str, Any] = {}
+    for k, v in raw.items():
+        ck = _REAL_KEY_MAP.get(k) if isinstance(k, str) else None
+        if ck is None or ck in sec:
+            raise ValueError(f"Invalid or duplicate realization key {k!r}")
+        if v is not None:
+            sec[ck] = v
+    return sec
+
+
+def _normalize_pauli_slot_map(
+    raw_p: Any, max_choices: Sequence[int], noise_kinds: Mapping[int, str]
+) -> Any:
+    if not isinstance(raw_p, Mapping):
+        return raw_p
+    out: dict[int, Any] = {}
+    for k, v in raw_p.items():
+        ik = _coerce_strict_int(k, "paulis key")
+        if ik < 0 or ik >= len(max_choices):
+            raise ValueError(f"Pauli slot {ik} out of range")
+        mc, kind = max_choices[ik], noise_kinds.get(ik, "")
+        if isinstance(v, str):
+            s = v.strip().upper()
+            tbl = (
+                ({"I": 0, kind[:1]: 1} if kind in ("X_ERROR", "Y_ERROR", "Z_ERROR") else {"I": 0})
+                if mc == 1
+                else {3: _PAULI_1Q_STR, 4: _PAULI_4_STR, 15: _PAULI_2Q_STR}.get(mc, {})
+            )
+            if s not in tbl:
+                raise ValueError(f"Invalid Pauli label {v!r} at slot {ik}")
+            out[ik] = tbl[s]
+        else:
+            out[ik] = int(bool(v)) if (mc == 1 and isinstance(v, (bool, np.bool_))) else v
+    return out
 
 
 def _sample_categorical_branch(probs: Sequence[float] | NDArray[np.float64], rng: np.random.Generator) -> int:
@@ -1727,6 +1799,8 @@ def _normalize_choice_map(
     key_to_slot: Mapping[int, int] | None = None,
     allow_none_zero: bool = False,
     allow_bool_values: bool = False,
+    allow_binary_bool: bool = False,
+    strict_length: bool = False,
     mapping_only: bool = False,
 ) -> dict[int, int] | None:
     """Validate integer keys/indices and choice bounds, returning slot-indexed `dict[int, int]`."""
@@ -1740,7 +1814,8 @@ def _normalize_choice_map(
             if ik not in slot_lookup:
                 raise ValueError(f"Out-of-range or unknown key {k!r} in {name}")
             slot = slot_lookup[ik]
-            iv = 0 if (v is None and allow_none_zero) else _coerce_strict_int(v, f"{name}[{ik}]", allow_bool=allow_bool_values)
+            allow_b = allow_bool_values or (allow_binary_bool and max_choices[slot] == 1)
+            iv = 0 if (v is None and allow_none_zero) else _coerce_strict_int(v, f"{name}[{ik}]", allow_bool=allow_b)
             if iv < 0 or iv > max_choices[slot]:
                 raise ValueError(f"{name}[{ik}]={iv} out of range [0, {max_choices[slot]}]")
             out[slot] = iv
@@ -1749,11 +1824,12 @@ def _normalize_choice_map(
         raise ValueError(f"Invalid {name} container type: {type(trace)!r}")
     if isinstance(trace, np.ndarray) and trace.ndim != 1:
         raise ValueError(f"{name} array must be 1D, got shape {trace.shape}")
-    if len(trace) < len(max_choices):
-        raise ValueError(f"{name} length {len(trace)} shorter than required {len(max_choices)}")
+    if (len(trace) != len(max_choices)) if strict_length else (len(trace) < len(max_choices)):
+        raise ValueError(f"{name} length {len(trace)} invalid for {len(max_choices)} slots")
     out_seq: dict[int, int] = {}
     for idx, max_c in enumerate(max_choices):
-        iv = _coerce_strict_int(trace[idx], f"{name}[{idx}]", allow_bool=allow_bool_values)
+        allow_b = allow_bool_values or (allow_binary_bool and max_c == 1)
+        iv = _coerce_strict_int(trace[idx], f"{name}[{idx}]", allow_bool=allow_b)
         if iv < 0 or iv > max_c:
             raise ValueError(f"{name}[{idx}]={iv} out of range [0, {max_c}]")
         out_seq[idx] = iv
@@ -1843,29 +1919,10 @@ def _measure_with_readout_and_postselection(
         exp.log_mass = -math.inf
         return exp, 0, bool(c), bool(c ^ iota), (0.0, 0.0, 0.0), True
 
-    if words_any_nonzero(obs_axis.a_words):
-        e_p_w = unit_bit_words(first_set_bit_in_words(obs_axis.a_words), exp.n_words)
-        work_exp = _pq.apply_quarter_turn(
-            exp, obs_axis.a_words, np.ascontiguousarray(obs_axis.b_words ^ e_p_w),
-            (obs_axis.kappa + 1) & 3, sign=1, check_unitary=True, atol=tol,
-        )
-        b_diag, sig_diag = e_p_w, 0
-    else:
-        work_exp, b_diag, sig_diag = exp, obs_axis.b_words, (obs_axis.kappa >> 1) & 1
-
-    exp0, z0_raw = _pq.project_diagonal(work_exp, b_diag, sig_diag, 0)
-    exp1, z1_raw = _pq.project_diagonal(work_exp, b_diag, sig_diag, 1)
-
+    exp0, z0, exp1, z1, _, _, _ = born_split_expansion(
+        exp, obs_axis.a_words, obs_axis.b_words, obs_axis.kappa, atol=tol, z_in=z_in
+    )
     scale_z = max(1.0, z_in)
-    if not (math.isfinite(z0_raw) and math.isfinite(z1_raw)):
-        raise FloatingPointError(f"Non-finite projected Born masses: z0={z0_raw!r}, z1={z1_raw!r}")
-    if z0_raw < -1e-12 * scale_z or z1_raw < -1e-12 * scale_z:
-        raise FloatingPointError(f"Significantly negative projected Born mass: z0={z0_raw!r}, z1={z1_raw!r}")
-    z0, z1 = max(0.0, float(z0_raw)), max(0.0, float(z1_raw))
-    if abs((z0 + z1) - z_in) > tol * scale_z:
-        raise FloatingPointError(
-            f"M2 Born mass conservation violated: z0={z0:.16e}, z1={z1:.16e}, z={z_in:.16e}, tol={tol:.3e}"
-        )
 
     zero_floor = K1_CANCEL_REL_TOL * z_in
     if req_q is not None:
@@ -1936,13 +1993,7 @@ def _execute_compiled_records(
             c_idx = fault_map.get(rec.slot_index, 0) if fault_map is not None else _sample_categorical_branch(rec.probs, rng)
             chosen_faults.append(c_idx)
             if c_idx > 0 and not zero_mass:
-                fac = rec.branch_factors[c_idx - 1]
-                if fac.p0 is not None:
-                    exp = apply_pauli(exp, fac.p0)
-                for r_ax in fac.r_axes:
-                    exp = apply_quarter_turn(exp, r_ax, sign=1, atol=atol)
-                if fac.v != 0 and exp.chi > 0:
-                    exp.weights = np.ascontiguousarray(exp.weights * OMEGA_POWERS[fac.v])
+                exp = apply_clifford_factors(exp, rec.branch_factors[c_idx - 1], atol=atol)
                 peak_chi, peak_d = max(peak_chi, exp.chi), max(peak_d, exp.d)
 
         elif isinstance(rec, PauliNoiseRecord):
@@ -2157,22 +2208,28 @@ def run_direct(
     )
 
 
+def fault_selector_bits(plan: SelectorPlan, faults: Mapping[int, int]) -> NDArray[np.bool_]:
+    """Build one-hot fault selector bit vector `bool[num_selector_qubits]` from slot choices."""
+    sel = np.zeros(plan.num_selector_qubits, dtype=np.bool_)
+    for s_idx, s_grp in enumerate(plan.fault_selector_groups):
+        c_val = faults.get(s_idx, 0)
+        if c_val > 0:
+            sel[s_grp[c_val - 1] - plan.num_data_qubits] = True
+    return sel
+
+
 def _sample_selector_activations_from_maps(
     plan: SelectorPlan,
     rng_obj: np.random.Generator,
     fault_map: Mapping[int, int] | None,
     noise_map: Mapping[int, int] | None,
 ) -> tuple[NDArray[np.bool_], tuple[int, ...], dict[int, int]]:
-    sel_bits = np.zeros(plan.num_selector_qubits, dtype=np.bool_)
-    fault_choices: list[int] = []
-    for slot_idx, (ch, s_grp) in enumerate(zip(plan.fault_channels, plan.fault_selector_groups)):
-        c_val = (
-            fault_map.get(slot_idx, 0) if fault_map is not None
-            else _sample_categorical_branch([b.prob for b in ch.branches], rng_obj)
-        )
-        fault_choices.append(c_val)
-        if c_val > 0:
-            sel_bits[s_grp[c_val - 1] - plan.num_data_qubits] = True
+    fault_choices = tuple(
+        fault_map.get(slot_idx, 0) if fault_map is not None
+        else _sample_categorical_branch([b.prob for b in ch.branches], rng_obj)
+        for slot_idx, ch in enumerate(plan.fault_channels)
+    )
+    sel_bits = fault_selector_bits(plan, dict(enumerate(fault_choices)))
 
     noise_choice_map: dict[int, int] = {}
     if plan.gadgetize_pauli_noise and plan.noise_selector_groups:

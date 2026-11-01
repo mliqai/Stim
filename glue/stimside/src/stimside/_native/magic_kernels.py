@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ctypes
 from pathlib import Path
-import sys
 from typing import Any
 
 from stimside._native._kernel_loader import (
@@ -93,9 +92,6 @@ def get_magic_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
 
     if force_recompile:
         _LIB_INSTANCE = None
-        pq_mod = sys.modules.get("stimside._magic.phase_qfe")
-        if pq_mod is not None and hasattr(pq_mod, "_reset_cpp_kernel_cache"):
-            pq_mod._reset_cpp_kernel_cache()
 
     resolver = (
         (lambda force_recompile=True: _resolve_magic_kernels_so(force_recompile=True))
