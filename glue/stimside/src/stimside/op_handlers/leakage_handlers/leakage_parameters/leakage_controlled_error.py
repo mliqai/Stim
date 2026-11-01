@@ -1,7 +1,7 @@
 import dataclasses
 from typing import ClassVar, Literal
 
-import numpy as np
+from stimside.util.alias_table import is_1_up_to_rounding
 
 Pauli = Literal["X", "Y", "Z"]
 
@@ -53,7 +53,9 @@ class LeakageControlledErrorParams:
             probs_by_state[state] = probs_by_state.get(state, 0.0) + p
 
         for state, total_p in probs_by_state.items():
-            if total_p > 1 and not np.isclose(total_p, 1):
+            if total_p > 1 and not is_1_up_to_rounding(
+                total_p, [p for _, p in self.args_by_input_state[state]]
+            ):
                 raise ValueError(
                     f"{self.name} total probability {total_p}>1 for state {state}"
                 )

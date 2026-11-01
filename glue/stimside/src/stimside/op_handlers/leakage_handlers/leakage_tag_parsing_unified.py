@@ -44,9 +44,9 @@ def _combine_conditioned_states(states: list[int | str], name: str) -> list[int 
         else: new_states += qubit_states
         return new_states
 
-def _parse_list_of_states(args: str, name: str) -> set[str | int]:
+def _parse_list_of_states(args: str, name: str) -> tuple[str | int, ...]:
     states = [try_as_integer(st.strip()) for st in args.split()]
-    return set(_combine_conditioned_states(cast(list[int | str], states), name))
+    return tuple(dict.fromkeys(_combine_conditioned_states(cast(list[int | str], states), name)))
 
 # --- TAG-SPECIFIC PARSER FUNCTIONS ---
 
@@ -123,14 +123,14 @@ def _parse_measurement(op: stim.CircuitInstruction, match: Any, sim: str) -> Lea
 
 def _parse_conditioned_self(op: stim.CircuitInstruction, match: Any, sim: str) -> LeakageConditioningParams:
     states = _parse_list_of_states(match.group("args"), match.group("name"))
-    return LeakageConditioningParams(args=(tuple(states),), from_tag=op.tag, targets=None)
+    return LeakageConditioningParams(args=(states,), from_tag=op.tag, targets=None)
 
 def _parse_conditioned_other(op: stim.CircuitInstruction, match: Any, sim: str) -> LeakageConditioningParams:
     args, targets = match.group("args"), match.group("targets")
     if not targets: raise ValueError("CONDITIONED_ON_OTHER tag needs to specify targets.")
     states = _parse_list_of_states(args, match.group("name"))
     return LeakageConditioningParams(
-        args=(tuple(states),), 
+        args=(states,), 
         from_tag=op.tag, 
         targets=tuple(parse_list_of_targets(targets))
     )

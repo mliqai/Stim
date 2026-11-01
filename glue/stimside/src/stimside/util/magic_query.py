@@ -360,8 +360,8 @@ def _compute_partial_trace_fidelity_mass(ref_data: ReferenceCHPTableau, exp_data
         w_exp = apply_quarter_turn(j_se.exp, rot_ax.a_words, rot_ax.b_words, rot_ax.kappa, sign=1, check_unitary=True, atol=atol) if rot_ax is not None else j_se.exp
         ctx.check_exp(w_exp, is_choi=False)
         z_pre, (p_exp, z0_r) = w_exp.norm_sq(), project_diagonal(w_exp, bd, sg, 0)
-        z0_f, tol_z = float(z0_r), atol * max(1.0, abs(z_pre))
-        if not math.isfinite(z0_f) or z0_f < -tol_z or z0_f > z_pre + tol_z:
+        z0_f, scale_z = float(z0_r), max(1.0, abs(z_pre))
+        if not math.isfinite(z0_f) or z0_f < -1e-12 * scale_z or z0_f > z_pre + atol * scale_z:
             raise FloatingPointError(f"Bell projection norm drift: z0={z0_f}, z_pre={z_pre}, atol={atol}")
         if z0_f <= K1_CANCEL_REL_TOL * z_pre or p_exp.chi == 0:
             return _FP_ZERO
@@ -681,9 +681,15 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
                 _, b_diag, kp = _ax_tup(rec.obs_axis, nw)
                 sig = (kp >> 1) & 1
             (e0, z0_r), (e1, z1_r) = project_diagonal(work, b_diag, sig, 0), project_diagonal(work, b_diag, sig, 1)
-            z0_f, z1_f, tol_z, z0_c, z1_c = float(z0_r), float(z1_r), ctx.atol * max(1.0, abs(z_in_r)), max(0.0, float(z0_r)), max(0.0, float(z1_r))
-            if not (math.isfinite(z0_f) and math.isfinite(z1_f) and math.isfinite(z_in_r)) or z0_f < -tol_z or z1_f < -tol_z or abs((z0_c + z1_c) - z_in_r) > tol_z:
-                raise FloatingPointError(f"Born mass conservation violated: z0={z0_f}, z1={z1_f}, z_in={z_in_r}, atol={ctx.atol}")
+            z0_f, z1_f = float(z0_r), float(z1_r)
+            if not (math.isfinite(z0_f) and math.isfinite(z1_f) and math.isfinite(z_in_r)):
+                raise FloatingPointError(f"Non-finite projected Born masses: z0={z0_f!r}, z1={z1_f!r}, z_in={z_in_r!r}")
+            scale_z = max(1.0, z_in_r)
+            if z0_f < -1e-12 * scale_z or z1_f < -1e-12 * scale_z:
+                raise FloatingPointError(f"Significantly negative projected Born mass: z0={z0_f!r}, z1={z1_f!r}")
+            z0_c, z1_c = max(0.0, z0_f), max(0.0, z1_f)
+            if abs((z0_c + z1_c) - z_in_r) > ctx.atol * scale_z:
+                raise FloatingPointError(f"Born mass conservation violated: z0={z0_c}, z1={z1_c}, z_in={z_in_r}, atol={ctx.atol}")
             brs = []
             for qb, eb, zb_c in ((0, e0, z0_c), (1, e1, z1_c)):
                 if z_in_r > 0.0 and zb_c > K1_CANCEL_REL_TOL * z_in_r and eb.chi > 0:

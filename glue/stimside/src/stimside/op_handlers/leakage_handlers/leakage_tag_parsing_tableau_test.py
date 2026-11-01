@@ -497,3 +497,25 @@ def test_transition_totals_above_1_by_more_than_rounding_still_raise(text):
     for name in _ALL:
         with pytest.raises(ValueError, match="total probability 1.000005>1"):
             _COMPILERS[name](stim.Circuit(text))
+
+
+def test_controlled_error_totals_and_conditioned_states_ordering() -> None:
+    lce_bad = stim.Circuit(
+        "R 0 1\nII_ERROR[LEAKAGE_CONTROLLED_ERROR: (0.5, 2-->X) (0.500005, 2-->Z)] 0 1"
+    )
+    with pytest.raises(ValueError, match="total probability 1.000005>1"):
+        _COMPILERS["flip"](lce_bad)
+
+    lce_round = stim.Circuit(
+        "R 0 1\nII_ERROR[LEAKAGE_CONTROLLED_ERROR: (0.1, 2-->X) (0.1, 2-->Y) (0.8, 2-->Z)] 0 1"
+    )
+    _COMPILERS["flip"](lce_round)
+
+    p_self = ltp.parse_leakage_tag(
+        stim.Circuit("X[CONDITIONED_ON_SELF: U 3 2 3 U] 0")[0]
+    )
+    p_other = ltp.parse_leakage_tag(
+        stim.Circuit("X[CONDITIONED_ON_OTHER: 3 2 3 0 1 : 1] 0")[0]
+    )
+    assert p_self is not None and p_self.args == (("U", 3, 2),)
+    assert p_other is not None and p_other.args == ((3, 2, "U"),)

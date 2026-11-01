@@ -468,3 +468,17 @@ def test_quantum_measurements_query_and_fallback_stream_parity(fault_mode: str) 
     for bad_qm in ({True: 0}, {-1: 0}, {99: 1}, {0: 2}):
         with pytest.raises(ValueError):
             EvaluateQueries(PrepareQueries(c_two, fault_mode=fault_mode), {"quantum_measurements": bad_qm})
+
+
+def test_query_born_split_rejects_negative_mass_matching_magic_compile(monkeypatch: pytest.MonkeyPatch) -> None:
+    import stimside.util.magic_query as mq
+    from stimside.util.phase_qfe import project_diagonal as real_pd
+
+    plan = PrepareQueries(stim.Circuit("H 0\nI[T] 0\nM 0"), atol=1e-2)
+    monkeypatch.setattr(
+        mq,
+        "project_diagonal",
+        lambda exp, bd, sg, outcome: (real_pd(exp, bd, sg, outcome)[0], -1e-4 if outcome == 0 else exp.norm_sq()),
+    )
+    with pytest.raises(FloatingPointError, match="Significantly negative projected Born mass"):
+        EvaluateQueries(plan, queries=("mass",))
