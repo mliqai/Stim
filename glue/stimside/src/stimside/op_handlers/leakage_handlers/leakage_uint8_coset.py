@@ -311,6 +311,19 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                     cond_mask = self._filter_targets_2q_mask(
                         target_pairs, (("U",), ("U",)), sss
                     )
+                elif op_name in ("SPP", "SPP_DAG"):
+                    terms = op.target_groups()
+                    cond_mask = (
+                        np.array(
+                            [
+                                np.all(self._state[[t.qubit_value for t in term], :] < 2, axis=0)
+                                for term in terms
+                            ],
+                            dtype=np.bool_,
+                        )
+                        if terms
+                        else np.zeros((0, sss.batch_size), dtype=np.bool_)
+                    )
                 else:
                     sss._do_bare_instruction(op)
                     return

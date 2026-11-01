@@ -753,12 +753,6 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._next_step_meta(op)
         if gd.is_noisy_gate and not gd.produces_measurements and not gd.is_reset:
             self.do_conditional_pauli_noise(op, None)
-        elif cname in ("SPP", "SPP_DAG"):
-            dag = cname == "SPP_DAG"
-            for grp, inv in _split_pauli_product_targets(op):
-                red = _reduce_pauli_product_targets(grp)
-                apply_spp_to_reference_chp(self._live_ref_tab, red, negate=inv, dag=dag)
-                self._live_frame_events.append(LeftSppEvent(tuple(red), inv, dag))
         elif gd.is_unitary:
             self.do_conditional_clifford(op, None)
         elif gd.produces_measurements or gd.is_reset:
@@ -919,9 +913,24 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 for g_idx in range(sum(t.qubit_value is not None for t in op.targets_copy()) // arity):
                     condition_group_fn(g_idx)
             return
+        mask_at = lambda i: condition_group_fn(i) if condition_group_fn is not None else (condition_met_mask[i] if condition_met_mask is not None else None)
+        if name in ("SPP", "SPP_DAG"):
+            dag = name == "SPP_DAG"
+            for g_idx, (grp, inv) in enumerate(_split_pauli_product_targets(op)):
+                red = _reduce_pauli_product_targets(grp)
+                self._apply_conditional_ref_step(
+                    mask_at(g_idx),
+                    lambda r=red, iv=inv: (
+                        apply_spp_to_reference_chp(self._live_ref_tab, r, negate=iv, dag=dag),
+                        self._live_frame_events.append(LeftSppEvent(tuple(r), iv, dag)),
+                    ),
+                    lambda r=red, iv=inv: CompiledCliffordFactorList(
+                        7 if dag else 1, None, (compile_pauli_product(self._live_ref_tab, r, negate=iv ^ (not dag)),)
+                    ),
+                )
+            return
         canon, arity = _canonical_clifford_gate_name_and_arity(name)
         raw = op.targets_copy()
-        mask_at = lambda i: condition_group_fn(i) if condition_group_fn is not None else (condition_met_mask[i] if condition_met_mask is not None else None)
         if arity == 2 and any(t.qubit_value is None for t in raw):
             fb_axes = _FEEDBACK_2Q_GATES.get(canon)
             for p_idx, (a, b_t) in enumerate(zip(raw[::2], raw[1::2])):
@@ -950,21 +959,31 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._apply_unitary_group(canon, tuple(qs[off : off + arity]), mask_at(g_idx))
 
     def _apply_unitary_group(self, canon: str, grp: tuple[int, ...], mask_g: NDArray[np.bool_] | None) -> None:
+        self._apply_conditional_ref_step(
+            mask_g,
+            lambda: (self._live_ref_tab.do_unitary(canon, grp), self._live_frame_events.append(LeftUnitaryEvent(canon, grp))),
+            lambda: _compile_clifford_factors(self._live_ref_tab, canon, grp),
+        )
+
+    def _apply_conditional_ref_step(
+        self,
+        mask_g: NDArray[np.bool_] | None,
+        advance_ref: Callable[[], object],
+        compile_fac: Callable[[], CompiledCliffordFactorList],
+    ) -> None:
         if mask_g is None or np.all(mask_g):
-            self._live_ref_tab.do_unitary(canon, grp)
-            self._live_frame_events.append(LeftUnitaryEvent(canon, grp))
+            advance_ref()
             return
         n_act = int(np.count_nonzero(mask_g))
         if n_act == 0:
             return
         self._flush_magic()
-        fac = _compile_clifford_factors(self._live_ref_tab, canon, grp)
+        fac = compile_fac()
         if 2 * n_act <= self.batch_size:
             for s in np.flatnonzero(mask_g):
                 self._apply_factor_list(int(s), fac, inverse=False)
         else:
-            self._live_ref_tab.do_unitary(canon, grp)
-            self._live_frame_events.append(LeftUnitaryEvent(canon, grp))
+            advance_ref()
             for s in np.flatnonzero(~mask_g):
                 self._apply_factor_list(int(s), fac, inverse=True)
 

@@ -484,3 +484,62 @@ def test_noiseless_ref_conditioning_collapse_semantics() -> None:
         stim.Circuit("H 0\nX[CONDITIONED_ON_SELF: 2] 0\nCZ[CONDITIONED_ON_PAIR: (2, U)] 0 1\nH 0\nM 0 1")
     )
     assert not needs_leak_drop and "CONDITIONED_ON" not in str(stripped_drop) and "CZ" not in str(stripped_drop)
+
+
+@pytest.mark.parametrize("gate", ["SPP", "SPP_DAG"])
+def test_spp_terms_on_leaked_qubits_align_across_magic_and_tableside(gate: str) -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8 as LeakageUint8Tableau
+    from stimside.simulator_tableau import TablesideSimulator
+
+    # 1. Stochastic lockstep parity with TablesideSimulator across minority & majority active fractions + `!`.
+    for p_leak in (0.25, 0.75):
+        circ = stim.Circuit(
+            f"R 0 1 2 3\nH 1\n"
+            f"I[LEAKAGE_TRANSITION_1: ({p_leak}, U-->2)] 0\n"
+            f"{gate} Z0*X2 !Y1*Z3\n"
+            f"{gate} Z0*X2 X3\n"
+            f"MPAD[LEAKAGE_MEASUREMENT: (1.0, 2): 0] 0\n"
+            f"H 1\nM 1 2 3"
+        )
+        tab = TablesideSimulator(
+            circuit=circ,
+            compiled_op_handler=LeakageUint8Tableau().compile_op_handler(circuit=circ, batch_size=1),
+            batch_size=32,
+            seed=19,
+            sync_tableside_rng=True,
+        )
+        mag = MagicsideSimulator(
+            circ, op_handler=LeakageUint8Magic(), batch_size=32, seed=19, sync_tableside_rng=True
+        )
+        tab.run()
+        mag.run()
+        t_rec, m_rec = tab.get_final_measurement_records(), mag.get_final_measurement_records()
+        assert 0 < int(np.count_nonzero(t_rec[:, 0])) < 32
+        np.testing.assert_array_equal(m_rec, t_rec)
+
+        # 2. Magic statevector check on both minority and majority leakage batches.
+        m_circ = stim.Circuit(
+            f"R 0 1 2\nH 1 2\nI[T] 1\nI[T_DAG] 2\n"
+            f"I[LEAKAGE_TRANSITION_1: ({p_leak}, U-->2)] 0\n"
+            f"{gate} !Z0*X1 Y1*Z2\n"
+            f"MPAD[LEAKAGE_MEASUREMENT: (1.0, 2): 0] 0"
+        )
+        msim = MagicsideSimulator(m_circ, op_handler=LeakageUint8Magic(), batch_size=16, seed=23)
+        msim.run()
+        leaked = msim.get_final_measurement_records()[:, 0]
+        assert 0 < int(np.count_nonzero(leaked)) < 16
+        ref_kept = MagicsideSimulator(stim.Circuit(f"R 0 1 2\nH 1 2\nI[T] 1\nI[T_DAG] 2\n{gate} !Z0*X1 Y1*Z2"))
+        ref_skip = MagicsideSimulator(stim.Circuit(f"R 0 1 2\nH 1 2\nI[T] 1\nI[T_DAG] 2\n{gate} Y1*Z2"))
+        ref_kept.run()
+        ref_skip.run()
+        psi_kept, psi_skip = ref_kept.get_statevector(0), ref_skip.get_statevector(0)
+        for s in range(16):
+            psi_s = msim.get_statevector(s)
+            want = psi_skip if leaked[s] else psi_kept
+            assert np.allclose(psi_s, want, atol=1e-12)
+
+    # 3. unconditional_condition_on_U=False still applies all SPP terms unconditionally.
+    c_u_false = stim.Circuit(f"R 0 1\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\n{gate} Z0*X1 Z0*X1\nM 1")
+    sim_uf = MagicsideSimulator(c_u_false, op_handler=LeakageUint8Magic(unconditional_condition_on_U=False), batch_size=4, seed=3)
+    sim_uf.run()
+    assert np.all(sim_uf.get_final_measurement_records()[:, 0])
