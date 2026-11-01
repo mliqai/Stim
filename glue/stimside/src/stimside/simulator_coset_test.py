@@ -4,9 +4,9 @@ import dataclasses
 import numpy as np
 import stim
 
+from stimside._coset.reference_compile import CompiledReferenceCircuit, MeasStepMeta
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.simulator_coset import CosetsideSimulator
-from stimside.util.reference_chp import CompiledReferenceCircuit, MeasStepMeta
 
 
 def test_shared_compiled_reference_circuit_no_per_batch_scratch_or_undeclared_attrs() -> None:

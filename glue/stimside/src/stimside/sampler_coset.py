@@ -7,6 +7,7 @@ import numpy as np
 import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
+from stimside._coset.reference_compile import CompiledReferenceCircuit
 from stimside.dem_generators.leakage_decoder import (
     CompiledLeakageDecoder,
     LeakageDecoderLike,
@@ -15,7 +16,6 @@ from stimside.dem_generators.leakage_decoder import (
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler
 from stimside.sampler_tableau import _CompiledSeedMixin
 from stimside.simulator_coset import CosetsideSimulator
-from stimside.util.reference_chp import CompiledReferenceCircuit
 
 
 class CosetsideSampler(_CompiledSeedMixin, sinter.Sampler):

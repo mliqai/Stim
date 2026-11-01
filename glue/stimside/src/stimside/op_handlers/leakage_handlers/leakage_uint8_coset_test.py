@@ -780,7 +780,7 @@ class TestCompiledLeakageUint8Coset:
 
     def test_mrqf_primitives_s1_to_s5_p1_to_p3_q1_and_collisions(self) -> None:
         """Verify MRQF routines S1-S5, P1-P3, PCP, Q1, collision branches, multi-word (>64q) invariants, and conditional gates."""
-        from stimside.simulator_coset import MRQFState
+        from stimside._coset.mrqf_state import MRQFState
 
         # 1. Example 14.1: S|+> measured in Y (d: 1 -> 0, deterministic m=0, rho=1.0)
         st = MRQFState(num_qubits=1)
