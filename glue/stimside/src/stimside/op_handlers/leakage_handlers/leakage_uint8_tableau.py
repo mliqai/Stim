@@ -16,6 +16,9 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageMeasurementParams,
     LeakageSwapParams,
 )
+from stimside.op_handlers.leakage_handlers.leakage_tag_parsing_tableau import (
+    parse_leakage_in_circuit,
+)
 from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
 from stimside.util.numpy_types import Int2DArray
 from stimside.util.stim_workarounds import split_fused_instruction
@@ -52,21 +55,16 @@ class LeakageUint8(OpHandler["TablesideSimulator"]):
         self.unconditional_condition_on_U = unconditional_condition_on_U
 
     def compile_op_handler(
-            self, *, circuit: stim.Circuit, batch_size: int
-            ) -> "CompiledLeakageUint8":
-        from stimside._tableau.runner import get_precompiled_circuit
-
-        pre = get_precompiled_circuit(circuit, self.unconditional_condition_on_U)
-        check_tag_qubits(pre.parsed_ops, circuit.num_qubits)
-
-        handler = CompiledLeakageUint8(
+        self, *, circuit: stim.Circuit, batch_size: int
+    ) -> "CompiledLeakageUint8":
+        parsed_ops = parse_leakage_in_circuit(circuit)
+        check_tag_qubits(parsed_ops, circuit.num_qubits)
+        return CompiledLeakageUint8(
             num_qubits=circuit.num_qubits,
             batch_size=batch_size,
-            ops_to_params=pre.parsed_ops,
+            ops_to_params=parsed_ops,
             unconditional_condition_on_U=self.unconditional_condition_on_U,
         )
-        handler._precompiled_circuit = pre
-        return handler
 
 
 @dataclasses.dataclass
@@ -79,9 +77,6 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
     state: NDArray[np.uint8] = dataclasses.field(init=False)
 
     ops_to_params: dict[stim.CircuitInstruction, LeakageParams]
-    _precompiled_circuit: object | None = dataclasses.field(
-        default=None, init=False, repr=False
-    )
 
     def __post_init__(self):
         self.claimed_ops_keys = set(self.ops_to_params.keys())

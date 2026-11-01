@@ -25,7 +25,7 @@ from stimside._native.tableside_kernels import (
     TransBranchC,
     get_tableside_kernels_lib,
 )
-from stimside.util.circuit import apply_coords_op
+from stimside.util.circuit import apply_coords_op, unroll_circuit
 
 if TYPE_CHECKING:
     from stimside.simulator_tableau import TablesideSimulator
@@ -93,6 +93,8 @@ def _slice_circuit(
                 sub.append(inst)
         else:
             sub = _circuit_of(insts[a:b])
+        if len(cache) >= 512:
+            cache.pop(next(iter(cache)))
         cache[(a, b)] = sub
     return sub
 
@@ -104,6 +106,7 @@ class PrecompiledTablesideCircuit:
         self,
         circuit: stim.Circuit,
         unconditional_condition_on_U: bool = True,
+        parsed_ops: dict[stim.CircuitInstruction, LeakageParams] | None = None,
     ) -> None:
         self.circuit = circuit
         self.num_qubits = circuit.num_qubits
@@ -114,11 +117,22 @@ class PrecompiledTablesideCircuit:
         self._full_bare_circuit: stim.Circuit | None = None
         self._quantum_bare_circuit: stim.Circuit | None = None
 
-        from stimside.util.circuit import unroll_circuit
-
         has_repeat = any(isinstance(inst, stim.CircuitRepeatBlock) for inst in circuit)
         # Not circuit.flattened(): it fuses identical consecutive instructions, desyncing steps from step_to_unrolled_idx.
         unrolled_ops = unroll_circuit(circuit) if has_repeat else list(circuit)
+        use_supplied_ops = parsed_ops is not None and all(
+            isinstance(
+                v,
+                (
+                    LeakageConditioningParams,
+                    LeakageTransition1Params,
+                    LeakageTransition2Params,
+                    LeakageMeasurementParams,
+                    LeakageSwapParams,
+                ),
+            )
+            for v in parsed_ops.values()
+        )
         self.parsed_ops: dict[stim.CircuitInstruction, LeakageParams] = {}
 
         self.final_qubit_coords: dict[int, list[float]] = {}
@@ -196,7 +210,11 @@ class PrecompiledTablesideCircuit:
 
             params: LeakageParams | None = None
             if op.tag != "":
-                params = parse_leakage_tag(op, simulator="tableau")
+                params = (
+                    parsed_ops.get(op)
+                    if use_supplied_ops and parsed_ops is not None
+                    else parse_leakage_tag(op, simulator="tableau")
+                )
                 if params is not None:
                     self.parsed_ops[op] = params
             is_claimed = params is not None
@@ -592,28 +610,105 @@ _PRECOMPILED_CACHE: dict[
 
 
 def get_precompiled_circuit(
-    circuit: stim.Circuit, unconditional_condition_on_U: bool
+    circuit: stim.Circuit,
+    unconditional_condition_on_U: bool,
+    parsed_ops: dict[stim.CircuitInstruction, LeakageParams] | None = None,
 ) -> PrecompiledTablesideCircuit:
     key = (id(circuit), len(circuit), bool(unconditional_condition_on_U))
     entry = _PRECOMPILED_CACHE.get(key)
     if entry is not None and entry[0] is circuit and len(circuit) == key[1]:
         return entry[1]
-    pre = PrecompiledTablesideCircuit(circuit, unconditional_condition_on_U)
+    pre = PrecompiledTablesideCircuit(circuit, unconditional_condition_on_U, parsed_ops)
     if len(_PRECOMPILED_CACHE) >= 16:
         _PRECOMPILED_CACHE.pop(next(iter(_PRECOMPILED_CACHE)))
     _PRECOMPILED_CACHE[key] = (circuit, pre)
     return pre
 
 
-def _apply_final_metadata(
-    tss: "TablesideSimulator", pre: PrecompiledTablesideCircuit
-) -> None:
-    tss.qubit_coords = pre.final_qubit_coords
-    tss.qubit_tags = pre.final_qubit_tags
-    tss.coords_shifts = pre.final_coords_shifts
-    if tss._construct_reference_circuit:
-        tss._new_reference_circuit = pre.reference_circuit.copy()
-    tss._circuit_time = pre.unrolled_num_ops
+_ACTION_OP_MAP: dict[int, tuple[str, bool]] = {
+    3: ("R", False),
+    4: ("X", False),
+    5: ("Y", False),
+    6: ("Z", False),
+    7: ("DEPOLARIZE1", True),
+    8: ("X_ERROR", True),
+    9: ("Z_ERROR", True),
+}
+
+
+def _leaked_meas_text(qs: np.ndarray, p2: float, bare_text: str) -> str:
+    t = " ".join(str(int(q)) for q in qs)
+    x = f"X_ERROR({p2}) {t}\n" if p2 > 0.0 else ""
+    return f"R {t}\n{x}{bare_text}DEPOLARIZE1(0.75) {t}\n"
+
+
+class _StepCursor:
+    """Shared circuit/tableau slice-flush and handler-yield cursor for Tableside runners."""
+
+    __slots__ = ("tss", "pre", "sync", "f", "q", "use_tab")
+
+    def __init__(
+        self,
+        tss: "TablesideSimulator",
+        pre: PrecompiledTablesideCircuit,
+        *,
+        sync: bool = False,
+    ) -> None:
+        self.tss, self.pre, self.sync = tss, pre, sync
+        self.f = self.q = 0
+        self.use_tab = tss._running_tableau
+
+    def flush_full(self, f_end: int) -> None:
+        if f_end > self.f:
+            self.tss._new_circuit += self.pre.get_full_slice(self.f, f_end)
+            self.f = f_end
+
+    def flush_quant(self, q_end: int) -> None:
+        if self.use_tab and q_end > self.q:
+            tab = self.tss._tableau_simulator
+            if self.sync:
+                do = tab.do
+                for inst in self.pre.quantum_bare_insts[self.q : q_end]:
+                    do(inst)
+            else:
+                tab.do_circuit(self.pre.get_quant_slice(self.q, q_end))
+            self.q = q_end
+
+    def flush(self, f_end: int, q_end: int) -> None:
+        self.flush_full(f_end)
+        self.flush_quant(q_end)
+
+    def emit(self, s_idx: int, txt: str, consumes: int) -> None:
+        f_s = self.pre.step_to_full_idx[s_idx]
+        self.flush_full(f_s)
+        if txt:
+            self.tss._new_circuit.append_from_stim_program_text(txt)
+        self.f = f_s + consumes
+        if self.use_tab:
+            q_s = self.pre.step_to_quant_idx[s_idx]
+            self.flush_quant(q_s)
+            if txt:
+                self.tss._tableau_simulator.do_circuit(stim.Circuit(txt))
+            self.q = q_s + consumes
+
+    def yield_step(self, s_idx: int) -> None:
+        pre, tss = self.pre, self.tss
+        f_s, q_s = pre.step_to_full_idx[s_idx], pre.step_to_quant_idx[s_idx]
+        self.flush(f_s, q_s)
+        tss._circuit_time = pre.step_to_unrolled_idx[s_idx]
+        tss._compiled_op_handler.handle_op(op=pre.orig_ops[s_idx], sss=tss)
+        self.use_tab = tss._running_tableau
+        consumes = 1 if pre.step_has_bare_op[s_idx] else 0
+        self.f, self.q = f_s + consumes, q_s + consumes
+
+    def finish(self) -> None:
+        self.flush(self.pre.step_to_full_idx[-1], self.pre.step_to_quant_idx[-1])
+        self.tss.qubit_coords = self.pre.final_qubit_coords
+        self.tss.qubit_tags = self.pre.final_qubit_tags
+        self.tss.coords_shifts = self.pre.final_coords_shifts
+        if self.tss._construct_reference_circuit:
+            self.tss._new_reference_circuit = self.pre.reference_circuit.copy()
+        self.tss._circuit_time = self.pre.unrolled_num_ops
 
 
 def run_tableside_sync_rng(
@@ -621,23 +716,15 @@ def run_tableside_sync_rng(
     pre: PrecompiledTablesideCircuit,
 ) -> None:
     """Tier 1 Python execution preserving 100% exact RNG lockstep with CosetsideSimulator(sync_tableside_rng=True)."""
-    coh = tss._compiled_op_handler
-    state = coh.state
+    state = tss._compiled_op_handler.state
     steps = pre.steps_py
-    step_to_full = pre.step_to_full_idx
-    step_to_quant = pre.step_to_quant_idx
-    quant_insts = pre.quantum_bare_insts
-    num_steps = pre.num_steps
-    use_tableau = tss._running_tableau
-    sim_do = tss._tableau_simulator.do
+    cur = _StepCursor(tss, pre, sync=True)
 
-    f_cursor = 0
-    q_cursor = 0
-    for s in range(num_steps):
+    for s in range(pre.num_steps):
         kind, _, _, _, qubit_i32, params = steps[s]
         if kind == 0:
             continue
-        elif kind in (1, 2, 5, 8):
+        if kind in (1, 2, 5, 8):
             is_other = isinstance(params, LeakageConditioningParams) and params.targets
             check_qs = (
                 np.asarray(params.targets, dtype=np.int32)
@@ -650,29 +737,9 @@ def run_tableside_sync_rng(
                 is_other and len(qubit_i32) > len(params.targets)
             ):
                 continue
+        cur.yield_step(s)
 
-        f_s = step_to_full[s]
-        if f_s > f_cursor:
-            tss._new_circuit += pre.get_full_slice(f_cursor, f_s)
-        q_s = step_to_quant[s]
-        if use_tableau and q_s > q_cursor:
-            for inst in quant_insts[q_cursor:q_s]:
-                sim_do(inst)
-        tss._circuit_time = pre.step_to_unrolled_idx[s]
-        coh.handle_op(op=pre.orig_ops[s], sss=tss)
-        if not use_tableau and tss._running_tableau:
-            use_tableau = True
-            sim_do = tss._tableau_simulator.do
-        consumes = 1 if pre.step_has_bare_op[s] else 0
-        f_cursor = f_s + consumes
-        q_cursor = q_s + consumes
-
-    if step_to_full[-1] > f_cursor:
-        tss._new_circuit += pre.get_full_slice(f_cursor, step_to_full[-1])
-    if use_tableau and step_to_quant[-1] > q_cursor:
-        for inst in quant_insts[q_cursor : step_to_quant[-1]]:
-            sim_do(inst)
-    _apply_final_metadata(tss, pre)
+    cur.finish()
 
 
 class CppTablesideRunner:
@@ -748,10 +815,9 @@ class CppTablesideRunner:
 
     def run(self, tss: "TablesideSimulator") -> None:
         pre = self.pre
+        cur = _StepCursor(tss, pre)
         if pre.num_steps == 0:
-            if len(pre.full_bare_circuit) > 0:
-                tss._new_circuit += pre.full_bare_circuit
-            _apply_final_metadata(tss, pre)
+            cur.finish()
             return
 
         # Sync leaked mask in case user/test manually modified self._compiled_op_handler.state before run()
@@ -772,11 +838,6 @@ class CppTablesideRunner:
         steps_py = pre.steps_py
         step_to_full = pre.step_to_full_idx
         step_to_quant = pre.step_to_quant_idx
-        use_tableau = tss._running_tableau
-        coh = tss._compiled_op_handler
-
-        f_cursor = 0
-        q_cursor = 0
         cur_step = 0
         num_steps = pre.num_steps
 
@@ -811,181 +872,73 @@ class CppTablesideRunner:
                 act = actions_ptr[i]
                 kind = act.kind
                 if kind == 0:  # ACT_RUN_SLICE
-                    f_end = step_to_full[act.slice_end]
-                    if f_end > f_cursor:
-                        tss._new_circuit += pre.get_full_slice(f_cursor, f_end)
-                        f_cursor = f_end
-                    if use_tableau:
-                        q_end = step_to_quant[act.slice_end]
-                        if q_end > q_cursor:
-                            tss._tableau_simulator.do_circuit(
-                                pre.get_quant_slice(q_cursor, q_end)
-                            )
-                        q_cursor = q_end
+                    cur.flush(step_to_full[act.slice_end], step_to_quant[act.slice_end])
                 elif kind in (1, 2):  # ACT_FILTERED_1Q / ACT_FILTERED_2Q
                     s_idx = act.step_idx
-                    f_s = step_to_full[s_idx]
-                    if f_s > f_cursor:
-                        tss._new_circuit += pre.get_full_slice(f_cursor, f_s)
                     _, op_name, gate_args, _, _, _ = steps_py[s_idx]
                     txt = self._cpp_format_op(
-                        op_name,
-                        gate_args,
-                        targets_ptr,
-                        act.target_offset,
-                        act.target_count,
+                        op_name, gate_args, targets_ptr, act.target_offset, act.target_count
                     )
-                    if txt:
-                        tss._new_circuit.append_from_stim_program_text(txt)
-                    f_cursor = f_s + 1
-                    if use_tableau:
-                        q_s = step_to_quant[s_idx]
-                        if q_s > q_cursor:
-                            tss._tableau_simulator.do_circuit(
-                                pre.get_quant_slice(q_cursor, q_s)
-                            )
-                        if txt:
-                            tss._tableau_simulator.do_circuit(stim.Circuit(txt))
-                        q_cursor = q_s + 1
-                elif kind in (3, 4, 5, 6, 7, 8, 9):
-                    s_idx = act.step_idx
-                    f_s = step_to_full[s_idx]
-                    if f_s > f_cursor:
-                        tss._new_circuit += pre.get_full_slice(f_cursor, f_s)
-                        f_cursor = f_s
-                    op_map = {
-                        3: ("R", []),
-                        4: ("X", []),
-                        5: ("Y", []),
-                        6: ("Z", []),
-                        7: ("DEPOLARIZE1", [act.prob]),
-                        8: ("X_ERROR", [act.prob]),
-                        9: ("Z_ERROR", [act.prob]),
-                    }
-                    g_name, g_args = op_map[kind]
+                    cur.emit(s_idx, txt, 1)
+                elif kind in _ACTION_OP_MAP:
+                    g_name, has_p = _ACTION_OP_MAP[kind]
                     txt = self._cpp_format_op(
                         g_name,
-                        g_args,
+                        [act.prob] if has_p else [],
                         targets_ptr,
                         act.target_offset,
                         act.target_count,
                     )
-                    if txt:
-                        tss._new_circuit.append_from_stim_program_text(txt)
-                    if use_tableau:
-                        q_s = step_to_quant[s_idx]
-                        if q_s > q_cursor:
-                            tss._tableau_simulator.do_circuit(
-                                pre.get_quant_slice(q_cursor, q_s)
-                            )
-                        if txt:
-                            tss._tableau_simulator.do_circuit(stim.Circuit(txt))
-                        q_cursor = q_s
+                    cur.emit(act.step_idx, txt, 0)
                 elif kind == 10:  # ACT_MODIFIED_MEAS
                     s_idx = act.step_idx
-                    f_s = step_to_full[s_idx]
-                    if f_s > f_cursor:
-                        tss._new_circuit += pre.get_full_slice(f_cursor, f_s)
                     _, _, _, bare_op_text, _, _ = steps_py[s_idx]
-                    r_str = self._cpp_format_op(
-                        "R",
-                        [],
-                        targets_ptr,
-                        act.target_offset,
-                        act.target_count,
-                    )
+                    off, cnt = act.target_offset, act.target_count
+                    r_str = self._cpp_format_op("R", [], targets_ptr, off, cnt)
                     x_str = (
-                        self._cpp_format_op(
-                            "X_ERROR",
-                            [act.prob],
-                            targets_ptr,
-                            act.target_offset,
-                            act.target_count,
-                        )
+                        self._cpp_format_op("X_ERROR", [act.prob], targets_ptr, off, cnt)
                         if act.prob > 0.0
                         else ""
                     )
-                    d_str = self._cpp_format_op(
-                        "DEPOLARIZE1",
-                        [0.75],
-                        targets_ptr,
-                        act.target_offset,
-                        act.target_count,
-                    )
-                    txt = r_str + x_str + bare_op_text + d_str
-                    tss._new_circuit.append_from_stim_program_text(txt)
-                    f_cursor = f_s + 1
-                    if use_tableau:
-                        q_s = step_to_quant[s_idx]
-                        if q_s > q_cursor:
-                            tss._tableau_simulator.do_circuit(
-                                pre.get_quant_slice(q_cursor, q_s)
-                            )
-                        tss._tableau_simulator.do_circuit(stim.Circuit(txt))
-                        q_cursor = q_s + 1
+                    d_str = self._cpp_format_op("DEPOLARIZE1", [0.75], targets_ptr, off, cnt)
+                    cur.emit(s_idx, r_str + x_str + bare_op_text + d_str, 1)
                 elif kind == 12:  # ACT_YIELD_FUSED_MEAS
                     s_trans = act.step_idx
                     s_meas = act.slice_end
-                    if not use_tableau:
-                        f_s = step_to_full[s_trans]
-                        if f_s > f_cursor:
-                            tss._new_circuit += pre.get_full_slice(
-                                f_cursor, f_s
-                            )
-                            f_cursor = f_s
+                    if not cur.use_tab:
+                        cur.flush_full(step_to_full[s_trans])
                         tss._run_tableau()
-                        use_tableau = True
-                        q_cursor = step_to_quant[s_trans]
+                        cur.use_tab = True
+                        cur.q = step_to_quant[s_trans]
 
                     _, _, _, meas_bare_text, meas_qs, _ = steps_py[s_meas]
                     p2 = act.prob
                     pre_leaked_qs = meas_qs[self.state[meas_qs] >= 2]
-                    q_m = step_to_quant[s_meas]
-
                     if len(pre_leaked_qs) == 0:
-                        q_after_m = step_to_quant[s_meas + 1]
-                        if q_after_m > q_cursor:
-                            tss._tableau_simulator.do_circuit(
-                                pre.get_quant_slice(q_cursor, q_after_m)
-                            )
-                        q_cursor = q_after_m
+                        cur.flush_quant(step_to_quant[s_meas + 1])
                     else:
-                        if q_m > q_cursor:
-                            tss._tableau_simulator.do_circuit(
-                                pre.get_quant_slice(q_cursor, q_m)
-                            )
-                        t_pre = " ".join(str(int(q)) for q in pre_leaked_qs)
-                        pre_cmd = (
-                            f"R {t_pre}\n"
-                            + (f"X_ERROR({p2}) {t_pre}\n" if p2 > 0.0 else "")
-                            + meas_bare_text
-                            + f"DEPOLARIZE1(0.75) {t_pre}\n"
+                        q_m = step_to_quant[s_meas]
+                        cur.flush_quant(q_m)
+                        tss._tableau_simulator.do_circuit(
+                            stim.Circuit(_leaked_meas_text(pre_leaked_qs, p2, meas_bare_text))
                         )
-                        tss._tableau_simulator.do_circuit(stim.Circuit(pre_cmd))
-                        q_cursor = q_m + 1
+                        cur.q = q_m + 1
 
-                    newly_leaked = []
-                    for k in range(act.target_count):
-                        q_cand = int(targets_ptr[act.target_offset + k])
-                        if tss._tableau_simulator.peek_z(q_cand) == -1:
-                            newly_leaked.append(q_cand)
+                    newly_leaked = [
+                        int(targets_ptr[act.target_offset + k])
+                        for k in range(act.target_count)
+                        if tss._tableau_simulator.peek_z(int(targets_ptr[act.target_offset + k])) == -1
+                    ]
                     if newly_leaked:
-                        out_state = int(
-                            steps_py[s_trans][5].args_by_input_state[1][0][0]
-                        )
+                        out_state = int(steps_py[s_trans][5].args_by_input_state[1][0][0])
                         if rec_ev:
+                            u_idx = pre.step_to_unrolled_idx[s_trans]
                             for q_new in newly_leaked:
-                                tss._record_leakage_event(
-                                    pre.step_to_unrolled_idx[s_trans],
-                                    q_new,
-                                    self.state[q_new],
-                                    out_state,
-                                )
+                                tss._record_leakage_event(u_idx, q_new, self.state[q_new], out_state)
                         self.state[newly_leaked] = out_state
                         if rec_leak:
                             tss._record_unleaked_to_leaked_count(
-                                len(newly_leaked),
-                                pre.step_to_unrolled_idx[s_trans],
+                                len(newly_leaked), pre.step_to_unrolled_idx[s_trans]
                             )
                         self.lib.fast_engine_sync_leaked_mask(self._eng)
                         t_new = " ".join(str(q) for q in newly_leaked)
@@ -996,48 +949,19 @@ class CppTablesideRunner:
                     all_leaked_qs = meas_qs[self.state[meas_qs] >= 2]
                     if len(all_leaked_qs) > 0:
                         f_m = step_to_full[s_meas]
-                        if f_m > f_cursor:
-                            tss._new_circuit += pre.get_full_slice(
-                                f_cursor, f_m
-                            )
-                        t_all = " ".join(str(int(q)) for q in all_leaked_qs)
-                        full_cmd = (
-                            f"R {t_all}\n"
-                            + (f"X_ERROR({p2}) {t_all}\n" if p2 > 0.0 else "")
-                            + meas_bare_text
-                            + f"DEPOLARIZE1(0.75) {t_all}\n"
+                        cur.flush_full(f_m)
+                        tss._new_circuit.append_from_stim_program_text(
+                            _leaked_meas_text(all_leaked_qs, p2, meas_bare_text)
                         )
-                        tss._new_circuit.append_from_stim_program_text(full_cmd)
-                        f_cursor = f_m + 1
+                        cur.f = f_m + 1
 
                     next_step = s_meas + 1
                     break
                 elif kind == 11:  # ACT_YIELD_PYTHON
-                    s_idx = act.step_idx
-                    f_s = step_to_full[s_idx]
-                    if f_s > f_cursor:
-                        tss._new_circuit += pre.get_full_slice(f_cursor, f_s)
-                    q_s = step_to_quant[s_idx]
-                    if use_tableau and q_s > q_cursor:
-                        tss._tableau_simulator.do_circuit(
-                            pre.get_quant_slice(q_cursor, q_s)
-                        )
-                    tss._circuit_time = pre.step_to_unrolled_idx[s_idx]
-                    coh.handle_op(op=pre.orig_ops[s_idx], sss=tss)
-                    if not use_tableau and tss._running_tableau:
-                        use_tableau = True
-                    consumes = 1 if pre.step_has_bare_op[s_idx] else 0
-                    f_cursor = f_s + consumes
-                    q_cursor = q_s + consumes
+                    cur.yield_step(act.step_idx)
                     self.lib.fast_engine_sync_leaked_mask(self._eng)
-                    next_step = s_idx + 1
+                    next_step = act.step_idx + 1
                     break
             cur_step = next_step
 
-        if step_to_full[-1] > f_cursor:
-            tss._new_circuit += pre.get_full_slice(f_cursor, step_to_full[-1])
-        if use_tableau and step_to_quant[-1] > q_cursor:
-            tss._tableau_simulator.do_circuit(
-                pre.get_quant_slice(q_cursor, step_to_quant[-1])
-            )
-        _apply_final_metadata(tss, pre)
+        cur.finish()

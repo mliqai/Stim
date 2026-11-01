@@ -17,10 +17,7 @@ ALLOWED_LAYER_DEPS: dict[str, set[str]] = {
     "root": {"root", "samplers", "engines", "dem", "op_handlers", "util", "_native"},
 }
 
-# Pre-existing runtime layering violations; shrinks monotonically to empty by end of Phase 4.
-ALLOWLIST: set[tuple[str, str]] = {
-    ("stimside.op_handlers.leakage_handlers.leakage_uint8_tableau", "stimside._tableau.runner"),
-}
+ALLOWLIST: set[tuple[str, str]] = set()
 
 
 def _layer_of(mod: str) -> str:

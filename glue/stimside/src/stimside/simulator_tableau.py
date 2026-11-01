@@ -123,20 +123,17 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._new_reference_circuit = stim.Circuit()
 
         self._compiled_op_handler = compiled_op_handler
-        self._precompiled_circuit = getattr(
-            compiled_op_handler, "_precompiled_circuit", None
-        )
-        if (
-            self._precompiled_circuit is None
-            and hasattr(compiled_op_handler, "ops_to_params")
-            and hasattr(compiled_op_handler, "unconditional_condition_on_U")
+        self._precompiled_circuit = None
+        if hasattr(compiled_op_handler, "ops_to_params") and hasattr(
+            compiled_op_handler, "unconditional_condition_on_U"
         ):
             from stimside._tableau.runner import get_precompiled_circuit
 
             self._precompiled_circuit = get_precompiled_circuit(
-                circuit, bool(getattr(compiled_op_handler, "unconditional_condition_on_U"))
+                circuit,
+                bool(getattr(compiled_op_handler, "unconditional_condition_on_U")),
+                getattr(compiled_op_handler, "ops_to_params"),
             )
-            compiled_op_handler._precompiled_circuit = self._precompiled_circuit  # type: ignore[attr-defined]
 
         self._compiled_m2d_converter_inst: object | None = None
         if self._precompiled_circuit is not None:
