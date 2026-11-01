@@ -70,6 +70,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import dataclasses
+import functools
 from typing import Any, Sequence
 import warnings
 import weakref
@@ -81,9 +82,9 @@ import stim  # type: ignore[import-untyped]
 from stimside.dem_generators.dem_generator_base import DemGenerator
 from stimside.dem_generators.graphlike import (
     Symptom,
-    canonical_symptom_from_components,
     collect_known_graphlike,
-    graphlike_components,
+    dets_edge_key,
+    graphlike_inst_symptom,
     inst_symptom,
     prob_xor,
     raw_inst_components,
@@ -1014,12 +1015,7 @@ class Builder:
                         decomposed_base.append(inst)
                         continue
                     p = float(inst.args_copy()[0])
-                    raw_comps = raw_inst_components(inst)
-                    if any(len(d) > 2 for d, _ in raw_comps):
-                        comps = graphlike_components(inst, known_base)
-                    else:
-                        comps = [(d, o) for d, o in raw_comps if d]
-                    sym = canonical_symptom_from_components(comps)
+                    _, sym = graphlike_inst_symptom(inst, known_base)
                     if sym != ((), ()):
                         decomposed_base.append("error", p, sym_to_targets(sym))
                 baseline = decomposed_base
@@ -1758,7 +1754,7 @@ class Builder:
                 decompose_errors=False, approximate_disjoint_errors=True
             )
 
-        known_graphlike: dict[tuple[int, ...], Symptom] | None = None
+        get_known = functools.cache(lambda: collect_known_graphlike(baseline, dem))
         sym_to_id: dict[Any, int] = {}
         symptoms: list[Any] = []
         entry_sites: list[int] = []
@@ -1776,14 +1772,7 @@ class Builder:
             site_id = int(inst.tag[len(prefix) :])
             p = float(inst.args_copy()[0])
             if decompose_errors:
-                raw_comps = raw_inst_components(inst)
-                if any(len(d) > 2 for d, _ in raw_comps):
-                    if known_graphlike is None:
-                        known_graphlike = collect_known_graphlike(baseline, dem)
-                    comps = graphlike_components(inst, known_graphlike)
-                else:
-                    comps = [(d, o) for d, o in raw_comps if d]
-                sym = canonical_symptom_from_components(comps)
+                _, sym = graphlike_inst_symptom(inst, get_known)
             else:
                 sym = inst_symptom(inst)
             if sym == ((), ()):
@@ -1831,7 +1820,7 @@ class Builder:
         for sym in symptoms:
             for dets, obs in symptom_components(sym):
                 if 1 <= len(dets) <= 2:
-                    edge_key = (dets[0], -1) if len(dets) == 1 else (dets[0], dets[1])
+                    edge_key = dets_edge_key(dets)
                     eid = edge_to_id.get(edge_key)
                     if eid is None:
                         eid = len(edge_nodes_list)
@@ -1854,20 +1843,13 @@ class Builder:
         base_edge_probs = np.zeros(num_edges, dtype=np.float64)
         edge_in_baseline = np.zeros(num_edges, dtype=bool)
 
-        known_base_graphlike: dict[tuple[int, ...], Symptom] | None = None
+        get_known_base = functools.cache(lambda: collect_known_graphlike(baseline))
         for inst in baseline.flattened():
             if inst.type != "error":
                 continue
             p = float(inst.args_copy()[0])
             if decompose_errors:
-                raw_comps = raw_inst_components(inst)
-                if any(len(d) > 2 for d, _ in raw_comps):
-                    if known_base_graphlike is None:
-                        known_base_graphlike = collect_known_graphlike(baseline)
-                    comps = graphlike_components(inst, known_base_graphlike)
-                else:
-                    comps = [(d, o) for d, o in raw_comps if d]
-                sym = canonical_symptom_from_components(comps)
+                comps, sym = graphlike_inst_symptom(inst, get_known_base)
             else:
                 sym = inst_symptom(inst)
                 comps = [sym]
@@ -1876,8 +1858,7 @@ class Builder:
                 base_sym_probs[sid] = prob_xor(float(base_sym_probs[sid]), p)
             for dets, _ in comps:
                 if 1 <= len(dets) <= 2:
-                    edge_key = (dets[0], -1) if len(dets) == 1 else (dets[0], dets[1])
-                    eid = edge_to_id.get(edge_key)
+                    eid = edge_to_id.get(dets_edge_key(dets))
                     if eid is not None:
                         base_edge_probs[eid] = prob_xor(float(base_edge_probs[eid]), p)
                         edge_in_baseline[eid] = True
@@ -1886,12 +1867,8 @@ class Builder:
         if decompose_errors and num_edges > 0 and not edge_in_baseline.all():
             for eid in range(num_edges):
                 if not edge_in_baseline[eid]:
-                    dets, obs = first_sym_for_edge[eid]
                     matching_base_dem.append(
-                        "error",
-                        1e-12,
-                        [stim.target_relative_detector_id(d) for d in dets]
-                        + [stim.target_logical_observable_id(o) for o in obs],
+                        "error", 1e-12, sym_to_targets(first_sym_for_edge[eid])
                     )
 
         return (

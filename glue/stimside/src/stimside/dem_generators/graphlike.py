@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
-import warnings
+from typing import Any, Callable, Sequence
 
 import stim  # type: ignore[import-untyped]
 
@@ -45,6 +44,21 @@ def sym_to_targets(sym: Any) -> list[stim.DemTarget]:
         targets.extend(stim.target_relative_detector_id(d) for d in dets)
         targets.extend(stim.target_logical_observable_id(o) for o in obs)
     return targets
+
+
+def dets_edge_key(dets: tuple[int, ...]) -> tuple[int, int]:
+    return (dets[0], -1) if len(dets) == 1 else (dets[0], dets[1])
+
+
+def nodes_edge_key(u: int, v: int) -> tuple[int, int]:
+    return (max(u, v), -1) if (u < 0 or v < 0) else (min(u, v), max(u, v))
+
+
+def edge_to_targets(
+    edge: tuple[int, int], obs: Sequence[int] = ()
+) -> list[stim.DemTarget]:
+    dets = (edge[0],) if edge[1] < 0 else edge
+    return sym_to_targets((dets, tuple(obs)))
 
 
 def inst_symptom(inst: stim.DemInstruction) -> Symptom:
@@ -235,21 +249,39 @@ def decompose_hyperedge_component(
     return [(dets[idx : idx + 2], obs if idx == 0 else ()) for idx in range(0, n, 2)]
 
 
-def graphlike_components(
+def graphlike_inst_symptom(
     inst: stim.DemInstruction,
-    known_graphlike: dict[tuple[int, ...], Symptom] | None = None,
-) -> list[Symptom]:
-    """Extract graphlike (<=2 detector) symptom components from a DEM error instruction."""
+    known_graphlike: (
+        dict[tuple[int, ...], Symptom]
+        | Callable[[], dict[tuple[int, ...], Symptom]]
+        | None
+    ) = None,
+) -> tuple[list[Symptom], Any]:
+    """Return ``(graphlike_components, canonical_symptom)`` for an error instruction."""
     comps: list[Symptom] = []
     for d_sorted, o_sorted in raw_inst_components(inst):
         if len(d_sorted) <= 2:
             if d_sorted:
                 comps.append((d_sorted, o_sorted))
         else:
+            if callable(known_graphlike):
+                known_graphlike = known_graphlike()
             comps.extend(
                 decompose_hyperedge_component(d_sorted, o_sorted, known_graphlike)
             )
-    return comps
+    return comps, canonical_symptom_from_components(comps)
+
+
+def graphlike_components(
+    inst: stim.DemInstruction,
+    known_graphlike: (
+        dict[tuple[int, ...], Symptom]
+        | Callable[[], dict[tuple[int, ...], Symptom]]
+        | None
+    ) = None,
+) -> list[Symptom]:
+    """Extract graphlike (<=2 detector) symptom components from a DEM error instruction."""
+    return graphlike_inst_symptom(inst, known_graphlike)[0]
 
 
 def prob_xor(p: float, q: float) -> float:
@@ -278,11 +310,11 @@ def dem_has_hyperedge(dem: stim.DetectorErrorModel) -> bool:
     return False
 
 
-def decompose_dem_graphlike_py(
+def decompose_dem_graphlike(
     dem: stim.DetectorErrorModel,
     base_dem: stim.DetectorErrorModel | None = None,
 ) -> stim.DetectorErrorModel:
-    """Python reference implementation of ``decompose_dem_graphlike``."""
+    """Ensure every error instruction in ``dem`` is decomposed into <=2-detector components."""
     if not dem_has_hyperedge(dem):
         return dem
     known_graphlike = collect_known_graphlike(base_dem, dem)
@@ -292,52 +324,7 @@ def decompose_dem_graphlike_py(
             out.append(inst)
             continue
         p = float(inst.args_copy()[0])
-        comps = graphlike_components(inst, known_graphlike)
-        sym = canonical_symptom_from_components(comps)
-        if sym == ((), ()):
-            continue
-        out.append("error", p, sym_to_targets(sym))
+        _, sym = graphlike_inst_symptom(inst, known_graphlike)
+        if sym != ((), ()):
+            out.append("error", p, sym_to_targets(sym))
     return out
-
-
-_CPP_DECOMPOSITION_UNAVAILABLE = False
-
-
-def decompose_dem_graphlike_cpp(
-    dem: stim.DetectorErrorModel,
-    base_dem: stim.DetectorErrorModel | None = None,
-) -> stim.DetectorErrorModel:
-    """C++ port of ``decompose_dem_graphlike_py`` (identical output DEM)."""
-    from stimside._native.marginal_dem_kernels import (
-        decompose_dem_text_cpp,
-        dem_text_has_hyperedge_cpp,
-    )
-
-    dem_text = str(dem.flattened()).encode("utf-8")
-    if not dem_text_has_hyperedge_cpp(dem_text):
-        return dem
-    base_text = None if base_dem is None else str(base_dem.flattened()).encode("utf-8")
-    return stim.DetectorErrorModel(decompose_dem_text_cpp(dem_text, base_text))
-
-
-def decompose_dem_graphlike(
-    dem: stim.DetectorErrorModel,
-    base_dem: stim.DetectorErrorModel | None = None,
-) -> stim.DetectorErrorModel:
-    """Ensure every error instruction in ``dem`` is decomposed into <=2-detector components.
-
-    Uses the C++ kernel when it can be loaded and the Python implementation
-    (``decompose_dem_graphlike_py``) otherwise; both give the same DEM.
-    """
-    global _CPP_DECOMPOSITION_UNAVAILABLE
-    if not _CPP_DECOMPOSITION_UNAVAILABLE:
-        try:
-            return decompose_dem_graphlike_cpp(dem, base_dem)
-        except (OSError, RuntimeError, AttributeError) as exc:
-            _CPP_DECOMPOSITION_UNAVAILABLE = True
-            warnings.warn(
-                f"Falling back to the Python DEM decomposition ({exc!r}).",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-    return decompose_dem_graphlike_py(dem, base_dem)

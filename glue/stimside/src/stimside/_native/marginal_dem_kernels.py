@@ -129,7 +129,7 @@ def get_marginal_dem_kernels_lib() -> ctypes.CDLL:
         return _LIB_INSTANCE
 
     # The version of the .cpp's struct layouts and function signatures: an older library is rebuilt.
-    lib = load_cdll(_resolve_marginal_dem_kernels_so, "marginal_dem_kernels_abi_v4")
+    lib = load_cdll(_resolve_marginal_dem_kernels_so, "marginal_dem_kernels_abi_v5")
 
     lib.marginal_trace_flows.argtypes = [
         ctypes.c_int32,
@@ -245,22 +245,6 @@ def get_marginal_dem_kernels_lib() -> ctypes.CDLL:
     lib.marginal_free_batch_result.argtypes = [void_p]
     lib.marginal_free_batch_result.restype = None
 
-    lib.marginal_dem_text_has_hyperedge.argtypes = [ctypes.c_char_p, ctypes.c_int64]
-    lib.marginal_dem_text_has_hyperedge.restype = ctypes.c_int32
-    lib.marginal_decompose_dem_text.argtypes = [
-        ctypes.c_char_p,
-        ctypes.c_int64,
-        ctypes.c_char_p,
-        ctypes.c_int64,
-    ]
-    lib.marginal_decompose_dem_text.restype = void_p
-    lib.marginal_text_result_size.argtypes = [void_p]
-    lib.marginal_text_result_size.restype = ctypes.c_int64
-    lib.marginal_text_result_data.argtypes = [void_p]
-    lib.marginal_text_result_data.restype = void_p
-    lib.marginal_free_text_result.argtypes = [void_p]
-    lib.marginal_free_text_result.restype = None
-
     _LIB_INSTANCE = lib
     return lib
 
@@ -275,29 +259,6 @@ def _ptr_f64(arr: NDArray[np.float64]) -> f64_p:
 
 def _ptr_u8(arr: NDArray[np.uint8]) -> u8_p:
     return arr.ctypes.data_as(u8_p) if arr.size > 0 else ctypes.cast(None, u8_p)
-
-
-def dem_text_has_hyperedge_cpp(dem_text: bytes) -> bool:
-    """Whether a flattened DEM's text has a p > 0 error component with > 2 detectors."""
-    lib = get_marginal_dem_kernels_lib()
-    return bool(lib.marginal_dem_text_has_hyperedge(dem_text, len(dem_text)))
-
-
-def decompose_dem_text_cpp(dem_text: bytes, base_text: bytes | None) -> str:
-    """Text of the graph-like decomposition of a flattened DEM's text (see `decompose_dem_graphlike`)."""
-    lib = get_marginal_dem_kernels_lib()
-    res_ptr = lib.marginal_decompose_dem_text(
-        dem_text,
-        len(dem_text),
-        base_text,
-        0 if base_text is None else len(base_text),
-    )
-    try:
-        size = int(lib.marginal_text_result_size(res_ptr))
-        data = lib.marginal_text_result_data(res_ptr)
-        return ctypes.string_at(data, size).decode("utf-8") if size > 0 else ""
-    finally:
-        lib.marginal_free_text_result(res_ptr)
 
 
 def trace_flows_cpp(

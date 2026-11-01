@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from collections import Counter
 import heapq
-import inspect
 import itertools
 import math
 from typing import Any, Sequence
@@ -38,12 +37,14 @@ import stim  # type: ignore[import-untyped]
 from stimside.dem_generators.dem_decoding import (
     decode_with_edge_reweights,
     is_pymatching_decoder,
+    matching_supports,
 )
 from stimside.dem_generators.dem_generator_marginal import (
     Analysis,
     Builder,
     MarginalLeakageDemGenerator,
 )
+from stimside.dem_generators.graphlike import nodes_edge_key
 from stimside.dem_generators.leakage_decoder import (
     CompiledLeakageDecoder,
     LeakageDecoder,
@@ -52,7 +53,6 @@ from stimside.dem_generators.leakage_decoder import (
 from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageMeasurementParams,
 )
-from stimside.op_handlers.leakage_handlers.tag_registry import parse_leakage_tag
 from stimside.util.leakage_events import ShotLeakageEvents
 
 # Weight of the edges that only leakage can flip (the marginal generator's
@@ -207,10 +207,7 @@ def _reduce_factors(
 
 
 def _has_fork_matching() -> bool:
-    import pymatching  # type: ignore[import-untyped]
-
-    params = inspect.signature(pymatching.Matching.decode_batch).parameters
-    return "return_no_matching" in params and "edge_reweights" in params
+    return matching_supports("return_no_matching", "edge_reweights")
 
 
 def _flag_symptoms(
@@ -411,7 +408,7 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
         self.search_dem = _search_dem(analysis)
         self._matcher: Any = None
         self._build_tables(analysis, priors)
-        self._warn_if_equivalent_to_marginal(circuit)
+        self._warn_if_equivalent_to_marginal(builder)
         # A non-PyMatching decoder decodes the accepted node's undecomposed DEM
         # (hyperedges kept), built from this analysis' symptoms.
         self.hyper_analysis: Analysis | None = None
@@ -477,7 +474,7 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
             (int(u), int(v)): e for e, (u, v) in enumerate(a.edge_nodes.tolist())
         }
 
-    def _warn_if_equivalent_to_marginal(self, circuit: stim.Circuit) -> None:
+    def _warn_if_equivalent_to_marginal(self, builder: Builder) -> None:
         eventful = [f for f, env in enumerate(self.env_factors) if env is not None]
         if not eventful:
             warnings.warn(
@@ -492,11 +489,12 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
                 "it decodes like MarginalDecoder.",
                 stacklevel=3,
             )
-        for op in circuit.flattened():
-            if op.name != "MPAD" or not op.tag:
-                continue
-            params = parse_leakage_tag(op, simulator="tableau")
-            if isinstance(params, LeakageMeasurementParams) and params.targets:
+        for op, params in zip(builder.ops, builder.params):
+            if (
+                op.name == "MPAD"
+                and isinstance(params, LeakageMeasurementParams)
+                and params.targets
+            ):
                 probs = params.prob_for_input_state
                 if any((s < 2 and p > 0) or (s >= 2 and p < 1) for s, p in probs.items()):
                     warnings.warn(
@@ -550,8 +548,7 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
         pairs = self._get_matcher().decode_to_edges_array(dets, edge_reweights=rw)
         out = set()
         for u, v in pairs.tolist():
-            key = (max(u, v), -1) if (u < 0 or v < 0) else (min(u, v), max(u, v))
-            e = self.edge_id.get(key)
+            e = self.edge_id.get(nodes_edge_key(u, v))
             if e is not None:
                 out.add(e)
         return frozenset(out)

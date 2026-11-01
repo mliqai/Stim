@@ -10,7 +10,7 @@ batch from its detection events (and, if ``needs_records`` /
 from __future__ import annotations
 
 import abc
-from typing import Any, Callable, Protocol, Sequence, Union
+from typing import Protocol, Sequence, Union
 
 import numpy as np
 from numpy.typing import NDArray
@@ -29,30 +29,6 @@ from stimside.dem_generators.dem_generator_marginal import (
 )
 from stimside.dem_generators.graphlike import decompose_dem_graphlike
 from stimside.util.leakage_events import ShotLeakageEvents
-
-
-def _call_dem_gen(
-    dem_gen: Callable[..., Any],
-    circuit: stim.Circuit,
-    records: NDArray[np.bool_],
-    decompose_errors: bool,
-    reweight_only: bool,
-    leakage_events: Sequence[ShotLeakageEvents] | None = None,
-) -> Any:
-    if isinstance(dem_gen, DemGenerator) and (
-        decompose_errors or reweight_only or dem_gen.needs_leakage_events
-    ):
-        extra: dict[str, Any] = {}
-        if dem_gen.needs_leakage_events:
-            extra["leakage_events"] = leakage_events
-        return dem_gen(
-            circuit,
-            records,
-            decompose_errors=decompose_errors or dem_gen.decompose_errors,
-            reweight_only=reweight_only or dem_gen.reweight_only,
-            **extra,
-        )
-    return dem_gen(circuit, records)
 
 
 class CompiledLeakageDecoder(abc.ABC):
@@ -414,12 +390,11 @@ class _CompiledMarginalDecoder(CompiledLeakageDecoder):
             )
         if bit_packed_detection_event_data.shape[0] == 0:
             return np.zeros((0, (self.circuit.num_observables + 7) // 8), dtype=np.uint8)
-        dem = _call_dem_gen(
-            self.dem_gen,
+        dem = self.dem_gen(
             self.circuit,
             records,
-            self.decompose_errors,
-            self.reweight_only,
+            decompose_errors=self.decompose_errors or self.dem_gen.decompose_errors,
+            reweight_only=self.reweight_only or self.dem_gen.reweight_only,
             leakage_events=leakage_events,
         )
         return decode_with_generated_dems(
