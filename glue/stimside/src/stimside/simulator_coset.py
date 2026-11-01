@@ -7,16 +7,20 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
+from stimside._native.coset_kernels import get_coset_kernels_lib
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
-from stimside.util.circuit import apply_coords_op
-from stimside._native.coset_kernels import (
-    get_coset_kernels_lib,
+from stimside.util.bitwords import (
+    first_set_bit_in_words as _first_set_bit_in_words,
     i8_p,
     i32_p,
     i64_p,
     u8_p,
     u64_p,
+    word_dot_parity as _word_dot_parity,
+    words_any_nonzero as _words_any_nonzero,
+    words_any_overlap as _words_any_overlap,
 )
+from stimside.util.circuit import apply_coords_op
 from stimside.util.reference_chp import (
     CompiledReferenceCircuit,
     InverseCliffordCocycle,
@@ -34,42 +38,6 @@ from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
 # Pauli applied to the qubit of a record-controlled 2Q gate (stim only parses these with rec[] controls).
 _REC_FIRST_PAULI = {"CX": "X", "CNOT": "X", "ZCX": "X", "CY": "Y", "ZCY": "Y"}
 _REC_SECOND_PAULI = {"XCZ": "X", "YCZ": "Y"}
-
-
-def _word_dot_parity(
-    u_words: NDArray[np.uint64], v_words: NDArray[np.uint64]
-) -> int:
-    """Compute (u . v) mod 2 across uint64 words without allocating temporary NumPy arrays."""
-    acc = 0
-    for a, b in zip(u_words.tolist(), v_words.tolist()):
-        acc ^= a & b
-    return acc.bit_count() & 1
-
-
-def _words_any_overlap(
-    u_words: NDArray[np.uint64], v_words: NDArray[np.uint64]
-) -> bool:
-    """Return True iff u_words and v_words share at least one set bit."""
-    for a, b in zip(u_words.tolist(), v_words.tolist()):
-        if a & b:
-            return True
-    return False
-
-
-def _words_any_nonzero(u_words: NDArray[np.uint64]) -> bool:
-    """Return True iff u_words has at least one non-zero bit."""
-    for a in u_words.tolist():
-        if a:
-            return True
-    return False
-
-
-def _first_set_bit_in_words(col_words: NDArray[np.uint64]) -> int:
-    """Return the index of the lowest set bit across col_words, or -1 if all zero."""
-    for w, val in enumerate(col_words.tolist()):
-        if val:
-            return (val & -val).bit_length() - 1 + (w << 6)
-    return -1
 
 
 class MRQFState:

@@ -17,15 +17,29 @@ import stim  # type: ignore[import-untyped]
 from stimside.op_handlers.leakage_handlers.common_parsing import split_arguments
 from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageParams
 from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits, parse_leakage_tag_magic
+from stimside.util.bitwords import (
+    I_POWERS_ARR as _PHASE4_ARR,
+    INV_SQRT2 as _INV_SQRT2,
+    OMEGA,
+    OMEGA_ARR as _OMEGA_ARR,
+    OMEGA_POWERS,
+    first_set_bit_in_words,
+    get_bit_in_words,
+    n_words_for_qubits,
+    pauli_multiply,
+    tail_mask,
+    unit_bit_words,
+    validate_hermitian_pauli,
+    word_dot_parity,
+    word_dot_parity_batch,
+    words_any_nonzero,
+)
 import stimside.util.phase_qfe as _pq
 from stimside.util.phase_qfe import (
     DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep,
     ImpossiblePostselectionError, ShotExpansion,
     _apply_local_unitary_c128, apply_compiled_block, apply_pauli, apply_quarter_turn,
-    apply_reference_tableau_to_statevector, first_set_bit_in_words, get_bit_in_words,
-    merge_frames, n_words_for_qubits, pauli_multiply, project_diagonal, tail_mask,
-    unit_bit_words, validate_atol, validate_hermitian_pauli, word_dot_parity,
-    word_dot_parity_batch, words_any_nonzero,
+    apply_reference_tableau_to_statevector, merge_frames, project_diagonal, validate_atol,
 )
 from stimside.util.reference_chp import DetMeasMeta, RandMeasMeta, ReferenceCHPTableau, _pauli_image
 
@@ -45,15 +59,6 @@ __all__ = [
     "extract_data_expansion", "reconstruct_statevector",
 ]
 
-_INV_SQRT2: float = math.ldexp(1.0, -1) * math.sqrt(2.0)
-OMEGA: complex = complex(_INV_SQRT2, _INV_SQRT2)
-OMEGA_POWERS: tuple[complex, ...] = (
-    1.0 + 0.0j, complex(_INV_SQRT2, _INV_SQRT2), 0.0 + 1.0j, complex(-_INV_SQRT2, _INV_SQRT2),
-    -1.0 + 0.0j, complex(-_INV_SQRT2, -_INV_SQRT2), 0.0 - 1.0j, complex(_INV_SQRT2, -_INV_SQRT2),
-)
-_PHASE4: tuple[complex, ...] = (1.0 + 0.0j, 0.0 + 1.0j, -1.0 + 0.0j, 0.0 - 1.0j)
-_PHASE4_ARR: NDArray[np.complex128] = np.array(_PHASE4, dtype=np.complex128)
-_OMEGA_ARR: NDArray[np.complex128] = np.array(OMEGA_POWERS, dtype=np.complex128)
 _PAU_ABK: dict[str, tuple[int, int, int]] = {"I": (0, 0, 0), "X": (1, 0, 0), "Z": (0, 1, 0), "Y": (1, 1, 1)}
 
 # Verified exact F = OMEGA_POWERS[v] * R(r_specs[-1]) ... R(r_specs[0]) * P(p0_spec) over all 46 canonical 1Q/2Q Stim gates

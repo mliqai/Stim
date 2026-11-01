@@ -15,6 +15,33 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
+from stimside.util.bitwords import (
+    I_POWERS_ARR as _PHASE4,
+    INV_SQRT2 as _INV_SQRT2,
+    OMEGA as _OMEGA,
+    OMEGA_CONJ as _OMEGA_CONJ,
+    SQRT2 as _SQRT2,
+    c_ptr as _c_ptr,
+    c_w_ptr as _c_w_ptr,
+    coerce_pauli_words,
+    first_set_bit_in_words,
+    get_bit_in_words,
+    get_bits_at_qubits,
+    i32_p as _c_i32_p,
+    n_words_for_qubits,
+    pack_bit_vector,
+    pauli_multiply,
+    tail_mask,
+    u8_p as _c_u8_p,
+    u64_p as _c_u64_p,
+    unit_bit_words,
+    unpack_bit_vector,
+    validate_hermitian_pauli,
+    word_dot_parity,
+    word_dot_parity_batch,
+    words_any_nonzero,
+    words_any_overlap,
+)
 from stimside.util.reference_chp import ReferenceCHPTableau
 
 __all__ = [
@@ -35,11 +62,6 @@ __all__ = [
 ]
 
 # Exact IEEE-754 float64 / complex128 constants
-_SQRT2: float = math.sqrt(2.0)
-_INV_SQRT2: float = math.ldexp(1.0, -1) * _SQRT2
-_OMEGA: complex = complex(_INV_SQRT2, _INV_SQRT2)
-_OMEGA_CONJ: complex = complex(_INV_SQRT2, -_INV_SQRT2)
-_PHASE4: NDArray[np.complex128] = np.array([1.0 + 0.0j, 1.0j, -1.0 + 0.0j, -1.0j], dtype=np.complex128)
 _T_C0: complex = complex(0.5 + 0.5 * _INV_SQRT2, 0.5 * _INV_SQRT2)
 _T_C1: complex = complex(0.5 - 0.5 * _INV_SQRT2, -0.5 * _INV_SQRT2)
 _TDAG_C0: complex = complex(0.5 + 0.5 * _INV_SQRT2, -0.5 * _INV_SQRT2)
@@ -110,11 +132,6 @@ def _check_unitary_norm(pre_norm: float, post_norm: float, atol: float, op_name:
 
 _CACHED_MAGIC_LIB: ctypes.CDLL | None = None
 
-_c_double_p = ctypes.POINTER(ctypes.c_double)
-_c_u64_p = ctypes.POINTER(ctypes.c_uint64)
-_c_u8_p = ctypes.POINTER(ctypes.c_uint8)
-_c_i32_p = ctypes.POINTER(ctypes.c_int32)
-
 
 def _reset_cpp_kernel_cache() -> None:
     """Reset cached M2 C++ kernel library handle."""
@@ -130,160 +147,6 @@ def _get_cpp_lib() -> ctypes.CDLL:
 
     _CACHED_MAGIC_LIB = mk.get_magic_kernels_lib()
     return _CACHED_MAGIC_LIB
-
-
-def _c_ptr(arr: NDArray[Any], ptr_t: Any) -> Any:
-    return ctypes.cast(arr.ctypes.data, ptr_t) if arr.size > 0 else ctypes.cast(0, ptr_t)
-
-
-def _c_w_ptr(w: NDArray[np.complex128]) -> Any:
-    return _c_ptr(w.view(np.float64), _c_double_p)
-
-
-# ---------------------------------------------------------------------------
-# Multi-word uint64 bitpacking & Pauli helpers
-# ---------------------------------------------------------------------------
-
-
-def n_words_for_qubits(n_qubits: int) -> int:
-    """Return number of uint64 words needed for `n_qubits` (`max(1, ceil(N / 64))`)."""
-    if n_qubits < 0:
-        raise ValueError(f"n_qubits must be non-negative, got {n_qubits}")
-    return max(1, (n_qubits + 63) // 64)
-
-
-def tail_mask(n_qubits: int) -> np.uint64:
-    """Valid bit mask for the final uint64 word `n_words - 1`."""
-    if n_qubits <= 0:
-        return np.uint64(0)
-    rem = n_qubits & 63
-    return np.uint64(0xFFFFFFFFFFFFFFFF) if rem == 0 else (np.uint64(1) << np.uint64(rem)) - np.uint64(1)
-
-
-def pack_bit_vector(bits: Sequence[int | bool] | NDArray[Any], n_qubits: int) -> NDArray[np.uint64]:
-    """Pack a binary length-`n_qubits` sequence into `uint64[n_words]`."""
-    n_words = n_words_for_qubits(n_qubits)
-    arr = np.asarray(bits)
-    if arr.ndim != 1 or arr.shape[0] != n_qubits:
-        raise ValueError(f"Expected 1D bit vector of length {n_qubits}, got shape {arr.shape}")
-    if arr.dtype != np.bool_ and np.any((arr != 0) & (arr != 1)):
-        raise ValueError("Bit vector entries must be binary (0 or 1)")
-    b_u64 = arr.astype(np.uint64, copy=False)
-    out = np.zeros(n_words, dtype=np.uint64)
-    if n_qubits == 0:
-        return out
-    shifts = np.arange(64, dtype=np.uint64)
-    full_words = n_qubits >> 6
-    for w in range(full_words):
-        out[w] = np.bitwise_or.reduce(b_u64[(w << 6) : ((w + 1) << 6)] << shifts)
-    rem = n_qubits & 63
-    if rem:
-        out[full_words] = np.bitwise_or.reduce(b_u64[(full_words << 6) :] << shifts[:rem])
-    return out
-
-
-def unpack_bit_vector(words: NDArray[np.uint64], n_qubits: int) -> NDArray[np.uint8]:
-    """Unpack `uint64[..., n_words]` into `uint8[..., n_qubits]`."""
-    n_words = n_words_for_qubits(n_qubits)
-    w_arr = np.asarray(words, dtype=np.uint64)
-    if w_arr.ndim < 1 or w_arr.shape[-1] != n_words:
-        raise ValueError(f"Expected trailing dimension n_words={n_words}, got shape {w_arr.shape}")
-    if n_qubits == 0:
-        return np.zeros(w_arr.shape[:-1] + (0,), dtype=np.uint8)
-    q_idx = np.arange(n_qubits, dtype=np.intp)
-    return ((w_arr[..., q_idx >> 6] >> (q_idx & 63).astype(np.uint64)) & np.uint64(1)).astype(np.uint8)
-
-
-def coerce_pauli_words(vec: Sequence[int | bool] | NDArray[Any], n_qubits: int) -> NDArray[np.uint64]:
-    """Coerce unpacked `(n_qubits,)` binary vector OR packed `uint64[n_words]`."""
-    n_words = n_words_for_qubits(n_qubits)
-    if isinstance(vec, np.ndarray) and vec.dtype == np.uint64 and vec.ndim == 1 and vec.shape[0] == n_words:
-        if (vec[-1] & ~tail_mask(n_qubits)) != np.uint64(0):
-            raise ValueError(f"Non-zero upper padding bits in packed uint64 word for n_qubits={n_qubits}")
-        return np.ascontiguousarray(vec.copy(), dtype=np.uint64)
-    return pack_bit_vector(vec, n_qubits)
-
-
-def unit_bit_words(q: int, n_words: int) -> NDArray[np.uint64]:
-    """Return packed basis vector `e_q` of shape `(n_words,)`."""
-    if q < 0 or (q >> 6) >= n_words:
-        raise ValueError(f"Qubit index {q} out of range for n_words={n_words}")
-    out = np.zeros(n_words, dtype=np.uint64)
-    out[q >> 6] = np.uint64(1) << np.uint64(q & 63)
-    return out
-
-
-def get_bit_in_words(words: NDArray[np.uint64], q: int) -> int:
-    """Extract bit `q` (`0` or `1`) from 1D `uint64` array `words`."""
-    return int((int(words[q >> 6]) >> (q & 63)) & 1)
-
-
-def get_bits_at_qubits(words_2d: NDArray[np.uint64], qubits: NDArray[np.int32]) -> NDArray[np.uint8]:
-    """Extract bits at `qubits` `(K,)` across `words_2d` `(M, n_words)` -> `uint8[M, K]`."""
-    M, K = words_2d.shape[0], qubits.shape[0]
-    if M == 0 or K == 0:
-        return np.zeros((M, K), dtype=np.uint8)
-    shifts = (qubits & 63).astype(np.uint64)[None, :]
-    return np.ascontiguousarray(((words_2d[:, qubits >> 6] >> shifts) & np.uint64(1)).astype(np.uint8))
-
-
-def word_dot_parity(u_words: NDArray[np.uint64], v_words: NDArray[np.uint64]) -> int:
-    """Compute `<u, v> mod 2` across packed `uint64` word arrays."""
-    if u_words.shape[0] == 1:
-        return (int(u_words[0]) & int(v_words[0])).bit_count() & 1
-    acc = 0
-    for a, b in zip(u_words.tolist(), v_words.tolist()):
-        acc ^= a & b
-    return acc.bit_count() & 1
-
-
-def word_dot_parity_batch(mat_words: NDArray[np.uint64], vec_words: NDArray[np.uint64]) -> NDArray[np.uint8]:
-    """Compute `(mat_words @ vec_words) mod 2` -> `uint8[M]`."""
-    if mat_words.shape[0] == 0:
-        return np.zeros(0, dtype=np.uint8)
-    if mat_words.shape[1] == 1:
-        par = np.bitwise_count(mat_words[:, 0] & vec_words[0]) & 1
-    else:
-        par = np.bitwise_count(mat_words & vec_words[None, :]).sum(axis=1) & 1
-    return np.ascontiguousarray(par.astype(np.uint8))
-
-
-def words_any_nonzero(words: NDArray[np.uint64]) -> bool:
-    """Return True iff at least one bit in `words` is non-zero."""
-    return bool(int(words[0]) != 0) if words.shape[0] == 1 else bool(np.any(words != 0))
-
-
-def words_any_overlap(u_words: NDArray[np.uint64], v_words: NDArray[np.uint64]) -> bool:
-    """Return True iff `u_words & v_words` has at least one set bit."""
-    if u_words.shape[0] == 1:
-        return bool((int(u_words[0]) & int(v_words[0])) != 0)
-    return bool(np.any((u_words & v_words) != 0))
-
-
-def first_set_bit_in_words(words: NDArray[np.uint64]) -> int:
-    """Return smallest bit index `q >= 0` set in `words`, or `-1` if all zero."""
-    for w_idx, val in enumerate(words.tolist()):
-        if val != 0:
-            return (w_idx << 6) + (val & -val).bit_length() - 1
-    return -1
-
-
-def pauli_multiply(
-    a1_w: NDArray[np.uint64], b1_w: NDArray[np.uint64], kap1: int,
-    a2_w: NDArray[np.uint64], b2_w: NDArray[np.uint64], kap2: int,
-) -> tuple[NDArray[np.uint64], NDArray[np.uint64], int]:
-    """Multiply `P(a1, b1, kap1) * P(a2, b2, kap2)` -> `(a12, b12, kap12)`."""
-    kap12 = (int(kap1) + int(kap2) + (word_dot_parity(b1_w, a2_w) << 1)) & 3
-    return np.ascontiguousarray(a1_w ^ a2_w), np.ascontiguousarray(b1_w ^ b2_w), kap12
-
-
-def validate_hermitian_pauli(a_w: NDArray[np.uint64], b_w: NDArray[np.uint64], kappa: int) -> int:
-    """Validate `(kappa - <a, b>) % 2 == 0` and return `kappa & 3`."""
-    kap = int(kappa) & 3
-    ab = word_dot_parity(a_w, b_w)
-    if ((kap - ab) & 1) != 0:
-        raise ValueError(f"Pauli operator P(a, b, kappa={kap}) must be Hermitian (<a,b>={ab})")
-    return kap
 
 
 def _unpack_pauli_args(

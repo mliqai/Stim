@@ -13,13 +13,20 @@ import stim  # type: ignore[import-untyped]
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler, _TrivialCompiledOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageConditioningParams, LeakageMeasurementParams
 from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS
+from stimside.util.bitwords import (
+    OMEGA_POWERS,
+    first_set_bit_in_words,
+    unit_bit_words,
+    word_dot_parity,
+    words_any_nonzero,
+)
 from stimside.util.circuit import apply_coords_op
 from stimside.util.known_states import _replays, _unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.magic_compile import (
     CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis,
     CorrelatedNoiseRecord, DirectPlan, FrameEvent, HeraldedNoiseRecord, LeftSppEvent, LeftUnitaryEvent,
-    MagicTermRecord, MeasurementRecord, OMEGA_POWERS, PauliNoiseRecord, ResetRecord, SelectorPlan,
+    MagicTermRecord, MeasurementRecord, PauliNoiseRecord, ResetRecord, SelectorPlan,
     _FEEDBACK_2Q_GATES, _PAULI_2Q_ORDER, _canonical_clifford_gate_name_and_arity, _canonical_gate_data,
     _coerce_strict_int, _compile_clifford_factors, _compile_pauli_measurement_c15, _compile_reset_c15,
     _infer_total_data_qubits, _merge_and_validate_fault_channels, _normalize_choice_map,
@@ -34,8 +41,7 @@ from stimside.util.magic_query import (
 )
 from stimside.util.phase_qfe import (
     DEFAULT_ATOL, ImpossiblePostselectionError, K1_CANCEL_REL_TOL, ShotExpansion, apply_compiled_block, apply_pauli,
-    apply_quarter_turn, first_set_bit_in_words, measure_expansion, project_diagonal,
-    reference_chp_to_stim_tableau, unit_bit_words, validate_atol, word_dot_parity, words_any_nonzero,
+    apply_quarter_turn, measure_expansion, project_diagonal, reference_chp_to_stim_tableau, validate_atol,
 )
 from stimside.util.reference_chp import ReferenceCHPTableau
 from stimside.util.seeding import derived_seed
