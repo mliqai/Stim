@@ -13,7 +13,7 @@ import stim  # type: ignore[import-untyped]
 
 from stimside.util import magic_compile as _mc
 from stimside.util.magic_compile import OMEGA_POWERS, CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _sample_categorical_branch, clone_reference_chp, compile_direct, compile_open_block, compile_selector, extract_data_expansion
-from stimside.util.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, eliminate_zero_amplitude, first_set_bit_in_words, make_principal, merge_frames, n_words_for_qubits, project_diagonal, restrict_amplitude, tail_mask, unit_bit_words, validate_atol
+from stimside.util.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, eliminate_zero_amplitude, first_set_bit_in_words, make_principal, merge_frames, n_words_for_qubits, project_diagonal, restrict_amplitude, stim_tableau_to_reference_chp, tail_mask, unit_bit_words, validate_atol
 from stimside.util.reference_chp import ReferenceCHPTableau
 
 __all__ = ["QueryBudgetExceededError", "QueryBudget", "QueryDiagnostics", "QueryResult", "PreparedQueryPlan", "PrepareQueries", "EvaluateQueries", "prepare_queries", "evaluate_queries", "QueryShotTrajectory", "run_query_shot", "run_query_batch"]
@@ -276,7 +276,7 @@ def _compile_target_spec(target_spec: Any, output_qubits: tuple[int, ...], atol:
         target_spec = (ReferenceCHPTableau(target_spec.n_qubits), target_spec)
     elif isinstance(target_spec, ReferenceCHPTableau):
         target_spec = (target_spec, ShotExpansion.zero(max(1, k), atol=atol))
-    is_pair = isinstance(target_spec, tuple) and len(target_spec) == 2 and isinstance(target_spec[0], ReferenceCHPTableau)
+    is_pair = isinstance(target_spec, tuple) and len(target_spec) == 2 and isinstance(target_spec[0], (stim.Tableau, ReferenceCHPTableau))
     if isinstance(target_spec, (np.ndarray, list, tuple)) and not is_pair:
         if k > 20:
             raise ValueError(f"Dense statevector target_spec exceeds 20 qubits (k={k})")
@@ -290,7 +290,8 @@ def _compile_target_spec(target_spec: Any, output_qubits: tuple[int, ...], atol:
         target_spec, is_pair = (ReferenceCHPTableau(k), ShotExpansion(k, 0, np.zeros((0, 1), dtype=np.uint64), np.zeros(1, dtype=np.uint64), np.zeros((0, 0), dtype=np.uint8), np.zeros(0, dtype=np.int32), np.ascontiguousarray(arr[nz] / math.sqrt(nrm2), dtype=np.complex128), np.ascontiguousarray(nz.astype(np.uint64)[:, None]), np.zeros((int(nz.shape[0]), 0), dtype=np.uint8), np.zeros(0, dtype=np.uint8), atol=atol, _is_canonical_merged=True)), True
     if not is_pair:
         raise TypeError(f"Unsupported target_spec type: {type(target_spec)!r}")
-    ref_t, exp_t = target_spec
+    raw_ref_t, exp_t = target_spec
+    ref_t = stim_tableau_to_reference_chp(raw_ref_t) if isinstance(raw_ref_t, stim.Tableau) else raw_ref_t
     exp_t = ShotExpansion.from_component(exp_t, atol=atol) if isinstance(exp_t, PhaseQFEComponent) else exp_t
     if not isinstance(exp_t, ShotExpansion):
         raise TypeError(f"Expected ShotExpansion in target_spec tuple, got {type(exp_t)!r}")

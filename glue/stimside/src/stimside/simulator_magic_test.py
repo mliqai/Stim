@@ -12,7 +12,12 @@ from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUin
 from stimside.sampler_magic import MagicsideSampler
 from stimside.simulator_magic import MagicsideSimulator
 from stimside.util.magic_compile import CliffordFaultChannel, FaultBranch
-from stimside.util.magic_query import QueryBudget, QueryBudgetExceededError
+from stimside.util.magic_query import (
+    EvaluateQueries,
+    PrepareQueries,
+    QueryBudget,
+    QueryBudgetExceededError,
+)
 
 
 def test_statevector_and_branch_mass_across_fault_modes_and_backends() -> None:
@@ -27,7 +32,8 @@ def test_statevector_and_branch_mass_across_fault_modes_and_backends() -> None:
             assert psi.shape == (8,) and abs(np.linalg.norm(psi) - 1.0) < 1e-12
             assert abs(sim.get_branch_mass(0) - 1.0) < 1e-12
             tab, exp = sim.get_qfe_expansion(0, trace_selectors=True)
-            assert tab.num_qubits == 3 and exp.n_qubits == 3
+            assert isinstance(tab, stim.Tableau)
+            assert len(tab) == 3 and exp.n_qubits == 3
             assert len(sim.get_state_expansions()) == 1
             want_big = psi.reshape((2, 2, 2)).transpose((2, 1, 0)).ravel()
             np.testing.assert_allclose(psi_big, want_big, atol=1e-12)
@@ -275,8 +281,9 @@ def test_trace_selectors_normalize_unleaked_records_and_statevector_cap() -> Non
         assert u2l is not None and len(u2l) == 2 and all(len(a) == 0 for a in u2l)
         tab_t, exp_t = sim.get_qfe_expansion(0, trace_selectors=True)
         tab_f, exp_f = sim.get_qfe_expansion(0, trace_selectors=False)
-        assert tab_t.num_qubits == 2 and exp_t.n_qubits == 2
-        assert tab_f.num_qubits == 3 and exp_f.n_qubits == 3
+        assert isinstance(tab_t, stim.Tableau) and isinstance(tab_f, stim.Tableau)
+        assert len(tab_t) == 2 and exp_t.n_qubits == 2
+        assert len(tab_f) == 3 and exp_f.n_qubits == 3
         assert len(sim.get_state_expansions(trace_selectors=False)) == 2
         psi_t = sim.get_statevector(0, trace_selectors=True)
         psi_f = sim.get_statevector(0, trace_selectors=False)
@@ -543,3 +550,19 @@ def test_spp_terms_on_leaked_qubits_align_across_magic_and_tableside(gate: str) 
     sim_uf = MagicsideSimulator(c_u_false, op_handler=LeakageUint8Magic(unconditional_condition_on_U=False), batch_size=4, seed=3)
     sim_uf.run()
     assert np.all(sim_uf.get_final_measurement_records()[:, 0])
+
+
+def test_get_qfe_expansion_returns_forward_stim_tableau_and_roundtrips_into_queries() -> None:
+    empty = MagicsideSimulator(stim.Circuit(), batch_size=1)
+    empty.run()
+    tab0, exp0 = empty.get_qfe_expansion(0)
+    assert isinstance(tab0, stim.Tableau) and len(tab0) == exp0.n_qubits == 1
+
+    circ = stim.Circuit("H 0\nCX 0 1\nS 0\nI[T] 0")
+    sim = MagicsideSimulator(circ, batch_size=1)
+    sim.run()
+    qfe = sim.get_qfe_expansion(0)
+    assert isinstance(qfe[0], stim.Tableau)
+    assert qfe[0] == stim.Tableau.from_circuit(stim.Circuit("H 0\nCX 0 1\nS 0"))
+    res = EvaluateQueries(PrepareQueries(circ, target_spec=qfe), queries=("fidelity",))
+    assert res.fidelity_mass == pytest.approx(1.0, abs=1e-12)

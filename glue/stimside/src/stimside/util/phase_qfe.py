@@ -25,7 +25,8 @@ __all__ = [
     "first_set_bit_in_words", "pauli_multiply", "validate_hermitian_pauli",
     "PhaseQFEComponent", "ShotExpansion",
     "MeasurementResult", "CompiledPauliBlockStep", "CompiledPauliBlock",
-    "reference_chp_to_stim_tableau", "apply_reference_tableau_to_statevector",
+    "reference_chp_to_stim_tableau", "stim_tableau_to_reference_chp",
+    "apply_reference_tableau_to_statevector",
     "drop_variable", "add_column", "make_principal", "restrict_amplitude",
     "eliminate_zero_amplitude", "apply_pauli", "apply_quarter_turn",
     "merge_frames", "apply_pauli_t", "apply_ccz",
@@ -756,6 +757,24 @@ def reference_chp_to_stim_tableau(ref_chp: ReferenceCHPTableau) -> stim.Tableau:
             chars = "".join(pauli_chars[(int(bx[i]) << 1) | int(bz[i])] for i in range(n))
             out_list.append(stim.PauliString(("-" if exp4 == 2 else "+") + chars))
     return stim.Tableau.from_conjugated_generators(xs=xs, zs=zs).inverse()
+
+
+def stim_tableau_to_reference_chp(tab: stim.Tableau) -> ReferenceCHPTableau:
+    """Convert forward `stim.Tableau` into inverse-convention `ReferenceCHPTableau`."""
+    n = len(tab)
+    out = ReferenceCHPTableau(n)
+    if n == 0:
+        return out
+    inv = tab.inverse()
+    for q in range(n):
+        for ax, az, ak, ps in (
+            (out.x2x, out.x2z, out.x_kap, inv.x_output(q)),
+            (out.z2x, out.z2z, out.z_kap, inv.z_output(q)),
+        ):
+            xs, zs = ps.to_numpy()
+            ax[q], az[q] = pack_bit_vector(xs, n), pack_bit_vector(zs, n)
+            ak[q] = ((2 if ps.sign == -1 else 0) + int(np.count_nonzero(xs & zs))) & 3
+    return out
 
 
 def _apply_local_unitary_c128(

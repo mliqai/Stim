@@ -34,7 +34,7 @@ from stimside.util.magic_query import (
 )
 from stimside.util.phase_qfe import (
     DEFAULT_ATOL, ImpossiblePostselectionError, K1_CANCEL_REL_TOL, ShotExpansion, apply_compiled_block, apply_pauli,
-    apply_quarter_turn, first_set_bit_in_words, measure_expansion, pack_bit_vector, project_diagonal,
+    apply_quarter_turn, first_set_bit_in_words, measure_expansion, project_diagonal,
     reference_chp_to_stim_tableau, unit_bit_words, validate_atol, word_dot_parity, words_any_nonzero,
 )
 from stimside.util.reference_chp import ReferenceCHPTableau
@@ -160,20 +160,6 @@ def _normalize_sweep_matrix(sweep_bits: Any, batch_size: int) -> NDArray[np.bool
     if arr.ndim == 2 and arr.shape[0] == batch_size:
         return arr.copy()
     raise ValueError(f"Invalid sweep_bits shape {arr.shape} for batch_size={batch_size}")
-
-
-def _to_forward_chp(rt: ReferenceCHPTableau) -> ReferenceCHPTableau:
-    n = rt.num_qubits
-    out = ReferenceCHPTableau(n)
-    if n == 0:
-        return out
-    ft = reference_chp_to_stim_tableau(rt)
-    for q in range(n):
-        for ax, az, ak, ps in ((out.x2x, out.x2z, out.x_kap, ft.x_output(q)), (out.z2x, out.z2z, out.z_kap, ft.z_output(q))):
-            xs, zs = ps.to_numpy()
-            ax[q], az[q] = pack_bit_vector(xs, n), pack_bit_vector(zs, n)
-            ak[q] = ((2 if ps.sign == -1 else 0) + int(np.count_nonzero(xs & zs))) & 3
-    return out
 
 
 def _strip_circuit_for_noiseless_ref(circuit: stim.Circuit) -> tuple[stim.Circuit, bool]:
@@ -1204,12 +1190,12 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             return tab, exp, cp.frame_events
         return tab, exp, self._live_frame_events
 
-    def get_qfe_expansion(self, shot: int = 0, *, trace_selectors: bool = True) -> tuple[ReferenceCHPTableau, ShotExpansion]:
+    def get_qfe_expansion(self, shot: int = 0, *, trace_selectors: bool = True) -> tuple[stim.Tableau, ShotExpansion]:
         self._flush_magic()
         tab, exp, _ = self._resolve_shot_state(self._validate_shot_idx(shot), bool(trace_selectors))
-        return _to_forward_chp(tab), exp.copy()
+        return reference_chp_to_stim_tableau(tab), exp.copy()
 
-    def get_state_expansions(self, *, trace_selectors: bool = True) -> list[tuple[ReferenceCHPTableau, ShotExpansion]]:
+    def get_state_expansions(self, *, trace_selectors: bool = True) -> list[tuple[stim.Tableau, ShotExpansion]]:
         self._flush_magic()
         return [self.get_qfe_expansion(s, trace_selectors=trace_selectors) for s in range(self.batch_size)]
 
