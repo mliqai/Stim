@@ -329,8 +329,6 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._has_non_fault_reals = any(bool(set(nr) - {"faults"}) for nr in parsed)
             if self._has_non_fault_reals and (not self._has_trivial_handler or self.sync_tableside_rng):
                 raise ValueError("Non-fault keys in fault_realizations require trivial op_handler and sync_tableside_rng=False")
-            if self.backend == "QUERY" and any("quantum_measurements" in nr for nr in parsed):
-                raise ValueError("quantum_measurements in fault_realizations requires backend='STREAM'")
             if any("sweep_bits" in nr for nr in parsed):
                 rows = [nr["sweep_bits"] if "sweep_bits" in nr else (self._sweep_mat[s] if self._sweep_mat is not None else ()) for s, nr in enumerate(self._norm_reals)]
                 self._sweep_mat = np.zeros((self.batch_size, max(len(r) for r in rows)), dtype=np.bool_)

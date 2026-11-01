@@ -22,7 +22,7 @@ _SQRT2, _EMPTY_DEPS = math.sqrt(2.0), ((), (), ())
 _PAULI_1Q_STR, _PAULI_4_STR = {"I": 0, "X": 1, "Y": 2, "Z": 3}, {"I": 0, "X": 2, "Y": 3, "Z": 4}
 _PAULI_2Q_STR = {a + b: i for i, (a, b) in enumerate((p, q) for p in "IXYZ" for q in "IXYZ")}
 _VALID_QUERIES = frozenset({"mass", "acceptance", "fidelity", "prefix_probs", "sample_measurements"})
-_VALID_REAL_KEYS = frozenset({"faults", "measurements", "paulis", "pauli_noise", "resets", "sweep", "sweep_bits"})
+_VALID_REAL_KEYS = frozenset({"faults", "measurements", "quantum_measurements", "paulis", "pauli_noise", "resets", "sweep", "sweep_bits"})
 
 class QueryBudgetExceededError(RuntimeError):
     """Raised when `Q1`/`Q2` contraction exceeds `QueryBudget` with `on_budget_exceeded == 'raise'`."""
@@ -550,19 +550,19 @@ def _norm_sweep(raw_s: Any) -> dict[int, int]:
         raise ValueError("Sweep keys must be >= 0 and sweep bits must be 0 or 1")
     return out
 
-def _unpack_realization(plan: PreparedQueryPlan, realization: Mapping[Any, Any] | None) -> tuple[dict[int, int], dict[int, int], dict[int, int], dict[int, int], dict[int, int]]:
+def _unpack_realization(plan: PreparedQueryPlan, realization: Mapping[Any, Any] | None) -> tuple[dict[int, int], dict[int, int], dict[int, int], dict[int, int], dict[int, int], dict[int, int]]:
     if not isinstance(plan, PreparedQueryPlan) or (realization is not None and not isinstance(realization, Mapping)):
         raise TypeError(f"Expected PreparedQueryPlan and Mapping|None realization, got {type(plan)!r}, {type(realization)!r}")
     if not realization:
-        return {}, {}, {}, {}, {}
+        return {}, {}, {}, {}, {}, {}
     if any(isinstance(k, str) for k in realization):
         if set(realization) - _VALID_REAL_KEYS:
             raise ValueError(f"Unknown realization keys: {sorted(map(str, set(realization) - _VALID_REAL_KEYS))}")
-        raw_f, raw_m = realization.get("faults"), realization.get("measurements")
+        raw_f, raw_m, raw_qm = realization.get("faults"), realization.get("measurements"), realization.get("quantum_measurements")
         raw_p, raw_r = realization.get("paulis", realization.get("pauli_noise")), realization.get("resets")
         raw_s = realization.get("sweep_bits", realization.get("sweep"))
     else:
-        raw_f, raw_m, raw_p, raw_r, raw_s = realization, None, None, None, None
+        raw_f, raw_m, raw_qm, raw_p, raw_r, raw_s = realization, None, None, None, None, None
     cp, n_meta, max_c = plan.compiled_plan, plan._state["noise"], plan.compiled_plan.noise_channel_max_choices
     if isinstance(raw_p, Mapping):
         conv_p: dict[Any, Any] = {}
@@ -583,10 +583,11 @@ def _unpack_realization(plan: PreparedQueryPlan, realization: Mapping[Any, Any] 
     raw_f = ({k: (int(bool(v)) if (isinstance(v, (bool, np.bool_)) and not isinstance(k, (bool, np.bool_)) and isinstance(k, (int, np.integer)) and int(k) in plan._state["slots"] and f_max[plan._state["slots"][int(k)]] == 1) else v) for k, v in raw_f.items()} if isinstance(raw_f, Mapping) else ([(int(bool(v)) if (isinstance(v, (bool, np.bool_)) and i < len(f_max) and f_max[i] == 1) else v) for i, v in enumerate(raw_f)] if ((isinstance(raw_f, Sequence) and not isinstance(raw_f, (str, bytes))) or (isinstance(raw_f, np.ndarray) and raw_f.ndim == 1)) else raw_f))
     faults = _normalize_choice_map(raw_f, f_max, "faults", key_to_slot=plan._state["slots"], allow_none_zero=True) or {}
     meas = _normalize_choice_map(raw_m, (1,) * plan.num_measurements, "measurements", allow_bool_values=True) or {}
+    qmeas = _normalize_choice_map(raw_qm, (1,) * plan.num_measurements, "quantum_measurements", allow_bool_values=True) or {}
     paulis, resets = (_normalize_choice_map(raw_p, max_c, "paulis") or {}), (_normalize_choice_map(raw_r, (1,) * cp.num_resets, "resets", allow_bool_values=True) or {})
-    return faults, meas, paulis, resets, _norm_sweep(raw_s)
+    return faults, meas, qmeas, paulis, resets, _norm_sweep(raw_s)
 
-def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: dict[int, int], paulis_in: dict[int, int], resets_in: dict[int, int], sweep_in: dict[int, int],
+def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: dict[int, int], qmeas_in: dict[int, int], paulis_in: dict[int, int], resets_in: dict[int, int], sweep_in: dict[int, int],
                    q_set: frozenset[str], norm_acc: tuple[str, Any], comp_target: Any, rng_obj: np.random.Generator | None, *, sample_mc_faults: bool, is_mixed: bool,
                    stream_only: bool = False, prev_diag: QueryDiagnostics | None = None, out_ctx: list[_EvalCtx] | None = None, pin: Any = None
                    ) -> tuple[tuple[float, int], tuple[float, int], tuple[float, int], bool, list[tuple[float, float]], NDArray[np.bool_], _ScaledExpansion, dict[int, int], QueryDiagnostics]:
@@ -698,13 +699,13 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
             for qb, pb in (((0, pb0), (1, pb1)) if mi is not None else ()):
                 for fl, pfl in (fl_opts if pb > 0.0 else ()):
                     step_w[qb ^ iota ^ fl][mi] = _fp_add(step_w[qb ^ iota ^ fl][mi], _fp_mul(z_in_fp, pb * pfl))  # type: ignore[index]
-            q_cands = [(qb, sk, pb) for qb, sk, pb in ((0, s0, pb0), (1, s1, pb1)) if pb > 0.0 and (not isinstance(rec, ResetRecord) or aux not in r_map or r_map[aux] == qb)]
+            q_cands = [(qb, sk, pb) for qb, sk, pb in ((0, s0, pb0), (1, s1, pb1)) if pb > 0.0 and (not isinstance(rec, ResetRecord) or aux not in r_map or r_map[aux] == qb) and (mi is None or mi not in qmeas_in or qmeas_in[mi] == qb)]
             cands = [(qb, sk, pb, (None if mi is None else (qb ^ iota ^ fl)), pfl) for qb, sk, pb in q_cands for fl, pfl in fl_opts if pfl > 0.0 and (mi is None or mi not in meas_in or meas_in[mi] == (qb ^ iota ^ fl))]
             if use_sampling and cands:
                 assert r_gen is not None
                 pc = next((c for c in cands if ((aux in pin[2] and c[0] == pin[2][aux]) if mi is None else (mi in pin[1] and c[0] == pin[1][mi] and (mi in meas_in or c[3] == pin[0].get(mi))))), None) if pin else None
                 if mi is None or mi not in meas_in:
-                    qb = pc[0] if pc else (r_map[aux] if (isinstance(rec, ResetRecord) and aux in r_map) else (1 if pb0 <= 0.0 else (0 if pb1 <= 0.0 else int(float(r_gen.random()) < pb1))))
+                    qb = pc[0] if pc else (q_cands[0][0] if len(q_cands) == 1 else int(float(r_gen.random()) < pb1))
                     fl = (qb ^ iota ^ int(pc[3])) if (pc and mi is not None) else (int(float(r_gen.random()) < fp) if (mi is not None and fp > 0.0) else 0)
                     sk, pb, pfl, rp = *((s1, pb1) if qb else (s0, pb0)), ((fp if fl else (1.0 - fp)) if mi is not None else 1.0), (None if mi is None else (qb ^ iota ^ fl))
                     if mi is not None:
@@ -732,14 +733,14 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
     p_probs = [((_fp_div(w0, _fp_add(w0, w1)), _fp_div(w1, _fp_add(w0, w1))) if _fp_add(w0, w1)[0] > 0.0 else (0.0, 0.0)) for w0, w1 in zip(step_w[0], step_w[1])]
     return totals[0], totals[1], totals[2], acc, p_probs, m_arr, last_ket, faults, ctx.diagnostics
 
-def _run_stream_trajectory(plan: PreparedQueryPlan, faults: dict[int, int], meas: dict[int, int], paulis: dict[int, int], resets: dict[int, int], sweep: dict[int, int],
+def _run_stream_trajectory(plan: PreparedQueryPlan, faults: dict[int, int], meas: dict[int, int], qmeas: dict[int, int], paulis: dict[int, int], resets: dict[int, int], sweep: dict[int, int],
                            rng_obj: np.random.Generator | None, *, sample_mc_faults: bool, use_sampling: bool, extract_data: bool, pctx: _EvalCtx | None = None,
                            skip: bool = False) -> tuple[TrajectoryRunResult | None, tuple[float, int], NDArray[np.bool_], dict[int, int], Any, bool, QueryDiagnostics]:
     f_in, fb_dg = (pctx.faults if (pctx is not None and sample_mc_faults) else faults), (pctx.diagnostics if pctx else QueryDiagnostics(used_fallback=True))
     mp, qp, rp, pp = (dict(pctx.m_map), dict(pctx.q_map), dict(pctx.r_map), dict(pctx.p_map)) if pctx else ({}, {}, {}, {})
     if skip or resets:
         return None, _FP_ZERO, np.empty(0, dtype=np.bool_), dict(f_in), (mp, qp, rp, pp), True, fb_dg
-    r_gen, eff_m, p_seed = (rng_obj if rng_obj is not None else np.random.default_rng(0)), {**meas, **mp}, {**paulis, **pp}
+    r_gen, eff_m, eff_q, p_seed = (rng_obj if rng_obj is not None else np.random.default_rng(0)), {**meas, **mp}, {**qmeas, **qp}, {**paulis, **pp}
     f_tr = [(f_in[i] if i in f_in else _sample_categorical_branch([b.prob for b in ch.branches], r_gen)) if sample_mc_faults else f_in.get(i, 0) for i, ch in enumerate(plan.compiled_plan.fault_channels)]
     m_log, p_tr = ((-pctx.extra_cl_log if math.isfinite(pctx.extra_cl_log) else -math.inf) if pctx else 0.0), (None if (use_sampling and not p_seed) else {})
     for _, rec, aux in (plan._state["dyn"] if p_tr is not None else ()):
@@ -754,7 +755,7 @@ def _run_stream_trajectory(plan: PreparedQueryPlan, faults: dict[int, int], meas
             p_tr[aux] = p_seed[aux] if aux in p_seed else (c_req if rec.meas_index in eff_m else (_sample_categorical_branch(rec.probs, r_gen) if use_sampling else 0))  # type: ignore[index]
     sw_m = max((k for k in plan._state["root"].deps[2] if sweep.get(k, 0)), default=-1) if (sweep and plan._state["root"]) else -1
     kw: dict[str, Any] = dict(rng=r_gen, fault_trace=f_tr, pauli_noise_trace=p_tr, reset_outcomes=rp or None, requested_outcomes=eff_m or None,
-                              requested_quantum_outcomes=qp if pctx else None, sweep_bits=([sweep.get(i, 0) for i in range(sw_m + 1)] if sw_m >= 0 else None), atol=plan.atol)
+                              requested_quantum_outcomes=eff_q or None, sweep_bits=([sweep.get(i, 0) for i in range(sw_m + 1)] if sw_m >= 0 else None), atol=plan.atol)
     try:
         tr = _mc.run_selector(plan.compiled_plan, extract_data=extract_data, **kw) if isinstance(plan.compiled_plan, SelectorPlan) else _mc.run_direct(plan.compiled_plan, **kw)
     except ImpossiblePostselectionError:
@@ -795,28 +796,28 @@ def EvaluateQueries(plan: PreparedQueryPlan, realization: Mapping[Any, Any] | No
     q_set, cond, comp_target = frozenset(queries), bool(conditional), (_compile_target_spec(target_spec, plan.output_qubits, plan.atol) if target_spec is not None else plan._state["target"])
     if "fidelity" in q_set and comp_target is None:
         raise ValueError("target_spec must be provided when querying 'fidelity'")
-    norm_acc, (faults, meas, paulis, resets, sweep) = _normalize_acceptance_spec(acceptance_spec if acceptance_spec is not None else plan.acceptance_spec, plan.num_measurements), _unpack_realization(plan, realization)
+    norm_acc, (faults, meas, qmeas, paulis, resets, sweep) = _normalize_acceptance_spec(acceptance_spec if acceptance_spec is not None else plan.acceptance_spec, plan.num_measurements), _unpack_realization(plan, realization)
     sample_mc_faults, use_sampling = ((realization is None) and (rng is not None)), (("sample_measurements" in q_set) or ((realization is None) and (rng is not None)))
     rng_obj = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(_coerce_strict_int(rng, "rng seed"))) if rng is not None else (np.random.default_rng() if use_sampling else None)
     is_mixed = (not use_sampling) and any(
-        (isinstance(r, PauliNoiseRecord) and ax not in paulis and sum(r.probs) > 0.0) or (isinstance(r, ResetRecord) and ax not in resets)
+        (isinstance(r, PauliNoiseRecord) and ax not in paulis and sum(r.probs) > 0.0) or (isinstance(r, ResetRecord) and ax not in resets and (r.meas_index is None or r.meas_index not in qmeas))
         or (isinstance(r, CorrelatedNoiseRecord) and ax[0] not in paulis and r.prob > 0.0 and not any(paulis.get(j, 0) > 0 for j in ax[1]))
         or (isinstance(r, HeraldedNoiseRecord) and ax not in paulis and sum(r.probs) > 0.0 and meas.get(r.meas_index, 1) == 1)
-        or (isinstance(r, (MeasurementRecord, ResetRecord, MPadRecord)) and r.meas_index is not None and (r.meas_index not in meas or r.flip_prob not in (0.0, 1.0))) for _, r, ax in plan._state["dyn"])
+        or (isinstance(r, (MeasurementRecord, ResetRecord, MPadRecord)) and r.meas_index is not None and ((r.meas_index not in meas and r.flip_prob not in (0.0, 1.0)) or (not isinstance(r, MPadRecord) and r.meas_index not in qmeas and not (isinstance(r, ResetRecord) and ax in resets) and (r.meas_index not in meas or r.flip_prob not in (0.0, 1.0))))) for _, r, ax in plan._state["dyn"])
     pack = lambda z_fp, a_fp, b_fp, ac, pp, ma, dg: QueryResult(
         _ldexp(*z_fp) if "mass" in q_set else None, ((_fp_div(a_fp, z_fp) if cond else _ldexp(*a_fp)) if "acceptance" in q_set else None),
         ((_fp_div(b_fp, z_fp) if cond else _ldexp(*b_fp)) if "fidelity" in q_set else None), pp if "prefix_probs" in q_set else None,
         ma.copy() if ("sample_measurements" in q_set and ma is not None) else None, bool(ac) if "acceptance" in q_set else None, dg)
     c_box: list[_EvalCtx] = []
     try:
-        z_fp, a_fp, b_fp, acc, p_probs, m_arr, _, _, diag = _eval_via_tree(plan, faults, meas, paulis, resets, sweep, q_set, norm_acc, comp_target, rng_obj, sample_mc_faults=sample_mc_faults, is_mixed=is_mixed, out_ctx=c_box)
+        z_fp, a_fp, b_fp, acc, p_probs, m_arr, _, _, diag = _eval_via_tree(plan, faults, meas, qmeas, paulis, resets, sweep, q_set, norm_acc, comp_target, rng_obj, sample_mc_faults=sample_mc_faults, is_mixed=is_mixed, out_ctx=c_box)
         return pack(z_fp, a_fp, b_fp, acc, p_probs, None if is_mixed else m_arr, diag)
     except QueryBudgetExceededError:
         if plan.budget.on_budget_exceeded == "raise":
             raise
-        tr, z_fp, m_out, f_pin, pin, clip, diag = _run_stream_trajectory(plan, faults, meas, paulis, resets, sweep, rng_obj, sample_mc_faults=sample_mc_faults, use_sampling=use_sampling, extract_data=True, pctx=c_box[0] if c_box else None, skip=is_mixed)
+        tr, z_fp, m_out, f_pin, pin, clip, diag = _run_stream_trajectory(plan, faults, meas, qmeas, paulis, resets, sweep, rng_obj, sample_mc_faults=sample_mc_faults, use_sampling=use_sampling, extract_data=True, pctx=c_box[0] if c_box else None, skip=is_mixed)
         if tr is None or (z_fp[0] <= 0.0 and (clip or "prefix_probs" in q_set)):
-            z_fp, a_fp, b_fp, acc, p_probs, m_arr, _, _, diag = _eval_via_tree(plan, f_pin, meas, paulis, resets, sweep, q_set, norm_acc, comp_target, rng_obj, sample_mc_faults=sample_mc_faults, is_mixed=is_mixed, stream_only=True, prev_diag=diag, pin=pin)
+            z_fp, a_fp, b_fp, acc, p_probs, m_arr, _, _, diag = _eval_via_tree(plan, f_pin, meas, qmeas, paulis, resets, sweep, q_set, norm_acc, comp_target, rng_obj, sample_mc_faults=sample_mc_faults, is_mixed=is_mixed, stream_only=True, prev_diag=diag, pin=pin)
             return pack(z_fp, a_fp, b_fp, acc, p_probs, None if is_mixed else m_arr, diag)
         acc, f_ctx = _check_acc(norm_acc, m_out), _EvalCtx(plan.budget, plan.atol, len(plan._state["q_act"]), faults, meas, sweep, enforce_budget=False, prev_diag=diag)
         b_fp = _fp_mul(z_fp, *_compute_partial_trace_fidelity_mass(tr.final_tableau, tr.expansion, 0, comp_target, plan.output_qubits, f_ctx, plan._state["bcache"])) if ("fidelity" in q_set and acc and z_fp[0] > 0.0 and comp_target is not None) else _FP_ZERO
@@ -836,7 +837,7 @@ prepare_queries, evaluate_queries = PrepareQueries, EvaluateQueries
 
 def run_query_shot(plan: PreparedQueryPlan, *, realization: Mapping[Any, Any] | None = None, sweep_bits: Mapping[int, int | bool] | Sequence[int | bool] | NDArray[np.bool_] | None = None, rng: np.random.Generator | int | None = None, extract_data: bool = False) -> QueryShotTrajectory:
     """Execute one causal shot via `plan`'s cached segment tree (or `STREAM` fallback)."""
-    faults, meas, paulis, resets, r_sweep = _unpack_realization(plan, realization)
+    faults, meas, qmeas, paulis, resets, r_sweep = _unpack_realization(plan, realization)
     sweep, cp = (_norm_sweep(sweep_bits) if sweep_bits is not None else r_sweep), plan.compiled_plan
     rng_obj, c_box = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(None if rng is None else _coerce_strict_int(rng, "rng seed"))), []
     def _pack_shot(zf: tuple[float, int], ma: NDArray[np.bool_], kf: _ScaledExpansion, ef: dict[int, int], dg: QueryDiagnostics) -> QueryShotTrajectory:
@@ -846,14 +847,14 @@ def run_query_shot(plan: PreparedQueryPlan, *, realization: Mapping[Any, Any] | 
             oe.weights = np.ascontiguousarray(oe.weights / math.sqrt(oe.norm_sq()))
         return QueryShotTrajectory(ma, _ldexp(*zf), oe, ft, sb, dg)
     try:
-        z_fp, _, _, _, _, m_arr, ket_f, eff_f, diag = _eval_via_tree(plan, faults, meas, paulis, resets, sweep, frozenset({"mass", "sample_measurements"}), ("all", None), None, rng_obj, sample_mc_faults=True, is_mixed=False, out_ctx=c_box)
+        z_fp, _, _, _, _, m_arr, ket_f, eff_f, diag = _eval_via_tree(plan, faults, meas, qmeas, paulis, resets, sweep, frozenset({"mass", "sample_measurements"}), ("all", None), None, rng_obj, sample_mc_faults=True, is_mixed=False, out_ctx=c_box)
         return _pack_shot(z_fp, m_arr, ket_f, eff_f, diag)
     except QueryBudgetExceededError:
         if plan.budget.on_budget_exceeded == "raise":
             raise
-        tr, z_fp, m_out, f_pin, pin, clip, diag = _run_stream_trajectory(plan, faults, meas, paulis, resets, sweep, rng_obj, sample_mc_faults=True, use_sampling=True, extract_data=extract_data, pctx=c_box[0] if c_box else None)
+        tr, z_fp, m_out, f_pin, pin, clip, diag = _run_stream_trajectory(plan, faults, meas, qmeas, paulis, resets, sweep, rng_obj, sample_mc_faults=True, use_sampling=True, extract_data=extract_data, pctx=c_box[0] if c_box else None)
         if tr is None or (z_fp[0] <= 0.0 and clip):
-            z_fp, _, _, _, _, m_arr, ket_f, eff_f, diag = _eval_via_tree(plan, f_pin, meas, paulis, resets, sweep, frozenset({"mass", "sample_measurements"}), ("all", None), None, rng_obj, sample_mc_faults=True, is_mixed=False, stream_only=True, prev_diag=diag, pin=pin)
+            z_fp, _, _, _, _, m_arr, ket_f, eff_f, diag = _eval_via_tree(plan, f_pin, meas, qmeas, paulis, resets, sweep, frozenset({"mass", "sample_measurements"}), ("all", None), None, rng_obj, sample_mc_faults=True, is_mixed=False, stream_only=True, prev_diag=diag, pin=pin)
             return _pack_shot(z_fp, m_arr, ket_f, eff_f, diag)
         return QueryShotTrajectory(m_out, _ldexp(*z_fp), tr.expansion, tr.final_tableau, tr.selector_bits, diag) if z_fp[0] > 0.0 else _pack_shot(_FP_ZERO, m_out, _empty_se(plan.num_total_qubits, plan.atol), f_pin, diag)
 

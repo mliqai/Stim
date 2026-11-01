@@ -236,8 +236,6 @@ def test_incompatible_modes_realization_validation_and_stream_pinning() -> None:
     for bad_real in ({"measurements": {0: 1}}, {"paulis": {0: 1}}, {"resets": {0: 1}}, {"bogus": 1}):
         with pytest.raises(ValueError):
             MagicsideSimulator(c, batch_size=1, op_handler=lh, fault_realizations=bad_real)
-    with pytest.raises(ValueError):
-        MagicsideSimulator(c, batch_size=1, backend="QUERY", fault_realizations={"quantum_measurements": {0: 1}})
     sim_ir = MagicsideSimulator(c, batch_size=1, fault_realizations={"measurements": {0: 1}})
     with pytest.raises(ValueError):
         sim_ir.interactive_do(c)
@@ -409,9 +407,17 @@ def test_zero_born_reset_and_quantum_measurement_stream_parity() -> None:
                 s_run.run()
             assert all(abs(s_run.get_branch_mass(0) - exp_m) < 1e-12 for s_run in runs)
             np.testing.assert_array_equal(runs[0].get_final_measurement_records(), runs[1].get_final_measurement_records())
-        sqm = MagicsideSimulator(c_qm, fault_mode=fm, backend="STREAM", fault_realizations=[{"quantum_measurements": {0: 1}}])
-        sqm.run()
-        assert sqm.get_branch_mass(0) == 0.0 and not np.any(sqm.state_vector(0))
+        for be in ("STREAM", "QUERY"):
+            sqm = MagicsideSimulator(c_qm, fault_mode=fm, backend=be, fault_realizations=[{"quantum_measurements": {0: 1}}])
+            sqm.run()
+            assert sqm.get_branch_mass(0) == 0.0 and not np.any(sqm.state_vector(0))
+        c_qmp = stim.Circuit("H 0\nM(0.25) 0\nM 0")
+        reals_qmp = [{"quantum_measurements": {0: 0}, "measurements": {0: 0, 1: 0}}, {"quantum_measurements": {0: 1}, "measurements": {0: 0, 1: 1}}]
+        pair_qmp = [MagicsideSimulator(c_qmp, batch_size=2, fault_mode=fm, backend=be, fault_realizations=reals_qmp, seed=5) for be in ("STREAM", "QUERY")]
+        for sq_sim in pair_qmp:
+            sq_sim.run()
+        np.testing.assert_array_equal(pair_qmp[0].get_final_measurement_records(), pair_qmp[1].get_final_measurement_records())
+        np.testing.assert_allclose([pair_qmp[1].get_branch_mass(0), pair_qmp[1].get_branch_mass(1)], [0.375, 0.125], atol=1e-12)
 
 
 def test_m2d_per_shot_fault_realization_sweep_bits_and_override() -> None:

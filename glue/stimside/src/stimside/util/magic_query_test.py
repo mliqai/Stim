@@ -416,3 +416,55 @@ def test_correlated_chain_interleaving_and_mpad_ulp_fallback_parity(fault_mode: 
             b_n, b_s = EvaluateQueries(p_b, {"measurements": {1: 0}}, queries=("mass", "acceptance", "sample_measurements"), rng=0), run_query_shot(p_b, realization={"measurements": {1: 0}}, rng=0)
             assert b_n.diagnostics.used_fallback and b_n.acceptance_mass == 1.0 and b_s.expansion.chi > 0 and math.isclose(b_n.mass or 0.0, ex_b, rel_tol=1e-12, abs_tol=0.0)
             assert b_n.mass == EvaluateQueries(p_b, {"measurements": {1: 0}}, queries=("mass", "acceptance", "prefix_probs", "sample_measurements"), rng=0).mass == b_s.branch_mass
+
+
+@pytest.mark.parametrize("fault_mode", ["DIRECT", "SELECTOR"])
+def test_quantum_measurements_query_and_fallback_stream_parity(fault_mode: str) -> None:
+    """Verify `quantum_measurements` in `EvaluateQueries`, `run_query_shot`, and STREAM fallback matches `STREAM`."""
+    from stimside.util.magic_compile import compile_direct, compile_selector, run_direct, run_selector
+
+    hdr, fb1 = "H 2 3 4\nI[CCZ] 2 3 4\n", QueryBudget(max_terms=1, on_budget_exceeded="fallback")
+    c_two = stim.Circuit(f"{hdr}H 0\nM(0.25) 0\nCX rec[-1] 1\nM 0 1")
+    dp = compile_direct(c_two) if fault_mode == "DIRECT" else compile_selector(c_two)
+    run_s = (lambda **kw: run_selector(dp, extract_data=True, **kw)) if fault_mode == "SELECTOR" else (lambda **kw: run_direct(dp, **kw))  # type: ignore[arg-type]
+
+    for b_cfg in (QueryBudget(), fb1):
+        plan = PrepareQueries(c_two, fault_mode=fault_mode, budget=b_cfg, acceptance_spec={2: 1})
+        # 1) quantum_measurements alone: mass sums classical readout flips (= 0.5); acceptance tracks CX rec[-1] feedback
+        rq = EvaluateQueries(plan, {"quantum_measurements": {0: 1}}, queries=("mass", "acceptance", "prefix_probs"), conditional=True)
+        assert abs((rq.mass or 0.0) - 0.5) < 1e-12
+        assert abs((rq.acceptance_mass or 0.0) - 0.75) < 1e-12
+        assert rq.prefix_probs is not None and abs(rq.prefix_probs[0][0] - 0.5) < 1e-12
+
+        # 2) Causal shot sampling under quantum_measurements={0: 1}: branch_mass == 0.5, readout flip prob == 0.25
+        rng_mc = np.random.default_rng(1234)
+        shots = [run_query_shot(plan, realization={"quantum_measurements": {0: 1}}, rng=rng_mc) for _ in range(300)]
+        assert all(abs(t.branch_mass - 0.5) < 1e-12 and t.measurements[1] and t.measurements[0] == t.measurements[2] for t in shots)
+        assert abs(float(np.mean([int(t.measurements[0]) for t in shots])) - 0.75) < 0.08
+
+        # 3) Joint quantum_measurements + measurements exact STREAM parity
+        for qm, cm, exp_m, exp_r in (
+            ({0: 0}, {0: 0, 1: 0, 2: 0}, 0.375, [False, False, False]),
+            ({0: 1}, {0: 0, 1: 1, 2: 0}, 0.125, [False, True, False]),
+            ({0: 1}, {0: 1, 1: 1, 2: 1}, 0.375, [True, True, True]),
+            ({0: 1}, {0: 1, 1: 0, 2: 1}, 0.0, [True, False, True]),
+        ):
+            rs = run_s(requested_quantum_outcomes=qm, requested_outcomes=cm) if exp_m > 0.0 else None
+            eq = EvaluateQueries(plan, {"quantum_measurements": qm, "measurements": cm}, queries=("mass", "sample_measurements"))
+            sq = run_query_shot(plan, realization={"quantum_measurements": qm, "measurements": cm}, rng=7)
+            assert abs((eq.mass or 0.0) - exp_m) < 1e-12 and abs(sq.branch_mass - exp_m) < 1e-12
+            if rs is not None:
+                assert abs(rs.branch_mass - exp_m) < 1e-12
+                assert eq.sampled_measurements is not None and eq.sampled_measurements.tolist() == exp_r == sq.measurements.tolist() == rs.measurements.tolist()
+
+        # 4) Zero Born probability & MR conflict with resets -> mass 0.0
+        pz = PrepareQueries(stim.Circuit(f"{hdr}M(0.25) 0"), fault_mode=fault_mode, budget=b_cfg)
+        assert EvaluateQueries(pz, {"quantum_measurements": {0: 1}, "measurements": {0: 1}}).mass == 0.0
+        assert run_query_shot(pz, realization={"quantum_measurements": {0: 1}}, rng=0).branch_mass == 0.0
+        pmr = PrepareQueries(stim.Circuit(f"{hdr}H 0\nMR 0\nM 0"), fault_mode=fault_mode, budget=b_cfg)
+        assert EvaluateQueries(pmr, {"quantum_measurements": {0: 1}, "resets": {0: 0}}).mass == 0.0
+        assert abs((EvaluateQueries(pmr, {"quantum_measurements": {0: 1}}, queries=("mass", "sample_measurements")).mass or 0.0) - 0.5) < 1e-12
+
+    for bad_qm in ({True: 0}, {-1: 0}, {99: 1}, {0: 2}):
+        with pytest.raises(ValueError):
+            EvaluateQueries(PrepareQueries(c_two, fault_mode=fault_mode), {"quantum_measurements": bad_qm})
