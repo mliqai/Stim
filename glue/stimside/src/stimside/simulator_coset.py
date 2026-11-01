@@ -700,6 +700,9 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             (self.num_qubits, self.batch_size), dtype=np.bool_
         )
         self._cpp_m_buf: NDArray[np.bool_] = np.empty(0, dtype=np.bool_)
+        self._correlated_error_occurred: NDArray[np.bool_] = np.zeros(
+            self.batch_size, dtype=np.bool_
+        )
 
         self._circuit_time = 0
         self._step_cursor = 0
@@ -958,6 +961,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._cpp_dirty = False
         self._py_dirty = False
         self._measurement_columns.clear()
+        self._correlated_error_occurred.fill(False)
 
         self.qubit_coords = {}
         self.qubit_tags = {}
@@ -1763,12 +1767,6 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
         args = op.gate_args_copy()
         if name in ("E", "CORRELATED_ERROR", "ELSE_CORRELATED_ERROR"):
-            if not hasattr(self, "_correlated_error_occurred") or len(
-                self._correlated_error_occurred
-            ) != self.batch_size:
-                self._correlated_error_occurred = np.zeros(
-                    self.batch_size, dtype=np.bool_
-                )
             p_err = float(args[0]) if len(args) > 0 else 0.0
             raw_targets = op.targets_copy()
             if self._tab_rngs is not None:

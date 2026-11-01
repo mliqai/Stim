@@ -62,3 +62,20 @@ def test_shared_compiled_reference_circuit_no_per_batch_scratch_or_undeclared_at
                 assert set(vars(sub.meta)) <= sub_declared, (
                     set(vars(sub.meta)) - sub_declared
                 )
+
+
+def test_correlated_error_occurred_initialized_and_reset_on_clear() -> None:
+    circuit = stim.Circuit("ELSE_CORRELATED_ERROR(1.0) X0\nM 0\nCORRELATED_ERROR(1.0) Z0")
+    handler = LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=8)
+    sim = CosetsideSimulator(circuit=circuit, compiled_op_handler=handler, batch_size=8, seed=5)
+    assert sim._correlated_error_occurred.shape == (8,)
+    assert not np.any(sim._correlated_error_occurred)
+
+    sim.run()
+    assert np.all(sim.get_final_measurement_records()[:, 0])
+    assert np.all(sim._correlated_error_occurred)
+
+    sim.clear()
+    assert not np.any(sim._correlated_error_occurred)
+    sim.run()
+    assert np.all(sim.get_final_measurement_records()[:, 0])
