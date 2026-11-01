@@ -582,14 +582,27 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             separate_observables=True,
         )
 
-    def get_detector_flips(self, append_observables=False) -> NDArray[np.bool_]:
+    def get_detector_flips(
+        self, append_observables: bool = False, *, bit_packed: bool = False
+    ) -> NDArray[np.bool_] | NDArray[np.uint8]:
         if self._detector_flips is None:
             self._convert_measurements_to_detector_flips()
-        if append_observables and self._observable_flips is not None:
-            return np.hstack([self._detector_flips, self._observable_flips])
-        return self._detector_flips
+        assert self._detector_flips is not None
+        out = (
+            np.hstack([self._detector_flips, self._observable_flips])
+            if append_observables and self._observable_flips is not None
+            else self._detector_flips
+        )
+        return np.packbits(out, axis=-1, bitorder="little") if bit_packed else out
 
-    def get_observable_flips(self) -> NDArray[np.bool_]:
+    def get_observable_flips(
+        self, *, bit_packed: bool = False
+    ) -> NDArray[np.bool_] | NDArray[np.uint8]:
         if self._observable_flips is None:
             self._convert_measurements_to_detector_flips()
-        return self._observable_flips
+        assert self._observable_flips is not None
+        return (
+            np.packbits(self._observable_flips, axis=-1, bitorder="little")
+            if bit_packed
+            else self._observable_flips
+        )

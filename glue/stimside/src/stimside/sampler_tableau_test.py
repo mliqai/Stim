@@ -159,3 +159,39 @@ def test_6_tableside_batch_size_greater_than_one_and_sampler():
     compiled = sampler.compiled_sampler_for_task(sinter.Task(circuit=circuit))
     stats = compiled.sample(8)
     assert stats.shots == 8
+
+
+def test_bit_packed_detector_and_observable_getters_across_engines() -> None:
+    import numpy as np
+    from stimside.simulator_coset import CosetsideSimulator
+    from stimside.simulator_magic import MagicsideSimulator
+    from stimside.simulator_tableau import TablesideSimulator
+
+    lines = ["R " + " ".join(map(str, range(10))), "X_ERROR(0.3) " + " ".join(map(str, range(10))), "M " + " ".join(map(str, range(10)))]
+    for i in range(10):
+        lines.append(f"DETECTOR rec[-{10 - i}]")
+    lines.append("OBSERVABLE_INCLUDE(0) rec[-1] rec[-3]")
+    lines.append("OBSERVABLE_INCLUDE(1) rec[-2] rec[-4]")
+    circ = stim.Circuit("\n".join(lines))
+
+    th = TrivialOpHandler()
+    sims = [
+        TablesideSimulator(circ, compiled_op_handler=th.compile_op_handler(circuit=circ, batch_size=7), batch_size=7, seed=11),
+        CosetsideSimulator(circ, compiled_op_handler=th.compile_op_handler(circuit=circ, batch_size=7), batch_size=7, seed=11),
+        MagicsideSimulator(circ, op_handler=th, batch_size=7, seed=11),
+    ]
+    for sim in sims:
+        sim.run()
+        dets = sim.get_detector_flips()
+        obs = sim.get_observable_flips()
+        both = sim.get_detector_flips(append_observables=True)
+        dets_p = sim.get_detector_flips(bit_packed=True)
+        obs_p = sim.get_observable_flips(bit_packed=True)
+        both_p = sim.get_detector_flips(append_observables=True, bit_packed=True)
+        assert dets_p.shape == (7, 2) and dets_p.dtype == np.uint8
+        assert obs_p.shape == (7, 1) and obs_p.dtype == np.uint8
+        assert both_p.shape == (7, 2) and both_p.dtype == np.uint8
+        np.testing.assert_array_equal(dets_p, np.packbits(dets, axis=-1, bitorder="little"))
+        np.testing.assert_array_equal(obs_p, np.packbits(obs, axis=-1, bitorder="little"))
+        np.testing.assert_array_equal(both_p, np.packbits(both, axis=-1, bitorder="little"))
+

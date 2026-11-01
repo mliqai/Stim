@@ -248,6 +248,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
     def clear(self) -> None:
         self._measurement_columns.clear()
+        self._cached_m2d: tuple[NDArray[np.bool_], NDArray[np.bool_]] | None = None
         self.qubit_coords: dict[int, list[float]] = {}
         self.qubit_tags: dict[int, str] = {}
         self.coords_shifts: list[float] = []
@@ -525,6 +526,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._step_cursor = step_cursor + 1
 
     def record_direct_measurements(self, outcomes_per_target: NDArray[np.bool_]) -> None:
+        self._cached_m2d = None
         for row in np.asarray(outcomes_per_target, dtype=np.bool_):
             self._measurement_columns.append(row.copy())
 
@@ -1003,6 +1005,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         return self._compute_noiseless_magic_ref(None if sweep_bits is None else _normalize_sweep_matrix(sweep_bits, 1)[0])  # type: ignore[index]
 
     def _convert_m2d(self, sweep_bits: Any) -> tuple[NDArray[np.bool_], NDArray[np.bool_]]:
+        if sweep_bits is None and self._cached_m2d is not None:
+            return self._cached_m2d
         recs = self.get_final_measurement_records()
         if recs.shape[1] != self.num_measurements:
             raise ValueError(f"Measurement count {recs.shape[1]} != circuit.num_measurements={self.num_measurements}")
@@ -1015,25 +1019,37 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             kw: dict[str, Any] = {"separate_observables": True}
             if sw is not None:
                 kw["sweep_bits"] = sw
-            return self._m2d_stim_conv.convert(measurements=recs, **kw)  # type: ignore[no-any-return]
-        if self._m2d_skip_conv is None:
-            self._m2d_skip_conv = self.circuit.compile_m2d_converter(skip_reference_sample=True)
-        if self._explicit_ref_sample is not None:
-            xor_recs = np.ascontiguousarray(recs ^ self._explicit_ref_sample[None, :])
-        elif self._eff_m2d_mode == "zero":
-            xor_recs = np.ascontiguousarray(recs)
-        elif sw is None:
-            xor_recs = np.ascontiguousarray(recs ^ self._compute_noiseless_magic_ref(None)[None, :])
+            res: tuple[NDArray[np.bool_], NDArray[np.bool_]] = self._m2d_stim_conv.convert(measurements=recs, **kw)
         else:
-            xor_recs = np.ascontiguousarray(recs ^ np.stack([self._compute_noiseless_magic_ref(sw[s]) for s in range(self.batch_size)], axis=0))
-        return self._m2d_skip_conv.convert(measurements=xor_recs, separate_observables=True)  # type: ignore[no-any-return]
+            if self._m2d_skip_conv is None:
+                self._m2d_skip_conv = self.circuit.compile_m2d_converter(skip_reference_sample=True)
+            if self._explicit_ref_sample is not None:
+                xor_recs = np.ascontiguousarray(recs ^ self._explicit_ref_sample[None, :])
+            elif self._eff_m2d_mode == "zero":
+                xor_recs = np.ascontiguousarray(recs)
+            elif sw is None:
+                xor_recs = np.ascontiguousarray(recs ^ self._compute_noiseless_magic_ref(None)[None, :])
+            else:
+                xor_recs = np.ascontiguousarray(recs ^ np.stack([self._compute_noiseless_magic_ref(sw[s]) for s in range(self.batch_size)], axis=0))
+            res = self._m2d_skip_conv.convert(measurements=xor_recs, separate_observables=True)
+        if sweep_bits is None:
+            self._cached_m2d = res
+        return res
 
-    def get_detector_flips(self, *, append_observables: bool = False, sweep_bits: Any = None) -> NDArray[np.bool_]:
+    def get_detector_flips(
+        self, *, append_observables: bool = False, sweep_bits: Any = None, bit_packed: bool = False
+    ) -> NDArray[np.bool_] | NDArray[np.uint8]:
         dets, obs = self._convert_m2d(sweep_bits)
-        return np.hstack([dets, obs]) if append_observables else dets
+        if append_observables:
+            out = np.hstack([dets, obs])
+            return np.packbits(out, axis=-1, bitorder="little") if bit_packed else out
+        return np.packbits(dets, axis=-1, bitorder="little") if bit_packed else dets.copy()
 
-    def get_observable_flips(self, *, sweep_bits: Any = None) -> NDArray[np.bool_]:
-        return self._convert_m2d(sweep_bits)[1]
+    def get_observable_flips(
+        self, *, sweep_bits: Any = None, bit_packed: bool = False
+    ) -> NDArray[np.bool_] | NDArray[np.uint8]:
+        obs = self._convert_m2d(sweep_bits)[1]
+        return np.packbits(obs, axis=-1, bitorder="little") if bit_packed else obs.copy()
 
     def _validate_shot_idx(self, shot: int) -> int:
         s = int(shot) + (self.batch_size if int(shot) < 0 else 0)
