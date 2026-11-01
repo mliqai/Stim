@@ -213,17 +213,15 @@ def _strip_circuit_for_noiseless_ref(circuit: stim.Circuit) -> tuple[stim.Circui
                     continue
                 params, _ = _parse_leakage_tag_magic(op)
                 assert isinstance(params, LeakageConditioningParams)
-                if len(params.args) == 1:
-                    alw = set(params.args[0])
-                    hits = 4 if ("U" in alw or (0 in alw and 1 in alw)) else (1 if (0 in alw or 1 in alw) else 0)
-                else:
-                    rules = list(zip(params.args[0], params.args[1]))
-                    hits = sum(any((a in ("U", q0)) and (b in ("U", q1)) for a, b in rules) for q0 in (0, 1) for q1 in (0, 1))
-                if hits == 4:
-                    out.append(stim.CircuitInstruction(name, tgs, op.gate_args_copy()))
-                elif hits > 0:
+                has_comp_proj = any(0 in g or 1 in g for g in params.args) or (
+                    len(params.args) == 1
+                    and any(tok in ("0", "1") for tok in (params.from_tag or ":").split(":")[1].split())
+                )
+                if has_comp_proj:
                     out.append(op)
                     needs_leakage = True
+                elif ("U",) * len(params.args) in zip(*params.args):
+                    out.append(stim.CircuitInstruction(name, tgs, op.gate_args_copy()))
             elif tag == "" and name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
                 out.append(stim.CircuitInstruction("MPAD", [0] * len(tgs)))
             elif tag in _MAGIC_TAGS:

@@ -437,3 +437,50 @@ def test_m2d_per_shot_fault_realization_sweep_bits_and_override() -> None:
             sm_m.run()
             np.testing.assert_array_equal(sm_m.get_final_measurement_records(), [[False], [True]])
             assert not np.any(sm_m.get_detector_flips()) and not np.any(sm_m.get_observable_flips())
+
+
+def test_noiseless_ref_conditioning_collapse_semantics() -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
+    from stimside.simulator_coset import CosetsideSimulator
+    from stimside.simulator_magic import _strip_circuit_for_noiseless_ref
+
+    for cond_op in (
+        "I[CONDITIONED_ON_SELF: 0 1] 0",
+        "I[CONDITIONED_ON_OTHER: 0 1 : 0] 1",
+        "CZ[CONDITIONED_ON_PAIR: (0, U) (1, U)] 0 1",
+        "CZ[CONDITIONED_ON_PAIR: (0, 2)] 0 1",
+    ):
+        cliff = stim.Circuit(f"H 0\n{cond_op}\nH 0\nM 0 1")
+        cos = CosetsideSimulator(
+            cliff,
+            compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=cliff, batch_size=256),
+            batch_size=256,
+            seed=7,
+        )
+        cos.run()
+        # Z-collapsing q0 in |+> destroys X coherence -> M 0 is ~50/50, not deterministic 0.
+        assert 64 < int(np.count_nonzero(cos.get_final_measurement_records()[:, 0])) < 192
+
+        magic = stim.Circuit(f"H 0\nI[T] 0\nI[T] 0\nI[T] 0\nI[T] 0\n{cond_op}\nH 0\nM 0 1")
+        stripped, needs_leak = _strip_circuit_for_noiseless_ref(magic)
+        assert needs_leak
+        assert cond_op in str(stripped)
+        sim = MagicsideSimulator(magic, op_handler=LeakageUint8Magic(), batch_size=1, seed=0, m2d_reference_mode="magicside")
+        sim.run()
+        np.testing.assert_array_equal(sim.get_reference_sample(), sim.get_final_measurement_records()[0])
+
+    for u_op, bare in (
+        ("Z[CONDITIONED_ON_SELF: U] 0", "Z 0"),
+        ("Z[CONDITIONED_ON_OTHER: U : 0] 1", "Z 1"),
+        ("CZ[CONDITIONED_ON_PAIR: (U, U)] 0 1", "CZ 0 1"),
+        ("CZ[CONDITIONED_ON_PAIR: (2, U) (U, U)] 0 1", "CZ 0 1"),
+    ):
+        magic_u = stim.Circuit(f"H 0\nI[T] 0\nI[T_DAG] 0\n{u_op}\nH 0\nM 0 1")
+        stripped_u, needs_leak_u = _strip_circuit_for_noiseless_ref(magic_u)
+        assert not needs_leak_u
+        assert bare in str(stripped_u) and "CONDITIONED_ON" not in str(stripped_u)
+
+    stripped_drop, needs_leak_drop = _strip_circuit_for_noiseless_ref(
+        stim.Circuit("H 0\nX[CONDITIONED_ON_SELF: 2] 0\nCZ[CONDITIONED_ON_PAIR: (2, U)] 0 1\nH 0\nM 0 1")
+    )
+    assert not needs_leak_drop and "CONDITIONED_ON" not in str(stripped_drop) and "CZ" not in str(stripped_drop)
