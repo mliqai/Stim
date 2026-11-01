@@ -41,7 +41,7 @@ from stimside._magic.phase_qfe import (
     _apply_local_unitary_c128, apply_compiled_block, apply_pauli, apply_quarter_turn,
     apply_reference_tableau_to_statevector, merge_frames, project_diagonal, validate_atol,
 )
-from stimside.util.reference_chp import DetMeasMeta, RandMeasMeta, ReferenceCHPTableau, _pauli_image
+from stimside.util.reference_chp import DetMeasMeta, RandMeasMeta, ReferenceCHPTableau
 
 __all__ = [
     "OMEGA", "OMEGA_POWERS", "DECOMP_1Q", "DECOMP_2Q", "CONTROLLED_PAULI_2Q_AXES",
@@ -680,16 +680,8 @@ class CoordinateCompilation:
 
 
 def clone_reference_chp(ref_chp: ReferenceCHPTableau) -> ReferenceCHPTableau:
-    """Deep-copy `ReferenceCHPTableau` including any attached `_frame_events` / `_selector_plan_meta`."""
-    x2x, x2z, z2x, z2z, x_kap, z_kap = ref_chp.snapshot_packed()
-    out = ReferenceCHPTableau(ref_chp.num_qubits)
-    out.x2x[:], out.x2z[:] = x2x, x2z
-    out.z2x[:], out.z2z[:] = z2x, z2z
-    out.x_kap[:], out.z_kap[:] = x_kap, z_kap
-    for attr in ("_frame_events", "_selector_plan_meta"):
-        if hasattr(ref_chp, attr):
-            setattr(out, attr, getattr(ref_chp, attr))
-    return out
+    """Deep-copy `ReferenceCHPTableau`."""
+    return ref_chp.copy()
 
 
 def compile_pauli_product(
@@ -708,12 +700,8 @@ def compile_pauli_product(
             continue
         if q < 0 or q >= ref_chp.num_qubits:
             raise ValueError(f"Qubit {q} out of range for num_qubits={ref_chp.num_qubits}")
-        aw, bw, kw = _pauli_image(
-            pchar, q, ref_chp.x2x, ref_chp.x2z, ref_chp.z2x, ref_chp.z2z, ref_chp.x_kap, ref_chp.z_kap
-        )
-        kap_acc = (kap_acc + int(kw) + (word_dot_parity(b_acc, aw) << 1)) & 3
-        a_acc ^= aw
-        b_acc ^= bw
+        aw, bw, kw = ref_chp.pauli_image(pchar, q)
+        a_acc, b_acc, kap_acc = pauli_multiply(a_acc, b_acc, kap_acc, aw, bw, kw)
     kap_acc = validate_hermitian_pauli(a_acc, b_acc, kap_acc)
     return CompiledPauliAxis(np.ascontiguousarray(a_acc), np.ascontiguousarray(b_acc), kap_acc)
 
@@ -790,42 +778,14 @@ def apply_spp_to_reference_chp(
     dag: bool = False,
 ) -> None:
     """Update `ref_chp` in `O(|supp| * n_words)` under `SPP` / `SPP_DAG`."""
-    bar_P = compile_pauli_product(ref_chp, terms, negate=negate)
-    phys_xz: dict[int, tuple[int, int]] = {}
-    for q, pch in terms:
-        xp, zp = phys_xz.get(q, (0, 0))
-        dx, dz, _ = _PAU_ABK[pch]
-        phys_xz[q] = (xp ^ dx, zp ^ dz)
-
-    kap_fac = (bar_P.kappa + (3 if dag else 1)) & 3
-    for q, (xp, zp) in phys_xz.items():
-        for flag, arr_x, arr_z, arr_k in (
-            (zp, ref_chp.x2x, ref_chp.x2z, ref_chp.x_kap),
-            (xp, ref_chp.z2x, ref_chp.z2z, ref_chp.z_kap),
-        ):
-            if flag:
-                dot = word_dot_parity(bar_P.b_words, arr_x[q])
-                arr_k[q] = np.uint8((kap_fac + int(arr_k[q]) + (dot << 1)) & 3)
-                arr_x[q] ^= bar_P.a_words
-                arr_z[q] ^= bar_P.b_words
+    ref_chp.do_spp(terms, negate=negate, dag=dag)
 
 
 def _apply_right_rot_to_ref_chp(
     ref_chp: ReferenceCHPTableau, rot_axis: CompiledPauliAxis
 ) -> None:
     """Apply `B_t <- B_t * R(-rot_axis)` in-place via vectorized rank-1 transvection."""
-    rot_a, rot_b = rot_axis.a_words, rot_axis.b_words
-    fac_kap = np.uint8((rot_axis.kappa + 1) & 3)
-    for arr_x, arr_z, arr_k in (
-        (ref_chp.x2x, ref_chp.x2z, ref_chp.x_kap),
-        (ref_chp.z2x, ref_chp.z2z, ref_chp.z_kap),
-    ):
-        idx = np.flatnonzero((np.bitwise_count((arr_x & rot_b) ^ (arr_z & rot_a)).sum(axis=1) & 1) != 0)
-        if len(idx) > 0:
-            dp = (np.bitwise_count(arr_x[idx] & rot_b).sum(axis=1) & 1).astype(np.uint8)
-            arr_k[idx] = (fac_kap + arr_k[idx] + (dp << np.uint8(1))) & np.uint8(3)
-            arr_x[idx] ^= rot_a
-            arr_z[idx] ^= rot_b
+    ref_chp.apply_right_rot(rot_axis.a_words, rot_axis.b_words, (rot_axis.kappa + 1) & 3)
 
 
 def _compile_pauli_measurement_c15(
@@ -1190,7 +1150,7 @@ def _compile_circuit_pass(
             elif canon_name in ("SPP", "SPP_DAG"):
                 dag = canon_name == "SPP_DAG"
                 for grp_terms, grp_inv in _split_pauli_product_targets(op):
-                    apply_spp_to_reference_chp(ref_chp, grp_terms, negate=grp_inv, dag=dag)
+                    ref_chp.do_spp(grp_terms, negate=grp_inv, dag=dag)
                     frame_events.append(LeftSppEvent(tuple(grp_terms), grp_inv, dag))
             elif canon_name in _FEEDBACK_2Q_GATES and any(
                 t.is_measurement_record_target or t.is_sweep_bit_target for t in targs
@@ -1335,7 +1295,6 @@ def _compile_circuit_pass(
         _emit_fault_slots(prog_by_step[len(flat_ops)])
 
     frame_tup = tuple(frame_events)
-    ref_chp._frame_events = frame_tup  # type: ignore[attr-defined]
     out: dict[str, Any] = {
         "n_data": n_data, "n_sel": n_sel, "n_total": n_total, "num_measurements": next_meas_idx,
         "raw_records": tuple(raw_records), "final_tableau": ref_chp, "frame_events": frame_tup,
@@ -1351,7 +1310,6 @@ def _compile_circuit_pass(
             if not (isinstance(ev, LeftUnitaryEvent) and any(q >= n_data for q in ev.targets))
         )
         data_tab = _restrict_tableau_to_data(ref_chp, n_data)
-        data_tab._frame_events = data_events  # type: ignore[attr-defined]
         out["data_frame_events"] = data_events
         out["data_final_tableau"] = data_tab
     return out
@@ -1695,6 +1653,7 @@ class TrajectoryRunResult:
     selector_bits: NDArray[np.bool_] | None = None
     peak_components: int = 1
     peak_dim: int = 0
+    frame_events: tuple[FrameEvent, ...] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1740,15 +1699,13 @@ def compile_selector(
         res["raw_records"], n_qubits=res["n_total"],
         budget=c2_budget, c2_max_rank=c2_max_rank, c2_max_poly_terms=c2_max_poly_terms,
     )
-    plan = SelectorPlan(
+    return SelectorPlan(
         res["n_data"], res["n_sel"], res["n_total"], res["num_measurements"], records,
         res["final_tableau"], res["data_final_tableau"], res["frame_events"], res["data_frame_events"],
         res["fault_channels"], res["fault_sel_groups"], res["noise_sel_groups"], gadgetize_pauli_noise,
         res["raw_records"], res["noise_sel_ch_indices"], res["total_noise_channels"],
         res["noise_max_choices"], res["num_resets"], res["gauge_steps"],
     )
-    res["final_tableau"]._selector_plan_meta = plan  # type: ignore[attr-defined]
-    return plan
 
 
 def _sample_categorical_branch(probs: Sequence[float] | NDArray[np.float64], rng: np.random.Generator) -> int:
@@ -1952,6 +1909,7 @@ def _execute_compiled_records(
     preset_noise_map: Mapping[int, int] | None = None,
     total_noise_channels: int | None = None,
     selector_bits: NDArray[np.bool_] | None = None,
+    frame_events: tuple[FrameEvent, ...] | None = None,
 ) -> TrajectoryRunResult:
     atol = validate_atol(atol)
     meas_record = np.zeros(num_measurements, dtype=np.bool_)
@@ -2165,6 +2123,7 @@ def _execute_compiled_records(
         selector_bits=selector_bits,
         peak_components=peak_chi,
         peak_dim=peak_d,
+        frame_events=frame_events,
     )
 
 
@@ -2194,6 +2153,7 @@ def run_direct(
         rng=rng_obj, fault_map=f_map, noise_map=n_map, reset_map=r_map,
         req_c_map=c_map, req_q_map=q_map, sweep_bits=sweep_bits,
         max_components=max_components, atol=atol,
+        frame_events=plan.frame_events,
     )
 
 
@@ -2294,6 +2254,7 @@ def run_selector(
         preset_noise_map=gad_noise_map if plan.gadgetize_pauli_noise else None,
         total_noise_channels=plan.total_noise_channels if plan.gadgetize_pauli_noise else None,
         selector_bits=sel_bits,
+        frame_events=plan.data_frame_events if extract_data else plan.frame_events,
     )
     if extract_data:
         res.final_tableau, res.expansion = extract_data_expansion(
@@ -2357,9 +2318,6 @@ def extract_data_expansion(
                 "extract_data_expansion(ref_tableau, expansion, n_data_qubits, selector_bits)"
             )
         n_data, raw_bits = int(n_data_or_bits), selector_bits
-        cand = getattr(plan_or_tableau, "_selector_plan_meta", None)
-        if isinstance(cand, SelectorPlan) and cand.num_data_qubits == n_data:
-            plan_meta = cand
     else:
         raise TypeError(f"Expected SelectorPlan or ReferenceCHPTableau, got {type(plan_or_tableau)!r}")
 
@@ -2389,7 +2347,7 @@ def extract_data_expansion(
             data_exp = merge_frames(data_exp)
         if odd_ph and data_exp.chi > 0:
             data_exp.weights = np.ascontiguousarray(data_exp.weights * 1.0j)
-        return clone_reference_chp(plan_meta.data_final_tableau), data_exp
+        return plan_meta.data_final_tableau.copy(), data_exp
 
     assert isinstance(plan_or_tableau, ReferenceCHPTableau)
     return _restrict_tableau_to_data(plan_or_tableau, n_data, sel_arr), data_exp
@@ -2435,6 +2393,8 @@ def reconstruct_statevector(
         expansion = first.expansion
         if ref_tableau is None:
             ref_tableau = first.final_tableau
+        if frame_events is None:
+            frame_events = first.frame_events
     elif isinstance(first, ReferenceCHPTableau):
         if not isinstance(second, ShotExpansion):
             raise TypeError("Expected ShotExpansion as second argument when first is ReferenceCHPTableau")
@@ -2455,8 +2415,6 @@ def reconstruct_statevector(
             events = plan.frame_events
         elif isinstance(plan, SelectorPlan):
             events = plan.data_frame_events if n == plan.num_data_qubits else plan.frame_events
-    if events is None and ref_tableau is not None and hasattr(ref_tableau, "_frame_events"):
-        events = getattr(ref_tableau, "_frame_events")
 
     if events is None:
         psi_ref = expansion.to_statevector(endian="little")

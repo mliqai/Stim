@@ -12,8 +12,8 @@ from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 from stimside._magic import compile as _mc
-from stimside._magic.compile import CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _sample_categorical_branch, clone_reference_chp, compile_direct, compile_open_block, compile_selector, extract_data_expansion
-from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, stim_tableau_to_reference_chp, validate_atol
+from stimside._magic.compile import CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _sample_categorical_branch, compile_direct, compile_open_block, compile_selector, extract_data_expansion
+from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, validate_atol
 from stimside.util.bitwords import (
     OMEGA_POWERS,
     SQRT2 as _SQRT2,
@@ -299,7 +299,7 @@ def _compile_target_spec(target_spec: Any, output_qubits: tuple[int, ...], atol:
     if not is_pair:
         raise TypeError(f"Unsupported target_spec type: {type(target_spec)!r}")
     raw_ref_t, exp_t = target_spec
-    ref_t = stim_tableau_to_reference_chp(raw_ref_t) if isinstance(raw_ref_t, stim.Tableau) else raw_ref_t
+    ref_t = ReferenceCHPTableau.from_stim_tableau(raw_ref_t) if isinstance(raw_ref_t, stim.Tableau) else raw_ref_t
     exp_t = ShotExpansion.from_component(exp_t, atol=atol) if isinstance(exp_t, PhaseQFEComponent) else exp_t
     if not isinstance(exp_t, ShotExpansion):
         raise TypeError(f"Expected ShotExpansion in target_spec tuple, got {type(exp_t)!r}")
@@ -312,7 +312,7 @@ def _compile_target_spec(target_spec: Any, output_qubits: tuple[int, ...], atol:
     if not math.isfinite(nrm) or nrm <= 1e-15 or merged_t.chi == 0:
         raise ValueError("target_spec ShotExpansion has zero or non-finite norm")
     merged_t.weights = np.ascontiguousarray(merged_t.weights / math.sqrt(nrm))
-    return (clone_reference_chp(ref_t), merged_t)
+    return (ref_t.copy(), merged_t)
 
 def _normalize_acceptance_spec(acc_spec: Any, num_meas: int) -> tuple[str, Any]:
     if acc_spec is None or callable(acc_spec):
@@ -626,7 +626,7 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
                 if _check_acc(norm_acc, np.array([bool(m_map.get(j, 0)) for j in range(plan.num_measurements)], dtype=np.bool_)):
                     totals[1] = _fp_add(totals[1], z_b)
                     if "fidelity" in q_set and comp_target is not None:
-                        d_state = extract_data_expansion(plan.compiled_plan, ket_e.exp, _selector_bits(plan.compiled_plan, faults)) if isinstance(plan.compiled_plan, SelectorPlan) else (clone_reference_chp(plan.compiled_plan.final_tableau), ket_e.exp.copy())
+                        d_state = extract_data_expansion(plan.compiled_plan, ket_e.exp, _selector_bits(plan.compiled_plan, faults)) if isinstance(plan.compiled_plan, SelectorPlan) else (plan.compiled_plan.final_tableau.copy(), ket_e.exp.copy())
                         totals[2] = _fp_add(totals[2], _fp_mul(pi_w, *_compute_partial_trace_fidelity_mass(*d_state, ket_e.log2_scale, comp_target, plan.output_qubits, ctx, bcache)))
             continue
         op_off, rec, aux = dyn[di]
@@ -857,7 +857,7 @@ def run_query_shot(plan: PreparedQueryPlan, *, realization: Mapping[Any, Any] | 
     rng_obj, c_box = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(None if rng is None else _coerce_strict_int(rng, "rng seed"))), []
     def _pack_shot(zf: tuple[float, int], ma: NDArray[np.bool_], kf: _ScaledExpansion, ef: dict[int, int], dg: QueryDiagnostics) -> QueryShotTrajectory:
         sb = _selector_bits(cp, ef) if isinstance(cp, SelectorPlan) else None
-        ft, oe = (extract_data_expansion(cp, kf.exp, sb) if (extract_data and isinstance(cp, SelectorPlan) and sb is not None) else (clone_reference_chp(cp.final_tableau), kf.exp.copy()))
+        ft, oe = (extract_data_expansion(cp, kf.exp, sb) if (extract_data and isinstance(cp, SelectorPlan) and sb is not None) else (cp.final_tableau.copy(), kf.exp.copy()))
         if oe.chi > 0 and oe.norm_sq() > 0.0:
             oe.weights = np.ascontiguousarray(oe.weights / math.sqrt(oe.norm_sq()))
         return QueryShotTrajectory(ma, _ldexp(*zf), oe, ft, sb, dg)

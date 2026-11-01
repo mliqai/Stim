@@ -18,13 +18,13 @@ from stimside._magic.compile import (
     _coerce_strict_int, _compile_clifford_factors, _compile_pauli_measurement_c15, _compile_reset_c15,
     _infer_total_data_qubits, _merge_and_validate_fault_channels, _normalize_choice_map,
     _prepare_run_maps, _reduce_pauli_product_targets, _sample_categorical_branch, _split_pauli_product_targets,
-    _validate_and_emit_magic_op, apply_spp_to_reference_chp, clone_reference_chp, compile_direct,
+    _validate_and_emit_magic_op, compile_direct,
     compile_open_block, compile_pauli_product, compile_selector, extract_circuit_faults, extract_data_expansion,
     parse_clifford_fault_instruction, reconstruct_statevector, run_direct, run_selector,
 )
 from stimside._magic.phase_qfe import (
     DEFAULT_ATOL, ImpossiblePostselectionError, K1_CANCEL_REL_TOL, ShotExpansion, apply_compiled_block, apply_pauli,
-    apply_quarter_turn, measure_expansion, project_diagonal, reference_chp_to_stim_tableau, validate_atol,
+    apply_quarter_turn, measure_expansion, project_diagonal, validate_atol,
 )
 from stimside._magic.query import (
     PrepareQueries, PreparedQueryPlan, QueryBudget, QueryBudgetExceededError,
@@ -350,7 +350,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._active_plan, self._shot_sel_bits = cp, sel_bits
         self._live_frame_events = list(cp.frame_events)
         self._shot_tabs = tabs
-        self._live_ref_tab = clone_reference_chp(tabs[0])
+        self._live_ref_tab = tabs[0].copy()
         self._live_exps = exps
         for op in self._unrolled_ops:
             apply_coords_op(op, self.qubit_coords, self.qubit_tags, self.coords_shifts)
@@ -447,7 +447,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             except ImpossiblePostselectionError:
                 recs[s], self._branch_masses[s] = [bool(c_map.get(j, 0)) for j in range(plan.num_measurements)], 0.0
                 exps.append(ShotExpansion.from_components((), n_qubits=plan.final_tableau.num_qubits, merge=False, atol=self.atol))
-                tabs.append(clone_reference_chp(plan.final_tableau))
+                tabs.append(plan.final_tableau.copy())
                 sel_bits.append(np.zeros(plan.num_selector_qubits, dtype=np.bool_) if isinstance(plan, SelectorPlan) else None)
             except RuntimeError as exc:
                 if mc_cap is not None and "max_components" in str(exc):
@@ -808,7 +808,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._apply_conditional_ref_step(
                     mask_at(g_idx),
                     lambda g=grp, iv=inv: (
-                        apply_spp_to_reference_chp(self._live_ref_tab, g, negate=iv, dag=dag),
+                        self._live_ref_tab.do_spp(g, negate=iv, dag=dag),
                         self._live_frame_events.append(LeftSppEvent(tuple(g), iv, dag)),
                     ),
                     lambda g=grp, iv=inv: CompiledCliffordFactorList(
@@ -1096,7 +1096,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def get_qfe_expansion(self, shot: int = 0, *, trace_selectors: bool = True) -> tuple[stim.Tableau, ShotExpansion]:
         self._flush_magic()
         tab, exp, _ = self._resolve_shot_state(self._validate_shot_idx(shot), bool(trace_selectors))
-        return reference_chp_to_stim_tableau(tab), exp.copy()
+        return tab.to_stim_tableau(), exp.copy()
 
     def get_state_expansions(self, *, trace_selectors: bool = True) -> list[tuple[stim.Tableau, ShotExpansion]]:
         self._flush_magic()

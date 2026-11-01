@@ -30,7 +30,7 @@ from stimside.util.bitwords import (
 )
 from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
-from stimside.util.reference_chp import PackedSymplecticTables, _pauli_image
+from stimside.util.reference_chp import PackedSymplecticTables, pauli_image, pauli_image_batch
 from stimside.util.seeding import derived_seed
 from stimside.util.stim_workarounds import broadcast_pauli_errors
 from stimside.util.sync_rng import (
@@ -1892,7 +1892,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             if len(shots_for_q) == 0:
                 continue
 
-            aw, bw, kap = _pauli_image(pauli, q, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa)
+            aw, bw, kap = pauli_image(pauli, q, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa)
             a_is_zero, sign_bool, rot = self._projection_words(aw, bw, kap)
             ref_exp = -1 if sign_bool else 1
 
@@ -1970,7 +1970,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         any_x_kick = False
         any_z_kick = False
 
-        aw, bw, kap = _pauli_image(pauli, q, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa)
+        aw, bw, kap = pauli_image(pauli, q, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa)
         _, sign_bool, rot = self._projection_words(aw, bw, kap)
 
         for b_np in shots_for_q:
@@ -2020,6 +2020,8 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         pauli: Literal["X", "Y", "Z"] = "Z",
     ) -> NDArray[np.int8]:
         """Return exact single-qubit Pauli expectations (+1, -1, or 0) of shape (len(targets), batch_size) via Q1."""
+        if pauli not in ("X", "Y", "Z"):
+            raise ValueError(f"Unrecognised Pauli: {pauli}")
         targets_arr = np.ascontiguousarray(targets, dtype=np.int64)
         if len(targets_arr) == 0:
             return np.zeros((0, self.batch_size), dtype=np.int8)
@@ -2054,37 +2056,16 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             )
             return out
 
-        if pauli == "Z":
-            f_comm_mat = xs_base[targets_arr, :]
-            a_words_all = z2x_w[targets_arr]
-            b_words_all = z2z_w[targets_arr]
-            kappas = z_kappa[targets_arr]
-        elif pauli == "X":
-            f_comm_mat = zs_base[targets_arr, :]
-            a_words_all = x2x_w[targets_arr]
-            b_words_all = x2z_w[targets_arr]
-            kappas = x_kappa[targets_arr]
-        elif pauli == "Y":
-            f_comm_mat = xs_base[targets_arr, :] ^ zs_base[targets_arr, :]
-            a_words_all = x2x_w[targets_arr] ^ z2x_w[targets_arr]
-            b_words_all = x2z_w[targets_arr] ^ z2z_w[targets_arr]
-            dp = (
-                np.bitwise_count(
-                    x2z_w[targets_arr] & z2x_w[targets_arr]
-                ).sum(axis=1, dtype=np.int32)
-                & 1
-            )
-            kappas = (
-                (
-                    1
-                    + x_kappa[targets_arr].astype(np.int32)
-                    + z_kappa[targets_arr].astype(np.int32)
-                    + (dp << 1)
-                )
-                & 3
-            ).astype(np.uint8)
-        else:
-            raise ValueError(f"Unrecognised Pauli: {pauli}")
+        f_comm_mat = (
+            xs_base[targets_arr, :]
+            if pauli == "Z"
+            else zs_base[targets_arr, :]
+            if pauli == "X"
+            else (xs_base[targets_arr, :] ^ zs_base[targets_arr, :])
+        )
+        a_words_all, b_words_all, kappas = pauli_image_batch(
+            pauli, targets_arr, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa
+        )
 
         a_is_zero = ~np.any(a_words_all != 0, axis=1)
         signs_bool = (kappas & 3) == 2

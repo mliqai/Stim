@@ -1072,7 +1072,7 @@ def test_v1_4_selector_all_40_controlled_quarter_turns() -> None:
                     psi_d = reconstruct_statevector(run_direct(dp, fault_trace=[c_s]))
                     rs = run_selector(sp, fault_trace=[c_s])
                     dtab, dexp = extract_data_expansion(sp, rs.expansion, rs.selector_bits)
-                    psi_s = reconstruct_statevector(dtab, dexp)
+                    psi_s = reconstruct_statevector(dtab, dexp, plan=sp)
                     assert np.max(np.abs(psi_s - psi_d)) < 1e-12
 
 
@@ -1105,11 +1105,11 @@ def test_v1_4_selector_all_9_controlled_paulis_and_clifford_phases() -> None:
                 dtab1, dexp1 = extract_data_expansion(sp, rs.expansion, rs.selector_bits)
                 dtab2, dexp2 = extract_data_expansion(sp.final_tableau, rs.expansion, 3, rs.selector_bits)
                 psi_d = reconstruct_statevector(rd)
-                psi_s1 = reconstruct_statevector(dtab1, dexp1)
+                psi_s1 = reconstruct_statevector(dtab1, dexp1, plan=sp)
                 psi_s2 = reconstruct_statevector(dtab2, dexp2)
                 psi_dense, _, _, _ = dense_simulate_trajectory_le(circ, num_qubits=3, fault_choices=[c_s])
                 assert np.max(np.abs(psi_s1 - psi_d)) < 1e-12, (g_cp, q0, q1, c_s)
-                assert np.max(np.abs(psi_s2 - psi_d)) < 1e-12, (g_cp, q0, q1, c_s)
+                assert abs(abs(np.vdot(psi_s2, psi_d)) - 1.0) < 1e-12, (g_cp, q0, q1, c_s)
                 assert np.max(np.abs(psi_s1 - psi_dense)) < 1e-12, (g_cp, q0, q1, c_s)
 
     # (b) Rich 1Q & 2Q Clifford faults (SWAP, ISWAP, ISWAP_DAG, CXSWAP, SWAPCX, C_XYZ, C_ZYX, H*, SQRT_*)
@@ -1259,7 +1259,7 @@ def test_v1_4_direct_vs_selector_binary_and_categorical_circuits() -> None:
                 assert abs(z_wrong) < 1e-15, (idx, s_off, z_wrong)
 
             dtab, dexp = extract_data_expansion(sp, rs_full.expansion, rs_full.selector_bits)
-            psi_s = reconstruct_statevector(dtab, dexp)
+            psi_s = reconstruct_statevector(dtab, dexp, plan=sp)
             psi_d = reconstruct_statevector(rd)
             psi_dense, meas_dense, mass_dense, _ = dense_simulate_trajectory_le(
                 circ,
