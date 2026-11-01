@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
+from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 
@@ -72,3 +75,62 @@ def apply_coords_op(
                 coords_shifts[i] += s
         return True
     return False
+
+
+def stack_measurement_columns(columns: list[NDArray[np.bool_]], batch_size: int) -> NDArray[np.bool_]:
+    return np.zeros((batch_size, 0), dtype=np.bool_) if not columns else np.column_stack(columns)
+
+
+def pack_shot_flips(
+    flips: NDArray[np.bool_], *, bit_packed: bool = False, copy_unpacked: bool = False
+) -> NDArray[np.bool_] | NDArray[np.uint8]:
+    if bit_packed:
+        return np.packbits(flips, axis=-1, bitorder="little")
+    return flips.copy() if copy_unpacked else flips
+
+
+def format_detector_flips(
+    dets: NDArray[np.bool_],
+    obs: NDArray[np.bool_] | None,
+    *,
+    append_observables: bool = False,
+    bit_packed: bool = False,
+    copy_unpacked: bool = False,
+) -> NDArray[np.bool_] | NDArray[np.uint8]:
+    if append_observables and obs is not None:
+        out = np.hstack([dets, obs])
+        return np.packbits(out, axis=-1, bitorder="little") if bit_packed else out
+    return pack_shot_flips(dets, bit_packed=bit_packed, copy_unpacked=copy_unpacked)
+
+
+class ShotMajorM2DMixin:
+    """Shared shot-major m2d conversion and ``get_detector_flips`` / ``get_observable_flips``."""
+
+    _detector_flips: NDArray[np.bool_] | None
+    _observable_flips: NDArray[np.bool_] | None
+    _compiled_m2d_converter: Any
+
+    def get_final_measurement_records(self) -> NDArray[np.bool_]:
+        raise NotImplementedError
+
+    def _convert_measurements_to_detector_flips(self) -> None:
+        self._detector_flips, self._observable_flips = self._compiled_m2d_converter.convert(
+            measurements=self.get_final_measurement_records(), separate_observables=True
+        )
+
+    def get_detector_flips(
+        self, append_observables: bool = False, *, bit_packed: bool = False
+    ) -> NDArray[np.bool_] | NDArray[np.uint8]:
+        if self._detector_flips is None:
+            self._convert_measurements_to_detector_flips()
+        assert self._detector_flips is not None
+        return format_detector_flips(
+            self._detector_flips, self._observable_flips,
+            append_observables=append_observables, bit_packed=bit_packed,
+        )
+
+    def get_observable_flips(self, *, bit_packed: bool = False) -> NDArray[np.bool_] | NDArray[np.uint8]:
+        if self._observable_flips is None:
+            self._convert_measurements_to_detector_flips()
+        assert self._observable_flips is not None
+        return pack_shot_flips(self._observable_flips, bit_packed=bit_packed)

@@ -47,9 +47,6 @@ def pauli_image(pauli, q, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa):
     )
 
 
-_pauli_image = pauli_image
-
-
 def pauli_image_batch(pauli, targets_arr, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa):
     """Batched reference-frame image (a_words, b_words, kappas) for targets_arr."""
     if pauli == "Z":

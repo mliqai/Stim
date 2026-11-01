@@ -927,8 +927,8 @@ class TestCompiledLeakageUint8Coset:
         st_big.check_invariants()
 
     def test_reference_chp_peek_pauli_expectation_readonly(self) -> None:
-        """Verify read-only Pauli expectation accumulation via _pauli_image leaves tableau unchanged."""
-        from stimside.util.reference_chp import ReferenceCHPTableau, _pauli_image
+        """Verify read-only Pauli expectation accumulation via pauli_image leaves tableau unchanged."""
+        from stimside.util.reference_chp import ReferenceCHPTableau, pauli_image
 
         def _peek_pauli_expectation(
             chp: ReferenceCHPTableau, pauli_terms: list[tuple[int, str]]
@@ -938,7 +938,7 @@ class TestCompiledLeakageUint8Coset:
             kap_acc = 0
             tabs = (chp.x2x, chp.x2z, chp.z2x, chp.z2z, chp.x_kap, chp.z_kap)
             for q, p_char in pauli_terms:
-                aw_t, bw_t, kap_t = _pauli_image(p_char.upper(), q, *tabs)
+                aw_t, bw_t, kap_t = pauli_image(p_char.upper(), q, *tabs)
                 dp_acc = int(np.bitwise_count(bw_acc & aw_t).sum()) & 1
                 aw_acc ^= aw_t
                 bw_acc ^= bw_t

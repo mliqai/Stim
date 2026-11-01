@@ -38,7 +38,14 @@ from stimside.util.bitwords import (
     word_dot_parity,
     words_any_nonzero,
 )
-from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
+from stimside.util.circuit import (
+    apply_coords_op,
+    format_detector_flips,
+    pack_shot_flips,
+    replays,
+    stack_measurement_columns,
+    unroll_circuit,
+)
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.reference_chp import ReferenceCHPTableau
 from stimside.util.seeding import derived_seed
@@ -568,9 +575,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._fire_fault_channel_live(slot_idx, ch)
 
     def _emit_magic_op(self, op: stim.CircuitInstruction, qs: Sequence[int] | None = None) -> None:
-        tmp: list[Any] = []
-        _emit_magic_terms(op.tag, validate_magic_op(op) if qs is None else qs, self._live_ref_tab, tmp)
-        self._pending_magic.extend(r for r in tmp if isinstance(r, MagicTermRecord))
+        _emit_magic_terms(
+            op.tag, validate_magic_op(op) if qs is None else qs, self._live_ref_tab, self._pending_magic
+        )
         self._next_step_meta(op)
 
     def _do_bare_instruction(self, op: stim.Circuit | stim.CircuitInstruction) -> None:
@@ -674,6 +681,13 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         _, z1_r = project_diagonal(work, bd, sg, 1)
         return min(1.0, max(0.0, float(z1_r) / z_in))
 
+    def _sample_sync_born_bit(self, b: int, p1: float) -> int:
+        return (
+            int(self._draw_tab_rng_bit(b))
+            if abs(p1 - 0.5) <= 1e-12
+            else int(self._shot_np_rngs[b].random() < p1)  # type: ignore[index]
+        )
+
     def _project_substep_batch(self, rec: MeasurementRecord | ResetRecord) -> NDArray[np.bool_]:
         m_shots = np.zeros(self.batch_size, dtype=np.bool_)
         obs = rec.obs_axis
@@ -688,11 +702,19 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 if isinstance(rec, ResetRecord) and (bool(bit) != rec.reset_flip_ref):
                     self._live_exps[b] = apply_pauli(exp, rec.reset_kick_axis)
                 continue
-            req_b: int | None = None
-            if self._tab_rngs is not None:
-                p1 = self._obs_p1(exp, obs)
-                req_b = 0 if p1 <= K1_CANCEL_REL_TOL else (1 if p1 >= 1.0 - K1_CANCEL_REL_TOL else (int(self._draw_tab_rng_bit(b)) if abs(p1 - 0.5) <= 1e-12 else int(self._shot_np_rngs[b].random() < p1)))  # type: ignore[index]
-            m_res = measure_expansion(exp, obs, rng=self.np_rng, requested_bit=req_b, renormalize=True, keep_rotated_frame=(rec.rot_axis is not None), atol=self.atol)
+            sampler = (
+                None
+                if self._tab_rngs is None
+                else lambda p1, s=b: (
+                    0
+                    if p1 <= K1_CANCEL_REL_TOL
+                    else (1 if p1 >= 1.0 - K1_CANCEL_REL_TOL else self._sample_sync_born_bit(s, p1))
+                )
+            )
+            m_res = measure_expansion(
+                exp, obs, rng=self.np_rng, sample_outcome=sampler,
+                renormalize=True, keep_rotated_frame=(rec.rot_axis is not None), atol=self.atol,
+            )
             post = m_res.post_state
             zin = m_res.z0 + m_res.z1
             if zin > 0.0:
@@ -965,7 +987,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 if pb <= 1e-12 or pb >= 1.0 - 1e-12:
                     m_b = int(pb >= 1.0 - 1e-12)
                 else:
-                    m_b = (int(self._draw_tab_rng_bit(b)) if abs(pb - 0.5) <= 1e-12 else int(self._shot_np_rngs[b].random() < pb)) if self._tab_rngs is not None else int(float(self.np_rng.random()) < pb)  # type: ignore[index]
+                    m_b = self._sample_sync_born_bit(b, pb) if self._tab_rngs is not None else int(float(self.np_rng.random()) < pb)
                     m_res = measure_expansion(self._live_exps[b], obs, requested_bit=m_b, renormalize=True, keep_rotated_frame=False, atol=self.atol)
                     self._live_exps[b] = m_res.post_state
                 if m_b != int(reset_one_mask[q, b]) and self._live_exps[b].chi > 0:
@@ -980,7 +1002,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def get_final_measurement_records(self) -> NDArray[np.bool_]:
         if not self._finished_running_circuit:
             raise RuntimeError("Run not finished; call run() or finish_interactive_run() first.")
-        return np.empty((self.batch_size, 0), dtype=np.bool_) if not self._measurement_columns else np.column_stack(self._measurement_columns)
+        return stack_measurement_columns(self._measurement_columns, self.batch_size)
 
     def _compute_noiseless_magic_ref(self, sweep_row: NDArray[np.bool_] | None) -> NDArray[np.bool_]:
         key = b"" if sweep_row is None else np.asarray(sweep_row, dtype=np.bool_).tobytes()
@@ -1040,16 +1062,14 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self, *, append_observables: bool = False, sweep_bits: Any = None, bit_packed: bool = False
     ) -> NDArray[np.bool_] | NDArray[np.uint8]:
         dets, obs = self._convert_m2d(sweep_bits)
-        if append_observables:
-            out = np.hstack([dets, obs])
-            return np.packbits(out, axis=-1, bitorder="little") if bit_packed else out
-        return np.packbits(dets, axis=-1, bitorder="little") if bit_packed else dets.copy()
+        return format_detector_flips(
+            dets, obs, append_observables=append_observables, bit_packed=bit_packed, copy_unpacked=True
+        )
 
     def get_observable_flips(
         self, *, sweep_bits: Any = None, bit_packed: bool = False
     ) -> NDArray[np.bool_] | NDArray[np.uint8]:
-        obs = self._convert_m2d(sweep_bits)[1]
-        return np.packbits(obs, axis=-1, bitorder="little") if bit_packed else obs.copy()
+        return pack_shot_flips(self._convert_m2d(sweep_bits)[1], bit_packed=bit_packed, copy_unpacked=True)
 
     def _validate_shot_idx(self, shot: int) -> int:
         s = int(shot) + (self.batch_size if int(shot) < 0 else 0)

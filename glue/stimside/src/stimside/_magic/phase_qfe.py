@@ -9,7 +9,7 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 import math
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -1444,6 +1444,7 @@ def measure_expansion(
     sigma: int | None = None,
     rng: np.random.Generator | None = None,
     requested_bit: int | None = None,
+    sample_outcome: Callable[[float], int] | None = None,
     p_flip: float = 0.0,
     invert_result: bool = False,
     renormalize: bool = True,
@@ -1475,8 +1476,14 @@ def measure_expansion(
     exp0, z0, exp1, z1, z, _, rot = born_split_expansion(expansion, a_w, b_w, kap, atol=tol)
 
     zero_floor = K1_CANCEL_REL_TOL * z
-    if requested_bit is not None:
-        outcome = int(requested_bit)
+    if requested_bit is not None or sample_outcome is not None:
+        if requested_bit is None:
+            if z <= 0.0 or (z0 + z1) <= 0.0:
+                raise ImpossiblePostselectionError("Cannot sample measurement from a zero-norm expansion")
+            assert sample_outcome is not None
+            outcome = int(sample_outcome(min(1.0, max(0.0, z1 / z))))
+        else:
+            outcome = int(requested_bit)
         chosen_z, chosen_exp = (z0, exp0) if outcome == 0 else (z1, exp1)
         if z <= 0.0 or chosen_z <= zero_floor or chosen_exp.chi == 0:
             raise ImpossiblePostselectionError(

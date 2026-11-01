@@ -28,7 +28,13 @@ from stimside.util.bitwords import (
     words_any_nonzero as _words_any_nonzero,
     words_any_overlap as _words_any_overlap,
 )
-from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
+from stimside.util.circuit import (
+    ShotMajorM2DMixin,
+    apply_coords_op,
+    replays,
+    stack_measurement_columns,
+    unroll_circuit,
+)
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.reference_chp import PackedSymplecticTables, pauli_image, pauli_image_batch
 from stimside.util.seeding import derived_seed
@@ -49,7 +55,9 @@ _REC_FIRST_PAULI = {"CX": "X", "CNOT": "X", "ZCX": "X", "CY": "Y", "ZCY": "Y"}
 _REC_SECOND_PAULI = {"XCZ": "X", "YCZ": "Y"}
 
 
-class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixin):
+class CosetsideSimulator(
+    ShotMajorM2DMixin, UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixin
+):
     """High-performance batched Clifford-error & stabilizer simulator via Moving-Reference Quadratic Forms (MRQF).
 
     Combines:
@@ -1925,46 +1933,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if not self._finished_running_circuit:
             raise RuntimeError("The circuit has not been fully run yet.")
         if self._final_measurement_records is None:
-            if len(self._measurement_columns) == 0:
-                self._final_measurement_records = np.zeros(
-                    (self.batch_size, 0), dtype=np.bool_
-                )
-            else:
-                self._final_measurement_records = np.column_stack(
-                    self._measurement_columns
-                )
-        return self._final_measurement_records
-
-    def _convert_measurements_to_detector_flips(self) -> None:
-        records = self.get_final_measurement_records()
-        self._detector_flips, self._observable_flips = (
-            self._compiled_m2d_converter.convert(
-                measurements=records,
-                separate_observables=True,
+            self._final_measurement_records = stack_measurement_columns(
+                self._measurement_columns, self.batch_size
             )
-        )
-
-    def get_detector_flips(
-        self, append_observables: bool = False, *, bit_packed: bool = False
-    ) -> NDArray[np.bool_] | NDArray[np.uint8]:
-        if self._detector_flips is None:
-            self._convert_measurements_to_detector_flips()
-        assert self._detector_flips is not None
-        out = (
-            np.hstack([self._detector_flips, self._observable_flips])
-            if append_observables and self._observable_flips is not None
-            else self._detector_flips
-        )
-        return np.packbits(out, axis=-1, bitorder="little") if bit_packed else out
-
-    def get_observable_flips(
-        self, *, bit_packed: bool = False
-    ) -> NDArray[np.bool_] | NDArray[np.uint8]:
-        if self._observable_flips is None:
-            self._convert_measurements_to_detector_flips()
-        assert self._observable_flips is not None
-        return (
-            np.packbits(self._observable_flips, axis=-1, bitorder="little")
-            if bit_packed
-            else self._observable_flips
-        )
+        return self._final_measurement_records

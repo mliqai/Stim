@@ -38,12 +38,12 @@ from stimside.util.bitwords import (
     word_dot_parity_batch,
     words_any_nonzero,
 )
-import stimside._magic.phase_qfe as _pq
 from stimside._magic.phase_qfe import (
     DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep,
     ImpossiblePostselectionError, ShotExpansion,
     _apply_local_unitary_c128, apply_compiled_block, apply_pauli, apply_quarter_turn,
-    apply_reference_tableau_to_statevector, born_split_expansion, merge_frames, project_diagonal, validate_atol,
+    apply_reference_tableau_to_statevector, born_split_expansion, measure_expansion,
+    merge_frames, project_diagonal, validate_atol,
 )
 from stimside.util.reference_chp import DetMeasMeta, RandMeasMeta, ReferenceCHPTableau
 
@@ -879,7 +879,7 @@ def _emit_magic_terms(
     tag: str,
     qs: Sequence[int],
     ref_chp: ReferenceCHPTableau,
-    out_records: list[CompiledRecord],
+    out_records: list[Any],
 ) -> None:
     if tag in ("T", "T_DAG"):
         eps = 1 if tag == "T" else -1
@@ -1899,7 +1899,7 @@ def _measure_with_readout_and_postselection(
         return exp, q_out, rep_bit, bool(int(rep_bit) ^ q_out ^ iota), (0.0, 0.0, 0.0), True
 
     if fixed_classical is None:
-        m_res = _pq.measure_expansion(
+        m_res = measure_expansion(
             exp, obs_axis, rng=rng, requested_bit=req_q, p_flip=p, invert_result=invert_result,
             renormalize=True, keep_rotated_frame=True, atol=atol,
         )

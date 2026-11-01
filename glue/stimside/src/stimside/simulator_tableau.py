@@ -13,7 +13,7 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageTransition1Params,
     LeakageTransition2Params,
 )
-from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
+from stimside.util.circuit import ShotMajorM2DMixin, apply_coords_op, replays, unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.seeding import derived_seed
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
@@ -27,7 +27,9 @@ _STANDARD_LEAKAGE_PARAM_TYPES = (
 )
 
 
-class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixin):
+class TablesideSimulator(
+    ShotMajorM2DMixin, UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixin
+):
     """A convenient correlated error simulator based on stim.TableauSimulator.
 
     Inherits the advantages and disadvantages of a tableau simulator:
@@ -573,36 +575,3 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 flips = self.np_rng.random(self.batch_size) < prob_flip
                 self._final_measurement_records[:, meas_idx] ^= flips
         return self._final_measurement_records
-    
-    def _convert_measurements_to_detector_flips(self) -> None:
-        if not self._finished_running_circuit:
-            raise RuntimeError("Have not finished running the circuit.")
-        self._detector_flips, self._observable_flips = self._compiled_m2d_converter.convert(
-            measurements=self.get_final_measurement_records(),
-            separate_observables=True,
-        )
-
-    def get_detector_flips(
-        self, append_observables: bool = False, *, bit_packed: bool = False
-    ) -> NDArray[np.bool_] | NDArray[np.uint8]:
-        if self._detector_flips is None:
-            self._convert_measurements_to_detector_flips()
-        assert self._detector_flips is not None
-        out = (
-            np.hstack([self._detector_flips, self._observable_flips])
-            if append_observables and self._observable_flips is not None
-            else self._detector_flips
-        )
-        return np.packbits(out, axis=-1, bitorder="little") if bit_packed else out
-
-    def get_observable_flips(
-        self, *, bit_packed: bool = False
-    ) -> NDArray[np.bool_] | NDArray[np.uint8]:
-        if self._observable_flips is None:
-            self._convert_measurements_to_detector_flips()
-        assert self._observable_flips is not None
-        return (
-            np.packbits(self._observable_flips, axis=-1, bitorder="little")
-            if bit_packed
-            else self._observable_flips
-        )
