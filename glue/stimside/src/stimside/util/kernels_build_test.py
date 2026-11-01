@@ -11,7 +11,13 @@ from unittest import mock
 import pytest
 
 import stimside
-from stimside.util import _kernel_loader, coset_kernels, magic_kernels, marginal_dem_kernels, tableside_kernels
+from stimside._native import (
+    _kernel_loader,
+    coset_kernels,
+    magic_kernels,
+    marginal_dem_kernels,
+    tableside_kernels,
+)
 
 KERNELS = pytest.mark.parametrize(
     "mod,name",
@@ -106,7 +112,7 @@ def test_prebuilt_kernels_load_without_runtime_subprocess(mod, name) -> None:
 def test_wheel_install_resolution_ignores_cpp_mtime_and_missing_cpp(
     mod, name, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake_pkg = tmp_path / "site-packages" / "stimside" / "util"
+    fake_pkg = tmp_path / "site-packages" / "stimside" / "_native"
     fake_pkg.mkdir(parents=True)
     shutil.copy2(_resolve(mod, name), fake_pkg / f"lib{name}.so")
     monkeypatch.setattr(mod, "__file__", str(fake_pkg / f"{name}.py"))
@@ -118,14 +124,14 @@ def test_wheel_install_resolution_ignores_cpp_mtime_and_missing_cpp(
 def test_source_tree_discovers_prebuilt_so_from_sys_path_without_subprocess(
     mod, name, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake_site_util = tmp_path / "installed_site" / "stimside" / "util"
-    fake_site_util.mkdir(parents=True)
-    shutil.copy2(_resolve(mod, name), fake_site_util / f"lib{name}.so")
-    fake_src_util = tmp_path / "repo" / "src" / "stimside" / "util"
-    fake_src_util.mkdir(parents=True)
+    fake_site_native = tmp_path / "installed_site" / "stimside" / "_native"
+    fake_site_native.mkdir(parents=True)
+    shutil.copy2(_resolve(mod, name), fake_site_native / f"lib{name}.so")
+    fake_src_native = tmp_path / "repo" / "src" / "stimside" / "_native"
+    fake_src_native.mkdir(parents=True)
     (tmp_path / "repo" / "setup.py").write_text("# dummy\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path / "installed_site"))
-    monkeypatch.setattr(mod, "__file__", str(fake_src_util / f"{name}.py"))
+    monkeypatch.setattr(mod, "__file__", str(fake_src_native / f"{name}.py"))
     with _forbid_subprocess("subprocess.run should not be called when prebuilt .so is on sys.path"):
         assert _resolve(mod, name).exists()
 
@@ -134,10 +140,10 @@ def test_source_tree_discovers_prebuilt_so_from_sys_path_without_subprocess(
 def test_missing_so_and_cpp_raises_clear_file_not_found(
     mod, name, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    empty_util = tmp_path / "empty_util"
-    empty_util.mkdir(parents=True)
+    empty_native = tmp_path / "empty_native"
+    empty_native.mkdir(parents=True)
     monkeypatch.setattr(mod, "_find_prebuilt_so_candidate", lambda *a, **kw: None)
-    monkeypatch.setattr(mod, "__file__", str(empty_util / f"{name}.py"))
+    monkeypatch.setattr(mod, "__file__", str(empty_native / f"{name}.py"))
     with pytest.raises(FileNotFoundError, match="pip install"):
         _resolve(mod, name)
 
@@ -145,11 +151,11 @@ def test_missing_so_and_cpp_raises_clear_file_not_found(
 def _stale_tiny_library(tmp_path: Path) -> tuple[functools.partial[Path], Path]:
     # A prebuilt library from an older layout, not older than the .cpp (so only the sentinel
     # can tell).
-    util = tmp_path / "src" / "stimside" / "util"
-    util.mkdir(parents=True)
+    native = tmp_path / "src" / "stimside" / "_native"
+    native.mkdir(parents=True)
     (tmp_path / "setup.py").write_text("# dummy\n", encoding="utf-8")
-    cpp = util / "tiny.cpp"
-    resolve = functools.partial(_kernel_loader.resolve_so, str(util / "tiny.py"), "tiny")
+    cpp = native / "tiny.cpp"
+    resolve = functools.partial(_kernel_loader.resolve_so, str(native / "tiny.py"), "tiny")
     cpp.write_text('extern "C" int tiny_abi_v1() { return 1; }\n', encoding="utf-8")
     so = resolve(force_recompile=True)
     cpp.write_text('extern "C" int tiny_abi_v2() { return 2; }\n', encoding="utf-8")
@@ -175,22 +181,22 @@ def test_stale_library_that_stays_loaded_raises_instead_of_being_used(tmp_path: 
 def test_loader_uses_hidden_tmp_so_and_never_uses_system_tempdir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    util = tmp_path / "src" / "stimside" / "util"
-    util.mkdir(parents=True)
+    native = tmp_path / "src" / "stimside" / "_native"
+    native.mkdir(parents=True)
     (tmp_path / "setup.py").write_text("# dummy\n", encoding="utf-8")
-    cpp = util / "tiny2.cpp"
+    cpp = native / "tiny2.cpp"
     cpp.write_text('extern "C" int tiny2_abi_v1() { return 1; }\n', encoding="utf-8")
 
     # 1. find_prebuilt_so must ignore both hidden .lib*.tmp.so and anything in tempfile.gettempdir().
     fake_tmp = tmp_path / "fake_sys_tmp"
     fake_tmp.mkdir()
     (fake_tmp / "libtiny2.so").write_bytes(b"bad")
-    (util / ".libtiny2.999.tmp.so").write_bytes(b"partial")
+    (native / ".libtiny2.999.tmp.so").write_bytes(b"partial")
     monkeypatch.setenv("TMPDIR", str(fake_tmp))
     import tempfile
 
     monkeypatch.setattr(tempfile, "tempdir", str(fake_tmp))
-    assert _kernel_loader.find_prebuilt_so(util, "libtiny2", cpp) is None
+    assert _kernel_loader.find_prebuilt_so(native, "libtiny2", cpp) is None
 
     # 2. Compilation writes to a dot-prefixed temp file invisible to find_prebuilt_so.
     seen_out: list[str] = []
@@ -202,17 +208,17 @@ def test_loader_uses_hidden_tmp_so_and_never_uses_system_tempdir(
         return real_run(cmd, *a, **kw)
 
     with mock.patch.object(subprocess, "run", side_effect=spy_run):
-        so = _kernel_loader.resolve_so(str(util / "tiny2.py"), "tiny2", force_recompile=True)
-    assert so == util / "libtiny2.so"
+        so = _kernel_loader.resolve_so(str(native / "tiny2.py"), "tiny2", force_recompile=True)
+    assert so == native / "libtiny2.so"
     assert seen_out and all(n.startswith(".libtiny2.") for n in seen_out)
-    assert list(util.glob("*lock*")) == []
+    assert list(native.glob("*lock*")) == []
 
     # 3. Unwritable package dir with missing .so raises instead of falling back to /tmp.
     so.unlink()
     monkeypatch.setattr(os, "access", lambda p, mode: False)
     with _forbid_subprocess("must not compile into /tmp when package dir is read-only"):
         with pytest.raises(PermissionError, match="pip install"):
-            _kernel_loader.resolve_so(str(util / "tiny2.py"), "tiny2")
+            _kernel_loader.resolve_so(str(native / "tiny2.py"), "tiny2")
 
 
 def test_coset_kernels_exports_and_checks_abi_sentinel() -> None:

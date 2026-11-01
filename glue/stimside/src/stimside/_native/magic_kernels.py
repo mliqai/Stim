@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from stimside.util._kernel_loader import (
+from stimside._native._kernel_loader import (
     find_prebuilt_so as _find_prebuilt_so_candidate,
     load_cdll,
     resolve_so,

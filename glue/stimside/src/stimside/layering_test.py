@@ -26,6 +26,8 @@ ALLOWLIST: set[tuple[str, str]] = {
     ("stimside.util.magic_compile", "stimside.op_handlers.leakage_handlers.common_parsing"),
     ("stimside.util.magic_compile", "stimside.op_handlers.leakage_handlers.leakage_parameters"),
     ("stimside.util.magic_compile", "stimside.op_handlers.leakage_handlers.tag_registry"),
+    ("stimside.util.phase_qfe", "stimside._native.magic_kernels"),
+    ("stimside.util.tableside_kernels", "stimside._native.tableside_kernels"),
     ("stimside.util.tableside_kernels", "stimside.op_handlers.leakage_handlers.leakage_parameters"),
     ("stimside.util.tableside_kernels", "stimside.op_handlers.leakage_handlers.tag_registry"),
 }

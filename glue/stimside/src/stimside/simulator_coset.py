@@ -9,7 +9,7 @@ import stim  # type: ignore[import-untyped]
 
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
 from stimside.util.circuit import apply_coords_op
-from stimside.util.coset_kernels import (
+from stimside._native.coset_kernels import (
     get_coset_kernels_lib,
     i8_p,
     i32_p,

@@ -126,7 +126,7 @@ def _get_cpp_lib() -> ctypes.CDLL:
     global _CACHED_MAGIC_LIB
     if _CACHED_MAGIC_LIB is not None:
         return _CACHED_MAGIC_LIB
-    from stimside.util import magic_kernels as mk  # type: ignore[import-not-found]
+    from stimside._native import magic_kernels as mk
 
     _CACHED_MAGIC_LIB = mk.get_magic_kernels_lib()
     return _CACHED_MAGIC_LIB

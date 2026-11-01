@@ -1,4 +1,4 @@
-"""Unit and C-ABI parity tests for `stimside.util.magic_kernels` (`libmagic_kernels.so`)."""
+"""Unit and C-ABI parity tests for `stimside._native.magic_kernels` (`libmagic_kernels.so`)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import stim
 
-from stimside.util import magic_kernels as mk
+from stimside._native import magic_kernels as mk
 from stimside.util import phase_qfe as pq
 from stimside.util.magic_compile import (
     compile_direct,
@@ -75,20 +75,20 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
         pq.apply_pauli(exp, [1, 0], [0, 0], 0)
         assert pq._CACHED_MAGIC_LIB is not None and pq._CACHED_MAGIC_LIB is lib1
 
-        tmp_util = tmp_path / "rebuild_pkg" / "src" / "stimside" / "util"
-        tmp_util.mkdir(parents=True)
+        tmp_native = tmp_path / "rebuild_pkg" / "src" / "stimside" / "_native"
+        tmp_native.mkdir(parents=True)
         (tmp_path / "rebuild_pkg" / "setup.py").write_text("# dummy\n", encoding="utf-8")
         stub_cpp = (
             'extern "C" {\nint magic_abi_v1() { return 1; }\n'
             + "".join(f"void {s}() {{}}\n" for s in EXPECTED_SYMBOLS if s != "magic_abi_v1")
             + "}\n"
         )
-        (tmp_util / "magic_kernels.cpp").write_text(stub_cpp, encoding="utf-8")
+        (tmp_native / "magic_kernels.cpp").write_text(stub_cpp, encoding="utf-8")
         with monkeypatch.context() as mp:
-            mp.setattr(mk, "__file__", str(tmp_util / "magic_kernels.py"))
+            mp.setattr(mk, "__file__", str(tmp_native / "magic_kernels.py"))
             mp.setattr(mk, "_find_prebuilt_so_candidate", lambda *a, **kw: None)
             rebuilt = mk.get_magic_kernels_lib(force_recompile=True)
-            assert (tmp_util / "libmagic_kernels.so").is_file()
+            assert (tmp_native / "libmagic_kernels.so").is_file()
             assert rebuilt is not lib1 and rebuilt._handle != lib1._handle
             assert mk._LIB_INSTANCE is rebuilt
             assert int(rebuilt.magic_abi_v1()) == 1

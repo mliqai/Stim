@@ -1,4 +1,4 @@
-"""Shared locate-or-compile logic for the ctypes kernel libraries (coset / tableside / marginal_dem)."""
+"""Shared locate-or-compile logic for the ctypes kernel libraries (coset / tableside / marginal_dem / magic)."""
 
 from __future__ import annotations
 
@@ -21,18 +21,19 @@ def find_prebuilt_so(here: Path, lib_stem: str, cpp_path: Path) -> Path | None:
     patterns = (f"{lib_stem}.so", f"{lib_stem}*.so", f"{lib_stem}*.dylib", f"{lib_stem}*.pyd", f"{lib_stem}*.dll")
     search_dirs: list[Path] = [here]
 
+    rel_pkg = Path(here.parent.name, here.name)
     repo_root = here.parent.parent.parent
     if (repo_root / "setup.py").exists():
         for build_dir_name in ("python_build_stimside", "build"):
             build_root = repo_root / build_dir_name
             if build_root.is_dir():
-                for sub in sorted(build_root.glob("lib*/stimside/util")):
+                for sub in sorted(build_root.glob(f"lib*/{rel_pkg.as_posix()}")):
                     search_dirs.append(sub)
 
     for sys_entry in sys.path:
         if not sys_entry:
             continue
-        candidate_dir = Path(sys_entry) / "stimside" / "util"
+        candidate_dir = Path(sys_entry) / rel_pkg
         if candidate_dir != here and candidate_dir.is_dir():
             search_dirs.append(candidate_dir)
 

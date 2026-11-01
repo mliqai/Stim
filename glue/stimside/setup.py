@@ -123,29 +123,29 @@ def _get_extensions() -> list[Extension]:
     compile_args, link_args = _get_compile_and_link_args()
     return [
         Extension(
-            name="stimside.util.libcoset_kernels",
-            sources=["src/stimside/util/coset_kernels.cpp"],
+            name="stimside._native.libcoset_kernels",
+            sources=["src/stimside/_native/coset_kernels.cpp"],
             language="c++",
             extra_compile_args=compile_args,
             extra_link_args=link_args,
         ),
         Extension(
-            name="stimside.util.libtableside_kernels",
-            sources=["src/stimside/util/tableside_kernels.cpp"],
+            name="stimside._native.libtableside_kernels",
+            sources=["src/stimside/_native/tableside_kernels.cpp"],
             language="c++",
             extra_compile_args=compile_args,
             extra_link_args=link_args,
         ),
         Extension(
-            name="stimside.util.libmarginal_dem_kernels",
-            sources=["src/stimside/util/marginal_dem_kernels.cpp"],
+            name="stimside._native.libmarginal_dem_kernels",
+            sources=["src/stimside/_native/marginal_dem_kernels.cpp"],
             language="c++",
             extra_compile_args=compile_args,
             extra_link_args=link_args,
         ),
         Extension(
-            name="stimside.util.libmagic_kernels",
-            sources=["src/stimside/util/magic_kernels.cpp"],
+            name="stimside._native.libmagic_kernels",
+            sources=["src/stimside/_native/magic_kernels.cpp"],
             language="c++",
             extra_compile_args=compile_args,
             extra_link_args=link_args,

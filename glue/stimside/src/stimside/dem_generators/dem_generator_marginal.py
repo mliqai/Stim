@@ -92,7 +92,7 @@ from stimside.util.leakage_events import (
     ShotLeakageEvents,
     unrolled_to_flattened_indices,
 )
-from stimside.util.marginal_dem_kernels import (
+from stimside._native.marginal_dem_kernels import (
     CondFireRuleC,
     MOP_BARE_1Q_UNITARY,
     MOP_BARE_NOOP,

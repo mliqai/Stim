@@ -111,7 +111,7 @@ def _decompose_dem_graphlike_cpp(
     base_dem: stim.DetectorErrorModel | None = None,
 ) -> stim.DetectorErrorModel:
     """C++ port of ``_decompose_dem_graphlike_py`` (identical output DEM)."""
-    from stimside.util.marginal_dem_kernels import (
+    from stimside._native.marginal_dem_kernels import (
         decompose_dem_text_cpp,
         dem_text_has_hyperedge_cpp,
     )
