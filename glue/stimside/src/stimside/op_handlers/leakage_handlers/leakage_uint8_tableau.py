@@ -412,7 +412,7 @@ class CompiledLeakageUint8(CompiledOpHandler[TablesideSimulator]):
         """implement conditioning on qubit (leakage) state"""
 
         if params.targets:
-            copy_len = len(params.targets) * (2 if stim.gate_data(op.name).is_two_qubit_gate else 1)
+            copy_len = len(params.targets)
             copies = split_fused_instruction(op, copy_len)
             if len(copies) > 1:
                 for sub_op in copies:
@@ -440,7 +440,6 @@ class CompiledLeakageUint8(CompiledOpHandler[TablesideSimulator]):
             tss._do_bare_instruction(op)
             return
 
-        gate_data = stim.gate_data(op.name)
         other_targets = params.targets
         if (
             any(0 in g or 1 in g for g in condition_groups)
@@ -480,68 +479,19 @@ class CompiledLeakageUint8(CompiledOpHandler[TablesideSimulator]):
         if other_targets:
             # CONDITIONED_ON_OTHER case
             raw_targets = op.targets_copy()
-            if gate_data.is_two_qubit_gate:
-                num_pairs = len(raw_targets) // 2
-                if len(other_targets) == num_pairs:
-                    pair_mask = self._filter_targets_1q_mask(
-                        list(other_targets),
-                        cast(tuple[tuple[int | str, ...]], condition_groups),
-                        tss,
-                    )
-                elif len(other_targets) == len(raw_targets):
-                    if len(condition_groups) == 1:
-                        mask = self._filter_targets_1q_mask(
-                            list(other_targets),
-                            cast(tuple[tuple[int | str, ...]], condition_groups),
-                            tss,
-                        )
-                        pair_mask = mask[0::2] & mask[1::2]
-                    else:
-                        other_pairs = [
-                            [other_targets[i], other_targets[i + 1]]
-                            for i in range(0, len(other_targets), 2)
-                        ]
-                        filtered_targets = []
-                        target_groups = op.target_groups()
-                        for p_idx in range(num_pairs):
-                            op_p = self._filter_targets_2q(
-                                [other_pairs[p_idx]],
-                                cast(
-                                    tuple[tuple[int | str, ...], tuple[int | str, ...]],
-                                    condition_groups,
-                                ),
-                                tss,
-                            )
-                            if len(op_p) > 0:
-                                filtered_targets.extend(target_groups[p_idx])
-                        pair_mask = None
-                else:
-                    raise ValueError(
-                        f"The number of targets of the {op} is not compatible with the "
-                        "number of targets specified in the CONDITIONED_ON_OTHER tag."
-                    )
-                if pair_mask is not None:
-                    target_groups = op.target_groups()
-                    filtered_targets = [
-                        t
-                        for grp, keep in zip(target_groups, pair_mask)
-                        if keep
-                        for t in grp
-                    ]
-            else:
-                if len(other_targets) != len(raw_targets):
-                    raise ValueError(
-                        f"The number of targets of the {op} is not the same as the"
-                        "number of targets specified in the CONDITIONED_ON_OTHER tag."
-                    )
-                mask = self._filter_targets_1q_mask(
-                    list(other_targets),
-                    cast(tuple[tuple[int | str, ...]], condition_groups),
-                    tss,
+            if len(other_targets) != len(raw_targets):
+                raise ValueError(
+                    f"The number of targets of the {op} is not the same as the"
+                    "number of targets specified in the CONDITIONED_ON_OTHER tag."
                 )
-                filtered_targets = [
-                    t for t, keep in zip(raw_targets, mask) if keep
-                ]
+            mask = self._filter_targets_1q_mask(
+                list(other_targets),
+                cast(tuple[tuple[int | str, ...]], condition_groups),
+                tss,
+            )
+            filtered_targets = [
+                t for t, keep in zip(raw_targets, mask) if keep
+            ]
         else:
             if len(condition_groups) == 1:
                 # CONDITIONED_ON_SELF / single-group CONDITIONED_ON case
@@ -553,19 +503,9 @@ class CompiledLeakageUint8(CompiledOpHandler[TablesideSimulator]):
                 mask = self._filter_targets_1q_mask(
                     qubit_indices, condition_groups, tss
                 )
-                if gate_data.is_two_qubit_gate:
-                    pair_mask = mask[0::2] & mask[1::2]
-                    target_groups = op.target_groups()
-                    filtered_targets = [
-                        t
-                        for grp, keep in zip(target_groups, pair_mask)
-                        if keep
-                        for t in grp
-                    ]
-                else:
-                    filtered_targets = [
-                        t for t, keep in zip(raw_targets, mask) if keep
-                    ]
+                filtered_targets = [
+                    t for t, keep in zip(raw_targets, mask) if keep
+                ]
             else:
                 # CONDITIONED_ON_PAIR case
                 target_groups = op.target_groups()
@@ -936,20 +876,12 @@ class CompiledLeakageUint8(CompiledOpHandler[TablesideSimulator]):
                     "The number of targets in the MPAD operation with a LEAKAGE_MEASUREMENT tag"
                     "does not equal to the number of targets specified in the tag."
                 )
-            if op.name != "MPAD":
-                raise ValueError(
-                    f"LEAKAGE_MEASUREMENT is only implemented for 'MPAD' operations, got {op}"
-                )
         ## The case of M with LEAKAGE_PROJECTION_Z tag
         else:
             targets = [
                 t.qubit_value if t.qubit_value is not None else t.value
                 for t in raw_op_targets
             ]
-            if op.name not in ("M", "MZ", "MR", "MRZ", "MX", "MY", "MRX", "MRY"):
-                raise ValueError(
-                    f"LEAKAGE_PROJECTION_Z is only implemented for M/MZ/MR/MRZ/MX/MY/MRX/MRY operations, got {op}"
-                )
 
         if not is_mpad and len(set(targets)) < len(targets):
             for t in raw_op_targets:

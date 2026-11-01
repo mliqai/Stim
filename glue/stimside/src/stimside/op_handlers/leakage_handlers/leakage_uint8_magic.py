@@ -14,11 +14,9 @@ from stimside.op_handlers.leakage_handlers.common_parsing import MEASURE_TAG_MAT
 from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageMeasurementParams, LeakageParams
 from stimside.op_handlers.leakage_handlers.leakage_tag_parsing_tableau import parse_leakage_tag
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import CompiledLeakageUint8Coset, LeakageUint8Coset, _do_copies_on_fused_step
-from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
+from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS, check_tag_qubits
 from stimside.simulator_magic import MagicsideSimulator
 from stimside.util.stim_workarounds import split_fused_instruction
-
-_MAGIC_TAGS: frozenset[str] = frozenset({"T", "T_DAG", "CCZ"})
 
 
 def _validate_magic_instruction(op: stim.CircuitInstruction, num_qubits: int) -> list[int]:

@@ -460,7 +460,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
         if other_targets:
             # stim fuses k identical consecutive CONDITIONED_ON_OTHER lines into one op with k times
             # the targets; each copy reuses the tag's controls.
-            copy_len = len(other_targets) * (2 if stim.gate_data(op.name).is_two_qubit_gate else 1)
+            copy_len = len(other_targets)
             copies = split_fused_instruction(op, copy_len)
             if len(copies) > 1 and not stim.gate_data(op.name).is_unitary:
                 # Noise has a no-op reference step, so loop (RNG draws as for k separate ops).
@@ -493,32 +493,10 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                                     g_idx * step_ot : (g_idx + 1) * step_ot
                                 ]
                             )
-                            if len(sub_ot) == 1:
-                                return self._filter_targets_1q_mask(
-                                    sub_ot,
-                                    cast(
-                                        tuple[tuple[int | str, ...], ...],
-                                        condition_groups,
-                                    ),
-                                    tss,
-                                )[0]
-                            if len(condition_groups) == 1:
-                                m_1q = self._filter_targets_1q_mask(
-                                    sub_ot,
-                                    cast(
-                                        tuple[tuple[int | str, ...], ...],
-                                        condition_groups,
-                                    ),
-                                    tss,
-                                )
-                                return m_1q[0] & m_1q[1]
-                            return self._filter_targets_2q_mask(
-                                [sub_ot],
+                            return self._filter_targets_1q_mask(
+                                sub_ot,
                                 cast(
-                                    tuple[
-                                        tuple[int | str, ...],
-                                        tuple[int | str, ...],
-                                    ],
+                                    tuple[tuple[int | str, ...], ...],
                                     condition_groups,
                                 ),
                                 tss,
@@ -528,14 +506,9 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                                 t.qubit_value if t.qubit_value is not None else -1
                                 for t in grp
                             ]
-                            m_1q = self._filter_targets_1q_mask(
+                            return self._filter_targets_1q_mask(
                                 sub_qs, condition_groups, tss
-                            )
-                            return (
-                                (m_1q[0] & m_1q[1])
-                                if gd.is_two_qubit_gate
-                                else m_1q[0]
-                            )
+                            )[0]
                         pair = [
                             [
                                 grp[0].qubit_value
@@ -563,70 +536,25 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                     )
                     return
         if other_targets:
-            if gd.is_two_qubit_gate:
-                num_pairs = len(raw_targets) // 2
-                if len(other_targets) == num_pairs:
-                    cond_mask = self._filter_targets_1q_mask(
-                        list(other_targets),
-                        cast(tuple[tuple[int | str, ...], ...], condition_groups),
-                        tss,
-                    )
-                elif len(other_targets) == len(raw_targets):
-                    if len(condition_groups) == 1:
-                        m_1q = self._filter_targets_1q_mask(
-                            list(other_targets),
-                            cast(
-                                tuple[tuple[int | str, ...], ...],
-                                condition_groups,
-                            ),
-                            tss,
-                        )
-                        cond_mask = m_1q[0::2, :] & m_1q[1::2, :]
-                    else:
-                        other_pairs = [
-                            [other_targets[i], other_targets[i + 1]]
-                            for i in range(0, len(other_targets), 2)
-                        ]
-                        cond_mask = self._filter_targets_2q_mask(
-                            other_pairs,
-                            cast(
-                                tuple[
-                                    tuple[int | str, ...],
-                                    tuple[int | str, ...],
-                                ],
-                                condition_groups,
-                            ),
-                            tss,
-                        )
-                else:
-                    raise ValueError(
-                        f"The number of targets of the {op} is not compatible with the "
-                        "number of targets specified in the CONDITIONED_ON_OTHER tag."
-                    )
-            else:
-                if len(other_targets) != len(raw_targets):
-                    raise ValueError(
-                        f"The number of targets of the {op} is not the same as the "
-                        "number of targets specified in the CONDITIONED_ON_OTHER tag."
-                    )
-                cond_mask = self._filter_targets_1q_mask(
-                    list(other_targets),
-                    cast(tuple[tuple[int | str, ...], ...], condition_groups),
-                    tss,
+            if len(other_targets) != len(raw_targets):
+                raise ValueError(
+                    f"The number of targets of the {op} is not the same as the "
+                    "number of targets specified in the CONDITIONED_ON_OTHER tag."
                 )
+            cond_mask = self._filter_targets_1q_mask(
+                list(other_targets),
+                cast(tuple[tuple[int | str, ...], ...], condition_groups),
+                tss,
+            )
         else:
             if len(condition_groups) == 1:
                 targets = [
                     t.qubit_value if t.qubit_value is not None else -1
                     for t in raw_targets
                 ]
-                m_1q = self._filter_targets_1q_mask(
+                cond_mask = self._filter_targets_1q_mask(
                     targets, condition_groups, tss
                 )
-                if gd.is_two_qubit_gate:
-                    cond_mask = m_1q[0::2, :] & m_1q[1::2, :]
-                else:
-                    cond_mask = m_1q
             else:
                 target_pairs = [
                     [
@@ -659,11 +587,11 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
         to_set_to_zero: NDArray[np.bool_],
         to_set_to_one: NDArray[np.bool_],
         to_depolarize: NDArray[np.bool_],
-        to_pauli_X: NDArray[np.bool_],
-        to_pauli_Y: NDArray[np.bool_],
-        to_pauli_Z: NDArray[np.bool_],
-        to_randomize_X: NDArray[np.bool_],
-        randomize_phase: NDArray[np.bool_],
+        to_pauli_X: NDArray[np.bool_] | None = None,
+        to_pauli_Y: NDArray[np.bool_] | None = None,
+        to_pauli_Z: NDArray[np.bool_] | None = None,
+        to_randomize_X: NDArray[np.bool_] | None = None,
+        randomize_phase: NDArray[np.bool_] | None = None,
     ) -> None:
         if np.any(to_set_to_zero):
             tss.do_unmatched_noisy_reset_z(
@@ -689,19 +617,19 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                 broadcast_pauli_errors(
                     tss._flip_simulator, pauli="Z", mask=to_depolarize, p=0.5, np_rng=tss.np_rng
                 )
-        if np.any(to_pauli_X):
+        if to_pauli_X is not None and np.any(to_pauli_X):
             tss._flip_simulator.broadcast_pauli_errors(
                 pauli="X", mask=to_pauli_X, p=1.0
             )
-        if np.any(to_pauli_Y):
+        if to_pauli_Y is not None and np.any(to_pauli_Y):
             tss._flip_simulator.broadcast_pauli_errors(
                 pauli="Y", mask=to_pauli_Y, p=1.0
             )
-        if np.any(to_pauli_Z):
+        if to_pauli_Z is not None and np.any(to_pauli_Z):
             tss._flip_simulator.broadcast_pauli_errors(
                 pauli="Z", mask=to_pauli_Z, p=1.0
             )
-        if np.any(to_randomize_X):
+        if to_randomize_X is not None and np.any(to_randomize_X):
             if tss._tab_rngs is not None:
                 targets_per_shot = [
                     list(np.where(to_randomize_X[:, b])[0])
@@ -714,7 +642,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                 broadcast_pauli_errors(
                     tss._flip_simulator, pauli="X", mask=to_randomize_X, p=0.5, np_rng=tss.np_rng
                 )
-        if np.any(randomize_phase):
+        if randomize_phase is not None and np.any(randomize_phase):
             if tss._tab_rngs is not None:
                 targets_per_shot = [
                     list(np.where(randomize_phase[:, b])[0])
@@ -759,20 +687,11 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
         sorted_target_indices = np.where(target_mask_1d)[0]
 
         to_depolarize = self._scratch_depolarize
-        to_pauli_X = self._scratch_pauli_X
-        to_pauli_Y = self._scratch_pauli_Y
-        to_pauli_Z = self._scratch_pauli_Z
         to_set_to_one = self._scratch_set_one
         to_set_to_zero = self._scratch_set_zero
-        randomize_phase = self._scratch_rand_phase
-        to_randomize_X = np.zeros_like(randomize_phase)
         to_depolarize.fill(False)
-        to_pauli_X.fill(False)
-        to_pauli_Y.fill(False)
-        to_pauli_Z.fill(False)
         to_set_to_one.fill(False)
         to_set_to_zero.fill(False)
-        randomize_phase.fill(False)
 
         if any(k in (0, 1) for k in params.args_by_input_state.keys()):
             self._update_state_from_peek_Z(sorted_target_indices, tss)
@@ -903,11 +822,6 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
             to_set_to_zero,
             to_set_to_one,
             to_depolarize,
-            to_pauli_X,
-            to_pauli_Y,
-            to_pauli_Z,
-            to_randomize_X,
-            randomize_phase,
         )
 
     def leakage_transition_2(
@@ -1199,17 +1113,9 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                     "The number of targets in the MPAD operation with a LEAKAGE_MEASUREMENT tag "
                     "does not equal to the number of targets specified in the tag."
                 )
-            if op.name != "MPAD":
-                raise ValueError(
-                    f"LEAKAGE_MEASUREMENT is only implemented for 'MPAD' operations, got {op}"
-                )
         else:
             targets = [t.qubit_value for t in raw_op_targets]
             inv_flags = [bool(t.is_inverted_result_target) for t in raw_op_targets]
-            if op.name not in ("M", "MZ", "MR", "MRZ", "MX", "MY", "MRX", "MRY"):
-                raise ValueError(
-                    f"LEAKAGE_PROJECTION_Z is only implemented for M/MZ/MR/MRZ/MX/MY/MRX/MRY operations, got {op}"
-                )
 
         target_leakage_state = self._state[targets, :].copy()  # (len(targets), batch_size)
         targets_arr = np.asarray(targets, dtype=np.intp)
@@ -1249,16 +1155,13 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                 tss.do_unmatched_noisy_reset_z(
                     leaked_zero_mask, self._scratch_zero_mask, pauli=basis, order=targets
                 )
+                assert tss._tab_rngs_x is not None
                 for b in range(tss.batch_size):
                     st_b = target_leakage_state[:, b]
                     if not np.any(st_b > 1):
                         continue
                     tr = tss._tab_rngs[b]
-                    tr_x = (
-                        tss._tab_rngs_x[b]
-                        if tss._tab_rngs_x is not None
-                        else None
-                    )
+                    tr_x = tss._tab_rngs_x[b]
                     max_leak_b = int(np.max(st_b))
                     for n in range(2, max_leak_b + 1):
                         if n in st_b and n in params.prob_for_input_state:
@@ -1270,8 +1173,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                                     "X_ERROR", q_n_list, [prob_n]
                                 )
                                 tr.do(inst_n)
-                                if tr_x is not None:
-                                    tr_x.do(inst_n)
+                                tr_x.do(inst_n)
                                 for k_idx, q_n in zip(idx_n, q_n_list):
                                     if tr.peek_z(q_n) == -1:
                                         tr.x(q_n)
@@ -1397,11 +1299,10 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                             1 if is_reset_meas else pauli_states[f_k, in_c]
                         )
 
+            assert tss._tab_rngs_x is not None
             for b in range(tss.batch_size):
                 tr = tss._tab_rngs[b]
-                tr_x = (
-                    tss._tab_rngs_x[b] if tss._tab_rngs_x is not None else None
-                )
+                tr_x = tss._tab_rngs_x[b]
                 st_b = target_leakage_state[:, b]
                 in_comp_b = st_b < 2
                 targets_in_q = targets_arr[in_comp_b]
@@ -1415,8 +1316,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                             "X_ERROR", t_all_q, [p0]
                         )
                         tr.do(inst_c)
-                        if tr_x is not None:
-                            tr_x.do(inst_c)
+                        tr_x.do(inst_c)
                         for k_i, q_tmp in enumerate(t_all_q):
                             if tr.peek_z(q_tmp) == -1:
                                 tr.x(q_tmp)
@@ -1433,8 +1333,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                             "X_ERROR", t_0, [p0]
                         )
                         tr.do(inst_0)
-                        if tr_x is not None:
-                            tr_x.do(inst_0)
+                        tr_x.do(inst_0)
                         for k_i, q_tmp in enumerate(t_0):
                             if tr.peek_z(q_tmp) == -1:
                                 tr.x(q_tmp)
@@ -1451,8 +1350,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                                 "X_ERROR", t_1, [prob_1_err]
                             )
                             tr.do(inst_1)
-                            if tr_x is not None:
-                                tr_x.do(inst_1)
+                            tr_x.do(inst_1)
                             for k_i, q_tmp in enumerate(t_1):
                                 if tr.peek_z(q_tmp) == -1:
                                     tr.x(q_tmp)
@@ -1471,11 +1369,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
             if has_leaked:
                 for b in range(tss.batch_size):
                     tr = tss._tab_rngs[b]
-                    tr_x = (
-                        tss._tab_rngs_x[b]
-                        if tss._tab_rngs_x is not None
-                        else None
-                    )
+                    tr_x = tss._tab_rngs_x[b]
                     st_b = target_leakage_state[:, b]
                     t_leaked_idx = np.where(st_b > 1)[0]
                     if len(t_leaked_idx) > 0:
@@ -1490,8 +1384,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                                         "X_ERROR", q_n_list, [prob_n]
                                     )
                                     tr.do(inst_n)
-                                    if tr_x is not None:
-                                        tr_x.do(inst_n)
+                                    tr_x.do(inst_n)
                                     for k_idx, q_n in zip(idx_n, q_n_list):
                                         if tr.peek_z(q_n) == -1:
                                             tr.x(q_n)

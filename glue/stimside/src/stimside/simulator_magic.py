@@ -13,6 +13,7 @@ import stim  # type: ignore[import-untyped]
 
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler, _TrivialCompiledOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageConditioningParams, LeakageMeasurementParams
+from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS
 from stimside.util.known_states import _replays, _unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.magic_compile import (
@@ -40,7 +41,6 @@ from stimside.util.reference_chp import ReferenceCHPTableau
 from stimside.util.seeding import derived_seed
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
 
-_MAGIC_TAGS: frozenset[str] = frozenset({"T", "T_DAG", "CCZ"})
 _PURE_NOISE_GATES: frozenset[str] = frozenset({
     "X_ERROR", "Y_ERROR", "Z_ERROR", "I_ERROR", "II_ERROR", "DEPOLARIZE1", "DEPOLARIZE2",
     "PAULI_CHANNEL_1", "PAULI_CHANNEL_2", "CORRELATED_ERROR", "E", "ELSE_CORRELATED_ERROR",

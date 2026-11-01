@@ -67,6 +67,8 @@ class TagDef:
 
 # --- THE REGISTRY ---
 
+MAGIC_TAGS: frozenset[str] = frozenset({"T", "T_DAG", "CCZ"})
+
 TAG_REGISTRY: dict[str, TagDef] = {
     "LEAKAGE_CONTROLLED_ERROR": TagDef(
         name="LEAKAGE_CONTROLLED_ERROR",
