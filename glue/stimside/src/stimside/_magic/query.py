@@ -1,4 +1,4 @@
-"""Section 10 `Q1`-`Q2` Global Scalar-Network Query Engine (`magic_query`, Milestone M3)."""
+"""Section 10 `Q1`-`Q2` Global Scalar-Network Query Engine (`stimside._magic.query`, Milestone M3)."""
 
 from __future__ import annotations
 

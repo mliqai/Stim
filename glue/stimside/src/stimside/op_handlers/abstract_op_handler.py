@@ -1,11 +1,7 @@
 import abc
-from typing import Union, TypeVar, TYPE_CHECKING, Generic
+from typing import Any, Generic, TypeVar
 
 import stim  # type: ignore[import-untyped]
-
-if TYPE_CHECKING:
-    from stimside.simulator_flip import FlipsideSimulator
-    from stimside.simulator_tableau import TablesideSimulator
 
 T = TypeVar("T")
 
@@ -62,22 +58,18 @@ class CompiledOpHandler(abc.ABC, Generic[T]):
         raise NotImplementedError
 
 
-class _TrivialOpHandler(OpHandler[Union["FlipsideSimulator", "TablesideSimulator"]]):
+class TrivialOpHandler(OpHandler[Any]):
+    """Pass-through op handler implementing no tag semantics."""
+
     def compile_op_handler(
         self, *, circuit: stim.Circuit, batch_size: int
-    ) -> "CompiledOpHandler[Union['FlipsideSimulator', 'TablesideSimulator']]":
+    ) -> "CompiledOpHandler[Any]":
         return _TrivialCompiledOpHandler()
 
 
-class _TrivialCompiledOpHandler(
-    CompiledOpHandler[Union["FlipsideSimulator", "TablesideSimulator"]]
-):
+class _TrivialCompiledOpHandler(CompiledOpHandler[Any]):
 
-    def handle_op(
-        self,
-        op: stim.CircuitInstruction,
-        sss: Union["FlipsideSimulator", "TablesideSimulator"],
-    ) -> None:
+    def handle_op(self, op: stim.CircuitInstruction, sss: Any) -> None:
         """Given an operation, manipulate the given simulator to perform that operation."""
         if hasattr(sss, "_do_bare_instruction"):
             sss._do_bare_instruction(op)
@@ -87,3 +79,7 @@ class _TrivialCompiledOpHandler(
     def clear(self) -> None:
         """clear any stored state, ready for a new simulation."""
         return
+
+
+_TrivialOpHandler = TrivialOpHandler
+

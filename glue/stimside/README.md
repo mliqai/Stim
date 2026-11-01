@@ -2,12 +2,15 @@
 
 ## tl;dr
 
-Stimside aims to enable classical state transition, tracking and conditioning that can be used to emulate leakage and loss events on top of either the flip simulator or the tableau simulator in Stim. The flip simulator wrapper is called flipside, and the tableau simulator wrapper is called tableside.
-It's based on and heavily intertwined with Stim and Sinter.
+Stimside enables classical state transition, tracking, and conditioning to emulate leakage and loss events across four simulators and corresponding Sinter samplers built on Stim:
+- `FlipsideSimulator` / `FlipsideSampler` (`LeakageUint8Flip`): batched Pauli-frame simulation.
+- `TablesideSimulator` / `TablesideSampler` (`LeakageUint8Tableau`): stabilizer tableau trajectory simulation.
+- `CosetsideSimulator` / `CosetsideSampler` (`LeakageUint8Coset`): batched stabilizer coset (`MRQF`) simulation.
+- `MagicsideSimulator` / `MagicsideSampler` (`LeakageUint8Magic`): exact non-Clifford Phase-QFE simulation.
 
 ## Setup & Installation
 
-From the `Stim/glue/stimside` directory, run a single command to compile the C++ kernel shared libraries (`libcoset_kernels.so`, `libtableside_kernels.so`, and `libmarginal_dem_kernels.so`) and install the `stimside` Python package:
+From the `Stim/glue/stimside` directory, run a single command to compile the C++ kernel shared libraries (`libcoset_kernels.so`, `libtableside_kernels.so`, `libmarginal_dem_kernels.so`, and `libmagic_kernels.so`) and install the `stimside` Python package:
 
 ```bash
 # Editable development install (compiles C++ kernels in-place and links Python package):
@@ -60,8 +63,8 @@ Instructions that reference the same qubit more than once in a single instructio
 ### Untagged Instructions on Leaked Qubits
 What an untagged instruction does to a leaked qubit (`state >= 2`) depends on the simulator:
 - **`FlipsideSimulator`: scrambled, then applied.** The qubit is fully depolarized when it leaks, untagged gates and noise act on it as usual, and it is depolarized again right after any `M`, `MX`, `MY`, `MR`, `MRX`, `MRY`, `R`, `RX` or `RY` that touches it. `MPP`, `MXX`, `MYY` and `MZZ` don't depolarize it again, which matches measuring the same product through an ancilla qubit.
-- **`TablesideSimulator` and `CosetsideSimulator` (default, `unconditional_condition_on_U=True`): skipped.** The qubit's computational state is frozen when it leaks, and untagged unitary gates and noise channels skip it: single-qubit instructions per target, two-qubit instructions per pair (a pair with a leaked qubit is skipped whole), `CORRELATED_ERROR`/`ELSE_CORRELATED_ERROR` as a whole (a skipped one still fires with its probability, without effect, so the rest of its `ELSE` chain is unchanged), and `SPP`/`SPP_DAG` per Pauli product term. Instructions that produce measurement results (including `MPP`, `MXX`, `MYY`, `MZZ`, `HERALDED_ERASE` and `HERALDED_PAULI_CHANNEL_1`) and resets are not filtered: they act on, or read, the frozen state.
-- **`TablesideSimulator` and `CosetsideSimulator` with `unconditional_condition_on_U=False`: frozen, then applied.** The computational state is frozen when the qubit leaks, and untagged instructions act on it as if it were unleaked.
+- **`TablesideSimulator`, `CosetsideSimulator`, and `MagicsideSimulator` (default, `unconditional_condition_on_U=True`): skipped.** The qubit's computational state is frozen when it leaks, and untagged unitary Clifford gates and noise channels skip it: single-qubit instructions per target, two-qubit instructions per pair (a pair with a leaked qubit is skipped whole), `CORRELATED_ERROR`/`ELSE_CORRELATED_ERROR` as a whole (a skipped one still fires with its probability, without effect, so the rest of its `ELSE` chain is unchanged), and `SPP`/`SPP_DAG` per Pauli product term. Instructions that produce measurement results (including `MPP`, `MXX`, `MYY`, `MZZ`, `HERALDED_ERASE` and `HERALDED_PAULI_CHANNEL_1`) and resets are not filtered: they act on, or read, the frozen state.
+- **`TablesideSimulator`, `CosetsideSimulator`, and `MagicsideSimulator` with `unconditional_condition_on_U=False`: frozen, then applied.** The computational state is frozen when the qubit leaks, and untagged instructions act on it as if it were unleaked.
 
 `CosetsideSimulator` does not support `SPP`/`SPP_DAG` and raises `NotImplementedError` for them. With `unconditional_condition_on_U=True`, so does `MarginalLeakageDemGenerator` (and the decoders built on it, `MarginalDecoder` and `BranchAndBoundDecoder`), whichever simulator the circuit is sampled with: it does not model a Pauli product term that touches a leaked qubit.
 
@@ -214,7 +217,10 @@ if __name__ == "__main__":
     print(stats[0].shots, stats[0].errors)
 ```
 
-### Top-Level `stimside` Exports for Magicside
+### Top-Level `stimside` Exports
 
-All 16 public `magicside` symbols are re-exported directly at the package root (`import stimside`) alongside the 13 existing `stimside` symbols:
-`MagicsideSimulator`, `MagicsideSampler`, `CompiledMagicsideSampler`, `LeakageUint8Magic`, `CompiledLeakageUint8Magic`, `PrepareQueries`, `EvaluateQueries`, `prepare_queries`, `evaluate_queries`, `QueryBudget`, `QueryBudgetExceededError`, `PreparedQueryPlan`, `QueryResult`, `QueryDiagnostics`, `CliffordFaultChannel`, and `FaultBranch`.
+All four simulators, samplers, op handlers (with `LeakageUint8Flip` and `LeakageUint8Tableau` aliases alongside the submodule `LeakageUint8` names), `TrivialOpHandler`, decoders, and Magicside query primitives are exported directly at the package root (`import stimside`):
+- **Simulators & samplers:** `FlipsideSimulator`, `FlipsideSampler`, `TablesideSimulator`, `TablesideSampler`, `CosetsideSimulator`, `CosetsideSampler`, `MagicsideSimulator`, `MagicsideSampler`, `CompiledMagicsideSampler`.
+- **Op handlers:** `OpHandler`, `CompiledOpHandler`, `TrivialOpHandler`, `LeakageUint8Flip`, `CompiledLeakageUint8Flip`, `LeakageUint8Tableau`, `CompiledLeakageUint8Tableau`, `LeakageUint8Coset`, `CompiledLeakageUint8Coset`, `LeakageUint8Magic`, `CompiledLeakageUint8Magic`.
+- **Decoders & DEM generation:** `LeakageDecoder`, `BaseDecoder`, `CallableDecoder`, `MarginalDecoder`, `BranchAndBoundDecoder`, `MarginalLeakageDemGenerator`.
+- **Magicside query & fault channels:** `PrepareQueries`, `EvaluateQueries`, `prepare_queries`, `evaluate_queries`, `QueryBudget`, `QueryBudgetExceededError`, `PreparedQueryPlan`, `QueryResult`, `QueryDiagnostics`, `CliffordFaultChannel`, `FaultBranch`.

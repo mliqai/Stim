@@ -13,11 +13,11 @@ import numpy as np
 import pytest
 import stim  # type: ignore[import-untyped]
 
-from stimside.op_handlers.abstract_op_handler import _TrivialOpHandler
+from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
-from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8 as LeakageUint8Flip
+from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8Flip
 from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
-from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8 as LeakageUint8Tableau
+from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8Tableau
 from stimside.simulator_coset import CosetsideSimulator
 from stimside.simulator_flip import FlipsideSimulator
 from stimside.simulator_magic import MagicsideSimulator
@@ -337,7 +337,7 @@ def _hash_payload(
 def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
     rec_flag = bool(has_leakage)
     if mode == "flip":
-        op_h = LeakageUint8Flip() if has_leakage else _TrivialOpHandler()
+        op_h = LeakageUint8Flip() if has_leakage else TrivialOpHandler()
         sim = FlipsideSimulator(
             circuit,
             compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=BATCH),
@@ -404,7 +404,7 @@ def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
         )
 
     if mode.startswith("coset_"):
-        op_h = LeakageUint8Coset() if has_leakage else _TrivialOpHandler()
+        op_h = LeakageUint8Coset() if has_leakage else TrivialOpHandler()
         sim_c = CosetsideSimulator(
             circuit,
             compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=BATCH),
@@ -430,7 +430,7 @@ def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
         "magic_sq": ("SELECTOR", "QUERY", False),
         "magic_sync": ("DIRECT", "STREAM", True),
     }[mode]
-    op_h = LeakageUint8Magic() if has_leakage else _TrivialOpHandler()
+    op_h = LeakageUint8Magic() if has_leakage else TrivialOpHandler()
     sim_m = MagicsideSimulator(
         circuit,
         compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=BATCH),

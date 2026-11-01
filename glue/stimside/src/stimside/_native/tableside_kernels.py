@@ -1,3 +1,5 @@
+"""Ctypes step descriptors and shared-library loader for `tableside_kernels.cpp`."""
+
 from __future__ import annotations
 
 import ctypes

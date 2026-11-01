@@ -1,3 +1,5 @@
+"""Moving-reference stabilizer circuit compiler for `CosetsideSimulator`."""
+
 from __future__ import annotations
 
 import dataclasses

@@ -118,9 +118,9 @@ class TestFlipsideSimulator:
             OBSERVABLE_INCLUDE(0) rec[-4] rec[-3]
         """
         )
-        from stimside.op_handlers.abstract_op_handler import _TrivialOpHandler
+        from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
 
-        coh = _TrivialOpHandler().compile_op_handler(circuit=circuit, batch_size=1)
+        coh = TrivialOpHandler().compile_op_handler(circuit=circuit, batch_size=1)
         tss = TablesideSimulator(
             circuit=circuit,
             compiled_op_handler=coh,
@@ -153,10 +153,10 @@ class TestFlipsideSimulator:
             DETECTOR(0) rec[-1]
         """
         )
-        from stimside.op_handlers.abstract_op_handler import _TrivialOpHandler
+        from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
 
-        coh1 = _TrivialOpHandler().compile_op_handler(circuit=circuit, batch_size=1)
-        coh2 = _TrivialOpHandler().compile_op_handler(circuit=circuit, batch_size=1)
+        coh1 = TrivialOpHandler().compile_op_handler(circuit=circuit, batch_size=1)
+        coh2 = TrivialOpHandler().compile_op_handler(circuit=circuit, batch_size=1)
         tss1 = TablesideSimulator(
             circuit=circuit,
             compiled_op_handler=coh1,

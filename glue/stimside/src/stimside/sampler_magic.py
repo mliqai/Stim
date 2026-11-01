@@ -18,7 +18,7 @@ from stimside._magic.query import QueryBudget
 from stimside.dem_generators.leakage_decoder import (
     BaseDecoder, CompiledLeakageDecoder, LeakageDecoder, LeakageDecoderLike, as_leakage_decoder,
 )
-from stimside.op_handlers.abstract_op_handler import OpHandler, _TrivialOpHandler
+from stimside.op_handlers.abstract_op_handler import OpHandler, TrivialOpHandler
 from stimside.simulator_magic import MagicsideSimulator, _BACKENDS, _FAULT_MODES, _M2D_MODES, _parse_enum, _resolve_budget
 from stimside.util.seeding import CompiledSeedMixin, derived_seed
 
@@ -50,7 +50,7 @@ class MagicsideSampler(CompiledSeedMixin, sinter.Sampler):
         self.op_handler, self.dem_decoder, self.batch_size = op_handler, _coerce_magic_decoder(dem_decoder), int(batch_size)
         self.fault_mode: Literal["DIRECT", "SELECTOR"] = _parse_enum(fault_mode, _FAULT_MODES, "fault_mode")
         self.backend: Literal["STREAM", "QUERY"] = _parse_enum(backend, _BACKENDS, "backend")
-        if (self.backend == "QUERY" or self.fault_mode == "SELECTOR") and op_handler is not None and not isinstance(op_handler, _TrivialOpHandler):
+        if (self.backend == "QUERY" or self.fault_mode == "SELECTOR") and op_handler is not None and not isinstance(op_handler, TrivialOpHandler):
             raise ValueError(f"backend={self.backend!r}, fault_mode={self.fault_mode!r} is incompatible with non-trivial op_handler")
         self.m2d_reference_mode: Literal["auto", "magicside", "stim", "zero"] = _parse_enum(m2d_reference_mode, _M2D_MODES, "m2d_reference_mode", lower=True)
         self.reference_sample = None if reference_sample is None else np.asarray(reference_sample, dtype=np.bool_).copy()

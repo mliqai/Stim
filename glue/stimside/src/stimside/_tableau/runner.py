@@ -1,3 +1,5 @@
+"""Precompiler, synchronized Python runner, and C++ runner wrapper for `TablesideSimulator`."""
+
 from __future__ import annotations
 
 import ctypes

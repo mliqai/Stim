@@ -1153,3 +1153,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                         "DEPOLARIZE1", leaked_qubits, [0.75]
                     )
                 )
+
+
+LeakageUint8Tableau = LeakageUint8
+CompiledLeakageUint8Tableau = CompiledLeakageUint8

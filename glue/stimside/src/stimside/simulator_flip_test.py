@@ -367,7 +367,7 @@ class TestFlipsideSimulator:
         assert fss.get_final_measurement_records().tolist() == [[True, True, False]] * self.batch_size
 
     def test_multi_target_qubit_coords_and_shift_coords_across_engines(self) -> None:
-        from stimside.op_handlers.abstract_op_handler import _TrivialOpHandler
+        from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
         from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
         from stimside.simulator_coset import CosetsideSimulator
         from stimside.simulator_magic import MagicsideSimulator
@@ -379,7 +379,7 @@ class TestFlipsideSimulator:
             "QUBIT_COORDS[anc](3, 4, 5) 2 3\n"
             "M 0 1 2 3"
         )
-        triv = _TrivialOpHandler()
+        triv = TrivialOpHandler()
 
         tss_int = TablesideSimulator(
             circuit=circuit,

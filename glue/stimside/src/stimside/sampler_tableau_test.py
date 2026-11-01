@@ -8,7 +8,7 @@ from stimside.dem_generators.leakage_decoder import (
     LeakageDecoder,
     MarginalDecoder,
 )
-from stimside.op_handlers.abstract_op_handler import _TrivialOpHandler
+from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
 from stimside.sampler_tableau import TablesideSampler
 
 
@@ -47,7 +47,7 @@ class _CallableDecoder(LeakageDecoder):
 
 def test_sampler():
 
-    op_handler = _TrivialOpHandler()
+    op_handler = TrivialOpHandler()
 
     sampler = TablesideSampler(op_handler=op_handler, dem_decoder=BaseDecoder())
 
@@ -67,7 +67,7 @@ def test_sampler():
 def test_sampler_sample_and_dem_gen():
     import pytest
 
-    op_handler = _TrivialOpHandler()
+    op_handler = TrivialOpHandler()
     circuit = stim.Circuit(
         """
         R 0 1

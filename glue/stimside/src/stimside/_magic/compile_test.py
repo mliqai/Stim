@@ -1,4 +1,4 @@
-"""Verification suite for `stimside.util.magic_compile` (Milestone M1: V1.2b, V1.3, V1.4).
+"""Verification suite for `stimside._magic.compile` (Milestone M1: V1.2b, V1.3, V1.4).
 
 Covers:
 1. Exact 8th-root-of-unity (`omega^v`) Clifford decompositions across all 55 1Q/2Q Stim gates.

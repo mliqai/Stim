@@ -1,4 +1,4 @@
-"""Unit and verification tests (`V1.5`) for `stimside.util.magic_query` (Milestone M3)."""
+"""Unit and verification tests (`V1.5`) for `stimside._magic.query` (Milestone M3)."""
 
 from __future__ import annotations
 

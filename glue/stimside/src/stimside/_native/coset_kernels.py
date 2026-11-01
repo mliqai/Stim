@@ -1,3 +1,5 @@
+"""Shared-library loader for `coset_kernels.cpp`."""
+
 from __future__ import annotations
 
 import ctypes

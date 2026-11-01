@@ -16,7 +16,7 @@ from stimside.dem_generators import (
 from stimside.dem_generators.dem_decoding import decode_with_generated_dems
 from stimside.dem_generators.dem_generator_marginal_test import REP_CIRCUIT
 from stimside.dem_generators.leakage_decoder import as_leakage_decoder
-from stimside.op_handlers.abstract_op_handler import _TrivialOpHandler
+from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import (
     LeakageUint8 as LeakageUint8Flip,
@@ -76,7 +76,7 @@ def test_exports():
 )
 def test_samplers_reject_non_leakage_decoders(sampler_cls, bad):
     with pytest.raises(TypeError, match="requires dem_decoder to be a LeakageDecoder"):
-        sampler_cls(_TrivialOpHandler(), bad)
+        sampler_cls(TrivialOpHandler(), bad)
 
 
 def test_marginal_decoder_settings():

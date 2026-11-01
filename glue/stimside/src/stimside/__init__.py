@@ -20,9 +20,26 @@ from stimside.dem_generators.leakage_decoder import (
     LeakageDecoder,
     MarginalDecoder,
 )
+from stimside.op_handlers.abstract_op_handler import (
+    CompiledOpHandler,
+    OpHandler,
+    TrivialOpHandler,
+)
+from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import (
+    CompiledLeakageUint8Coset,
+    LeakageUint8Coset,
+)
+from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import (
+    CompiledLeakageUint8Flip,
+    LeakageUint8Flip,
+)
 from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import (
     CompiledLeakageUint8Magic,
     LeakageUint8Magic,
+)
+from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
+    CompiledLeakageUint8Tableau,
+    LeakageUint8Tableau,
 )
 from stimside.sampler_coset import CosetsideSampler
 from stimside.sampler_flip import FlipsideSampler
@@ -41,8 +58,12 @@ __all__ = [
     "BranchAndBoundDecoder",
     "CallableDecoder",
     "CliffordFaultChannel",
+    "CompiledLeakageUint8Coset",
+    "CompiledLeakageUint8Flip",
     "CompiledLeakageUint8Magic",
+    "CompiledLeakageUint8Tableau",
     "CompiledMagicsideSampler",
+    "CompiledOpHandler",
     "CosetsideSampler",
     "CosetsideSimulator",
     "EvaluateQueries",
@@ -50,11 +71,15 @@ __all__ = [
     "FlipsideSampler",
     "FlipsideSimulator",
     "LeakageDecoder",
+    "LeakageUint8Coset",
+    "LeakageUint8Flip",
     "LeakageUint8Magic",
+    "LeakageUint8Tableau",
     "MagicsideSampler",
     "MagicsideSimulator",
     "MarginalDecoder",
     "MarginalLeakageDemGenerator",
+    "OpHandler",
     "PrepareQueries",
     "PreparedQueryPlan",
     "QueryBudget",
@@ -63,6 +88,7 @@ __all__ = [
     "QueryResult",
     "TablesideSampler",
     "TablesideSimulator",
+    "TrivialOpHandler",
     "evaluate_queries",
     "prepare_queries",
 ]

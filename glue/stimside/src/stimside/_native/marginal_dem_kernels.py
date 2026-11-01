@@ -1,3 +1,5 @@
+"""Shared-library loader for `marginal_dem_kernels.cpp`."""
+
 from __future__ import annotations
 
 import ctypes

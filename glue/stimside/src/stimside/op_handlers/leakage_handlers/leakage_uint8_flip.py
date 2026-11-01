@@ -1106,3 +1106,7 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                     error_mask=leaked_targets_mask, pauli="X", p=0.5
                 )
 
+
+LeakageUint8Flip = LeakageUint8
+CompiledLeakageUint8Flip = CompiledLeakageUint8
+

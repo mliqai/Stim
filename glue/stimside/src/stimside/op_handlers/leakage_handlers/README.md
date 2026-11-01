@@ -6,7 +6,9 @@ Basically, each qubit has hidden classical state, and these tags allow you to ma
 and use the tracked state to add Pauli noise to the simulator
 
 All leakage error tag starts with `LEAKAGE`, to make them easy to notice and to not waste time
-parsing a tag you don't care about.
+parsing a tag you don't care about. The four engine-specific handlers are exported at the `stimside`
+package root as `LeakageUint8Flip`, `LeakageUint8Tableau`, `LeakageUint8Coset`, and `LeakageUint8Magic`
+(with `LeakageUint8` kept as the legacy class name inside `leakage_uint8_flip` and `leakage_uint8_tableau`).
 
 The leakage tags follow the general form:
 

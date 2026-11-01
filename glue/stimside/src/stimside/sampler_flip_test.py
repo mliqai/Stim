@@ -2,14 +2,14 @@ import sinter
 import stim  # type: ignore[import-untyped]
 
 from stimside.dem_generators.leakage_decoder import BaseDecoder
-from stimside.op_handlers.abstract_op_handler import _TrivialOpHandler
+from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
 from stimside.sampler_flip import FlipsideSampler
 from stimside.sampler_tableau_test import _CallableDecoder
 
 
 def test_sampler():
 
-    op_handler = _TrivialOpHandler()
+    op_handler = TrivialOpHandler()
 
     sampler = FlipsideSampler(op_handler=op_handler, dem_decoder=BaseDecoder())
 
@@ -61,7 +61,7 @@ def test_flipside_sampler_with_dem_gen():
         return [flips if row[0] else keeps for row in records]
 
     sampler = FlipsideSampler(
-        op_handler=_TrivialOpHandler(), batch_size=64, dem_decoder=_CallableDecoder(gen)
+        op_handler=TrivialOpHandler(), batch_size=64, dem_decoder=_CallableDecoder(gen)
     )
     compiled = sampler.compiled_sampler_for_task(
         sinter.Task(circuit=circuit, decoder="pymatching")

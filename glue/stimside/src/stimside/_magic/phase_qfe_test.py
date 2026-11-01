@@ -1,4 +1,4 @@
-"""Unit and property tests for `stimside.util.phase_qfe` (Milestone M1: `V1.1`, `V1.2a`, multi-word, tolerance guards)."""
+"""Unit and property tests for `stimside._magic.phase_qfe` (Milestone M1: `V1.1`, `V1.2a`, multi-word, tolerance guards)."""
 
 from __future__ import annotations
 
