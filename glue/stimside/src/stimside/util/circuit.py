@@ -1,6 +1,49 @@
 from __future__ import annotations
 
+import numpy as np
 import stim  # type: ignore[import-untyped]
+
+
+def qubit_targets(raw_targets: list[stim.GateTarget]) -> np.ndarray:
+    """Qubit indices of the qubit-valued targets (record / sweep / combiner targets skipped)."""
+    return np.fromiter(
+        (t.qubit_value for t in raw_targets if t.qubit_value is not None), dtype=np.intp
+    )
+
+
+def unroll_circuit(
+    circuit: stim.Circuit | stim.CircuitRepeatBlock | stim.CircuitInstruction,
+) -> list[stim.CircuitInstruction]:
+    """Unroll REPEAT blocks into a flat list of CircuitInstructions without
+    stripping SHIFT_COORDS or fusing adjacent gates across loop boundaries.
+    """
+    if isinstance(circuit, stim.CircuitInstruction):
+        return [circuit]
+    if isinstance(circuit, stim.CircuitRepeatBlock):
+        return unroll_circuit(circuit.body_copy()) * circuit.repeat_count
+    ops: list[stim.CircuitInstruction] = []
+    for item in circuit:
+        if isinstance(item, stim.CircuitRepeatBlock):
+            ops.extend(unroll_circuit(item.body_copy()) * item.repeat_count)
+        else:
+            ops.append(item)
+    return ops
+
+
+def replays(this: stim.CircuitInstruction, op: stim.CircuitInstruction) -> bool:
+    """Whether interactive_do may do `this` where the construction circuit has `op`.
+
+    Only an untagged noisy gate's arguments (noise strengths) may differ: what the
+    simulators precompute from the construction circuit (reference sample or tape,
+    known states, detector/observable converter, op handler tag map) is noiseless
+    or keyed by tagged ops, and noise is applied live from `this`.
+    """
+    return this == op or (
+        this.tag == op.tag == ""
+        and this.name == op.name
+        and this.targets_copy() == op.targets_copy()
+        and stim.gate_data(this.name).is_noisy_gate
+    )
 
 
 def apply_coords_op(

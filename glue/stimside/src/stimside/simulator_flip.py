@@ -6,10 +6,8 @@ import stim  # type: ignore[import-untyped]
 
 from stimside._flip.sync_reference import compute_sync_reference
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
-from stimside.util.circuit import apply_coords_op
+from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
 from stimside.util.known_states import (
-    _replays,
-    _unroll_circuit,
     compute_known_states_uint8,
     convert_paulis_to_arrays,
 )
@@ -111,11 +109,11 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
             record_unleaked_to_leaked: If True, record only transitions from an unleaked
                 state (state < 2, i.e., U, 0, 1) to a leaked state (state >= 2) for each shot.
                 Each transition is labeled by its 0-based unrolled circuit instruction index
-                (`op_idx` into `_unroll_circuit(circuit)`, with REPEAT blocks unrolled).
+                (`op_idx` into `unroll_circuit(circuit)`, with REPEAT blocks unrolled).
         """
 
         self.circuit = circuit
-        self._unrolled_ops: list[stim.CircuitInstruction] = _unroll_circuit(circuit)
+        self._unrolled_ops: list[stim.CircuitInstruction] = unroll_circuit(circuit)
         self.num_qubits = circuit.num_qubits
 
         self.seed = seed
@@ -181,7 +179,7 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
 
         When `record_unleaked_to_leaked=True`, returns a list of length `batch_size`
         where element `b` is a 1D `np.ndarray` (`dtype=np.int64`) of the unrolled
-        circuit operation indices (`op_idx` into `_unroll_circuit(circuit)`) where an
+        circuit operation indices (`op_idx` into `unroll_circuit(circuit)`) where an
         unleaked-to-leaked transition occurred in shot `b`.
         """
         if self._used_interactively or self._circuit_time != 0:
@@ -452,7 +450,7 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
                 self._do(loop_body)
         elif isinstance(this, stim.CircuitInstruction):
             t = self._circuit_time
-            if t >= len(self._unrolled_ops) or not _replays(this, self._unrolled_ops[t]):
+            if t >= len(self._unrolled_ops) or not replays(this, self._unrolled_ops[t]):
                 expected = (
                     f"which has `{self._unrolled_ops[t]}` there"
                     if t < len(self._unrolled_ops)

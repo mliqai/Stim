@@ -6,7 +6,7 @@ that need them (e.g. ``MarginalLeakageDemGenerator(loss_oracle=True)``) consume
 them.
 
 Op-index convention: ``LeakageEvent.op_index`` is the 0-based index into
-``stimside.util.known_states._unroll_circuit(circuit)``, i.e. the circuit with
+``stimside.util.circuit.unroll_circuit(circuit)``, i.e. the circuit with
 ``REPEAT`` blocks expanded in place and every other instruction (including
 ``SHIFT_COORDS``, ``QUBIT_COORDS``, ``TICK``, ``DETECTOR`` and
 ``OBSERVABLE_INCLUDE``) kept at its position. This is the same index as the
@@ -26,7 +26,7 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside.util.known_states import _unroll_circuit
+from stimside.util.circuit import unroll_circuit
 
 
 class LeakageEvent(NamedTuple):
@@ -98,7 +98,7 @@ def unrolled_to_flattened_indices(
     mapped ops must agree in name, tag and targets, and in gate args except for
     ``DETECTOR``/``QUBIT_COORDS`` (whose coordinates ``flattened()`` shifts).
     """
-    unrolled = _unroll_circuit(circuit)
+    unrolled = unroll_circuit(circuit)
     flat_ops = list(circuit.flattened())
     flat_idx = np.full(len(unrolled), -1, dtype=np.int64)
     f = -1

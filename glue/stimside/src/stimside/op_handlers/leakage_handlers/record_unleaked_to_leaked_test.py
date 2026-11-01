@@ -14,7 +14,7 @@ from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
 from stimside.simulator_coset import CosetsideSimulator
 from stimside.simulator_flip import FlipsideSimulator
 from stimside.simulator_tableau import TablesideSimulator
-from stimside.util.known_states import _unroll_circuit
+from stimside.util.circuit import unroll_circuit
 
 
 def _build_flip_sim(
@@ -125,7 +125,7 @@ def test_only_unleaked_to_leaked_transitions_recorded() -> None:
         M 0 1 2
         """
     )
-    unrolled = _unroll_circuit(circuit)
+    unrolled = unroll_circuit(circuit)
     assert unrolled[6].name == "I"
     assert unrolled[10].name == "II"
     assert unrolled[11].name == "II"
@@ -159,7 +159,7 @@ def test_only_unleaked_to_leaked_transitions_recorded() -> None:
 
 def test_unrolled_instruction_indexing_with_repeat_blocks_and_metadata() -> None:
     """Verify that REPEAT blocks and QUBIT_COORDS / SHIFT_COORDS / TICK / DETECTOR
-    produce the exact 0-based unrolled instruction index (`_unroll_circuit(circuit)`).
+    produce the exact 0-based unrolled instruction index (`unroll_circuit(circuit)`).
     """
     circuit = stim.Circuit(
         """
@@ -182,7 +182,7 @@ def test_unrolled_instruction_indexing_with_repeat_blocks_and_metadata() -> None
         OBSERVABLE_INCLUDE(0) rec[-1]
         """
     )
-    unrolled = _unroll_circuit(circuit)
+    unrolled = unroll_circuit(circuit)
     expected_indices = [
         idx
         for idx, op in enumerate(unrolled)
@@ -234,7 +234,7 @@ def test_fused_mode_b_1_to_2_transition_unrolled_indexing() -> None:
         }
         """
     )
-    unrolled = _unroll_circuit(circuit)
+    unrolled = unroll_circuit(circuit)
     expected = np.array(
         [idx for idx, op in enumerate(unrolled) if "1-->2" in op.tag],
         dtype=np.int64,

@@ -19,9 +19,8 @@ from stimside.dem_generators.leakage_decoder import (
     BaseDecoder, CompiledLeakageDecoder, LeakageDecoder, LeakageDecoderLike, as_leakage_decoder,
 )
 from stimside.op_handlers.abstract_op_handler import OpHandler, _TrivialOpHandler
-from stimside.sampler_tableau import _CompiledSeedMixin
 from stimside.simulator_magic import MagicsideSimulator, _BACKENDS, _FAULT_MODES, _M2D_MODES, _parse_enum, _resolve_budget
-from stimside.util.seeding import derived_seed
+from stimside.util.seeding import CompiledSeedMixin, derived_seed
 
 
 def _coerce_magic_decoder(dem_decoder: LeakageDecoderLike | sinter.Decoder | str | None) -> LeakageDecoder | None:
@@ -30,7 +29,7 @@ def _coerce_magic_decoder(dem_decoder: LeakageDecoderLike | sinter.Decoder | str
     return BaseDecoder(decoder=dem_decoder) if isinstance(dem_decoder, (str, sinter.Decoder)) else as_leakage_decoder(dem_decoder, "MagicsideSampler")
 
 
-class MagicsideSampler(_CompiledSeedMixin, sinter.Sampler):
+class MagicsideSampler(CompiledSeedMixin, sinter.Sampler):
     """Sinter sampler running MagicsideSimulator with an arbitrary OpHandler and LeakageDecoder."""
 
     def __init__(

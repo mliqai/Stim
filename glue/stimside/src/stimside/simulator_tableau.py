@@ -13,8 +13,7 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageTransition1Params,
     LeakageTransition2Params,
 )
-from stimside.util.circuit import apply_coords_op
-from stimside.util.known_states import _replays, _unroll_circuit
+from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.seeding import derived_seed
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
@@ -370,7 +369,7 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 "Cannot do more operations after finishing an interactive run."
             )
         if self._unrolled_ops is None:
-            self._unrolled_ops = _unroll_circuit(self.circuit)
+            self._unrolled_ops = unroll_circuit(self.circuit)
         if not self._used_interactively:
             self._used_interactively = True
             self._running_tableau = True
@@ -403,7 +402,7 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         """Raise ValueError unless interactive_do may do `this` now (see interactive_do)."""
         assert self._unrolled_ops is not None
         t, n = self._circuit_time, len(self._unrolled_ops)
-        if t < n and not _replays(this, self._unrolled_ops[t]):
+        if t < n and not replays(this, self._unrolled_ops[t]):
             raise ValueError(
                 f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` doesn't match the "
                 "circuit the TablesideSimulator was constructed with, which has "

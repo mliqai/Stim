@@ -10,7 +10,7 @@ from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUin
 from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
 from stimside.simulator_coset import CosetsideSimulator
 from stimside.simulator_tableau import TablesideSimulator
-from stimside.util.known_states import _unroll_circuit
+from stimside.util.circuit import unroll_circuit
 from stimside.util.leakage_events import (
     LeakageEvent,
     is_leakage_event,
@@ -223,7 +223,7 @@ def test_deterministic_events_on_cosetside():
 
 
 def test_deterministic_event_op_indices_are_unrolled_indices():
-    unrolled = _unroll_circuit(DETERMINISTIC)
+    unrolled = unroll_circuit(DETERMINISTIC)
     for ev in DETERMINISTIC_EVENTS:
         assert "LEAKAGE_TRANSITION" in unrolled[ev.op_index].tag
 
@@ -266,9 +266,9 @@ def test_unrolled_to_flattened_indices():
     )
     got = unrolled_to_flattened_indices(circuit)
     assert got.tolist() == [0, 1, -1, 2, 3, 4, 5, 6, -1, 7, 8, 9, 10, 11]
-    assert len(_unroll_circuit(circuit)) == len(got)
+    assert len(unroll_circuit(circuit)) == len(got)
     flat = list(circuit.flattened())
-    unrolled = _unroll_circuit(circuit)
+    unrolled = unroll_circuit(circuit)
     for u, f in enumerate(got):
         if f >= 0:
             assert unrolled[u].name == flat[f].name

@@ -40,8 +40,7 @@ from stimside.util.bitwords import (
     word_dot_parity,
     words_any_nonzero,
 )
-from stimside.util.circuit import apply_coords_op
-from stimside.util.known_states import _replays, _unroll_circuit
+from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.reference_chp import ReferenceCHPTableau
 from stimside.util.seeding import derived_seed
@@ -227,7 +226,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 raise ValueError(f"reference_sample length {ref_arr.shape} != {circuit.num_measurements}")
             self._explicit_ref_sample = ref_arr.copy()
         self.num_qubits = int(circuit.num_qubits)
-        self._unrolled_ops: list[stim.CircuitInstruction] = _unroll_circuit(circuit)
+        self._unrolled_ops: list[stim.CircuitInstruction] = unroll_circuit(circuit)
         self._eff_m2d_mode: Literal["magicside", "stim", "zero"] = ("magicside" if any(op.tag in _MAGIC_TAGS for op in self._unrolled_ops) else "stim") if self.m2d_reference_mode == "auto" else self.m2d_reference_mode
         flat_ops, inline_faults = extract_circuit_faults(circuit)
         self._user_fault_channels = tuple(fault_channels) if fault_channels is not None else None
@@ -600,7 +599,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
     def _check_interactive_op(self, this: stim.CircuitInstruction) -> None:
         t, n = self._circuit_time, len(self._unrolled_ops)
-        if t < n and not _replays(this, self._unrolled_ops[t]):
+        if t < n and not replays(this, self._unrolled_ops[t]):
             raise ValueError(f"interactive_do: op {t} `{this}` does not match expected `{self._unrolled_ops[t]}`")
         if t >= n:
             if this.name in ("DETECTOR", "OBSERVABLE_INCLUDE"):
@@ -613,8 +612,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                         raise ValueError(f"interactive_do qubit {tgt.qubit_value} >= num_qubits={self.num_qubits}")
 
     def _do(self, obj: stim.Circuit | stim.CircuitInstruction | stim.CircuitRepeatBlock) -> None:
-        ops: Iterable[stim.CircuitInstruction] = (obj,) if isinstance(obj, stim.CircuitInstruction) else (_unroll_circuit(obj.body_copy()) * obj.repeat_count if isinstance(obj, stim.CircuitRepeatBlock) else _unroll_circuit(obj))
-        for op in ops:
+        for op in unroll_circuit(obj):
             if self._used_interactively:
                 self._check_interactive_op(op)
             self._do_instruction(op)

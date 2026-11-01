@@ -3,14 +3,8 @@ from typing import Any, cast
 import numpy as np
 import stim  # type: ignore[import-untyped]
 
+from stimside.util.circuit import qubit_targets, unroll_circuit
 from stimside.util.numpy_types import Bool1DArray
-
-
-def _qubit_targets(raw_targets: list[stim.GateTarget]) -> np.ndarray:
-    """Qubit indices of the qubit-valued targets (record / sweep / combiner targets skipped)."""
-    return np.fromiter(
-        (t.qubit_value for t in raw_targets if t.qubit_value is not None), dtype=np.intp
-    )
 
 
 def _without_noise_preserving_heralds(circuit: stim.Circuit) -> stim.Circuit:
@@ -116,36 +110,6 @@ def _get_gate_luts(op_name: str) -> tuple[np.ndarray, np.ndarray]:
     return fwd, bwd
 
 
-def _unroll_circuit(circuit: stim.Circuit) -> list[stim.CircuitInstruction]:
-    """Unroll REPEAT blocks into a flat list of CircuitInstructions without
-    stripping SHIFT_COORDS or fusing adjacent gates across loop boundaries.
-    """
-    ops: list[stim.CircuitInstruction] = []
-    for item in circuit:
-        if isinstance(item, stim.CircuitRepeatBlock):
-            body_ops = _unroll_circuit(item.body_copy())
-            ops.extend(body_ops * item.repeat_count)
-        else:
-            ops.append(item)
-    return ops
-
-
-def _replays(this: stim.CircuitInstruction, op: stim.CircuitInstruction) -> bool:
-    """Whether interactive_do may do `this` where the construction circuit has `op`.
-
-    Used by the Flipside, Cosetside and Tableside simulators. Only an untagged noisy gate's
-    arguments (noise strengths) may differ: what they precompute from the construction circuit
-    (reference sample or tape, known states, detector/observable converter, op handler tag map) is
-    noiseless or keyed by tagged ops, and noise is applied live from `this`.
-    """
-    return this == op or (
-        this.tag == op.tag == ""
-        and this.name == op.name
-        and this.targets_copy() == op.targets_copy()
-        and stim.gate_data(this.name).is_noisy_gate
-    )
-
-
 def compute_known_states_uint8(
     circuit: stim.Circuit,
     unrolled_ops: list[stim.CircuitInstruction] | None = None,
@@ -160,7 +124,7 @@ def compute_known_states_uint8(
     """
     known_measurements = compute_known_measurements(circuit)
     if unrolled_ops is None:
-        unrolled_ops = _unroll_circuit(circuit)
+        unrolled_ops = unroll_circuit(circuit)
 
     num_ops = len(unrolled_ops)
     num_qubits = circuit.num_qubits
@@ -187,7 +151,7 @@ def compute_known_states_uint8(
         if op.name == "MPAD":
             measurements_consumed += len(raw_targets)
             continue
-        q_targets = _qubit_targets(raw_targets)
+        q_targets = qubit_targets(raw_targets)
         has_dup_targets = len(set(q_targets.tolist())) != len(q_targets)
 
         if gd.is_reset:
@@ -246,7 +210,7 @@ def compute_known_states_uint8(
         ) or (gd.is_noisy_gate and not gd.produces_measurements):
             pass
         elif gd.is_reset and not gd.produces_measurements:
-            new_known_state[_qubit_targets(op.targets_copy())] = 0
+            new_known_state[qubit_targets(op.targets_copy())] = 0
         elif gd.produces_measurements:
             raw_targets = op.targets_copy()
             if op.name in ("M", "MZ", "MX", "MY", "MR", "MRX", "MRY", "MRZ"):
@@ -270,9 +234,9 @@ def compute_known_states_uint8(
                     "HERALDED_ERASE",
                     "HERALDED_PAULI_CHANNEL_1",
                 ):
-                    new_known_state[_qubit_targets(raw_targets)] = 0
+                    new_known_state[qubit_targets(raw_targets)] = 0
         elif gd.is_single_qubit_gate and gd.is_unitary:
-            q_targets = _qubit_targets(op.targets_copy())
+            q_targets = qubit_targets(op.targets_copy())
             _, bwd_lut = _get_gate_luts(op.name)
             if len(set(q_targets.tolist())) != len(q_targets):
                 for q in q_targets[::-1]:
@@ -280,7 +244,7 @@ def compute_known_states_uint8(
             else:
                 new_known_state[q_targets] = bwd_lut[new_known_state[q_targets]]
         else:
-            new_known_state[_qubit_targets(op.targets_copy())] = 0
+            new_known_state[qubit_targets(op.targets_copy())] = 0
 
         already_known = states_uint8[i]
         conflict = (

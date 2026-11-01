@@ -31,7 +31,7 @@ class UnleakedToLeakedRecordsMixin:
         """Return per-shot 1D int64 arrays of unrolled circuit instruction indices (`op_idx`)
         where a qubit transitioned from an unleaked state (state < 2) to a leaked state (state >= 2).
 
-        Note: `op_idx` is the 0-based index into the unrolled circuit (`_unroll_circuit(circuit)`),
+        Note: `op_idx` is the 0-based index into the unrolled circuit (`unroll_circuit(circuit)`),
         where `REPEAT` blocks are expanded in-place and metadata instructions (`QUBIT_COORDS`,
         `SHIFT_COORDS`, `TICK`, `DETECTOR`, `OBSERVABLE_INCLUDE`) are included at their unrolled
         positions. Only transitions from unleaked to leaked states are recorded.

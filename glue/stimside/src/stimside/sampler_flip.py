@@ -13,8 +13,8 @@ from stimside.dem_generators.leakage_decoder import (
     as_leakage_decoder,
 )
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler
-from stimside.sampler_tableau import _CompiledSeedMixin
 from stimside.simulator_flip import FlipsideSimulator
+from stimside.util.seeding import CompiledSeedMixin
 
 
 def _reject_loss_oracle(needs_leakage_events: bool) -> None:
@@ -26,7 +26,7 @@ def _reject_loss_oracle(needs_leakage_events: bool) -> None:
         )
 
 
-class FlipsideSampler(_CompiledSeedMixin, sinter.Sampler):
+class FlipsideSampler(CompiledSeedMixin, sinter.Sampler):
 
     def __init__(
         self,

@@ -14,11 +14,11 @@ from stimside.dem_generators.leakage_decoder import (
     as_leakage_decoder,
 )
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler
-from stimside.sampler_tableau import _CompiledSeedMixin
 from stimside.simulator_coset import CosetsideSimulator
+from stimside.util.seeding import CompiledSeedMixin
 
 
-class CosetsideSampler(_CompiledSeedMixin, sinter.Sampler):
+class CosetsideSampler(CompiledSeedMixin, sinter.Sampler):
     """Sinter sampler for CosetsideSimulator with multi-shot CPU batching."""
 
     def __init__(

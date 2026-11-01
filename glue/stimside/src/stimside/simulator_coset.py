@@ -28,8 +28,7 @@ from stimside.util.bitwords import (
     words_any_nonzero as _words_any_nonzero,
     words_any_overlap as _words_any_overlap,
 )
-from stimside.util.circuit import apply_coords_op
-from stimside.util.known_states import _replays, _unroll_circuit
+from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.reference_chp import PackedSymplecticTables, _pauli_image
 from stimside.util.seeding import derived_seed
@@ -376,7 +375,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
         When `record_unleaked_to_leaked=True`, returns a list of length `batch_size`
         where element `b` is a 1D `np.ndarray` (`dtype=np.int64`) of the unrolled
-        circuit operation indices (`op_idx` into `_unroll_circuit(circuit)`) where an
+        circuit operation indices (`op_idx` into `unroll_circuit(circuit)`) where an
         unleaked-to-leaked transition occurred in shot `b`.
         """
         if self._used_interactively or self._circuit_time != 0:
@@ -449,7 +448,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 "Cannot do more operations after finishing an interactive run."
             )
         if self._unrolled_ops is None:
-            self._unrolled_ops = _unroll_circuit(self.circuit)
+            self._unrolled_ops = unroll_circuit(self.circuit)
         self._used_interactively = True
         self._do(this)
 
@@ -533,7 +532,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         """Raise ValueError unless interactive_do may do `this` now (see interactive_do)."""
         assert self._unrolled_ops is not None
         t, n = self._circuit_time, len(self._unrolled_ops)
-        if t < n and not _replays(this, self._unrolled_ops[t]):
+        if t < n and not replays(this, self._unrolled_ops[t]):
             raise ValueError(
                 f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` doesn't match the "
                 "circuit the CosetsideSimulator was constructed with, which has "

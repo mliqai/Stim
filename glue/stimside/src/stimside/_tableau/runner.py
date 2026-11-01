@@ -112,11 +112,11 @@ class PrecompiledTablesideCircuit:
         self._full_bare_circuit: stim.Circuit | None = None
         self._quantum_bare_circuit: stim.Circuit | None = None
 
-        from stimside.util.known_states import _unroll_circuit
+        from stimside.util.circuit import unroll_circuit
 
         has_repeat = any(isinstance(inst, stim.CircuitRepeatBlock) for inst in circuit)
         # Not circuit.flattened(): it fuses identical consecutive instructions, desyncing steps from step_to_unrolled_idx.
-        unrolled_ops = _unroll_circuit(circuit) if has_repeat else list(circuit)
+        unrolled_ops = unroll_circuit(circuit) if has_repeat else list(circuit)
         self.parsed_ops: dict[stim.CircuitInstruction, LeakageParams] = {}
 
         self.final_qubit_coords: dict[int, list[float]] = {}
