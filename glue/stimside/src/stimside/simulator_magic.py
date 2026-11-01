@@ -891,15 +891,14 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if name in ("SPP", "SPP_DAG"):
             dag = name == "SPP_DAG"
             for g_idx, (grp, inv) in enumerate(_split_pauli_product_targets(op)):
-                red = _reduce_pauli_product_targets(grp)
                 self._apply_conditional_ref_step(
                     mask_at(g_idx),
-                    lambda r=red, iv=inv: (
-                        apply_spp_to_reference_chp(self._live_ref_tab, r, negate=iv, dag=dag),
-                        self._live_frame_events.append(LeftSppEvent(tuple(r), iv, dag)),
+                    lambda g=grp, iv=inv: (
+                        apply_spp_to_reference_chp(self._live_ref_tab, g, negate=iv, dag=dag),
+                        self._live_frame_events.append(LeftSppEvent(tuple(g), iv, dag)),
                     ),
-                    lambda r=red, iv=inv: CompiledCliffordFactorList(
-                        7 if dag else 1, None, (compile_pauli_product(self._live_ref_tab, r, negate=iv ^ (not dag)),)
+                    lambda g=grp, iv=inv: CompiledCliffordFactorList(
+                        7 if dag else 1, None, (compile_pauli_product(self._live_ref_tab, g, negate=iv ^ (not dag)),)
                     ),
                 )
             return

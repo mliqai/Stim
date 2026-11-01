@@ -63,13 +63,13 @@ def resolve_so(
         found = finder(here, f"lib{name}", cpp_path)
         if found is not None:
             if found.parent != here and os.access(here, os.W_OK):
+                tmp_copy = here / f".lib{name}.{os.getpid()}.tmp.so"
                 try:
-                    tmp_copy = here / f".lib{name}.{os.getpid()}.tmp.so"
                     shutil.copy2(found, tmp_copy)
                     os.replace(tmp_copy, so_path)
                     found = so_path
                 except OSError:
-                    pass
+                    tmp_copy.unlink(missing_ok=True)
             so_path = found
 
     in_source_tree = (
