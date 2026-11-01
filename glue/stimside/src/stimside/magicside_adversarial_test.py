@@ -185,8 +185,7 @@ def test_adv_cpp_heap_fallbacks_high_nwords_and_high_dim() -> None:
         assert abs(mc_r.z0 - 0.5) < 1e-12 and abs(mc_r.z1 - 0.5) < 1e-12
         assert sc.d == len(qs) - 1 and abs(sc.norm_sq() - 1.0) < 1e-12
         sc.check_invariants(require_canonical_offset=True)
-        c0_c = sc.to_components()[0][1]
-        assert abs(pq.overlap(c0_c, c0_c) - 1.0) < 1e-12
+        sc.to_components()[0][1].check_invariants(require_canonical_offset=True)
 
 
 @pytest.mark.parametrize("fault_mode", ["DIRECT", "SELECTOR"])

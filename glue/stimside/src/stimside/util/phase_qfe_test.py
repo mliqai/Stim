@@ -26,16 +26,14 @@ from stimside.util.phase_qfe import (
     coerce_pauli_words,
     drop_variable,
     eliminate_zero_amplitude,
-    expansion_norm_sq,
+    get_bits_at_qubits,
     make_principal,
     measure_expansion,
     merge_frames,
     n_words_for_qubits,
-    overlap,
     pack_bit_vector,
     pauli_multiply,
     project_diagonal,
-    quadratic_gauss_sum,
     restrict_amplitude,
     unit_bit_words,
     unpack_bit_vector,
@@ -477,17 +475,18 @@ def test_p1_apply_pauli_hermitian_and_non_hermitian() -> None:
                     piv_orig = comp.pivots.copy()
                     ell_par_orig = (comp.ell & 1).copy()
 
-                    g, after = apply_pauli(comp, a_bits, b_bits, kap)
+                    exp_unit = apply_pauli(ShotExpansion.from_component(comp), a_bits, b_bits, kap)
                     exp_in = ShotExpansion.from_component(comp, weight=0.6 + 0.8j)
                     exp_out = apply_pauli(exp_in, a_bits, b_bits, kap)
 
+                    g = complex(exp_unit.weights[0])
                     assert any(abs(g - u) < 1e-15 for u in (1, 1j, -1, -1j))
-                    assert np.array_equal(after.A_words, A_orig)
-                    assert np.array_equal(after.Gamma, G_orig)
-                    assert np.array_equal(after.pivots, piv_orig)
-                    assert np.array_equal(after.ell & 1, ell_par_orig)
+                    assert np.array_equal(exp_unit.A_words, A_orig)
+                    assert np.array_equal(exp_unit.Gamma, G_orig)
+                    assert np.array_equal(exp_unit.pivots, piv_orig)
+                    assert np.array_equal(exp_unit.ell[0] & 1, ell_par_orig)
                     expected = dense_pauli_le(n, a_bits, b_bits, kap) @ before
-                    assert np.max(np.abs(g * after.to_statevector() - expected)) < 1e-14
+                    assert np.max(np.abs(exp_unit.to_statevector() - expected)) < 1e-14
                     assert (
                         np.max(
                             np.abs(exp_out.to_statevector() - (0.6 + 0.8j) * expected)
@@ -498,43 +497,43 @@ def test_p1_apply_pauli_hermitian_and_non_hermitian() -> None:
 
 def test_p2_apply_quarter_turn_all_three_cases_and_errors() -> None:
     # Non-Hermitian axes must raise ValueError
-    c0 = PhaseQFEComponent.zero(2)
+    e0 = ShotExpansion.zero(2)
     with pytest.raises(ValueError):
-        apply_quarter_turn(c0, [1, 0], [0, 0], 1)
+        apply_quarter_turn(e0, [1, 0], [0, 0], 1)
     with pytest.raises(ValueError):
-        apply_quarter_turn(c0, [1, 0], [1, 0], 0)
+        apply_quarter_turn(e0, [1, 0], [1, 0], 0)
 
     # Case 1: d -> d + 1 (R(X0) on |0>, then R(X0 X1))
-    g1, c1 = apply_quarter_turn(c0, [1, 0], [0, 0], 0)
-    assert c1.d == 1 and abs(abs(g1) - 1.0) < 1e-14
+    e1 = apply_quarter_turn(e0, [1, 0], [0, 0], 0)
+    assert e1.d == 1 and abs(e1.norm_sq() - 1.0) < 1e-14
     assert (
         np.max(
             np.abs(
-                g1 * c1.to_statevector()
+                e1.to_statevector()
                 - dense_quarter_turn_le(2, np.array([1, 0]), np.array([0, 0]), 0)
-                @ c0.to_statevector()
+                @ e0.to_statevector()
             )
         )
         < 1e-14
     )
-    g2, c2 = apply_quarter_turn(c1, [1, 1], [0, 0], 0)
-    assert c2.d == 2 and abs(abs(g2) - 1.0) < 1e-14
+    e2 = apply_quarter_turn(e1, [1, 1], [0, 0], 0)
+    assert e2.d == 2 and abs(e2.norm_sq() - 1.0) < 1e-14
 
-    # Case 2: dependent column + odd c0 (R(Z0) on |0>, R(Z0 Z1) on c2, d' == d)
-    gz, cz = apply_quarter_turn(c0, [0, 0], [1, 0], 0)
-    assert cz.d == 0 and abs(gz - _OMEGA) < 1e-14
-    gzz, czz = apply_quarter_turn(c2, [0, 0], [1, 1], 0)
-    assert czz.d == 2 and abs(abs(gzz) - 1.0) < 1e-14
+    # Case 2: dependent column + odd c0 (R(Z0) on |0>, R(Z0 Z1) on e2, d' == d)
+    ez = apply_quarter_turn(e0, [0, 0], [1, 0], 0)
+    assert ez.d == 0 and abs(ez.weights[0] - _OMEGA) < 1e-14
+    ezz = apply_quarter_turn(e2, [0, 0], [1, 1], 0)
+    assert ezz.d == 2 and abs(ezz.norm_sq() - 1.0) < 1e-14
 
     # Case 3: dependent column + even c0, lam != 0 (R(-X0)R(+X0)|0> = |0>, R(+X0)^2|0> = i|1>, d: 1 -> 0)
-    g_inv, c_inv = apply_quarter_turn(c1, [1, 0], [0, 0], 2)
-    assert c_inv.d == 0
-    assert np.max(np.abs(g1 * g_inv * c_inv.to_statevector() - c0.to_statevector())) < 1e-14
+    e_inv = apply_quarter_turn(e1, [1, 0], [0, 0], 2)
+    assert e_inv.d == 0
+    assert np.max(np.abs(e_inv.to_statevector() - e0.to_statevector())) < 1e-14
 
-    g_sq, c_sq = apply_quarter_turn(c1, [1, 0], [0, 0], 0)
-    assert c_sq.d == 0
+    e_sq = apply_quarter_turn(e1, [1, 0], [0, 0], 0)
+    assert e_sq.d == 0
     expected_sq = np.array([0.0, 1.0j, 0.0, 0.0], dtype=np.complex128)
-    assert np.max(np.abs(g1 * g_sq * c_sq.to_statevector() - expected_sq)) < 1e-14
+    assert np.max(np.abs(e_sq.to_statevector() - expected_sq)) < 1e-14
 
     # 60 random Hermitian axes on random d in [0..5] states + ShotExpansion rank bound
     rng = np.random.default_rng(107)
@@ -544,14 +543,14 @@ def test_p2_apply_quarter_turn_all_three_cases_and_errors() -> None:
         comp = random_valid_component(rng, n, d)
         a_b, b_b, kap = random_hermitian_pauli_bits(rng, n)
         before = comp.to_statevector()
-        g, after = apply_quarter_turn(comp, a_b, b_b, kap)
-        after.check_invariants()
-        assert abs(abs(g) - 1.0) < 1e-12
+        after = apply_quarter_turn(ShotExpansion.from_component(comp), a_b, b_b, kap)
+        after.check_invariants(require_canonical_offset=True)
+        assert abs(after.norm_sq() - 1.0) < 1e-12
         expected = dense_quarter_turn_le(n, a_b, b_b, kap) @ before
-        assert np.max(np.abs(g * after.to_statevector() - expected)) < 1e-13
+        assert np.max(np.abs(after.to_statevector() - expected)) < 1e-13
 
         exp_in = ShotExpansion.from_component(comp)
-        exp_in = apply_pauli_t(exp_in, [0, 0, 0, 0, 0], [1, 0, 1, 0, 0], 0)  # type: ignore[assignment]
+        exp_in = apply_pauli_t(exp_in, [0, 0, 0, 0, 0], [1, 0, 1, 0, 0], 0)
         chi_before = exp_in.chi
         psi_exp_before = exp_in.to_statevector()
         exp_out = apply_quarter_turn(exp_in, a_b, b_b, kap)
@@ -613,40 +612,18 @@ def test_k1_canonical_offset_and_interference() -> None:
     assert abs(exp_tiny.norm_sq() - 1e-28) < 1e-40
 
 
-def test_k1_common_geometry_vs_heterogeneous_gram_fallback() -> None:
-    rng = np.random.default_rng(109)
+def test_k1_common_geometry_norm_sq() -> None:
     n = 4
-    # (a) Common geometry with chi = 12
-    exp = ShotExpansion.zero(n)
-    _, c_tmp = apply_quarter_turn(PhaseQFEComponent.zero(n), [1, 1, 0, 0], [0, 0, 0, 0], 0)
-    exp = ShotExpansion.from_component(c_tmp)
+    exp = apply_quarter_turn(ShotExpansion.zero(n), [1, 1, 0, 0], [0, 0, 0, 0], 0)
     for q in range(4):
         z_b = np.zeros(n, dtype=np.uint8)
         z_b[q] = 1
         x_b = np.zeros(n, dtype=np.uint8)
         x_b[(q + 1) % n] = 1
-        exp = apply_pauli_t(exp, x_b, z_b, int(x_b @ z_b) & 1)  # type: ignore[assignment]
+        exp = apply_pauli_t(exp, x_b, z_b, int(x_b @ z_b) & 1)
     assert exp.chi >= 8
     psi_common = exp.to_statevector()
     assert abs(exp.norm_sq() - float(np.vdot(psi_common, psi_common).real)) < 1e-14
-
-    # (b) Heterogeneous list with d=0 (|0000>), d=1 Bell (|0000>+|1100>)/sqrt(2), d=1 GHZ (|0000>+|1110>)/sqrt(2)
-    d0 = PhaseQFEComponent.zero(n)
-    _, d_bell = apply_quarter_turn(PhaseQFEComponent.zero(n), [1, 1, 0, 0], [0, 0, 0, 0], 0)
-    # Adjust d_bell phase on |1100> via S-like or direct ell=0 so overlap with d0 is +1/sqrt(2)
-    d_bell.ell[:] = 0
-    _, d_ghz = apply_quarter_turn(PhaseQFEComponent.zero(n), [1, 1, 1, 0], [0, 0, 0, 0], 0)
-    d_ghz.ell[:] = 0
-
-    het_terms = [(0.5 + 0.0j, d0), (0.4 + 0.1j, d_bell), (0.3 - 0.2j, d_ghz)]
-    psi_het = sum(
-        (w * c.to_statevector() for w, c in het_terms),
-        np.zeros(1 << n, dtype=np.complex128),
-    )
-    nu_gram = expansion_norm_sq(het_terms)
-    incoherent_sum = sum(abs(w) ** 2 for w, _ in het_terms)
-    assert abs(nu_gram - float(np.vdot(psi_het, psi_het).real)) < 1e-13
-    assert abs(nu_gram - incoherent_sum) > 0.05
 
 
 def test_n1_n2_n3_nonclifford_gates_and_c2_budgets() -> None:
@@ -838,119 +815,6 @@ def test_m2_deep_circuit_underflow_prevention() -> None:
     assert np.all(np.isfinite(exp.weights))
     assert abs(exp.log_mass - (-1200.0 * math.log(2.0))) < 1e-10
     assert exp.branch_mass() == 0.0  # 2^-1200 underflows float64 cleanly without error
-
-
-def test_o2_quadratic_gauss_sum_exhaustive_and_random() -> None:
-    def brute_gauss(q0: int, ell: np.ndarray, Gamma: np.ndarray) -> complex:
-        g = len(ell)
-        acc = 0.0 + 0.0j
-        U = np.triu(Gamma, 1).astype(np.int64)
-        ell_i = ell.astype(np.int64)
-        for mask in range(1 << g):
-            r = np.array([(mask >> j) & 1 for j in range(g)], dtype=np.int64)
-            ph = int((q0 + ell_i @ r + 2 * (r @ U @ r)) & 3)
-            acc += (1j) ** ph
-        return acc
-
-    # Structured cases across g in [0..6]
-    for g in range(7):
-        z_G = np.zeros((g, g), dtype=np.uint8)
-        for q0 in range(4):
-            # Case: ell = 0, Gamma = 0
-            z_ell = np.zeros(g, dtype=np.uint8)
-            assert abs(quadratic_gauss_sum(q0, z_ell, z_G) - brute_gauss(q0, z_ell, z_G)) < 1e-12
-            if g >= 1:
-                # Case: early zero (ell[0] = 2, Gamma = 0)
-                e2 = z_ell.copy()
-                e2[0] = 2
-                assert quadratic_gauss_sum(q0, e2, z_G) == 0.0j
-                # Case: odd linear entry
-                e1 = z_ell.copy()
-                e1[0] = 1
-                assert abs(quadratic_gauss_sum(q0, e1, z_G) - brute_gauss(q0, e1, z_G)) < 1e-12
-            if g >= 2:
-                # Case: 2-var elimination (even ell, off-diagonal Gamma[0, g-1] = 1)
-                G2 = z_G.copy()
-                G2[0, g - 1] = G2[g - 1, 0] = 1
-                for l0, l1 in itertools.product((0, 2), (0, 2)):
-                    ev = z_ell.copy()
-                    ev[0] = l0
-                    ev[g - 1] = l1
-                    assert abs(quadratic_gauss_sum(q0, ev, G2) - brute_gauss(q0, ev, G2)) < 1e-12
-
-    # 80 random instances up to g = 8 (testing both 3-arg and 2-arg signatures)
-    rng = np.random.default_rng(113)
-    for idx in range(80):
-        g = int(rng.integers(0, 9))
-        q0 = int(rng.integers(0, 4))
-        ell = rng.integers(0, 4, size=g, dtype=np.uint8)
-        G = rng.integers(0, 2, size=(g, g), dtype=np.uint8)
-        G = np.triu(G, 1)
-        G = G ^ G.T
-        expected = brute_gauss(q0, ell, G)
-        val_3arg = quadratic_gauss_sum(q0, ell, G)
-        val_2arg = quadratic_gauss_sum(ell, G, c0=q0)
-        assert abs(val_3arg - expected) < 1e-11
-        assert abs(val_2arg - expected) < 1e-11
-
-
-def test_o1_overlap_and_large_d_ldexp_safety() -> None:
-    rng = np.random.default_rng(114)
-    # (a) 120 random heterogeneous pairs on n in [1..6]
-    for _ in range(120):
-        n = int(rng.integers(1, 7))
-        d_bra = int(rng.integers(0, n + 1))
-        d_ket = int(rng.integers(0, n + 1))
-        bra = random_valid_component(rng, n, d_bra)
-        ket = random_valid_component(rng, n, d_ket)
-        ov = overlap(bra, ket)
-        expected = complex(np.vdot(bra.to_statevector(), ket.to_statevector()))
-        assert abs(ov - expected) < 1e-12
-
-    # (b) Pauli matrix elements <bra | P | ket>
-    for _ in range(30):
-        n = 5
-        bra = random_valid_component(rng, n, 3)
-        ket = random_valid_component(rng, n, 2)
-        a_b, b_b, kap = random_hermitian_pauli_bits(rng, n)
-        g, p_ket = apply_pauli(ket, a_b, b_b, kap)
-        mat_el = g * overlap(bra, p_ket)
-        expected_el = complex(
-            np.vdot(
-                bra.to_statevector(),
-                dense_pauli_le(n, a_b, b_b, kap) @ ket.to_statevector(),
-            )
-        )
-        assert abs(mat_el - expected_el) < 1e-12
-
-    # (c) Large-D ldexp underflow safety: N = 650, d = 600 -> D = 1200 > 1074
-    n_big, d_big = 650, 600
-    piv_big = np.arange(d_big, dtype=np.int32)
-    nw_big = n_words_for_qubits(n_big)
-    A_w_big = np.zeros((d_big, nw_big), dtype=np.uint64)
-    for j in range(d_big):
-        A_w_big[j, j >> 6] |= np.uint64(1) << np.uint64(j & 63)
-        # Mix in non-pivot qubits 600..649
-        extra_q = 600 + (j % 50)
-        A_w_big[j, extra_q >> 6] |= np.uint64(1) << np.uint64(extra_q & 63)
-    h_w_big = np.zeros(nw_big, dtype=np.uint64)
-    h_w_big[0] = np.uint64(0xA5A5A5A5A5A5A5A5)
-    ell_big = rng.integers(0, 4, size=d_big, dtype=np.uint8)
-    G_big = rng.integers(0, 2, size=(d_big, d_big), dtype=np.uint8)
-    G_big = np.triu(G_big, 1)
-    G_big = G_big ^ G_big.T
-    big_comp = PhaseQFEComponent(
-        n_qubits=n_big,
-        d=d_big,
-        h_words=h_w_big,
-        A_words=A_w_big,
-        ell=ell_big,
-        Gamma=G_big,
-        pivots=piv_big,
-    )
-    big_comp.check_invariants()
-    ov_self = overlap(big_comp, big_comp)
-    assert abs(ov_self - (1.0 + 0.0j)) < 1e-12
 
 
 # ---------------------------------------------------------------------------
@@ -1199,14 +1063,21 @@ def test_multiword_primitives_remap_invariance(n_big: int) -> None:
                 aw[q >> 6] |= np.uint64(1) << np.uint64(q & 63)
         return aw
 
-    def expansion_inner_product(e1: ShotExpansion, e2: ShotExpansion) -> complex:
-        total = 0.0 + 0.0j
-        c1 = e1.to_components()
-        c2 = e2.to_components()
-        for w1, d1 in c1:
-            for w2, d2 in c2:
-                total += np.conj(w1) * w2 * overlap(d1, d2)
-        return total
+    def restrict_to_qmap(e_big: ShotExpansion, qmap: list[int]) -> ShotExpansion:
+        qm_arr = np.asarray(qmap, dtype=np.int32)
+        loc = {q: j for j, q in enumerate(qmap)}
+        shifts = (np.uint64(1) << np.arange(n_small, dtype=np.uint64))[None, :]
+        a_b = get_bits_at_qubits(e_big.A_words, qm_arr) if e_big.d > 0 else np.zeros((0, n_small), dtype=np.uint8)
+        h_b = get_bits_at_qubits(e_big.h_words, qm_arr) if e_big.chi > 0 else np.zeros((0, n_small), dtype=np.uint8)
+        a_s = np.sum(a_b.astype(np.uint64) * shifts, axis=1, keepdims=True, dtype=np.uint64)
+        h_s = np.sum(h_b.astype(np.uint64) * shifts, axis=1, keepdims=True, dtype=np.uint64)
+        piv_s = np.array([loc[int(p)] for p in e_big.pivots], dtype=np.int32)
+        au_s = np.array([np.bitwise_or.reduce(a_s[:, 0])] if e_big.d > 0 else [0], dtype=np.uint64)
+        return ShotExpansion(
+            n_small, e_big.d, a_s, au_s, e_big.Gamma, piv_s,
+            e_big.weights, h_s, e_big.ell, e_big.ell_odd,
+            e_big.log_mass, e_big.atol, e_big._is_canonical_merged,
+        )
 
     for qmap in maps:
         exp_small = ShotExpansion.zero(n_small)
@@ -1277,24 +1148,19 @@ def test_multiword_primitives_remap_invariance(n_big: int) -> None:
                 checkpoints_small.append(exp_small.copy())
                 checkpoints_big.append(exp_big.copy())
 
-        # Verify full O1 expansion inner products AND exact 32-amplitude statevector!
+        # Verify active inner products AND exact 32-amplitude statevector!
         for i in range(len(checkpoints_small) - 1):
-            ov_s = expansion_inner_product(checkpoints_small[i], checkpoints_small[i + 1])
-            ov_b = expansion_inner_product(checkpoints_big[i], checkpoints_big[i + 1])
+            ov_s = complex(np.vdot(checkpoints_small[i].to_statevector(), checkpoints_small[i + 1].to_statevector()))
+            ov_b = complex(
+                np.vdot(
+                    restrict_to_qmap(checkpoints_big[i], qmap).to_statevector(),
+                    restrict_to_qmap(checkpoints_big[i + 1], qmap).to_statevector(),
+                )
+            )
             assert abs(ov_b - ov_s) < 1e-10
 
         psi_small = exp_small.to_statevector()
-        psi_big_active = np.zeros(1 << n_small, dtype=np.complex128)
-        big_comps = exp_big.to_components()
-        for idx in range(1 << n_small):
-            bits_s = np.array([(idx >> b) & 1 for b in range(n_small)], dtype=np.uint8)
-            bra_comp = PhaseQFEComponent.computational_basis_state(
-                n_big, embed_bits(bits_s, qmap)
-            )
-            amp = 0.0 + 0.0j
-            for w_c, c_big in big_comps:
-                amp += w_c * overlap(bra_comp, c_big)
-            psi_big_active[idx] = amp
+        psi_big_active = restrict_to_qmap(exp_big, qmap).to_statevector()
         assert np.max(np.abs(psi_big_active - psi_small)) < 1e-10
 
 
@@ -1416,35 +1282,34 @@ def test_m1_p1_sequence_terms_and_compiled_block_validation() -> None:
         (0.5 + 0.0j, PhaseQFEComponent.zero(3)),
     ]
 
-    # Mixed n_qubits across Sequence[ComponentTerm] must raise ValueError on every primitive
-    for bad_mixed_call in (
-        lambda: apply_pauli(mixed_terms, [0, 0, 0, 0, 1], [0, 0, 0, 0, 0], 0),
-        lambda: apply_quarter_turn(mixed_terms, [0, 0, 0, 0, 1], [0, 0, 0, 0, 0], 0),
-        lambda: merge_frames(mixed_terms),
-        lambda: expansion_norm_sq(mixed_terms, canonicalize_first=False),
-        lambda: apply_pauli_t(mixed_terms, [0, 0, 0, 0, 1], [0, 0, 0, 0, 0], 0),
-        lambda: apply_ccz(
-            mixed_terms,
-            [
-                ([0, 0, 0, 0, 0], [1, 0, 0, 0, 0], 0),
-                ([0, 0, 0, 0, 0], [0, 1, 0, 0, 0], 0),
-                ([0, 0, 0, 0, 0], [0, 0, 1, 0, 0], 0),
-            ],
-        ),
-        lambda: apply_compiled_block(
-            mixed_terms, CompiledPauliBlock(n_qubits=5, is_identity=True)
-        ),
-        lambda: project_diagonal(mixed_terms, [0, 0, 0, 0, 1]),
-        lambda: measure_expansion(mixed_terms, [0, 0, 0, 0, 1], [0, 0, 0, 0, 0], 0),
-    ):
-        with pytest.raises(ValueError):
-            bad_mixed_call()
+    with pytest.raises(ValueError):
+        ShotExpansion.from_components(mixed_terms)
 
-    # Dirty upper tail bits on a component in Sequence[ComponentTerm] (multi-word N=65)
+    # Non-ShotExpansion targets must raise TypeError on every primitive
+    for bad_target in (terms_3q, PhaseQFEComponent.zero(3)):
+        for bad_call in (
+            lambda: apply_pauli(bad_target, [0, 0, 1], [0, 0, 0], 0),  # type: ignore[arg-type]
+            lambda: apply_quarter_turn(bad_target, [0, 0, 1], [0, 0, 0], 0),  # type: ignore[arg-type]
+            lambda: merge_frames(bad_target),  # type: ignore[arg-type]
+            lambda: apply_pauli_t(bad_target, [0, 0, 1], [0, 0, 0], 0),  # type: ignore[arg-type]
+            lambda: apply_ccz(
+                bad_target,  # type: ignore[arg-type]
+                [([0, 0, 0], [1, 0, 0], 0), ([0, 0, 0], [0, 1, 0], 0), ([0, 0, 0], [0, 0, 1], 0)],
+            ),
+            lambda: apply_compiled_block(
+                bad_target, CompiledPauliBlock(n_qubits=3, is_identity=True)  # type: ignore[arg-type]
+            ),
+            lambda: project_diagonal(bad_target, [0, 0, 1]),  # type: ignore[arg-type]
+            lambda: measure_expansion(bad_target, [0, 0, 1], [0, 0, 0], 0),  # type: ignore[arg-type]
+        ):
+            with pytest.raises(TypeError):
+                bad_call()
+
+    # Dirty upper tail bits on a component in from_components (multi-word N=65)
     dirty_65 = PhaseQFEComponent.zero(65)
     dirty_65.h_words[1] = np.uint64(1) << np.uint64(6)  # q=70 >= 65
     with pytest.raises(ValueError):
-        apply_pauli([(1.0 + 0.0j, dirty_65)], np.zeros(2, dtype=np.uint64), np.zeros(2, dtype=np.uint64), 0)
+        ShotExpansion.from_components([(1.0 + 0.0j, dirty_65)])
 
     # Mismatched block.n_qubits, dirty step/pauli_sum tail masks, invalid mode, invalid step.kind
     blk_5q = CompiledPauliBlock(
@@ -1480,17 +1345,15 @@ def test_m1_p1_sequence_terms_and_compiled_block_validation() -> None:
         mode="sequential",
         steps=(CompiledPauliBlockStep(kind="BOGUS", paulis=()),),  # type: ignore[arg-type]
     )
-    for tgt in (exp_3q, terms_3q):
-        for bad_blk in (blk_5q, blk_dirty_tail, blk_seq_dirty, blk_bad_mode, blk_bad_step):
-            with pytest.raises(ValueError):
-                apply_compiled_block(tgt, bad_blk)
+    for bad_blk in (blk_5q, blk_dirty_tail, blk_seq_dirty, blk_bad_mode, blk_bad_step):
+        with pytest.raises(ValueError):
+            apply_compiled_block(exp_3q, bad_blk)
 
 
 def test_m1_p2_explicit_atol_override_precedence_all_primitives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     exp1 = ShotExpansion.zero(1)
-    lst1 = [(1.0 + 0.0j, PhaseQFEComponent.zero(1))]
 
     # (1) apply_compiled_block: is_identity, pauli_sum, and sequential modes
     for mode_blk_e11, mode_blk_e8 in (
@@ -1539,14 +1402,12 @@ def test_m1_p2_explicit_atol_override_precedence_all_primitives(
             ),
         ),
     ):
-        for tgt in (exp1, lst1):
-            with pytest.raises(FloatingPointError):
-                apply_compiled_block(tgt, mode_blk_e11, atol=1e-13)
-            _ = apply_compiled_block(tgt, mode_blk_e8, atol=1e-6)
+        with pytest.raises(FloatingPointError):
+            apply_compiled_block(exp1, mode_blk_e11, atol=1e-13)
+        _ = apply_compiled_block(exp1, mode_blk_e8, atol=1e-6)
 
     # (2) apply_ccz with drifted 8-branch weights
     exp3 = ShotExpansion.zero(3)
-    lst3 = [(1.0 + 0.0j, PhaseQFEComponent.zero(3))]
     ccz_e11 = [
         (
             math.sqrt(1.0 + 1e-11) if m == 0 else 0.0j,
@@ -1565,10 +1426,9 @@ def test_m1_p2_explicit_atol_override_precedence_all_primitives(
         )
         for m in range(8)
     ]
-    for tgt3 in (exp3, lst3):
-        with pytest.raises(FloatingPointError):
-            apply_ccz(tgt3, ccz_e11, atol=1e-13)
-        _ = apply_ccz(tgt3, ccz_e8, atol=1e-6)
+    with pytest.raises(FloatingPointError):
+        apply_ccz(exp3, ccz_e11, atol=1e-13)
+    _ = apply_ccz(exp3, ccz_e8, atol=1e-6)
 
     # (3) apply_quarter_turn and apply_pauli_t explicit atol overrides under norm drift
     orig_merge = pq.merge_frames
@@ -1577,27 +1437,22 @@ def test_m1_p2_explicit_atol_override_precedence_all_primitives(
     def make_drifted_merge(delta: float):  # type: ignore[no-untyped-def]
         def _drifted_merge(expansion, **kw):  # type: ignore[no-untyped-def]
             res = orig_merge(expansion, **kw)
-            scale = math.sqrt(1.0 + delta)
-            if isinstance(res, ShotExpansion):
-                res.weights = np.ascontiguousarray(res.weights * scale)
-                return res
-            return [(w * scale, c) for w, c in res]
+            res.weights = np.ascontiguousarray(res.weights * math.sqrt(1.0 + delta))
+            return res
 
         return _drifted_merge
 
     monkeypatch.setattr(pq, "merge_frames", make_drifted_merge(1e-11))
     monkeypatch.setattr(pq, "_checked_shot_pre_norm", lambda e, c, op, _p=orig_pre: _p(e, c, op) + 1e-11)
-    for tgt in (exp1, lst1):
-        with pytest.raises(FloatingPointError):
-            apply_quarter_turn(tgt, [1], [0], 0, atol=1e-13)
-        with pytest.raises(FloatingPointError):
-            apply_pauli_t(tgt, [0], [1], 0, atol=1e-13)
+    with pytest.raises(FloatingPointError):
+        apply_quarter_turn(exp1, [1], [0], 0, atol=1e-13)
+    with pytest.raises(FloatingPointError):
+        apply_pauli_t(exp1, [0], [1], 0, atol=1e-13)
 
     monkeypatch.setattr(pq, "merge_frames", make_drifted_merge(1e-8))
     monkeypatch.setattr(pq, "_checked_shot_pre_norm", lambda e, c, op, _p=orig_pre: _p(e, c, op) + 1e-8)
-    for tgt in (exp1, lst1):
-        _ = apply_quarter_turn(tgt, [1], [0], 0, atol=1e-6)
-        _ = apply_pauli_t(tgt, [0], [1], 0, atol=1e-6)
+    _ = apply_quarter_turn(exp1, [1], [0], 0, atol=1e-6)
+    _ = apply_pauli_t(exp1, [0], [1], 0, atol=1e-6)
     monkeypatch.setattr(pq, "merge_frames", orig_merge)
     monkeypatch.setattr(pq, "_checked_shot_pre_norm", orig_pre)
 
@@ -1611,15 +1466,15 @@ def test_m1_p2_explicit_atol_override_precedence_all_primitives(
 
     monkeypatch.setattr(pq, "apply_quarter_turn", _spy_qt)
     _ = measure_expansion(exp1, [1], [0], 0, atol=2.5e-6, rng=np.random.default_rng(7))
-    _ = measure_expansion(lst1, [1], [0], 0, atol=4.5e-7, rng=np.random.default_rng(8))
     monkeypatch.setattr(pq, "apply_quarter_turn", orig_qt)
-    assert recorded_atols == [2.5e-6, 2.5e-6, 4.5e-7, 4.5e-7]
+    assert recorded_atols == [2.5e-6, 2.5e-6]
 
 
 def test_m1_p3_unmerged_shot_expansion_physical_norm_and_primitives() -> None:
     c0 = PhaseQFEComponent.zero(3)
     terms_u = [(0.5 + 0.0j, c0.copy()), (0.5 + 0.0j, c0.copy())]
     exp_u = ShotExpansion.from_components(terms_u, merge=False)
+    exp_m = merge_frames(exp_u)
     assert exp_u.chi == 2
     assert exp_u._is_canonical_merged is False
     assert abs(exp_u.norm_sq() - 1.0) < 1e-14
@@ -1627,18 +1482,16 @@ def test_m1_p3_unmerged_shot_expansion_physical_norm_and_primitives() -> None:
     assert abs(exp_u.branch_mass() - 1.0) < 1e-14
     assert abs(exp_u.log_branch_mass() - 0.0) < 1e-14
 
-    # All unitary & measurement primitives must accept unmerged ShotExpansion and match Sequence[ComponentTerm]
+    # All unitary & measurement primitives must accept unmerged ShotExpansion and match merged ShotExpansion
     q_exp = apply_quarter_turn(exp_u, [1, 0, 0], [0, 0, 0], 0)
-    q_lst = apply_quarter_turn(terms_u, [1, 0, 0], [0, 0, 0], 0)
-    assert isinstance(q_exp, ShotExpansion) and q_exp._is_canonical_merged is True
-    psi_q_lst = sum(w * c.to_statevector() for w, c in q_lst)
-    assert np.max(np.abs(q_exp.to_statevector() - psi_q_lst)) < 1e-14
+    q_ref = apply_quarter_turn(exp_m, [1, 0, 0], [0, 0, 0], 0)
+    assert q_exp._is_canonical_merged is True
+    assert np.max(np.abs(q_exp.to_statevector() - q_ref.to_statevector())) < 1e-14
 
     t_exp = apply_pauli_t(exp_u, [1, 0, 0], [0, 0, 0], 0)
-    t_lst = apply_pauli_t(terms_u, [1, 0, 0], [0, 0, 0], 0)
-    assert isinstance(t_exp, ShotExpansion) and t_exp._is_canonical_merged is True
-    psi_t_lst = sum(w * c.to_statevector() for w, c in t_lst)
-    assert np.max(np.abs(t_exp.to_statevector() - psi_t_lst)) < 1e-14
+    t_ref = apply_pauli_t(exp_m, [1, 0, 0], [0, 0, 0], 0)
+    assert t_exp._is_canonical_merged is True
+    assert np.max(np.abs(t_exp.to_statevector() - t_ref.to_statevector())) < 1e-14
 
     ccz_axes = [
         ([0, 0, 0], [1, 0, 0], 0),
@@ -1646,27 +1499,26 @@ def test_m1_p3_unmerged_shot_expansion_physical_norm_and_primitives() -> None:
         ([0, 0, 0], [0, 0, 1], 0),
     ]
     c_exp = apply_ccz(exp_u, ccz_axes)
-    assert isinstance(c_exp, ShotExpansion) and abs(c_exp.norm_sq() - 1.0) < 1e-14
+    assert abs(c_exp.norm_sq() - 1.0) < 1e-14
 
     b_exp = apply_compiled_block(
         exp_u, CompiledPauliBlock(n_qubits=3, is_identity=True, global_scalar=_OMEGA)
     )
-    assert isinstance(b_exp, ShotExpansion) and abs(b_exp.norm_sq() - 1.0) < 1e-14
+    assert abs(b_exp.norm_sq() - 1.0) < 1e-14
 
     m_exp = measure_expansion(exp_u, [1, 0, 0], [0, 0, 0], 0, rng=np.random.default_rng(11))
-    m_lst = measure_expansion(terms_u, [1, 0, 0], [0, 0, 0], 0, rng=np.random.default_rng(11))
+    m_ref = measure_expansion(exp_m, [1, 0, 0], [0, 0, 0], 0, rng=np.random.default_rng(11))
     assert abs((m_exp.z0 + m_exp.z1) - 1.0) < 1e-14
-    assert abs(m_exp.z0 - m_lst.z0) < 1e-14 and abs(m_exp.z1 - m_lst.z1) < 1e-14
-    assert m_exp.outcome == m_lst.outcome
+    assert abs(m_exp.z0 - m_ref.z0) < 1e-14 and abs(m_exp.z1 - m_ref.z1) < 1e-14
+    assert m_exp.outcome == m_ref.outcome
 
-    # Unmerged raw output of apply_pauli_t(..., merge=False) and apply_ccz(..., merge=False)
+    # Unmerged raw output of apply_ccz(..., merge=False)
     plus_3 = apply_quarter_turn(ShotExpansion.zero(3), [1, 0, 0], [0, 0, 0], 0)
     unmerged_ccz = apply_ccz(
         plus_3,
         [([1, 0, 0], [0, 0, 0], 0), ([0, 0, 0], [0, 1, 0], 0), ([0, 0, 0], [0, 0, 1], 0)],
         merge=False,
     )
-    assert isinstance(unmerged_ccz, ShotExpansion)
     assert unmerged_ccz._is_canonical_merged is False
     assert abs(unmerged_ccz.norm_sq() - 1.0) < 1e-13
     assert abs(unmerged_ccz.branch_mass() - 1.0) < 1e-13
@@ -1754,7 +1606,7 @@ def test_m1_r3_compiled_block_nan_ndim_dtype_and_identity_validation(
 ) -> None:
     """Bugs 2 & 4: `apply_compiled_block` validates finiteness, ndim, dtypes, and `is_identity=True`."""
     blk = CompiledPauliBlock(n_qubits=1, **blk_kwargs)  # type: ignore[arg-type]
-    for tgt in (ShotExpansion.zero(1), [(1.0 + 0j, PhaseQFEComponent.zero(1))], []):
+    for tgt in (ShotExpansion.zero(1), ShotExpansion.from_components([], n_qubits=1)):
         with pytest.raises(exc_types):
             apply_compiled_block(tgt, blk, check_unitary=False)
 
@@ -1789,9 +1641,7 @@ def test_m1_r3_component_terms_invariants_and_in_place_quarter_turn() -> None:
         ([(1.0 + 0j, bad_ell)], ValueError),
     ):
         with pytest.raises(exc):  # type: ignore[arg-type]
-            expansion_norm_sq(bad_terms)  # type: ignore[arg-type]
-        with pytest.raises(exc):  # type: ignore[arg-type]
-            apply_pauli(bad_terms, [1, 0], [0, 0], 0)  # type: ignore[arg-type]
+            ShotExpansion.from_components(bad_terms)  # type: ignore[arg-type]
 
     # Bug 5: in_place=True on ShotExpansion must mutate & merge `exp_ip` in-place (`ret is exp_ip`)
     exp_ip = ShotExpansion.from_components(

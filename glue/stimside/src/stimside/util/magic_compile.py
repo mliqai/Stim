@@ -2458,15 +2458,13 @@ def run_selector(
 
 
 def _slice_expansion_to_data_qubits(
-    expansion: ShotExpansion | Sequence[tuple[complex, PhaseQFEComponent]],
+    expansion: ShotExpansion,
     n_data: int,
     sel_arr: NDArray[np.bool_],
 ) -> ShotExpansion:
     """Project/verify selector bits and slice `ShotExpansion` to `0 .. n_data - 1`."""
     if not isinstance(expansion, ShotExpansion):
-        expansion = ShotExpansion.from_components(
-            expansion, n_qubits=n_data + len(sel_arr)
-        )
+        raise TypeError(f"Expected ShotExpansion, got {type(expansion)!r}")
     n_total, n_sel = expansion.n_qubits, len(sel_arr)
     if n_data + n_sel != n_total:
         raise ValueError(f"n_data ({n_data}) + len(selector_bits) ({n_sel}) != expansion.n_qubits ({n_total})")
@@ -2479,7 +2477,6 @@ def _slice_expansion_to_data_qubits(
             proj_exp, _ = project_diagonal(
                 work, unit_bit_words(s_q, n_w_tot), 0, want_bit
             )
-            assert isinstance(proj_exp, ShotExpansion)
             proj_exp.log_mass = work.log_mass
             work = proj_exp
 
@@ -2493,7 +2490,7 @@ def _slice_expansion_to_data_qubits(
     data_exp = work.copy()
     data_exp.n_qubits, data_exp.A_words, data_exp.h_words = n_data, A_d, h_d
     data_exp._refresh_a_union()
-    return merge_frames(data_exp)  # type: ignore[return-value]
+    return merge_frames(data_exp)
 
 
 def extract_data_expansion(

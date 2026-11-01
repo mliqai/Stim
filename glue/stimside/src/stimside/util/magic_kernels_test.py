@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import replace
 from pathlib import Path
 import subprocess
 from unittest import mock
@@ -29,8 +28,6 @@ EXPECTED_SYMBOLS = (
     "magic_branch_pauli_t",
     "magic_branch_ccz",
     "magic_project_diagonal",
-    "magic_overlap",
-    "magic_quadratic_gauss_sum",
 )
 
 
@@ -153,37 +150,6 @@ def test_zero_size_raw_abi_contiguity_guard_and_rejection() -> None:
     )
     assert rc != 0
 
-    # Raw magic_overlap with d_bra=0, d_ket=0 on matching and mismatching h_words.
-    h0 = (ctypes.c_uint64 * 2)(5, 9)
-    h1 = (ctypes.c_uint64 * 2)(5, 11)
-    out_ri = (ctypes.c_double * 2)(0.0, 0.0)
-    lib.magic_overlap(2, 0, h0, null_u64, null_u8, null_u8, 0, h0, null_u64, null_u8, null_u8, out_ri)
-    assert (out_ri[0], out_ri[1]) == (1.0, 0.0)
-    lib.magic_overlap(2, 0, h0, null_u64, null_u8, null_u8, 0, h1, null_u64, null_u8, null_u8, out_ri)
-    assert (out_ri[0], out_ri[1]) == (0.0, 0.0)
-
-    # Strided / int64 PhaseQFEComponent arrays handled safely via cpp_overlap.
-    base_c = pq.PhaseQFEComponent.from_unpacked(
-        [0, 0, 1], np.array([[1, 0], [0, 1], [1, 1]], dtype=np.uint8), [1, 2], [[0, 1], [1, 0]], [0, 1]
-    )
-    strided_ell = np.array([1, 99, 2, 99], dtype=np.int64)[::2]
-    strided_G = np.array([[0, 0, 1, 0], [0, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]], dtype=np.int64)[::2, ::2]
-    strided_c = pq.PhaseQFEComponent(
-        n_qubits=3, d=2, h_words=base_c.h_words.astype(np.int64),
-        A_words=base_c.A_words, ell=strided_ell, Gamma=strided_G, pivots=base_c.pivots,
-    )
-    ov_ref = complex(np.vdot(base_c.to_statevector(), base_c.to_statevector()))
-    assert abs(ov_ref - 1.0) < 1e-14
-    assert abs(pq.overlap(strided_c, base_c) - ov_ref) < 1e-14
-
-    empty_l = np.zeros(0, dtype=np.uint8)
-    empty_B = np.zeros((0, 0), dtype=np.uint8)
-    for q0 in range(4):
-        for scl in (-3, 0, 5):
-            vc = pq.quadratic_gauss_sum(empty_l, empty_B, c0=q0, scale_log2=scl)
-            vp = (1j ** q0) * (2.0 ** (scl / 2.0))
-            assert abs(vc - vp) < 1e-15
-
 
 def _dense_pauli_apply(psi: np.ndarray, a_mask: int, b_mask: int, kappa: int) -> np.ndarray:
     idx = np.arange(psi.shape[0], dtype=np.uint64)
@@ -196,17 +162,23 @@ def _dense_pauli_apply(psi: np.ndarray, a_mask: int, b_mask: int, kappa: int) ->
 
 def _extract_active_statevector(exp: pq.ShotExpansion, qs: list[int]) -> np.ndarray:
     k = len(qs)
-    out = np.zeros(1 << k, dtype=np.complex128)
-    comps = exp.to_components()
-    for y in range(1 << k):
-        bra = pq.PhaseQFEComponent.zero_state(exp.n_qubits)
-        hw = np.zeros(exp.n_words, dtype=np.uint64)
-        for j, q in enumerate(qs):
-            if (y >> j) & 1:
-                hw |= pq.unit_bit_words(q, exp.n_words)
-        bra.h_words = hw
-        out[y] = sum(w * pq.overlap(bra, c) for w, c in comps)
-    return out
+    if exp.chi == 0:
+        return np.zeros(1 << k, dtype=np.complex128)
+    qs_arr = np.asarray(qs, dtype=np.int32)
+    loc = {q: j for j, q in enumerate(qs)}
+    a_bits = pq.get_bits_at_qubits(exp.A_words, qs_arr) if exp.d > 0 else np.zeros((0, k), dtype=np.uint8)
+    h_bits = pq.get_bits_at_qubits(exp.h_words, qs_arr)
+    shifts = (np.uint64(1) << np.arange(k, dtype=np.uint64))[None, :]
+    a_sub = np.sum(a_bits.astype(np.uint64) * shifts, axis=1, keepdims=True, dtype=np.uint64)
+    h_sub = np.sum(h_bits.astype(np.uint64) * shifts, axis=1, keepdims=True, dtype=np.uint64)
+    piv_sub = np.array([loc[int(p)] for p in exp.pivots], dtype=np.int32)
+    a_u = np.array([np.bitwise_or.reduce(a_sub[:, 0])] if exp.d > 0 else [0], dtype=np.uint64)
+    sub = pq.ShotExpansion(
+        k, exp.d, a_sub, a_u, exp.Gamma, piv_sub,
+        exp.weights, h_sub, exp.ell, exp.ell_odd,
+        exp.log_mass, exp.atol, exp._is_canonical_merged,
+    )
+    return sub.to_statevector()
 
 
 @pytest.mark.parametrize("n_qubits", [1, 5, 63, 64, 65, 70, 128, 129, 130])
@@ -281,16 +253,6 @@ def test_all_eight_kernels_word_boundaries_in_place_and_log_mass(n_qubits: int) 
                 np.testing.assert_allclose(_extract_active_statevector(p_c, qs), psi_proj, atol=1e-12)
                 z_sum += z_c
             assert abs(z_sum - cpp.norm_sq()) < 1e-12
-
-    rng = np.random.default_rng(1000 + n_qubits)
-    for g in (1, 8, 75 if n_qubits == 130 else 17):
-        l_arr = rng.integers(0, 4, size=g, dtype=np.uint8)
-        u_mat = np.triu(rng.integers(0, 2, size=(g, g), dtype=np.uint8), 1)
-        b_mat = np.ascontiguousarray(u_mat ^ u_mat.T)
-        gc = pq.quadratic_gauss_sum(l_arr, b_mat, c0=n_qubits & 3, scale_log2=-g)
-        nz, k2, v8 = pq.quadratic_gauss_sum_dyadic(l_arr, b_mat, c0=n_qubits & 3)
-        gp = 0.0j if not nz else complex(pq._OMEGA_POW[v8]) * (2.0 ** ((k2 - g) / 2.0))
-        assert abs(gc - gp) < 1e-14 * max(1.0, abs(gp))
 
 
 def test_high_chi_k1_first_seen_order_and_exact_cancellation() -> None:
@@ -399,56 +361,3 @@ def test_magic_compile_direct_vs_selector_and_word_boundary_parity() -> None:
     psi_d = so_d.expansion.to_statevector(ref_tableau=so_d.final_tableau)
     psi_s = so_s.expansion.to_statevector(ref_tableau=so_s.final_tableau)
     assert abs(abs(np.vdot(psi_d, psi_s)) - 1.0) < 1e-12
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "chi0_d0_self",
-        "chi0_d0_comp",
-        "chi0_d1",
-        "chi2_d0_bell",
-        "chi2_orth",
-        "nq_5_70",
-        "nq_70_5",
-        "empty_A",
-        "bad_Gamma",
-        "h_2d",
-    ],
-)
-def test_overlap_rejects_expansions_qubit_mismatch_and_malformed_shapes(case: str) -> None:
-    def _c1(nq: int, h0: int = 0) -> pq.PhaseQFEComponent:
-        nw = pq.n_words_for_qubits(nq)
-        h, a = np.zeros(nw, dtype=np.uint64), pq.unit_bit_words(0, nw)[None, :]
-        h[0] = np.uint64(h0)
-        return pq.PhaseQFEComponent(
-            nq, 1, h, a, np.zeros(1, dtype=np.uint8), np.zeros((1, 1), dtype=np.uint8), np.zeros(1, dtype=np.int32)
-        )
-
-    c2, c2_x1 = _c1(2, 0), _c1(2, 2)
-    z00, z11 = pq.PhaseQFEComponent.zero_state(2), pq.PhaseQFEComponent.computational_basis_state(2, [1, 1])
-    e0, s = pq.ShotExpansion.from_components([], n_qubits=2), 0.5**0.5
-    bra, ket = {
-        "chi0_d0_self": (e0, e0),
-        "chi0_d0_comp": (e0, z00),
-        "chi0_d1": (e0, c2),
-        "chi2_d0_bell": (
-            pq.ShotExpansion.from_components([(s, z00), (s, z11)]),
-            pq.ShotExpansion.from_components([(s, z00), (-s, z11)]),
-        ),
-        "chi2_orth": (
-            pq.ShotExpansion.from_components([(s, c2), (s, c2_x1)]),
-            pq.ShotExpansion.from_components([(s, c2), (-s, c2_x1)]),
-        ),
-        "nq_5_70": (_c1(5), _c1(70)),
-        "nq_70_5": (_c1(70), _c1(5)),
-        "empty_A": (replace(c2, A_words=np.zeros((0, 1), dtype=np.uint64)), c2),
-        "bad_Gamma": (replace(c2, Gamma=np.zeros((2, 2), dtype=np.uint8)), c2_x1),
-        "h_2d": (replace(c2, h_words=np.zeros((1, 1), dtype=np.uint64)), c2),
-    }[case]
-    exc = TypeError if case.startswith("chi") else ValueError
-    for b, k in ((bra, ket), (ket, bra)):
-        with pytest.raises(exc):
-            mk.cpp_overlap(b, k)
-        with pytest.raises(exc):
-            pq.overlap(b, k)

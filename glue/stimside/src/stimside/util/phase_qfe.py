@@ -1,7 +1,7 @@
 """Phase-preserving Moving-Reference Quadratic-Form Expansion (QFE) engine.
 
 Implements Recipe v3 primitives for `magicside`: `C1` (`PhaseQFEComponent`,
-`ShotExpansion`), `H0`–`H4`, `P1`–`P2`, `K1`, `N1`–`N3`, `M1`–`M2`, and `O1`–`O2`.
+`ShotExpansion`), `H0`–`H4`, `P1`–`P2`, `K1`, `N1`–`N3`, and `M1`–`M2`.
 """
 
 from __future__ import annotations
@@ -9,8 +9,7 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 import math
-from types import ModuleType
-from typing import Any, Literal, Sequence, TypeAlias
+from typing import Any, Literal, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -24,14 +23,14 @@ __all__ = [
     "coerce_pauli_words", "unit_bit_words", "get_bit_in_words", "get_bits_at_qubits",
     "word_dot_parity", "word_dot_parity_batch", "words_any_nonzero", "words_any_overlap",
     "first_set_bit_in_words", "pauli_multiply", "validate_hermitian_pauli",
-    "PhaseQFEComponent", "ShotExpansion", "ComponentTerm", "ExpansionInput",
+    "PhaseQFEComponent", "ShotExpansion",
     "MeasurementResult", "CompiledPauliBlockStep", "CompiledPauliBlock",
     "reference_chp_to_stim_tableau", "apply_reference_tableau_to_statevector",
     "drop_variable", "add_column", "make_principal", "restrict_amplitude",
-    "eliminate_zero_amplitude", "apply_pauli", "apply_quarter_turn", "canonicalize",
-    "merge_frames", "expansion_norm_sq", "apply_pauli_t", "apply_ccz",
+    "eliminate_zero_amplitude", "apply_pauli", "apply_quarter_turn",
+    "merge_frames", "apply_pauli_t", "apply_ccz",
     "apply_compiled_block", "project_diagonal", "measure_expansion",
-    "overlap", "quadratic_gauss_sum", "quadratic_gauss_sum_dyadic", "validate_atol",
+    "validate_atol",
 ]
 
 # Exact IEEE-754 float64 / complex128 constants
@@ -39,11 +38,6 @@ _SQRT2: float = math.sqrt(2.0)
 _INV_SQRT2: float = math.ldexp(1.0, -1) * _SQRT2
 _OMEGA: complex = complex(_INV_SQRT2, _INV_SQRT2)
 _OMEGA_CONJ: complex = complex(_INV_SQRT2, -_INV_SQRT2)
-_OMEGA_POW: NDArray[np.complex128] = np.array(
-    [1.0 + 0.0j, _OMEGA, 1.0j, complex(-_INV_SQRT2, _INV_SQRT2),
-     -1.0 + 0.0j, complex(-_INV_SQRT2, -_INV_SQRT2), -1.0j, _OMEGA_CONJ],
-    dtype=np.complex128,
-)
 _PHASE4: NDArray[np.complex128] = np.array([1.0 + 0.0j, 1.0j, -1.0 + 0.0j, -1.0j], dtype=np.complex128)
 _T_C0: complex = complex(0.5 + 0.5 * _INV_SQRT2, 0.5 * _INV_SQRT2)
 _T_C1: complex = complex(0.5 - 0.5 * _INV_SQRT2, -0.5 * _INV_SQRT2)
@@ -114,7 +108,6 @@ def _check_unitary_norm(pre_norm: float, post_norm: float, atol: float, op_name:
 # ---------------------------------------------------------------------------
 
 _CACHED_MAGIC_LIB: ctypes.CDLL | None = None
-_CACHED_MAGIC_MOD: ModuleType | None = None
 
 _c_double_p = ctypes.POINTER(ctypes.c_double)
 _c_u64_p = ctypes.POINTER(ctypes.c_uint64)
@@ -124,21 +117,18 @@ _c_i32_p = ctypes.POINTER(ctypes.c_int32)
 
 def _reset_cpp_kernel_cache() -> None:
     """Reset cached M2 C++ kernel library handle."""
-    global _CACHED_MAGIC_LIB, _CACHED_MAGIC_MOD
+    global _CACHED_MAGIC_LIB
     _CACHED_MAGIC_LIB = None
-    _CACHED_MAGIC_MOD = None
 
 
 def _get_cpp_lib() -> ctypes.CDLL:
-    global _CACHED_MAGIC_LIB, _CACHED_MAGIC_MOD
+    global _CACHED_MAGIC_LIB
     if _CACHED_MAGIC_LIB is not None:
         return _CACHED_MAGIC_LIB
     from stimside.util import magic_kernels as mk  # type: ignore[import-not-found]
 
-    lib = mk.get_magic_kernels_lib()
-    _CACHED_MAGIC_MOD = mk
-    _CACHED_MAGIC_LIB = lib
-    return lib
+    _CACHED_MAGIC_LIB = mk.get_magic_kernels_lib()
+    return _CACHED_MAGIC_LIB
 
 
 def _c_ptr(arr: NDArray[Any], ptr_t: Any) -> Any:
@@ -745,10 +735,6 @@ def _empty_shot_expansion(
     )
 
 
-ComponentTerm: TypeAlias = tuple[complex, PhaseQFEComponent]
-ExpansionInput: TypeAlias = ShotExpansion | Sequence[ComponentTerm]
-
-
 @dataclass(frozen=True)
 class MeasurementResult:
     """Result of `measure_expansion` (`M2`)."""
@@ -761,7 +747,7 @@ class MeasurementResult:
     input_norm_sq: float
     chosen_mass: float
     log_branch_mass: float
-    post_state: ShotExpansion | list[ComponentTerm]
+    post_state: ShotExpansion
 
 
 @dataclass(frozen=True)
@@ -1077,7 +1063,7 @@ def eliminate_zero_amplitude(target: PhaseQFEComponent | ShotExpansion, col: int
 # ---------------------------------------------------------------------------
 
 
-def _validate_component_terms(terms: Sequence[ComponentTerm]) -> int:
+def _validate_component_terms(terms: Sequence[tuple[complex, PhaseQFEComponent]]) -> int:
     n_q = -1
     for idx, item in enumerate(terms):
         if not isinstance(item, tuple) or len(item) != 2:
@@ -1182,87 +1168,34 @@ def _assign_cpp_geom_shot(
     return exp
 
 
-def _apply_pauli_component_inplace(
-    comp: PhaseQFEComponent, a_w: NDArray[np.uint64], b_w: NDArray[np.uint64], kap: int
-) -> complex:
-    factor = complex(_PHASE4[(kap + (word_dot_parity(b_w, comp.h_words) << 1)) & 3])
-    comp.h_words ^= a_w
-    if comp.d > 0 and words_any_overlap(b_w, comp.a_union):
-        comp.ell = np.ascontiguousarray((comp.ell + (word_dot_parity_batch(comp.A_words, b_w) << np.uint8(1))) & np.uint8(3))
-    return factor
-
-
 def apply_pauli(
-    target: PhaseQFEComponent | ExpansionInput,
+    target: ShotExpansion,
     a: Any,
     b: Any = None,
     kappa: int = 0,
     *,
     in_place: bool = False,
-) -> Any:
+) -> ShotExpansion:
     """`P1`: Apply `P = i**kappa X(a) Z(b)` (`O(chi * (n_words + d))`)."""
-    if isinstance(target, PhaseQFEComponent):
-        a_w, b_w, kap = _unpack_pauli_args(a, b, kappa, target.n_qubits)
-        comp = target if in_place else target.copy()
-        factor = _apply_pauli_component_inplace(comp, a_w, b_w, kap)
-        return factor if in_place else (factor, comp)
-
-    if isinstance(target, ShotExpansion):
-        a_w, b_w, kap = _unpack_pauli_args(a, b, kappa, target.n_qubits)
-        exp = target if in_place else target.copy()
-        if exp.chi == 0:
-            return exp
-        if not np.all(np.isfinite(exp.weights)):
-            raise FloatingPointError("Non-finite weights in apply_pauli")
-        _get_cpp_lib().magic_apply_pauli_batch(
-            exp.chi, exp.d, exp.n_words, _c_w_ptr(exp.weights),
-            _c_ptr(exp.h_words, _c_u64_p), _c_ptr(exp.ell, _c_u8_p),
-            _c_ptr(exp.A_words, _c_u64_p), _c_ptr(exp.a_union, _c_u64_p),
-            _c_ptr(a_w, _c_u64_p), _c_ptr(b_w, _c_u64_p), ctypes.c_uint8(kap),
-        )
+    if not isinstance(target, ShotExpansion):
+        raise TypeError(f"apply_pauli expects ShotExpansion, got {type(target)!r}")
+    a_w, b_w, kap = _unpack_pauli_args(a, b, kappa, target.n_qubits)
+    exp = target if in_place else target.copy()
+    if exp.chi == 0:
         return exp
-
-    terms = list(target)
-    if not terms:
-        return []
-    a_w, b_w, kap = _unpack_pauli_args(a, b, kappa, _validate_component_terms(terms))
-    out: list[ComponentTerm] = []
-    for w, comp in terms:
-        c_copy = comp.copy()
-        out.append((complex(w) * _apply_pauli_component_inplace(c_copy, a_w, b_w, kap), c_copy))
-    return out
-
-
-def _quarter_turn_step_inplace(
-    target: PhaseQFEComponent, a_w: NDArray[np.uint64], b_w: NDArray[np.uint64], kap: int
-) -> complex:
-    d0 = target.d
-    t = word_dot_parity_batch(target.A_words, b_w) if d0 > 0 else np.zeros(0, dtype=np.uint8)
-    s = get_bits_at_qubits(a_w[None, :], target.pivots)[0] if d0 > 0 else np.zeros(0, dtype=np.uint8)
-    new_G = np.zeros((d0 + 1, d0 + 1), dtype=np.uint8)
-    if d0 > 0:
-        new_G[:d0, :d0] = target.Gamma
-        new_G[:d0, d0] = t
-        new_G[d0, :d0] = t
-    target.A_words = np.ascontiguousarray(np.vstack([target.A_words, a_w[None, :]]))
-    target.Gamma = new_G
-    target.pivots = np.ascontiguousarray(np.append(target.pivots, np.int32(-1)))
-    c_val = np.uint8((kap + 1 + (word_dot_parity(b_w, target.h_words) << 1)) & 3)
-    target.ell = np.ascontiguousarray(np.append(target.ell, c_val))
-    target.d = d0 + 1
-    for i in np.flatnonzero(s):
-        add_column(target, int(i), d0)
-    p_new = first_set_bit_in_words(target.A_words[d0])
-    if p_new >= 0:
-        make_principal(target, d0, p_new)
-        return 1.0 + 0.0j
-    res = eliminate_zero_amplitude(target, d0)
-    assert isinstance(res, complex)
-    return res
+    if not np.all(np.isfinite(exp.weights)):
+        raise FloatingPointError("Non-finite weights in apply_pauli")
+    _get_cpp_lib().magic_apply_pauli_batch(
+        exp.chi, exp.d, exp.n_words, _c_w_ptr(exp.weights),
+        _c_ptr(exp.h_words, _c_u64_p), _c_ptr(exp.ell, _c_u8_p),
+        _c_ptr(exp.A_words, _c_u64_p), _c_ptr(exp.a_union, _c_u64_p),
+        _c_ptr(a_w, _c_u64_p), _c_ptr(b_w, _c_u64_p), ctypes.c_uint8(kap),
+    )
+    return exp
 
 
 def apply_quarter_turn(
-    target: PhaseQFEComponent | ExpansionInput,
+    target: ShotExpansion,
     a: Any,
     b: Any = None,
     kappa: int = 0,
@@ -1271,177 +1204,74 @@ def apply_quarter_turn(
     in_place: bool = False,
     check_unitary: bool = True,
     atol: float | None = None,
-) -> Any:
+) -> ShotExpansion:
     """`P2`: Apply `R(sign * P) = (I + i * sign * P) / sqrt(2)` without rank growth (`chi' <= chi`)."""
     if sign not in (1, -1):
         raise ValueError(f"sign must be +1 or -1, got {sign}")
     if atol is not None:
         validate_atol(atol)
-
-    if isinstance(target, PhaseQFEComponent):
-        tol_c = validate_atol(DEFAULT_ATOL if atol is None else atol)
-        a_w, b_w, kap = _unpack_pauli_args(a, b, kappa, target.n_qubits)
-        kap = (validate_hermitian_pauli(a_w, b_w, kap) + (2 if sign == -1 else 0)) & 3
-        comp = target if in_place else target.copy()
-        mult = _quarter_turn_step_inplace(comp, a_w, b_w, kap)
-        if check_unitary:
-            _check_unitary_norm(1.0, abs(mult) ** 2, tol_c, "apply_quarter_turn")
-        return mult if in_place else (mult, comp)
-
-    if isinstance(target, ShotExpansion):
-        tol_e = validate_atol(target.atol if atol is None else atol)
-        a_w, b_w, kap = _unpack_pauli_args(a, b, kappa, target.n_qubits)
-        kap = (validate_hermitian_pauli(a_w, b_w, kap) + (2 if sign == -1 else 0)) & 3
-        exp = target if in_place else target.copy()
-        pre_norm = _checked_shot_pre_norm(exp, check_unitary, "apply_quarter_turn")
-        if exp.chi == 0:
-            exp._is_canonical_merged = True
-            return exp
-
-        lib = _get_cpp_lib()
-        if not exp._is_canonical_merged:
-            merged_in = merge_frames(exp)
-            assert isinstance(merged_in, ShotExpansion)
-            exp = _copy_shot_inplace(exp, merged_in) if in_place else merged_in
-            if exp.chi == 0:
-                if check_unitary:
-                    _check_unitary_norm(pre_norm, 0.0, tol_e, "apply_quarter_turn")
-                return exp
-        out_chi, out_d, bufs, out_ptrs = _alloc_cpp_geom_bufs(exp.chi, exp.n_words, exp.d + 1)
-        rc = lib.magic_apply_quarter_turn(
-            exp.chi, exp.d, exp.n_qubits, exp.n_words, *_cpp_shot_in_ptrs(exp),
-            _c_ptr(a_w, _c_u64_p), _c_ptr(b_w, _c_u64_p), ctypes.c_uint8(kap), *out_ptrs,
-        )
-        if rc != 0:
-            raise FloatingPointError(f"magic_apply_quarter_turn returned error code {rc}")
-        _assign_cpp_geom_shot(exp, int(out_chi.value), int(out_d.value), bufs)
-        if check_unitary:
-            _check_unitary_norm(pre_norm, exp.norm_sq(), tol_e, "apply_quarter_turn")
-        return exp
-
-    tol_t = validate_atol(DEFAULT_ATOL if atol is None else atol)
-    terms = list(target)
-    if not terms:
-        return []
-    a_w, b_w, kap = _unpack_pauli_args(a, b, kappa, _validate_component_terms(terms))
+    if not isinstance(target, ShotExpansion):
+        raise TypeError(f"apply_quarter_turn expects ShotExpansion, got {type(target)!r}")
+    tol_e = validate_atol(target.atol if atol is None else atol)
+    a_w, b_w, kap = _unpack_pauli_args(a, b, kappa, target.n_qubits)
     kap = (validate_hermitian_pauli(a_w, b_w, kap) + (2 if sign == -1 else 0)) & 3
-    pre_norm = expansion_norm_sq(terms) if check_unitary else 0.0
-    out: list[ComponentTerm] = []
-    for w, comp in terms:
-        c_copy = comp.copy()
-        mult = _quarter_turn_step_inplace(c_copy, a_w, b_w, kap)
-        if check_unitary:
-            _check_unitary_norm(1.0, abs(mult) ** 2, tol_t, "apply_quarter_turn")
-        w_new = complex(w) * mult
-        if w_new != 0.0j:
-            out.append((w_new, c_copy))
-    merged_out = merge_frames(out)
-    assert isinstance(merged_out, list)
-    if check_unitary:
-        _check_unitary_norm(pre_norm, expansion_norm_sq(merged_out), tol_t, "apply_quarter_turn")
-    return merged_out
-
-
-# ---------------------------------------------------------------------------
-# Coherent Merging, Canonicalization & Norm (`K1`)
-# ---------------------------------------------------------------------------
-
-
-def canonicalize(
-    target: PhaseQFEComponent | ShotExpansion, *, in_place: bool = False
-) -> tuple[complex, PhaseQFEComponent] | ShotExpansion:
-    """Apply `canonical_offset` (clearing `h[pivots]`) without deduplicating rows."""
-    if isinstance(target, PhaseQFEComponent):
-        comp = target if in_place else target.copy()
-        return comp.canonical_offset(), comp
-    if isinstance(target, ShotExpansion):
-        exp = target if in_place else target.copy()
-        if exp.chi == 0 or exp.d == 0:
-            return exp
-        assert exp.ell_odd is not None
-        idx, phases = _canonicalize_rows_inplace(
-            exp.h_words, exp.ell, exp.A_words, exp.Gamma, exp.pivots, exp.ell_odd
-        )
-        if len(idx) > 0:
-            exp.weights[idx] *= phases
-        return exp
-    raise TypeError(f"Unsupported target type: {type(target)!r}")
-
-
-def merge_frames(
-    expansion: ExpansionInput,
-    *,
-    cancel_tol: float = K1_CANCEL_REL_TOL,
-) -> ShotExpansion | list[ComponentTerm]:
-    """`K1`: Canonicalize coset offsets, coherently sum identical keys, and cancel roundoff zeros."""
-    if isinstance(expansion, ShotExpansion):
-        exp = expansion.copy()
-        if exp.chi == 0:
-            exp._is_canonical_merged = True
-            return exp
-        if not np.all(np.isfinite(exp.weights)):
-            raise FloatingPointError("Non-finite weights encountered in merge_frames")
-        out_chi, out_w, out_h, out_ell, out_ptrs = _alloc_cpp_row_bufs(exp.chi, exp.n_words, exp.d)
-        _get_cpp_lib().magic_canonicalize_and_merge(
-            exp.chi, exp.d, exp.n_words, *_cpp_shot_in_ptrs(exp),
-            ctypes.c_double(cancel_tol), *out_ptrs,
-        )
-        oc = int(out_chi.value)
-        exp.weights = np.ascontiguousarray(out_w[:oc])
-        exp.h_words = np.ascontiguousarray(out_h[:oc])
-        exp.ell = np.ascontiguousarray(out_ell[:oc])
+    exp = target if in_place else target.copy()
+    pre_norm = _checked_shot_pre_norm(exp, check_unitary, "apply_quarter_turn")
+    if exp.chi == 0:
         exp._is_canonical_merged = True
         return exp
 
-    terms = list(expansion)
-    if not terms:
-        return []
-    _validate_component_terms(terms)
-    raw_ws = np.array([complex(w) for w, _ in terms], dtype=np.complex128)
-    if not np.all(np.isfinite(raw_ws)):
+    lib = _get_cpp_lib()
+    if not exp._is_canonical_merged:
+        merged_in = merge_frames(exp)
+        exp = _copy_shot_inplace(exp, merged_in) if in_place else merged_in
+        if exp.chi == 0:
+            if check_unitary:
+                _check_unitary_norm(pre_norm, 0.0, tol_e, "apply_quarter_turn")
+            return exp
+    out_chi, out_d, bufs, out_ptrs = _alloc_cpp_geom_bufs(exp.chi, exp.n_words, exp.d + 1)
+    rc = lib.magic_apply_quarter_turn(
+        exp.chi, exp.d, exp.n_qubits, exp.n_words, *_cpp_shot_in_ptrs(exp),
+        _c_ptr(a_w, _c_u64_p), _c_ptr(b_w, _c_u64_p), ctypes.c_uint8(kap), *out_ptrs,
+    )
+    if rc != 0:
+        raise FloatingPointError(f"magic_apply_quarter_turn returned error code {rc}")
+    _assign_cpp_geom_shot(exp, int(out_chi.value), int(out_d.value), bufs)
+    if check_unitary:
+        _check_unitary_norm(pre_norm, exp.norm_sq(), tol_e, "apply_quarter_turn")
+    return exp
+
+
+# ---------------------------------------------------------------------------
+# Coherent Merging (`K1`)
+# ---------------------------------------------------------------------------
+
+
+def merge_frames(
+    expansion: ShotExpansion,
+    *,
+    cancel_tol: float = K1_CANCEL_REL_TOL,
+) -> ShotExpansion:
+    """`K1`: Canonicalize coset offsets, coherently sum identical keys, and cancel roundoff zeros."""
+    if not isinstance(expansion, ShotExpansion):
+        raise TypeError(f"merge_frames expects ShotExpansion, got {type(expansion)!r}")
+    exp = expansion.copy()
+    if exp.chi == 0:
+        exp._is_canonical_merged = True
+        return exp
+    if not np.all(np.isfinite(exp.weights)):
         raise FloatingPointError("Non-finite weights encountered in merge_frames")
-    thresh = cancel_tol * min(1.0, float(np.max(np.abs(raw_ws))))
-
-    groups: dict[bytes, list[ComponentTerm]] = {}
-    for w, comp in terms:
-        groups.setdefault(comp.geometry_key(), []).append((complex(w), comp))
-
-    out_terms: list[ComponentTerm] = []
-    for g_terms in groups.values():
-        g_exp = ShotExpansion.from_components(g_terms, merge=False)
-        g_exp = merge_frames(g_exp, cancel_tol=0.0)  # type: ignore[assignment]
-        assert isinstance(g_exp, ShotExpansion)
-        for w_m, c_m in g_exp.to_components():
-            if abs(w_m) > thresh:
-                out_terms.append((w_m, c_m))
-    return out_terms
-
-
-def expansion_norm_sq(
-    expansion: ExpansionInput, *, canonicalize_first: bool = True
-) -> float:
-    """`K1.3`: Compute squared norm `||Psi||^2` via `O(chi)` shared-geometry fast path or `O1` Gram fallback."""
-    if isinstance(expansion, ShotExpansion):
-        return expansion.norm_sq(canonicalize_first=True if canonicalize_first else None)
-
-    terms_in = list(expansion)
-    if not terms_in:
-        return 0.0
-    _validate_component_terms(terms_in)
-    terms = merge_frames(terms_in) if canonicalize_first else terms_in
-    assert isinstance(terms, list)
-    if not terms:
-        return 0.0
-    if canonicalize_first and len({comp.geometry_key() for _, comp in terms}) == 1:
-        return float(sum(abs(w) ** 2 for w, _ in terms))
-
-    acc = 0.0
-    for i, (wi, ci) in enumerate(terms):
-        acc += (wi.real * wi.real) + (wi.imag * wi.imag)
-        for j in range(i + 1, len(terms)):
-            wj, cj = terms[j]
-            acc += 2.0 * ((wi.conjugate() * wj) * overlap(ci, cj)).real
-    return 0.0 if (-1e-12 < acc < 0.0) else float(acc)
+    out_chi, out_w, out_h, out_ell, out_ptrs = _alloc_cpp_row_bufs(exp.chi, exp.n_words, exp.d)
+    _get_cpp_lib().magic_canonicalize_and_merge(
+        exp.chi, exp.d, exp.n_words, *_cpp_shot_in_ptrs(exp),
+        ctypes.c_double(cancel_tol), *out_ptrs,
+    )
+    oc = int(out_chi.value)
+    exp.weights = np.ascontiguousarray(out_w[:oc])
+    exp.h_words = np.ascontiguousarray(out_h[:oc])
+    exp.ell = np.ascontiguousarray(out_ell[:oc])
+    exp._is_canonical_merged = True
+    return exp
 
 
 # ---------------------------------------------------------------------------
@@ -1489,45 +1319,13 @@ def _branch_pauli_sum_shot(
     if not merge:
         return raw
     out = merge_frames(raw)
-    assert isinstance(out, ShotExpansion)
     if check_unitary:
         _check_unitary_norm(pre_norm, out.norm_sq(), tol, op_name)
     return out
 
 
-def _branch_pauli_sum_terms(
-    terms: Sequence[ComponentTerm],
-    coeffs: NDArray[np.complex128],
-    a_arr: NDArray[np.uint64],
-    b_arr: NDArray[np.uint64],
-    k_arr: NDArray[np.uint8],
-    *,
-    merge: bool,
-    check_unitary: bool,
-    pre_norm: float,
-    tol: float,
-    op_name: str,
-) -> list[ComponentTerm]:
-    out_terms: list[ComponentTerm] = []
-    for m in range(int(coeffs.shape[0])):
-        cm = complex(coeffs[m])
-        am, bm, km = a_arr[m], b_arr[m], int(k_arr[m]) & 3
-        is_id = not (words_any_nonzero(am) or words_any_nonzero(bm) or km != 0)
-        for w, comp in terms:
-            c_copy = comp.copy()
-            f = 1.0 + 0.0j if is_id else _apply_pauli_component_inplace(c_copy, am, bm, km)
-            out_terms.append((complex(w) * cm * f, c_copy))
-    if not merge:
-        return out_terms
-    merged = merge_frames(out_terms)
-    assert isinstance(merged, list)
-    if check_unitary:
-        _check_unitary_norm(pre_norm, expansion_norm_sq(merged), tol, op_name)
-    return merged
-
-
 def _apply_pauli_sum_op(
-    expansion: ExpansionInput,
+    expansion: ShotExpansion,
     prep_branches: Any,
     cpp_runner: Any,
     *,
@@ -1535,54 +1333,40 @@ def _apply_pauli_sum_op(
     check_unitary: bool,
     atol: float | None,
     op_name: str,
-) -> ShotExpansion | list[ComponentTerm]:
+) -> ShotExpansion:
     if atol is not None:
         validate_atol(atol)
-    if isinstance(expansion, ShotExpansion):
-        tol = validate_atol(expansion.atol if atol is None else atol)
-        bw, ba, bb, bk = prep_branches(expansion.n_qubits)
-        pre_norm = _checked_shot_pre_norm(expansion, check_unitary, op_name)
-        if expansion.chi == 0:
-            empty_out = expansion.copy()
-            empty_out._is_canonical_merged = True
-            return empty_out
-        if merge:
-            r = int(bw.shape[0])
-            out_chi, out_w, out_h, out_ell, out_ptrs = _alloc_cpp_row_bufs(
-                r * expansion.chi, expansion.n_words, expansion.d
-            )
-            head = (expansion.chi, expansion.d, expansion.n_words, *_cpp_shot_in_ptrs(expansion, include_a_union=True))
-            cpp_runner(_get_cpp_lib(), head, out_ptrs, bw, ba, bb, bk)
-            oc = int(out_chi.value)
-            res = _clone_shot_with_rows(
-                expansion, out_w[:oc].copy(), out_h[:oc].copy(), out_ell[:oc].copy(), is_canonical_merged=True
-            )
-            if check_unitary:
-                _check_unitary_norm(pre_norm, res.norm_sq(), tol, op_name)
-            return res
-        return _branch_pauli_sum_shot(
-            expansion, bw, ba, bb, bk, merge=False,
-            check_unitary=check_unitary, pre_norm=pre_norm, tol=tol, op_name=op_name,
+    if not isinstance(expansion, ShotExpansion):
+        raise TypeError(f"{op_name} expects ShotExpansion, got {type(expansion)!r}")
+    tol = validate_atol(expansion.atol if atol is None else atol)
+    bw, ba, bb, bk = prep_branches(expansion.n_qubits)
+    pre_norm = _checked_shot_pre_norm(expansion, check_unitary, op_name)
+    if expansion.chi == 0:
+        empty_out = expansion.copy()
+        empty_out._is_canonical_merged = True
+        return empty_out
+    if merge:
+        r = int(bw.shape[0])
+        out_chi, out_w, out_h, out_ell, out_ptrs = _alloc_cpp_row_bufs(
+            r * expansion.chi, expansion.n_words, expansion.d
         )
-
-    tol = validate_atol(DEFAULT_ATOL if atol is None else atol)
-    terms = list(expansion)
-    if not terms:
-        return []
-    bw, ba, bb, bk = prep_branches(_validate_component_terms(terms))
-    pre_norm = (
-        expansion_norm_sq(terms, canonicalize_first=False)
-        if check_unitary
-        else 0.0
-    )
-    return _branch_pauli_sum_terms(
-        terms, bw, ba, bb, bk, merge=merge,
+        head = (expansion.chi, expansion.d, expansion.n_words, *_cpp_shot_in_ptrs(expansion, include_a_union=True))
+        cpp_runner(_get_cpp_lib(), head, out_ptrs, bw, ba, bb, bk)
+        oc = int(out_chi.value)
+        res = _clone_shot_with_rows(
+            expansion, out_w[:oc].copy(), out_h[:oc].copy(), out_ell[:oc].copy(), is_canonical_merged=True
+        )
+        if check_unitary:
+            _check_unitary_norm(pre_norm, res.norm_sq(), tol, op_name)
+        return res
+    return _branch_pauli_sum_shot(
+        expansion, bw, ba, bb, bk, merge=False,
         check_unitary=check_unitary, pre_norm=pre_norm, tol=tol, op_name=op_name,
     )
 
 
 def apply_pauli_t(
-    expansion: ExpansionInput,
+    expansion: ShotExpansion,
     a: Any,
     b: Any = None,
     kappa: int = 0,
@@ -1592,7 +1376,7 @@ def apply_pauli_t(
     merge: bool = True,
     check_unitary: bool = True,
     atol: float | None = None,
-) -> ShotExpansion | list[ComponentTerm]:
+) -> ShotExpansion:
     """`N1`: Apply Pauli-axis T gate `((1 + omega^s)/2) I + ((1 - omega^s)/2) P`."""
     if atol is not None:
         validate_atol(atol)
@@ -1668,13 +1452,13 @@ def _normalize_ccz_branches(
 
 
 def apply_ccz(
-    expansion: ExpansionInput,
+    expansion: ShotExpansion,
     paulis: Sequence[Any],
     *,
     merge: bool = True,
     check_unitary: bool = True,
     atol: float | None = None,
-) -> ShotExpansion | list[ComponentTerm]:
+) -> ShotExpansion:
     """`N2`: Apply generalized 3-axis `CCZ(Q1, Q2, Q3)` via 8-branch Pauli expansion."""
 
     def _cpp(lib: Any, head: tuple[Any, ...], out_ptrs: tuple[Any, ...], bw: Any, ba: Any, bb: Any, bk: Any) -> None:
@@ -1761,11 +1545,11 @@ def _validate_compiled_block(block: CompiledPauliBlock, n_qubits: int | None) ->
 
 
 def _execute_sequential_steps(
-    cur: ShotExpansion | list[ComponentTerm],
+    cur: ShotExpansion,
     steps: Sequence[CompiledPauliBlockStep | CompiledPauliBlock],
     *,
     tol: float,
-) -> ShotExpansion | list[ComponentTerm]:
+) -> ShotExpansion:
     for step in steps:
         if isinstance(step, CompiledPauliBlock):
             cur = apply_compiled_block(cur, step, check_unitary=False, atol=tol)
@@ -1784,83 +1568,49 @@ def _execute_sequential_steps(
             cur = apply_ccz(cur, step.paulis, merge=True, check_unitary=False, atol=tol)
         else:
             raise ValueError(f"Unknown step kind: {step.kind!r}")
-    return merge_frames(cur)  # type: ignore[return-value]
+    return merge_frames(cur)
 
 
 def apply_compiled_block(
-    expansion: ExpansionInput,
+    expansion: ShotExpansion,
     block: CompiledPauliBlock,
     *,
     check_unitary: bool | None = None,
     atol: float | None = None,
-) -> ShotExpansion | list[ComponentTerm]:
+) -> ShotExpansion:
     """`N3`: Execute a `CompiledPauliBlock` (`pauli_sum` or `sequential` mode)."""
     if atol is not None:
         validate_atol(atol)
     if not isinstance(block, CompiledPauliBlock):
         raise ValueError(f"Expected CompiledPauliBlock, got {type(block)!r}")
+    if not isinstance(expansion, ShotExpansion):
+        raise TypeError(f"apply_compiled_block expects ShotExpansion, got {type(expansion)!r}")
     do_check = block.is_unitary if check_unitary is None else bool(check_unitary)
+    tol = validate_atol(expansion.atol if atol is None else atol)
+    _validate_compiled_block(block, expansion.n_qubits)
+    pre_norm = _checked_shot_pre_norm(expansion, do_check, "apply_compiled_block")
+    if expansion.chi == 0:
+        empty_out = expansion.copy()
+        empty_out._is_canonical_merged = True
+        return empty_out
 
-    if isinstance(expansion, ShotExpansion):
-        tol = validate_atol(expansion.atol if atol is None else atol)
-        _validate_compiled_block(block, expansion.n_qubits)
-        pre_norm = _checked_shot_pre_norm(expansion, do_check, "apply_compiled_block")
-        if expansion.chi == 0:
-            empty_out = expansion.copy()
-            empty_out._is_canonical_merged = True
-            return empty_out
-
-        g_sc = _coerce_finite_complex(block.global_scalar, "block.global_scalar")
-        if block.mode == "pauli_sum" and not block.is_identity:
-            assert block.coeffs is not None and block.a_words is not None and block.b_words is not None and block.kappas is not None
-            nz = np.flatnonzero(np.abs(block.coeffs) > 0.0)
-            return _branch_pauli_sum_shot(
-                expansion, np.asarray(g_sc * block.coeffs[nz], dtype=np.complex128),
-                block.a_words[nz], block.b_words[nz], block.kappas[nz],
-                merge=True, check_unitary=do_check,
-                pre_norm=pre_norm, tol=tol, op_name="apply_compiled_block",
-            )
-
-        out = expansion.copy()
-        out.weights *= g_sc
-        if block.is_identity:
-            out = merge_frames(out)  # type: ignore[assignment]
-        else:
-            out = _execute_sequential_steps(out, block.steps, tol=tol)  # type: ignore[assignment]
-        assert isinstance(out, ShotExpansion)
-        if do_check:
-            _check_unitary_norm(pre_norm, out.norm_sq(), tol, "apply_compiled_block")
-        return out
-
-    tol = validate_atol(DEFAULT_ATOL if atol is None else atol)
-    terms = list(expansion)
-    if not terms:
-        _validate_compiled_block(block, None)
-        return []
-    _validate_compiled_block(block, _validate_component_terms(terms))
     g_sc = _coerce_finite_complex(block.global_scalar, "block.global_scalar")
-    pre_norm = expansion_norm_sq(terms, canonicalize_first=False) if do_check else 0.0
-
     if block.mode == "pauli_sum" and not block.is_identity:
         assert block.coeffs is not None and block.a_words is not None and block.b_words is not None and block.kappas is not None
         nz = np.flatnonzero(np.abs(block.coeffs) > 0.0)
-        return _branch_pauli_sum_terms(
-            terms, np.asarray(g_sc * block.coeffs[nz], dtype=np.complex128),
+        return _branch_pauli_sum_shot(
+            expansion, np.asarray(g_sc * block.coeffs[nz], dtype=np.complex128),
             block.a_words[nz], block.b_words[nz], block.kappas[nz],
             merge=True, check_unitary=do_check,
             pre_norm=pre_norm, tol=tol, op_name="apply_compiled_block",
         )
 
-    scaled: list[ComponentTerm] = [(g_sc * complex(w), c.copy()) for w, c in terms]
-    out_terms = (
-        merge_frames(scaled)
-        if block.is_identity
-        else _execute_sequential_steps(scaled, block.steps, tol=tol)
-    )
-    assert isinstance(out_terms, list)
+    out = expansion.copy()
+    out.weights *= g_sc
+    out = merge_frames(out) if block.is_identity else _execute_sequential_steps(out, block.steps, tol=tol)
     if do_check:
-        _check_unitary_norm(pre_norm, expansion_norm_sq(out_terms), tol, "apply_compiled_block")
-    return out_terms
+        _check_unitary_norm(pre_norm, out.norm_sq(), tol, "apply_compiled_block")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1869,13 +1619,13 @@ def apply_compiled_block(
 
 
 def project_diagonal(
-    expansion: ExpansionInput,
+    expansion: ShotExpansion,
     b: Any,
     sigma: int = 0,
     outcome: int = 0,
     *,
     kappa: int | None = None,
-) -> tuple[ShotExpansion | list[ComponentTerm], float]:
+) -> tuple[ShotExpansion, float]:
     """`M1`: Project onto `Pi_m = (I + (-1)^m (-1)^sigma Z(b)) / 2` without renormalizing."""
     if kappa is not None:
         kap = int(kappa) & 3
@@ -1889,46 +1639,30 @@ def project_diagonal(
     m = int(outcome)
     if m not in (0, 1):
         raise ValueError(f"outcome must be 0 or 1, got {outcome}")
+    if not isinstance(expansion, ShotExpansion):
+        raise TypeError(f"project_diagonal expects ShotExpansion, got {type(expansion)!r}")
 
-    if isinstance(expansion, ShotExpansion):
-        b_w = coerce_pauli_words(b, expansion.n_qubits)
-        exp = expansion.copy()
-        if exp.chi == 0:
-            exp._is_canonical_merged = True
-            return exp, 0.0
-        if not np.all(np.isfinite(exp.weights)):
-            raise FloatingPointError("Non-finite weights in project_diagonal")
+    b_w = coerce_pauli_words(b, expansion.n_qubits)
+    exp = expansion.copy()
+    if exp.chi == 0:
+        exp._is_canonical_merged = True
+        return exp, 0.0
+    if not np.all(np.isfinite(exp.weights)):
+        raise FloatingPointError("Non-finite weights in project_diagonal")
 
-        out_chi, out_d, bufs, out_ptrs = _alloc_cpp_geom_bufs(exp.chi, exp.n_words, max(1, exp.d))
-        out_z = ctypes.c_double(0.0)
-        _get_cpp_lib().magic_project_diagonal(
-            exp.chi, exp.d, exp.n_words, *_cpp_shot_in_ptrs(exp),
-            _c_ptr(b_w, _c_u64_p), ctypes.c_uint8(sig << 1), ctypes.c_uint8(m),
-            ctypes.c_double(K1_CANCEL_REL_TOL), *out_ptrs, ctypes.byref(out_z),
-        )
-        _assign_cpp_geom_shot(exp, int(out_chi.value), int(out_d.value), bufs)
-        return exp, float(out_z.value)
-
-    terms = list(expansion)
-    if not terms:
-        return [], 0.0
-    b_w = coerce_pauli_words(b, _validate_component_terms(terms))
-    out_terms: list[ComponentTerm] = []
-    for w, comp in terms:
-        c_copy = comp.copy()
-        lam = word_dot_parity_batch(c_copy.A_words, b_w) if c_copy.d > 0 else np.zeros(0, dtype=np.uint8)
-        eps = (m ^ sig ^ word_dot_parity(b_w, c_copy.h_words)) & 1
-        g = restrict_amplitude(c_copy, lam, eps, scale=_INV_SQRT2)
-        assert isinstance(g, complex)
-        if g != 0.0j:
-            out_terms.append((complex(w) * g, c_copy))
-    merged = merge_frames(out_terms)
-    assert isinstance(merged, list)
-    return merged, expansion_norm_sq(merged)
+    out_chi, out_d, bufs, out_ptrs = _alloc_cpp_geom_bufs(exp.chi, exp.n_words, max(1, exp.d))
+    out_z = ctypes.c_double(0.0)
+    _get_cpp_lib().magic_project_diagonal(
+        exp.chi, exp.d, exp.n_words, *_cpp_shot_in_ptrs(exp),
+        _c_ptr(b_w, _c_u64_p), ctypes.c_uint8(sig << 1), ctypes.c_uint8(m),
+        ctypes.c_double(K1_CANCEL_REL_TOL), *out_ptrs, ctypes.byref(out_z),
+    )
+    _assign_cpp_geom_shot(exp, int(out_chi.value), int(out_d.value), bufs)
+    return exp, float(out_z.value)
 
 
 def measure_expansion(
-    expansion: ExpansionInput,
+    expansion: ShotExpansion,
     a: Any,
     b: Any = None,
     kappa: int = 0,
@@ -1947,21 +1681,13 @@ def measure_expansion(
         raise ValueError(f"p_flip must be in [0, 1], got {p_flip}")
     if requested_bit is not None and requested_bit not in (0, 1):
         raise ValueError(f"requested_bit must be 0, 1, or None, got {requested_bit}")
+    if not isinstance(expansion, ShotExpansion):
+        raise TypeError(f"measure_expansion expects ShotExpansion, got {type(expansion)!r}")
 
-    if isinstance(expansion, ShotExpansion):
-        n_q = expansion.n_qubits
-        tol = validate_atol(expansion.atol if atol is None else atol)
-        z = expansion.norm_sq()
-        in_log_mass = expansion.log_mass
-    else:
-        tol = validate_atol(DEFAULT_ATOL if atol is None else atol)
-        terms_in = list(expansion)
-        if not terms_in:
-            raise ImpossiblePostselectionError("Cannot measure an empty component expansion")
-        n_q = _validate_component_terms(terms_in)
-        z = expansion_norm_sq(terms_in, canonicalize_first=False)
-        in_log_mass = 0.0
-
+    n_q = expansion.n_qubits
+    tol = validate_atol(expansion.atol if atol is None else atol)
+    z = expansion.norm_sq()
+    in_log_mass = expansion.log_mass
     if not (math.isfinite(z) and z >= 0.0):
         raise FloatingPointError(f"Invalid pre-measurement norm squared z={z!r}")
 
@@ -2007,8 +1733,7 @@ def measure_expansion(
     if requested_bit is not None:
         outcome = int(requested_bit)
         chosen_z, chosen_exp = (z0, exp0) if outcome == 0 else (z1, exp1)
-        chosen_empty = (chosen_exp.chi == 0) if isinstance(chosen_exp, ShotExpansion) else (len(chosen_exp) == 0)
-        if z <= 0.0 or chosen_z <= zero_floor or chosen_empty:
+        if z <= 0.0 or chosen_z <= zero_floor or chosen_exp.chi == 0:
             raise ImpossiblePostselectionError(
                 f"Requested postselection outcome {outcome} has zero Born probability "
                 f"(z_{outcome}={chosen_z:.3e}, total z={z:.3e})"
@@ -2038,149 +1763,14 @@ def measure_expansion(
             chosen_exp, a_rot, b_rot, kap_rot, sign=-1, check_unitary=True, atol=tol
         )
 
-    if isinstance(chosen_exp, ShotExpansion):
-        if renormalize:
-            chosen_exp.weights = np.ascontiguousarray(chosen_exp.weights * (1.0 / math.sqrt(chosen_z)))
-            chosen_exp.log_mass = in_log_mass + math.log(chosen_z)
-            out_log_mass = chosen_exp.log_mass
-        else:
-            chosen_exp.log_mass = in_log_mass
-            out_log_mass = in_log_mass + math.log(chosen_z)
+    if renormalize:
+        chosen_exp.weights = np.ascontiguousarray(chosen_exp.weights * (1.0 / math.sqrt(chosen_z)))
+        chosen_exp.log_mass = in_log_mass + math.log(chosen_z)
+        out_log_mass = chosen_exp.log_mass
     else:
-        if renormalize:
-            inv_sqrt_zm = 1.0 / math.sqrt(chosen_z)
-            chosen_exp = [(w * inv_sqrt_zm, c) for w, c in chosen_exp]
-        out_log_mass = math.log(chosen_z)
+        chosen_exp.log_mass = in_log_mass
+        out_log_mass = in_log_mass + math.log(chosen_z)
 
     return MeasurementResult(
         outcome, reported_outcome, readout_flipped, z0, z1, z, chosen_z, out_log_mass, chosen_exp
     )
-
-
-# ---------------------------------------------------------------------------
-# Coherent Contractions: O2 (`quadratic_gauss_sum`) and O1 (`overlap`)
-# ---------------------------------------------------------------------------
-
-
-def _parse_gauss_sum_args(
-    arg1: Any, arg2: Any, arg3: Any, c0: int
-) -> tuple[int, NDArray[np.uint8], NDArray[np.uint8]]:
-    if arg3 is not None:
-        q0 = int(arg1) & 3
-        l_arr = (np.asarray(arg2, dtype=np.int64) & 3).astype(np.uint8)
-        B_arr = (np.asarray(arg3, dtype=np.int64) & 1).astype(np.uint8)
-    else:
-        q0 = int(c0) & 3
-        l_arr = (np.asarray(arg1, dtype=np.int64) & 3).astype(np.uint8)
-        B_arr = (np.asarray(arg2, dtype=np.int64) & 1).astype(np.uint8)
-    if l_arr.ndim != 1:
-        raise ValueError(f"lin/ell must be 1D, got shape {l_arr.shape}")
-    g = int(l_arr.shape[0])
-    if B_arr.shape != (g, g):
-        raise ValueError(f"B/Gamma shape {B_arr.shape} does not match (g, g)=({g}, {g})")
-    if g > 0 and (not np.array_equal(B_arr, B_arr.T) or np.any(np.diag(B_arr) != 0)):
-        raise ValueError("B/Gamma must be symmetric with zero diagonal")
-    return q0, np.ascontiguousarray(l_arr.copy()), np.ascontiguousarray(B_arr.copy())
-
-
-def quadratic_gauss_sum_dyadic(
-    arg1: Any, arg2: Any, arg3: Any = None, *, c0: int = 0
-) -> tuple[bool, int, int]:
-    """`O2` exact dyadic evaluator: returns `(nonzero, k2, v8)` for `2^(k2 / 2) * omega^v8`."""
-    q0, l, M = _parse_gauss_sum_args(arg1, arg2, arg3, c0)
-    k = int(l.shape[0])
-    k2, v8 = 0, (2 * q0) & 7
-
-    def _swap_var(i: int, j: int, cur_k: int) -> None:
-        if i == j:
-            return
-        l[i], l[j] = l[j], l[i]
-        row_i = M[i, :cur_k].copy()
-        M[i, :cur_k] = M[j, :cur_k]
-        M[j, :cur_k] = row_i
-        col_i = M[:cur_k, i].copy()
-        M[:cur_k, i] = M[:cur_k, j]
-        M[:cur_k, j] = col_i
-
-    while k > 0:
-        odd_idx = np.flatnonzero(l[:k] & np.uint8(1))
-        if len(odd_idx) > 0:
-            _swap_var(int(odd_idx[0]), k - 1, k)
-            c = int(l[k - 1])
-            k2 += 1
-            v8 = (v8 + (1 if c == 1 else 7)) & 7
-            if k > 1:
-                m = M[k - 1, : k - 1]
-                l[: k - 1] = (l[: k - 1] + np.uint8(3 if c == 1 else 1) * m) & np.uint8(3)
-                M[: k - 1, : k - 1] ^= m[:, None] & m[None, :]
-                np.fill_diagonal(M[: k - 1, : k - 1], 0)
-            k -= 1
-            continue
-
-        row_any = np.any(M[:k, :k] != 0, axis=1)
-        if np.any(row_any):
-            f = int(np.argmax(row_any))
-            p = int(np.argmax(M[f, :k]))
-            if f > p:
-                f, p = p, f
-            _swap_var(p, k - 1, k)
-            _swap_var(f, k - 2, k)
-            lf, lp = int(l[k - 2]) >> 1, int(l[k - 1]) >> 1
-            k2 += 2
-            v8 = (v8 + 4 * (lf & lp)) & 7
-            if k > 2:
-                mf, mp = M[k - 2, : k - 2], M[k - 1, : k - 2]
-                lin_upd = ((np.uint8(lp) * mf) ^ (np.uint8(lf) * mp) ^ (mf & mp)) & np.uint8(1)
-                l[: k - 2] = (l[: k - 2] + (lin_upd << np.uint8(1))) & np.uint8(3)
-                M[: k - 2, : k - 2] ^= (mf[:, None] & mp[None, :]) ^ (mp[:, None] & mf[None, :])
-                np.fill_diagonal(M[: k - 2, : k - 2], 0)
-            k -= 2
-            continue
-
-        if np.any(l[:k] == np.uint8(2)):
-            return False, 0, 0
-        k2 += 2 * k
-        k = 0
-
-    return True, k2, v8
-
-
-def quadratic_gauss_sum(
-    arg1: Any, arg2: Any, arg3: Any = None, *, c0: int = 0, scale_log2: int = 0
-) -> complex:
-    """`O2`: Evaluate `2^(scale_log2 / 2) * sum_{r in F_2^g} i^(q0 + ell.r + 2 r^T triu(Gamma,1) r)`."""
-    q0, l_arr, B_arr = _parse_gauss_sum_args(arg1, arg2, arg3, c0)
-    lib = _get_cpp_lib()
-    out_ri = (ctypes.c_double * 2)(0.0, 0.0)
-    lib.magic_quadratic_gauss_sum(
-        l_arr.shape[0], _c_ptr(l_arr, _c_u8_p), _c_ptr(B_arr, _c_u8_p),
-        ctypes.c_int32(q0), ctypes.c_int64(int(scale_log2)), out_ri,
-    )
-    return complex(float(out_ri[0]), float(out_ri[1]))
-
-
-def overlap(bra: PhaseQFEComponent, ket: PhaseQFEComponent) -> complex:
-    """`O1`: Exact inner product `<phi(bra) | phi(ket)>` (`np.vdot(bra, ket)`)."""
-    if not (isinstance(bra, PhaseQFEComponent) and isinstance(ket, PhaseQFEComponent)):
-        raise TypeError("overlap expects PhaseQFEComponent operands")
-    for c in (bra, ket):
-        if not (_is_valid_int(c.n_qubits) and _is_valid_int(c.d)) or any(
-            not isinstance(a, np.ndarray) or a.dtype.kind not in ("u", "i")
-            for a in (c.h_words, c.A_words, c.ell, c.Gamma)
-        ):
-            raise TypeError("overlap requires integer metadata and integer ndarray buffers")
-        nw, cd = (int(c.n_qubits) + 63) // 64, int(c.d)
-        if c.n_qubits < 1 or cd < 0 or c.n_words != nw or (
-            c.h_words.shape, c.A_words.shape, c.ell.shape, c.Gamma.shape
-        ) != ((nw,), (cd, nw), (cd,), (cd, cd)):
-            raise ValueError("Invalid PhaseQFEComponent dimensions or buffer shapes in overlap")
-    if bra.n_qubits != ket.n_qubits:
-        raise ValueError(f"Qubit count mismatch in overlap: {bra.n_qubits} vs {ket.n_qubits}")
-
-    if int(ket.d) + int(bra.d) == 0:
-        same_h = np.array_equal(np.asarray(bra.h_words, dtype=np.uint64), np.asarray(ket.h_words, dtype=np.uint64))
-        return (1.0 + 0.0j) if same_h else 0.0j
-
-    _get_cpp_lib()
-    assert _CACHED_MAGIC_MOD is not None
-    return complex(_CACHED_MAGIC_MOD.cpp_overlap(bra, ket))

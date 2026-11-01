@@ -62,9 +62,8 @@ from stimside.util.phase_qfe import (
     apply_pauli,
     apply_quarter_turn,
     get_bit_in_words,
-    merge_frames,
+    get_bits_at_qubits,
     n_words_for_qubits,
-    overlap,
     tail_mask,
     unit_bit_words,
 )
@@ -507,14 +506,12 @@ def _reconstruct_unitary_via_qfe_primitives(
         comp = PhaseQFEComponent.zero(n)
         comp.h_words[0] = np.uint64(x)
         comp.check_invariants()
-        w = OMEGA_POWERS[decomp.omega_power]
-        g_p, comp = apply_pauli(comp, p0_a, p0_b, p0_k)
-        w *= g_p
+        exp = ShotExpansion.from_component(comp, weight=OMEGA_POWERS[decomp.omega_power])
+        exp = apply_pauli(exp, p0_a, p0_b, p0_k)
         for ra, rb, rk in r_axes:
-            g_r, comp = apply_quarter_turn(comp, ra, rb, rk, sign=1)
-            w *= g_r
-            comp.check_invariants()
-        U_qfe[:, x] = w * comp.to_statevector(endian="little")
+            exp = apply_quarter_turn(exp, ra, rb, rk, sign=1)
+            exp.check_invariants()
+        U_qfe[:, x] = exp.to_statevector(endian="little")
     return decomp.omega_power, U_qfe
 
 
@@ -950,8 +947,10 @@ def test_v1_4_selector_all_40_controlled_quarter_turns() -> None:
                 comp0.h_words[0] = np.uint64(c_s << 1)
                 comp1 = PhaseQFEComponent.zero(2)
                 comp1.h_words[0] = np.uint64(1 | (c_s << 1))
-                init_exp = merge_frames(
-                    [(psi_in_1q[0], comp0), (psi_in_1q[1], comp1)]
+                init_exp = ShotExpansion.from_components(
+                    [(psi_in_1q[0], comp0), (psi_in_1q[1], comp1)],
+                    n_qubits=2,
+                    merge=True,
                 )
                 from stimside.util.phase_qfe import apply_compiled_block
                 from stimside.util.reference_chp import ReferenceCHPTableau
@@ -1008,7 +1007,9 @@ def test_v1_4_selector_all_40_controlled_quarter_turns() -> None:
                         comp = PhaseQFEComponent.zero(3)
                         comp.h_words[0] = np.uint64(x_idx | (c_s << 2))
                         terms_init.append((psi_in_2q[x_idx], comp))
-                    init_exp = merge_frames(terms_init)
+                    init_exp = ShotExpansion.from_components(
+                        terms_init, n_qubits=3, merge=True
+                    )
                     out_aug = apply_compiled_block(init_exp, recs[0].block)
                     _, data_exp = extract_data_expansion(
                         ReferenceCHPTableau(3), out_aug, 2, [c_s]
@@ -1367,19 +1368,19 @@ def _reconstruct_5q_active_subspace_via_o1(
             for c_i in range(data_exp.chi):
                 assert get_bit_in_words(data_exp.h_words[c_i], s_spec) == 0
 
-    comps = data_exp.to_components()
-    ket5 = np.zeros(32, dtype=np.complex128)
-    for y in range(32):
-        bra = PhaseQFEComponent.zero(N)
-        hw = np.zeros(n_w, dtype=np.uint64)
-        for j in range(5):
-            if (y >> j) & 1:
-                hw |= unit_bit_words(q_map[j], n_w)
-        bra.h_words = hw
-        amp = 0.0 + 0.0j
-        for w_c, d_comp in comps:
-            amp += w_c * overlap(bra, d_comp)
-        ket5[y] = amp
+    qm_arr = np.asarray(q_map, dtype=np.int32)
+    shifts5 = (np.uint64(1) << np.arange(5, dtype=np.uint64))[None, :]
+    a5_bits = get_bits_at_qubits(data_exp.A_words, qm_arr) if data_exp.d > 0 else np.zeros((0, 5), dtype=np.uint8)
+    h5_bits = get_bits_at_qubits(data_exp.h_words, qm_arr) if data_exp.chi > 0 else np.zeros((0, 5), dtype=np.uint8)
+    a5_sub = np.sum(a5_bits.astype(np.uint64) * shifts5, axis=1, keepdims=True, dtype=np.uint64)
+    h5_sub = np.sum(h5_bits.astype(np.uint64) * shifts5, axis=1, keepdims=True, dtype=np.uint64)
+    piv5 = np.array([inv_map[int(p)] for p in data_exp.pivots], dtype=np.int32)
+    au5 = np.array([np.bitwise_or.reduce(a5_sub[:, 0])] if data_exp.d > 0 else [0], dtype=np.uint64)
+    ket5 = ShotExpansion(
+        5, data_exp.d, a5_sub, au5, data_exp.Gamma, piv5,
+        data_exp.weights, h5_sub, data_exp.ell, data_exp.ell_odd,
+        data_exp.log_mass, data_exp.atol, data_exp._is_canonical_merged,
+    ).to_statevector()
 
     # Apply the 5-qubit restriction of data_frame_events using independent dense 5Q matrices
     right_evs = [ev for ev in data_frame_events if isinstance(ev, RightRotEvent)]
