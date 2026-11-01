@@ -22,7 +22,7 @@ _SQRT2, _EMPTY_DEPS = math.sqrt(2.0), ((), (), ())
 _PAULI_1Q_STR, _PAULI_4_STR = {"I": 0, "X": 1, "Y": 2, "Z": 3}, {"I": 0, "X": 2, "Y": 3, "Z": 4}
 _PAULI_2Q_STR = {a + b: i for i, (a, b) in enumerate((p, q) for p in "IXYZ" for q in "IXYZ")}
 _VALID_QUERIES = frozenset({"mass", "acceptance", "fidelity", "prefix_probs", "sample_measurements"})
-_VALID_REAL_KEYS = frozenset({"faults", "measurements", "requested_outcomes", "paulis", "pauli_noise", "resets", "reset_outcomes", "sweep", "sweep_bits"})
+_VALID_REAL_KEYS = frozenset({"faults", "measurements", "paulis", "pauli_noise", "resets", "sweep", "sweep_bits"})
 
 class QueryBudgetExceededError(RuntimeError):
     """Raised when `Q1`/`Q2` contraction exceeds `QueryBudget` with `on_budget_exceeded == 'raise'`."""
@@ -558,8 +558,8 @@ def _unpack_realization(plan: PreparedQueryPlan, realization: Mapping[Any, Any] 
     if any(isinstance(k, str) for k in realization):
         if set(realization) - _VALID_REAL_KEYS:
             raise ValueError(f"Unknown realization keys: {sorted(map(str, set(realization) - _VALID_REAL_KEYS))}")
-        raw_f, raw_m = realization.get("faults"), realization.get("measurements", realization.get("requested_outcomes"))
-        raw_p, raw_r = realization.get("paulis", realization.get("pauli_noise")), realization.get("resets", realization.get("reset_outcomes"))
+        raw_f, raw_m = realization.get("faults"), realization.get("measurements")
+        raw_p, raw_r = realization.get("paulis", realization.get("pauli_noise")), realization.get("resets")
         raw_s = realization.get("sweep_bits", realization.get("sweep"))
     else:
         raw_f, raw_m, raw_p, raw_r, raw_s = realization, None, None, None, None

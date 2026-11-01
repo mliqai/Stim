@@ -52,10 +52,8 @@ _M2D_MODES: dict[str, Literal["auto", "magicside", "stim", "zero"]] = {
     "stim": "stim", "clifford": "stim", "zero": "zero", "skip": "zero",
 }
 _REAL_KEY_MAP: dict[str, str] = {
-    "faults": "faults", "measurements": "measurements", "requested_outcomes": "measurements",
-    "quantum_measurements": "quantum_measurements", "requested_quantum_outcomes": "quantum_measurements",
-    "paulis": "paulis", "pauli_noise": "paulis",
-    "resets": "resets", "reset_outcomes": "resets", "sweep": "sweep_bits", "sweep_bits": "sweep_bits",
+    "faults": "faults", "measurements": "measurements", "quantum_measurements": "quantum_measurements",
+    "paulis": "paulis", "pauli_noise": "paulis", "resets": "resets", "sweep": "sweep_bits", "sweep_bits": "sweep_bits",
 }
 
 
@@ -529,12 +527,11 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         }
         if n_map is None:
             return f_arg, None, 1.0
-        n_arg, cur, corr_occ, mass_scale = dict(n_map), 0, False, 1.0
+        n_arg, corr_occ, mass_scale = dict(n_map), False, 1.0
         for rec in plan.records:
             if not isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord, CorrelatedNoiseRecord)):
                 continue
-            idx = rec.noise_index if rec.noise_index is not None else cur
-            cur += 1
+            idx = rec.noise_index
             if isinstance(rec, PauliNoiseRecord):
                 if idx not in n_arg:
                     n_arg[idx] = _sample_categorical_branch(rec.probs, rng)
