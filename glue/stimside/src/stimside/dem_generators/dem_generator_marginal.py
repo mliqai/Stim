@@ -392,10 +392,7 @@ def _check_supported(params) -> None:
     elif isinstance(params, LeakageTransition2Params):
         bad = any(_is_int_below_2(s) for key in params.args_by_input_state for s in key)
     elif isinstance(params, LeakageConditioningParams):
-        parts = params.from_tag.split(":")
-        bad = any(_is_int_below_2(s) for group in params.args for s in group) or (
-            len(parts) > 1 and any(tok in ("0", "1") for tok in parts[1].split())
-        )
+        bad = any(_is_int_below_2(s) for group in params.args for s in group)
     else:
         bad = False
     if bad:

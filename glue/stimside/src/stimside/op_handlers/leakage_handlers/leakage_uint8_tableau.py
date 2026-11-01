@@ -411,20 +411,6 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         # controller state is an array where each qubit has the leakage state
         # of the qubit controlling it (or 0 if it's not being targeted)
         condition_groups = params.args
-        tag_parts = getattr(params, "from_tag", "").split(":")
-        if (
-            len(condition_groups) == 1
-            and "U" in condition_groups[0]
-            and len(tag_parts) > 1
-            and any(tok in ("0", "1") for tok in tag_parts[1].split())
-        ):
-            condition_groups = (
-                tuple(
-                    st
-                    for x in condition_groups[0]
-                    for st in ((0, 1) if x == "U" else (x,))
-                ),
-            )
         if all(g == ("U",) for g in condition_groups) and not np.any(self.state >= 2):
             tss._do_bare_instruction(op)
             return

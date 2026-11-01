@@ -317,11 +317,7 @@ class PrecompiledTablesideCircuit:
             else:
                 if isinstance(params, LeakageConditioningParams):
                     cond_groups = params.args
-                    tag_parts = getattr(params, "from_tag", "").split(":")
-                    tag_has_01 = len(tag_parts) > 1 and any(
-                        tok in ("0", "1") for tok in tag_parts[1].split()
-                    )
-                    if any(0 in g or 1 in g for g in cond_groups) or tag_has_01:
+                    if any(0 in g or 1 in g for g in cond_groups):
                         self.requires_tableau = True
                         kind = 6
                     elif (

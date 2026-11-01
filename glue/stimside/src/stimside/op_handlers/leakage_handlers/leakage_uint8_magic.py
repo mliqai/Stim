@@ -68,10 +68,7 @@ def _strip_circuit_for_noiseless_ref(circuit: stim.Circuit) -> tuple[stim.Circui
                     continue
                 params, _ = _parse_leakage_tag_magic(op)
                 assert isinstance(params, LeakageConditioningParams)
-                has_comp_proj = any(0 in g or 1 in g for g in params.args) or (
-                    len(params.args) == 1
-                    and any(tok in ("0", "1") for tok in (params.from_tag or ":").split(":")[1].split())
-                )
+                has_comp_proj = any(0 in g or 1 in g for g in params.args)
                 if has_comp_proj:
                     out.append(op)
                     needs_leakage = True

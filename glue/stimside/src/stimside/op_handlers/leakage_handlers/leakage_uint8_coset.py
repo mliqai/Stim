@@ -412,20 +412,6 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         params: LeakageConditioningParams,
     ) -> None:
         condition_groups = params.args
-        tag_parts = getattr(params, "from_tag", "").split(":")
-        if (
-            len(condition_groups) == 1
-            and "U" in condition_groups[0]
-            and len(tag_parts) > 1
-            and any(tok in ("0", "1") for tok in tag_parts[1].split())
-        ):
-            condition_groups = (
-                tuple(
-                    st
-                    for x in condition_groups[0]
-                    for st in ((0, 1) if x == "U" else (x,))
-                ),
-            )
         other_targets = params.targets
         if other_targets:
             # stim fuses k identical consecutive CONDITIONED_ON_OTHER lines into one op with k times

@@ -518,7 +518,7 @@ def test_controlled_error_totals_and_conditioned_states_ordering() -> None:
         stim.Circuit("X[CONDITIONED_ON_OTHER: 3 2 3 0 1 : 1] 0")[0]
     )
     assert p_self is not None and p_self.args == (("U", 3, 2),)
-    assert p_other is not None and p_other.args == ((3, 2, "U"),)
+    assert p_other is not None and p_other.args == ((3, 2, 0, 1),)
 
 
 def test_1a_tag_registry_widened_leakage_projection_z():

@@ -22,31 +22,20 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
 # --- PARSER HELPERS ---
 
 def _combine_conditioned_states(states: list[int | str], name: str) -> list[int | str]:
-    bad = "must be 'U' or an int between 0 and 9"
-    if "U" in states:
-        new_states: list[int | str] = ["U"]
-        for st in states:
-            if isinstance(st, int):
-                if 1 < st < 10: new_states.append(st)
-                elif st < 0 or st > 9: raise ValueError(f"{name} has invalid state {st}, {bad}")
-            elif st != "U": raise ValueError(f"{name} has invalid state {st}, {bad}")
-        return new_states
-    else:
-        new_states, qubit_states = [], []
-        for st in states:
-            if isinstance(st, int) and not isinstance(st, bool) and st in [0, 1]:
-                qubit_states.append(st)
-            elif not isinstance(st, int) or isinstance(st, bool) or not (1 < st < 10):
-                raise ValueError(f"{name} has invalid state {st}, {bad}")
-            else:
-                new_states.append(st)
-        if 0 in qubit_states and 1 in qubit_states: new_states.append("U")
-        else: new_states += qubit_states
-        return new_states
+    for st in states:
+        if not (
+            st == "U"
+            or (isinstance(st, int) and not isinstance(st, bool) and 0 <= st <= 9)
+        ):
+            raise ValueError(
+                f"{name} has invalid state {st}, must be 'U' or an int between 0 and 9"
+            )
+    return list(dict.fromkeys(states))
+
 
 def _parse_list_of_states(args: str, name: str) -> tuple[str | int, ...]:
     states = [try_as_integer(st.strip()) for st in args.split()]
-    return tuple(dict.fromkeys(_combine_conditioned_states(cast(list[int | str], states), name)))
+    return tuple(_combine_conditioned_states(cast(list[int | str], states), name))
 
 # --- TAG-SPECIFIC PARSER FUNCTIONS ---
 
