@@ -16,7 +16,7 @@ import stim  # type: ignore[import-untyped]
 
 from stimside.op_handlers.leakage_handlers.common_parsing import split_arguments
 from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageParams
-from stimside.op_handlers.leakage_handlers.tag_registry import TAG_REGISTRY, check_tag_qubits, parse_leakage_tag
+from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits, parse_leakage_tag_magic
 import stimside.util.phase_qfe as _pq
 from stimside.util.phase_qfe import (
     DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep,
@@ -955,26 +955,20 @@ def _validate_and_emit_non_magic_tagged_op(
 ) -> int:
     """Validate a registered leakage tag (emitting `LeakageBarrierRecord`) or reject unknown tags."""
     tag = op.tag
-    tag_prefix = tag.split(":", 1)[0]
-    tag_def = TAG_REGISTRY.get(tag_prefix)
-    if tag_def is None or not (tag.startswith("LEAKAGE") or tag.startswith("CONDITIONED_ON")):
+    if not (tag.startswith("LEAKAGE") or tag.startswith("CONDITIONED_ON")):
         raise ValueError(f"Unrecognized instruction tag {tag!r} on {op!r}")
-
-    sim_mode: Literal["tableau", "flip"] = "tableau" if "tableau" in tag_def.supported_simulators else "flip"
-    params = parse_leakage_tag(op, simulator=sim_mode)
+    params, _ = parse_leakage_tag_magic(op, syntax_only=True)
+    tag_prefix = tag.split(":", 1)[0].strip()
     if params is not None:
+        check_tag_qubits({op: params}, num_qubits)
         tag_targets = getattr(params, "targets", None)
-        if tag_targets:
-            if any(q < 0 for q in tag_targets):
-                raise ValueError(f"Negative qubit index in leakage tag on {op!r}")
-            check_tag_qubits({op: params}, num_qubits)
-            if tag_prefix in ("LEAKAGE_MEASUREMENT", "CONDITIONED_ON_OTHER"):
-                raw_targs = op.targets_copy()
-                if len(raw_targs) == 0 or (len(raw_targs) % len(tag_targets)) != 0:
-                    raise ValueError(
-                        f"{op.name}[{tag_prefix}] target count {len(raw_targs)} not a positive multiple "
-                        f"of tag target count {len(tag_targets)} in {op!r}"
-                    )
+        if tag_targets and tag_prefix in ("LEAKAGE_MEASUREMENT", "CONDITIONED_ON_OTHER"):
+            raw_targs = op.targets_copy()
+            if len(raw_targs) == 0 or (len(raw_targs) % len(tag_targets)) != 0:
+                raise ValueError(
+                    f"{op.name}[{tag_prefix}] target count {len(raw_targs)} not a positive multiple "
+                    f"of tag target count {len(tag_targets)} in {op!r}"
+                )
 
     canon_name = _canonical_gate_data(op.name).name
     n_meas = _instruction_num_measurements(op, canon_name)

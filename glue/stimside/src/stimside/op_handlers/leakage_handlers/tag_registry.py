@@ -8,8 +8,11 @@ from stimside.op_handlers.leakage_handlers.common_parsing import (
     LEAKAGE_SWAP_TAG_MATCH,
     CONDITION_TAG_MATCH,
     MEASURE_TAG_MATCH,
+    split_arguments,
+    try_as_integer,
 )
 from stimside.op_handlers.leakage_handlers.leakage_parameters import (
+    LeakageMeasurementParams,
     LeakageParams,
 )
 
@@ -175,6 +178,48 @@ def parse_leakage_tag(op: stim.CircuitInstruction, simulator: Literal["flip", "t
     # 3. Validate & Parse
     tag_def.validate(op, simulator)
     return tag_def.parser_func(op, match, simulator)
+
+
+def parse_leakage_tag_magic(
+    op: stim.CircuitInstruction, *, syntax_only: bool = False
+) -> tuple[LeakageParams | None, bool]:
+    """Parse a leakage tag under Magic rules (expanding MPAD `(p, U)` to `(p, 0) (p, 1)`).
+
+    When ``syntax_only=True``, tags supported only by the flip simulator are validated
+    against their flip grammar instead of being rejected as unsupported.
+    """
+    tag = op.tag
+    if not (tag.startswith("LEAKAGE") or tag.startswith("CONDITIONED_ON")):
+        return None, False
+    match = (
+        MEASURE_TAG_MATCH.fullmatch(tag)
+        if op.name == "MPAD" and tag.startswith("LEAKAGE_MEASUREMENT")
+        else None
+    )
+    if match and match.group("args"):
+        had_u, parts = False, []
+        for pair in split_arguments(match.group("args")):
+            if len(pair) != 2:
+                raise ValueError(f"Malformed argument '{pair}' in tag '{tag}'.")
+            is_u = try_as_integer(pair[1]) == "U"
+            had_u |= is_u
+            parts.append(f"({pair[0]}, 0) ({pair[0]}, 1)" if is_u else f"({pair[0]}, {pair[1]})")
+        if had_u:
+            rewritten = stim.CircuitInstruction(
+                op.name,
+                op.targets_copy(),
+                op.gate_args_copy(),
+                tag=f"LEAKAGE_MEASUREMENT: {' '.join(parts)} : {match.group('targets')}",
+            )
+            parsed = parse_leakage_tag(rewritten, simulator="tableau")
+            assert isinstance(parsed, LeakageMeasurementParams)
+            return LeakageMeasurementParams(parsed.args, parsed.targets, tag), True
+    sim: Literal["flip", "tableau"] = "tableau"
+    if syntax_only:
+        tag_def = TAG_REGISTRY.get(tag.split(":", 1)[0].strip())
+        if tag_def is not None and "tableau" not in tag_def.supported_simulators:
+            sim = "flip"
+    return parse_leakage_tag(op, simulator=sim), False
 
 
 # --- CIRCUIT PARSING ---

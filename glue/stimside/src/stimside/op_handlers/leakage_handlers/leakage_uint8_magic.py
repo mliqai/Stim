@@ -10,11 +10,13 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside.op_handlers.leakage_handlers.common_parsing import MEASURE_TAG_MATCH, split_arguments, try_as_integer
-from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageMeasurementParams, LeakageParams
-from stimside.op_handlers.leakage_handlers.leakage_tag_parsing_tableau import parse_leakage_tag
+from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageParams
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import CompiledLeakageUint8Coset, LeakageUint8Coset, _do_copies_on_fused_step
-from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS, check_tag_qubits
+from stimside.op_handlers.leakage_handlers.tag_registry import (
+    MAGIC_TAGS as _MAGIC_TAGS,
+    check_tag_qubits,
+    parse_leakage_tag_magic as _parse_leakage_tag_magic,
+)
 from stimside.simulator_magic import MagicsideSimulator
 from stimside.util.stim_workarounds import split_fused_instruction
 
@@ -28,23 +30,6 @@ def _validate_magic_instruction(op: stim.CircuitInstruction, num_qubits: int) ->
     if op.tag == "CCZ" and (len(qs) % 3 != 0 or any(len(set(qs[i : i + 3])) != 3 for i in range(0, len(qs), 3))):
         raise ValueError(f"I[CCZ] requires distinct triples of targets, got {qs}")
     return qs
-
-
-def _parse_leakage_tag_magic(op: stim.CircuitInstruction) -> tuple[LeakageParams | None, bool]:
-    match = MEASURE_TAG_MATCH.fullmatch(op.tag) if (op.name == "MPAD" and op.tag.startswith("LEAKAGE_MEASUREMENT")) else None
-    if match and match.group("args"):
-        had_u, parts = False, []
-        for pair in split_arguments(match.group("args")):
-            if len(pair) != 2:
-                raise ValueError(f"Malformed argument '{pair}' in tag '{op.tag}'.")
-            is_u = try_as_integer(pair[1]) == "U"
-            had_u |= is_u
-            parts.append(f"({pair[0]}, 0) ({pair[0]}, 1)" if is_u else f"({pair[0]}, {pair[1]})")
-        if had_u:
-            parsed = parse_leakage_tag(stim.CircuitInstruction(op.name, op.targets_copy(), op.gate_args_copy(), tag=f"LEAKAGE_MEASUREMENT: {' '.join(parts)} : {match.group('targets')}"))
-            assert isinstance(parsed, LeakageMeasurementParams)
-            return LeakageMeasurementParams(parsed.args, parsed.targets, op.tag), True
-    return parse_leakage_tag(op), False
 
 
 def _parse_leakage_in_circuit_magic(circuit: stim.Circuit, num_qubits: int) -> tuple[dict[stim.CircuitInstruction, LeakageParams], set[stim.CircuitInstruction]]:

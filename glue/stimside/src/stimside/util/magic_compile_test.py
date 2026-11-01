@@ -2375,3 +2375,29 @@ def test_m1_r3_selector_activations_heralded_and_strict_trace_validation() -> No
             run_direct(dp, **{kw_name: bad_map})  # type: ignore[arg-type]
         with pytest.raises(ValueError):
             run_selector(sp, **{kw_name: bad_map})  # type: ignore[arg-type]
+
+
+def test_magic_compile_accepts_magic_mpad_u_and_spaced_leakage_tags() -> None:
+    """`magic_compile` shares Magic tag parsing (including MPAD `(p, U)` rewrite and space-before-colon tags)."""
+    for op_str, exp_name, exp_meas in (
+        ("MPAD[LEAKAGE_MEASUREMENT: (0.25, U) (0.9, 2): 0] 0", "LEAKAGE_MEASUREMENT", 1),
+        ("MPAD[LEAKAGE_MEASUREMENT : (0.25, U) : 0] 0 0", "LEAKAGE_MEASUREMENT", 2),
+        ("X[CONDITIONED_ON_SELF : 2] 0", "CONDITIONED_ON_SELF", 0),
+    ):
+        circ = stim.Circuit(f"I[T] 0\n{op_str}\nI[T_DAG] 0")
+        coord = compile_coordinates(circ)
+        dp = compile_direct(circ, c2_budget=64)
+        sp = compile_selector(circ, gadgetize_pauli_noise=True, c2_budget=64)
+        assert coord.num_measurements == exp_meas
+        barriers = [r for r in dp.records if isinstance(r, LeakageBarrierRecord)]
+        assert len(barriers) == 1
+        assert barriers[0].tag_prefix == exp_name
+        assert barriers[0].num_measurements == exp_meas
+        assert sum(isinstance(r, LeakageBarrierRecord) for r in sp.records) == 1
+
+    for bad_str in (
+        "MPAD[LEAKAGE_MEASUREMENT: (0.25, U): 5] 0",
+        "MPAD[LEAKAGE_MEASUREMENT: (0.25, U): 0 1] 0 0 1",
+    ):
+        with pytest.raises(ValueError):
+            compile_direct(stim.Circuit(bad_str))
