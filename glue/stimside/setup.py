@@ -17,12 +17,10 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
-import platform
 import shutil
 import site
 import sys
 import sysconfig
-
 import time
 
 # When pip runs with build isolation in an offline/restricted environment,
@@ -48,24 +46,17 @@ from setuptools.command.build_ext import build_ext
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def _get_compile_and_link_args() -> tuple[list[str], list[str]]:
-    system = platform.system()
-    machine = (platform.machine() or platform.processor() or "").lower()
-    if system.startswith("Win"):
-        compile_args = ["/std:c++17", "/O2"]
-        link_args: list[str] = []
-    else:
-        compile_args = [
-            "-std=c++17",
-            "-O3",
-            "-fPIC",
-            "-fno-strict-aliasing",
-            "-g0",
-        ]
-        if any(arch in machine for arch in ("x86_64", "amd64", "i686", "i386", "arm64", "aarch64")):
-            compile_args.append("-march=native")
-        link_args = ["-O3", "-shared"]
-    return compile_args, link_args
+def _load_kernel_loader():
+    loader_path = PROJECT_ROOT / "src" / "stimside" / "_native" / "_kernel_loader.py"
+    spec = importlib.util.spec_from_file_location("_stimside_kernel_loader", loader_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_KERNEL_LOADER = _load_kernel_loader()
 
 
 class StimsideBuildExt(build_ext):
@@ -120,36 +111,16 @@ class StimsideBuildExt(build_ext):
 
 
 def _get_extensions() -> list[Extension]:
-    compile_args, link_args = _get_compile_and_link_args()
+    compile_args, link_args = _KERNEL_LOADER.get_cpp_compile_and_link_args()
     return [
         Extension(
-            name="stimside._native.libcoset_kernels",
-            sources=["src/stimside/_native/coset_kernels.cpp"],
+            name=f"stimside._native.lib{name}",
+            sources=[f"src/stimside/_native/{name}.cpp"],
             language="c++",
             extra_compile_args=compile_args,
             extra_link_args=link_args,
-        ),
-        Extension(
-            name="stimside._native.libtableside_kernels",
-            sources=["src/stimside/_native/tableside_kernels.cpp"],
-            language="c++",
-            extra_compile_args=compile_args,
-            extra_link_args=link_args,
-        ),
-        Extension(
-            name="stimside._native.libmarginal_dem_kernels",
-            sources=["src/stimside/_native/marginal_dem_kernels.cpp"],
-            language="c++",
-            extra_compile_args=compile_args,
-            extra_link_args=link_args,
-        ),
-        Extension(
-            name="stimside._native.libmagic_kernels",
-            sources=["src/stimside/_native/magic_kernels.cpp"],
-            language="c++",
-            extra_compile_args=compile_args,
-            extra_link_args=link_args,
-        ),
+        )
+        for name in _KERNEL_LOADER.KERNEL_NAMES
     ]
 
 

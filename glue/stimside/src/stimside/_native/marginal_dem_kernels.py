@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import ctypes
 from pathlib import Path
+import sys
 
 import numpy as np
 from numpy.typing import NDArray
 
 from stimside._native._kernel_loader import (
+    AbiSpec,
     find_prebuilt_so as _find_prebuilt_so_candidate,
-    load_cdll,
+    get_lib,
     resolve_so,
 )
 
@@ -116,137 +118,71 @@ class CondFireRuleC(ctypes.Structure):
 
 
 _LIB_INSTANCE: ctypes.CDLL | None = None
+_c_i32 = ctypes.c_int32
+
+_TRACE_FLOWS_ARGS = [
+    _c_i32,
+    _c_i32,
+    _c_i32,
+    ctypes.POINTER(OpDescC),
+    i32_p,
+    i32_p,
+    i32_p,
+    i32_p,
+    ctypes.POINTER(MeasStateProbC),
+    ctypes.POINTER(Trans1RuleC),
+    ctypes.POINTER(Trans2RuleC),
+    ctypes.POINTER(MoveBranchC),
+    ctypes.POINTER(CondFireRuleC),
+    _c_i32,
+    ctypes.POINTER(SourceDescC),
+]
+
+_SPECS: tuple[AbiSpec, ...] = (
+    ("marginal_trace_flows", _TRACE_FLOWS_ARGS, void_p),
+    ("marginal_trace_source_flows", _TRACE_FLOWS_ARGS, void_p),
+    ("marginal_trace_result_get_counts", [void_p, i32_p, i32_p, i32_p, i32_p, i32_p], None),
+    (
+        "marginal_trace_result_copy_data",
+        [void_p, i32_p, i32_p, i32_p, i32_p, i32_p, f64_p, i32_p, i32_p],
+        None,
+    ),
+    ("marginal_free_trace_result", [void_p], None),
+    (
+        "marginal_build_envelopes",
+        [_c_i32, _c_i32, _c_i32, i32_p, i32_p, f64_p, _c_i32, i32_p, i32_p, _c_i32, i32_p, i32_p, f64_p],
+        void_p,
+    ),
+    ("marginal_envelope_result_get_total_entries", [void_p], _c_i32),
+    ("marginal_envelope_result_copy_data", [void_p, i32_p, i32_p, f64_p], None),
+    ("marginal_free_envelope_result", [void_p], None),
+    (
+        "marginal_process_shots",
+        [
+            _c_i32, _c_i32, u8_p, i32_p, i32_p, i32_p, i32_p, f64_p,
+            _c_i32, _c_i32, f64_p, _c_i32, i32_p, i32_p, i32_p, f64_p,
+        ],
+        void_p,
+    ),
+    ("marginal_batch_result_get_counts", [void_p, i32_p, i32_p], None),
+    ("marginal_batch_result_copy_data", [void_p, i32_p, i32_p, i32_p, f64_p, f64_p], None),
+    ("marginal_free_batch_result", [void_p], None),
+)
 
 
 def _resolve_marginal_dem_kernels_so(force_recompile: bool = False) -> Path:
     return resolve_so(__file__, "marginal_dem_kernels", force_recompile, _find_prebuilt_so_candidate)
 
 
-def get_marginal_dem_kernels_lib() -> ctypes.CDLL:
+def get_marginal_dem_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
     """Locate (or compile if needed) and return the cached ctypes CDLL for marginal_dem_kernels.cpp."""
-    global _LIB_INSTANCE
-    if _LIB_INSTANCE is not None:
-        return _LIB_INSTANCE
-
-    # The version of the .cpp's struct layouts and function signatures: an older library is rebuilt.
-    lib = load_cdll(_resolve_marginal_dem_kernels_so, "marginal_dem_kernels_abi_v5")
-
-    lib.marginal_trace_flows.argtypes = [
-        ctypes.c_int32,
-        ctypes.c_int32,
-        ctypes.c_int32,
-        ctypes.POINTER(OpDescC),
-        i32_p,
-        i32_p,
-        i32_p,
-        i32_p,
-        ctypes.POINTER(MeasStateProbC),
-        ctypes.POINTER(Trans1RuleC),
-        ctypes.POINTER(Trans2RuleC),
-        ctypes.POINTER(MoveBranchC),
-        ctypes.POINTER(CondFireRuleC),
-        ctypes.c_int32,
-        ctypes.POINTER(SourceDescC),
-    ]
-    lib.marginal_trace_flows.restype = void_p
-    lib.marginal_trace_source_flows.argtypes = lib.marginal_trace_flows.argtypes
-    lib.marginal_trace_source_flows.restype = void_p
-
-    lib.marginal_trace_result_get_counts.argtypes = [
-        void_p,
-        i32_p,
-        i32_p,
-        i32_p,
-        i32_p,
-        i32_p,
-    ]
-    lib.marginal_trace_result_get_counts.restype = None
-
-    lib.marginal_trace_result_copy_data.argtypes = [
-        void_p,
-        i32_p,
-        i32_p,
-        i32_p,
-        i32_p,
-        i32_p,
-        f64_p,
-        i32_p,
-        i32_p,
-    ]
-    lib.marginal_trace_result_copy_data.restype = None
-
-    lib.marginal_free_trace_result.argtypes = [void_p]
-    lib.marginal_free_trace_result.restype = None
-
-    lib.marginal_build_envelopes.argtypes = [
-        ctypes.c_int32,
-        ctypes.c_int32,
-        ctypes.c_int32,
-        i32_p,
-        i32_p,
-        f64_p,
-        ctypes.c_int32,
-        i32_p,
-        i32_p,
-        ctypes.c_int32,
-        i32_p,
-        i32_p,
-        f64_p,
-    ]
-    lib.marginal_build_envelopes.restype = void_p
-
-    lib.marginal_envelope_result_get_total_entries.argtypes = [void_p]
-    lib.marginal_envelope_result_get_total_entries.restype = ctypes.c_int32
-
-    lib.marginal_envelope_result_copy_data.argtypes = [
-        void_p,
-        i32_p,
-        i32_p,
-        f64_p,
-    ]
-    lib.marginal_envelope_result_copy_data.restype = None
-
-    lib.marginal_free_envelope_result.argtypes = [void_p]
-    lib.marginal_free_envelope_result.restype = None
-
-    lib.marginal_process_shots.argtypes = [
-        ctypes.c_int32,
-        ctypes.c_int32,
-        u8_p,
-        i32_p,
-        i32_p,
-        i32_p,
-        i32_p,
-        f64_p,
-        ctypes.c_int32,
-        ctypes.c_int32,
-        f64_p,
-        ctypes.c_int32,
-        i32_p,
-        i32_p,
-        i32_p,
-        f64_p,
-    ]
-    lib.marginal_process_shots.restype = void_p
-
-    lib.marginal_batch_result_get_counts.argtypes = [void_p, i32_p, i32_p]
-    lib.marginal_batch_result_get_counts.restype = None
-
-    lib.marginal_batch_result_copy_data.argtypes = [
-        void_p,
-        i32_p,
-        i32_p,
-        i32_p,
-        f64_p,
-        f64_p,
-    ]
-    lib.marginal_batch_result_copy_data.restype = None
-
-    lib.marginal_free_batch_result.argtypes = [void_p]
-    lib.marginal_free_batch_result.restype = None
-
-    _LIB_INSTANCE = lib
-    return lib
+    return get_lib(
+        sys.modules[__name__],
+        "marginal_dem_kernels",
+        "marginal_dem_kernels_abi_v5",
+        _SPECS,
+        force_recompile=force_recompile,
+    )
 
 
 def _ptr_i32(arr: NDArray[np.int32]) -> i32_p:

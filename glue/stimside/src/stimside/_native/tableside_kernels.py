@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ctypes
 from pathlib import Path
+import sys
 
 from stimside._native._kernel_loader import (
+    AbiSpec,
     find_prebuilt_so as _find_prebuilt_so_candidate,
-    load_cdll,
+    get_lib,
     resolve_so,
 )
 
@@ -49,70 +51,62 @@ class EmittedActionC(ctypes.Structure):
 
 
 _LIB_INSTANCE: ctypes.CDLL | None = None
+_i32_pp = ctypes.POINTER(ctypes.POINTER(ctypes.c_int32))
+
+_SPECS: tuple[AbiSpec, ...] = (
+    (
+        "fast_engine_create",
+        [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.POINTER(StepDescC),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_int,
+            ctypes.POINTER(TransBranchC),
+        ],
+        ctypes.c_void_p,
+    ),
+    ("fast_engine_destroy", [ctypes.c_void_p], None),
+    ("fast_engine_clear", [ctypes.c_void_p, ctypes.c_uint64], None),
+    ("fast_engine_set_record_leakage", [ctypes.c_void_p, ctypes.c_int], None),
+    ("fast_engine_get_segment_leaked_ops", [ctypes.c_void_p, _i32_pp], ctypes.c_int),
+    ("fast_engine_set_record_events", [ctypes.c_void_p, ctypes.c_int], None),
+    ("fast_engine_get_segment_events", [ctypes.c_void_p, _i32_pp], ctypes.c_int),
+    ("fast_engine_get_state_ptr", [ctypes.c_void_p], ctypes.POINTER(ctypes.c_uint8)),
+    ("fast_engine_sync_leaked_mask", [ctypes.c_void_p], None),
+    (
+        "fast_engine_run_segment",
+        [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.POINTER(EmittedActionC)),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32)),
+        ],
+        ctypes.c_int,
+    ),
+    (
+        "fast_format_stim_op",
+        [ctypes.c_char_p, ctypes.c_int, ctypes.c_double, ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p],
+        ctypes.c_int,
+    ),
+)
 
 
 def _resolve_tableside_kernels_so(force_recompile: bool = False) -> Path:
     return resolve_so(__file__, "tableside_kernels", force_recompile, _find_prebuilt_so_candidate)
 
 
-def get_tableside_kernels_lib() -> ctypes.CDLL:
+def get_tableside_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
     """Locate (or compile if needed) and return the cached ctypes CDLL for tableside_kernels.cpp."""
-    global _LIB_INSTANCE
-    if _LIB_INSTANCE is not None:
-        return _LIB_INSTANCE
-
-    lib = load_cdll(_resolve_tableside_kernels_so, "fast_engine_get_segment_events")
-    lib.fast_engine_create.argtypes = [
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_uint64,
-        ctypes.POINTER(StepDescC),
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_uint32),
-        ctypes.POINTER(ctypes.c_int32),
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_uint64),
-        ctypes.c_int,
-        ctypes.POINTER(TransBranchC),
-    ]
-    lib.fast_engine_create.restype = ctypes.c_void_p
-    lib.fast_engine_destroy.argtypes = [ctypes.c_void_p]
-    lib.fast_engine_destroy.restype = None
-    lib.fast_engine_clear.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
-    lib.fast_engine_clear.restype = None
-    lib.fast_engine_set_record_leakage.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    lib.fast_engine_set_record_leakage.restype = None
-    lib.fast_engine_get_segment_leaked_ops.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.POINTER(ctypes.c_int32)),
-    ]
-    lib.fast_engine_get_segment_leaked_ops.restype = ctypes.c_int
-    lib.fast_engine_set_record_events.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    lib.fast_engine_set_record_events.restype = None
-    lib.fast_engine_get_segment_events.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.POINTER(ctypes.c_int32)),
-    ]
-    lib.fast_engine_get_segment_events.restype = ctypes.c_int
-    lib.fast_engine_get_state_ptr.argtypes = [ctypes.c_void_p]
-    lib.fast_engine_get_state_ptr.restype = ctypes.POINTER(ctypes.c_uint8)
-    lib.fast_engine_sync_leaked_mask.argtypes = [ctypes.c_void_p]
-    lib.fast_engine_sync_leaked_mask.restype = None
-    lib.fast_engine_run_segment.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.POINTER(EmittedActionC)),
-        ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32)),
-    ]
-    lib.fast_engine_run_segment.restype = ctypes.c_int
-    lib.fast_format_stim_op.argtypes = [
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_double,
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-    ]
-    lib.fast_format_stim_op.restype = ctypes.c_int
-    _LIB_INSTANCE = lib
-    return lib
+    return get_lib(
+        sys.modules[__name__],
+        "tableside_kernels",
+        "fast_engine_get_segment_events",
+        _SPECS,
+        force_recompile=force_recompile,
+    )

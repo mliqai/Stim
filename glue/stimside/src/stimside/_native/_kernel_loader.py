@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import _ctypes
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import ctypes
 try:
     import fcntl
@@ -11,10 +11,38 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
 import time
+from types import ModuleType
+from typing import Any
+
+KERNEL_NAMES: tuple[str, ...] = (
+    "coset_kernels",
+    "tableside_kernels",
+    "marginal_dem_kernels",
+    "magic_kernels",
+)
+
+AbiSpec = tuple[str, Sequence[Any], Any]
+
+
+def get_cpp_compile_and_link_args(
+    include_march_native: bool = True,
+) -> tuple[list[str], list[str]]:
+    system = platform.system()
+    machine = (platform.machine() or platform.processor() or "").lower()
+    if system.startswith("Win"):
+        return ["/std:c++17", "/O2"], []
+    compile_args = ["-std=c++17", "-O3", "-fPIC", "-fno-strict-aliasing", "-g0"]
+    if include_march_native and any(
+        arch in machine
+        for arch in ("x86_64", "amd64", "i686", "i386", "arm64", "aarch64")
+    ):
+        compile_args.append("-march=native")
+    return compile_args, ["-O3", "-shared"]
 
 
 def find_prebuilt_so(here: Path, lib_stem: str, cpp_path: Path) -> Path | None:
@@ -110,10 +138,11 @@ def resolve_so(
             or shutil.which("clang++")
             or "g++"
         )
-        cmd_variants = [
-            [cxx, "-O3", "-std=c++17", "-march=native", "-shared", "-fPIC", str(cpp_path), "-o", str(tmp_so)],
-            [cxx, "-O3", "-std=c++17", "-shared", "-fPIC", str(cpp_path), "-o", str(tmp_so)],
-        ]
+        c_native, link_args = get_cpp_compile_and_link_args(include_march_native=True)
+        c_generic, _ = get_cpp_compile_and_link_args(include_march_native=False)
+        cmd_variants = [[cxx, *c_native, *link_args, str(cpp_path), "-o", str(tmp_so)]]
+        if c_generic != c_native:
+            cmd_variants.append([cxx, *c_generic, *link_args, str(cpp_path), "-o", str(tmp_so)])
         last_exc: Exception | None = None
         with cpp_path.open("rb") as lf:
             if fcntl is not None:
@@ -170,4 +199,33 @@ def load_cdll(resolve: Callable[..., Path], sentinel: str | None = None) -> ctyp
             f"{lib._name} does not export {sentinel} even after a rebuild: restart Python if an "
             "older copy of it was loaded earlier in this process."
         )
+    return lib
+
+
+def get_lib(
+    mod: ModuleType,
+    name: str,
+    sentinel: str,
+    specs: Sequence[AbiSpec],
+    *,
+    force_recompile: bool = False,
+) -> ctypes.CDLL:
+    """Locate/compile, configure ctypes ABI, cache on ``mod._LIB_INSTANCE``, and return the CDLL."""
+    cached = getattr(mod, "_LIB_INSTANCE", None)
+    if not force_recompile and cached is not None:
+        return cached
+    if force_recompile:
+        mod._LIB_INSTANCE = None  # type: ignore[attr-defined]
+    resolve_fn = getattr(mod, f"_resolve_{name}_so")
+    resolver = (
+        (lambda force_recompile=True: resolve_fn(force_recompile=True))
+        if force_recompile
+        else resolve_fn
+    )
+    lib = load_cdll(resolver, sentinel)
+    for fn_name, argtypes, restype in specs:
+        fn = getattr(lib, fn_name)
+        fn.argtypes = list(argtypes)
+        fn.restype = restype
+    mod._LIB_INSTANCE = lib  # type: ignore[attr-defined]
     return lib
