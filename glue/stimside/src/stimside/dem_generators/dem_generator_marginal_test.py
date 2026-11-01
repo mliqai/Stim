@@ -2264,3 +2264,37 @@ def test_reweight_decoding_without_fork_edge_reweights_matches_full_dems(monkeyp
         want,
     )
     assert decode_with_generated_dems(decoder, rw[0], dets[:0]).shape == (0, 1)
+
+
+def test_item_analysis_registry_evicts_on_gc_including_empty_reweight() -> None:
+    import gc
+    import weakref
+    from stimside.dem_generators.dem_generator_marginal import (
+        _ITEM_ANALYSIS_META,
+        _get_item_analysis_meta,
+    )
+
+    sc = _make_surface_code_leakage_circuit(distance=3, rounds=2)
+    for dec, rew in ((False, False), (False, True), (True, True)):
+        gen = MarginalLeakageDemGenerator()
+        gen_ref = weakref.ref(gen)
+        flags = gen._get_analysis(sc, dec).flag_records
+        recs = np.zeros((4, sc.num_measurements), dtype=bool)
+        recs[1, flags[0]] = True
+        dems = gen(sc, recs, decompose_errors=dec, reweight_only=rew)
+        ids = {id(x) for x in dems}
+        assert all(_get_item_analysis_meta(x) is not None for x in dems)
+        del dems, gen
+        gc.collect()
+        assert gen_ref() is None
+        assert not (ids & _ITEM_ANALYSIS_META.keys())
+
+    gen_many = MarginalLeakageDemGenerator()
+    rec_1d = np.zeros(sc.num_measurements, dtype=bool)
+    rec_1d[gen_many._get_analysis(sc, False).flag_records[0]] = True
+    live = [gen_many(sc, rec_1d) for _ in range(300)]
+    assert len(live) == 300 and all(_get_item_analysis_meta(d) is not None for d in live)
+    live_ids = {id(d) for d in live}
+    live.clear()
+    gc.collect()
+    assert not (live_ids & _ITEM_ANALYSIS_META.keys())

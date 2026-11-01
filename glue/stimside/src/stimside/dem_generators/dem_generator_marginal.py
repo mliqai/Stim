@@ -72,6 +72,7 @@ from collections import defaultdict
 import dataclasses
 from typing import Any, Sequence
 import warnings
+import weakref
 
 import numpy as np
 from numpy.typing import NDArray
@@ -154,7 +155,7 @@ _SOURCE_TAG = "marginal_leakage_source"
 _ITEM_ANALYSIS_META: dict[
     int,
     tuple[
-        Any,
+        weakref.ReferenceType[Any],
         _Analysis,
         bool,
         bool,
@@ -176,11 +177,15 @@ def _register_item_analysis(
     record_1d: NDArray[np.bool_] | None = None,
     leakage_events_1d: ShotLeakageEvents | None = None,
 ) -> None:
-    if len(_ITEM_ANALYSIS_META) >= 8192:
-        oldest_key = next(iter(_ITEM_ANALYSIS_META))
-        _ITEM_ANALYSIS_META.pop(oldest_key, None)
-    _ITEM_ANALYSIS_META[id(obj)] = (
-        obj,
+    oid = id(obj)
+
+    def _evict(ref: weakref.ReferenceType[Any], key: int = oid) -> None:
+        cur = _ITEM_ANALYSIS_META.get(key)
+        if cur is not None and cur[0] is ref:
+            del _ITEM_ANALYSIS_META[key]
+
+    _ITEM_ANALYSIS_META[oid] = (
+        weakref.ref(obj, _evict),
         analysis,
         decompose_errors,
         reweight_only,
@@ -202,7 +207,7 @@ def _get_item_analysis_meta(
     NDArray[np.bool_] | None,
 ] | None:
     entry = _ITEM_ANALYSIS_META.get(id(obj))
-    if entry is not None and entry[0] is obj:
+    if entry is not None and entry[0]() is obj:
         return entry[1:7]
     return None
 
@@ -210,7 +215,7 @@ def _get_item_analysis_meta(
 def _get_item_leakage_events(obj: Any) -> ShotLeakageEvents | None:
     """The leakage events of the shot an item was generated for (loss-oracle mode), else None."""
     entry = _ITEM_ANALYSIS_META.get(id(obj))
-    if entry is not None and entry[0] is obj:
+    if entry is not None and entry[0]() is obj:
         return entry[7]
     return None
 
@@ -743,9 +748,6 @@ class _Analysis:
     _sym_targets: list[list[stim.DemTarget]] | None = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )
-    _empty_reweight: NDArray[np.float64] | None = dataclasses.field(
-        default=None, init=False, repr=False, compare=False
-    )
     _cached_matcher: Any = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )
@@ -753,7 +755,6 @@ class _Analysis:
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["_sym_targets"] = None
-        state["_empty_reweight"] = None
         state["_cached_matcher"] = None
         return state
 
@@ -761,11 +762,6 @@ class _Analysis:
         if self._sym_targets is None:
             self._sym_targets = [_sym_to_targets(sym) for sym in self.symptoms]
         return self._sym_targets
-
-    def _get_empty_reweight(self) -> NDArray[np.float64]:
-        if self._empty_reweight is None:
-            self._empty_reweight = np.empty((0, 3), dtype=np.float64)
-        return self._empty_reweight
 
     def generate_batch(
         self,
@@ -779,16 +775,10 @@ class _Analysis:
 
         if num_flags == 0 or len(self.symptoms) == 0:
             if mode == 2:
-                empty_rw = self._get_empty_reweight()
-                _register_item_analysis(empty_rw, self, decompose_errors, reweight_only)
-                return [empty_rw] * num_shots
+                return [np.empty((0, 3), dtype=np.float64)] * num_shots
             if mode == 1:
-                empty_dem = stim.DetectorErrorModel()
-                _register_item_analysis(empty_dem, self, decompose_errors, reweight_only)
-                return [empty_dem] * num_shots
-            base_copy = self.baseline.copy()
-            _register_item_analysis(base_copy, self, decompose_errors, reweight_only)
-            return [base_copy] * num_shots
+                return [stim.DetectorErrorModel()] * num_shots
+            return [self.baseline.copy()] * num_shots
 
         (
             shot_group_ids,
@@ -815,8 +805,7 @@ class _Analysis:
         num_groups = len(group_item_offsets) - 1
         if mode == 2:
             assert group_reweights is not None
-            empty_rw = self._get_empty_reweight()
-            _register_item_analysis(empty_rw, self, decompose_errors, reweight_only)
+            empty_rw = np.empty((0, 3), dtype=np.float64)
             group_objs: list[Any] = []
             for g in range(num_groups):
                 start = int(group_item_offsets[g])
@@ -824,9 +813,7 @@ class _Analysis:
                 if start == end:
                     group_objs.append(empty_rw)
                 else:
-                    arr = group_reweights[start:end].copy()
-                    _register_item_analysis(arr, self, decompose_errors, reweight_only)
-                    group_objs.append(arr)
+                    group_objs.append(group_reweights[start:end].copy())
             return [group_objs[int(gid)] for gid in shot_group_ids]
 
         assert group_sym_ids is not None and group_probs is not None
@@ -837,7 +824,6 @@ class _Analysis:
         empty_base = (
             stim.DetectorErrorModel() if mode == 1 else self.baseline.copy()
         )
-        _register_item_analysis(empty_base, self, decompose_errors, reweight_only)
         for g in range(num_groups):
             start = int(group_item_offsets[g])
             end = int(group_item_offsets[g + 1])
@@ -850,9 +836,7 @@ class _Analysis:
                 p = float(group_probs[idx])
                 if p > 0:
                     extra.append("error", p, sym_targets[sym_id])
-            dem_obj = extra if mode == 1 else (self.baseline + extra)
-            _register_item_analysis(dem_obj, self, decompose_errors, reweight_only)
-            group_dems.append(dem_obj)
+            group_dems.append(extra if mode == 1 else (self.baseline + extra))
         return [group_dems[int(gid)] for gid in shot_group_ids]
 
 
