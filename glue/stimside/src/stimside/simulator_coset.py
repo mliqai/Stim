@@ -33,6 +33,15 @@ from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixi
 from stimside.util.reference_chp import PackedSymplecticTables, _pauli_image
 from stimside.util.seeding import derived_seed
 from stimside.util.stim_workarounds import broadcast_pauli_errors
+from stimside.util.sync_rng import (
+    apply_sync_meas_flips,
+    build_sync_rngs,
+    conditioned_targets_per_shot,
+    draw_tab_rng_bit,
+    exec_sync_correlated_error,
+    exec_sync_heralded_noise,
+    exec_sync_pauli_batch,
+)
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
 
 # Pauli applied to the qubit of a record-controlled 2Q gate (stim only parses these with rec[] controls).
@@ -265,32 +274,15 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
     def _init_rngs(self) -> None:
         if self.sync_tableside_rng:
-            if self.seed is None:
-                base_seed = int(np.random.default_rng().integers(0, 2**63))
-                shot_seeds = [derived_seed(base_seed, b) for b in range(self.batch_size)]
-            else:
-                # Shot n of the run (counting across batches) is seeded as in TablesideSimulator.
-                n0 = self._batches_completed * self.batch_size
-                shot_seeds = [derived_seed(self.seed, n0 + b) for b in range(self.batch_size)]
-                base_seed = shot_seeds[0]
-            self._shot_np_rngs = [
-                np.random.default_rng(seed=shot_seeds[b])
-                for b in range(self.batch_size)
-            ]
+            (
+                base_seed,
+                self._shot_np_rngs,
+                self._tab_rngs,
+                self._tab_rngs_x,
+            ) = build_sync_rngs(
+                self.seed, self._batches_completed, self.batch_size, self.num_qubits
+            )
             self.np_rng = self._shot_np_rngs[0]
-            self._tab_rngs = []
-            self._tab_rngs_x = []
-            all_data_q = list(range(self.num_qubits))
-            for b in range(self.batch_size):
-                ts_z = stim.TableauSimulator(seed=shot_seeds[b])
-                ts_z.set_num_qubits(self.num_qubits + 1)
-                self._tab_rngs.append(ts_z)
-
-                ts_x = stim.TableauSimulator(seed=shot_seeds[b])
-                ts_x.set_num_qubits(self.num_qubits + 1)
-                if all_data_q:
-                    ts_x.h(*all_data_q)
-                self._tab_rngs_x.append(ts_x)
         else:
             self._shot_np_rngs = None
             self._tab_rngs = None
@@ -323,18 +315,9 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def _draw_tab_rng_bit(self, b_idx: int) -> bool:
         if self._tab_rngs is not None:
             assert self._tab_rngs_x is not None
-            tr_z = self._tab_rngs[b_idx]
-            tr_x = self._tab_rngs_x[b_idx]
-            sq = self._tab_scratch_q
-            tr_z.h(sq)
-            bit = bool(tr_z.measure(sq))
-            if bit:
-                tr_z.x(sq)
-            tr_x.h(sq)
-            bit_x = bool(tr_x.measure(sq))
-            if bit_x:
-                tr_x.x(sq)
-            return bit
+            return draw_tab_rng_bit(
+                self._tab_rngs[b_idx], self._tab_rngs_x[b_idx], self._tab_scratch_q
+            )
         z = (
             int(self._shot_tiebreak_rng[b_idx]) + 0x9E3779B97F4A7C15
         ) & 0xFFFFFFFFFFFFFFFF
@@ -352,26 +335,15 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         assert self._tab_rngs is not None and self._tab_rngs_x is not None
         self._scratch_x_mask.fill(False)
         self._scratch_z_mask.fill(False)
-        any_x = False
-        any_z = False
-        for b_idx in range(self.batch_size):
-            t_b = targets_per_shot[b_idx]
-            if len(t_b) == 0:
-                continue
-            inst_b = stim.CircuitInstruction(op_name, t_b, gate_args)
-            tr_z = self._tab_rngs[b_idx]
-            tr_x = self._tab_rngs_x[b_idx]
-            tr_z.do(inst_b)
-            tr_x.do(inst_b)
-            for q in set(t_b):
-                if tr_z.peek_z(q) == -1:
-                    self._scratch_x_mask[q, b_idx] ^= True
-                    tr_z.x(q)
-                    any_x = True
-                if tr_x.peek_x(q) == -1:
-                    self._scratch_z_mask[q, b_idx] ^= True
-                    tr_x.z(q)
-                    any_z = True
+        any_x, any_z = exec_sync_pauli_batch(
+            self._tab_rngs,
+            self._tab_rngs_x,
+            op_name,
+            targets_per_shot,
+            gate_args,
+            self._scratch_x_mask,
+            self._scratch_z_mask,
+        )
         self._flush_xz(any_x, any_z)
 
     ############################################################################
@@ -634,34 +606,19 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 return
             if self._tab_rngs is not None:
                 assert self._tab_rngs_x is not None
-                herald_cols = [
-                    np.zeros(self.batch_size, dtype=np.bool_)
-                    for _ in range(num_m)
-                ]
                 self._scratch_x_mask.fill(False)
                 self._scratch_z_mask.fill(False)
-                any_x = False
-                any_z = False
-                for b_idx in range(self.batch_size):
-                    tr_z = self._tab_rngs[b_idx]
-                    tr_x = self._tab_rngs_x[b_idx]
-                    tr_z.do(op)
-                    tr_x.do(op)
-                    rec = tr_z.current_measurement_record()
-                    for k_i in range(num_m):
-                        herald_cols[k_i][b_idx] = bool(rec[-num_m + k_i])
-                    for q in set(ts_targets):
-                        if tr_z.peek_z(q) == -1:
-                            self._scratch_x_mask[q, b_idx] ^= True
-                            tr_z.x(q)
-                            any_x = True
-                        if tr_x.peek_x(q) == -1:
-                            self._scratch_z_mask[q, b_idx] ^= True
-                            tr_x.z(q)
-                            any_z = True
+                any_x, any_z, herald_cols = exec_sync_heralded_noise(
+                    self._tab_rngs,
+                    self._tab_rngs_x,
+                    op,
+                    set(ts_targets),
+                    num_m,
+                    self._scratch_x_mask,
+                    self._scratch_z_mask,
+                )
                 self._flush_xz(any_x, any_z)
-                for col in herald_cols:
-                    self._measurement_columns.append(col)
+                self._measurement_columns.extend(herald_cols)
             else:
                 args = op.gate_args_copy()
                 self._scratch_x_mask.fill(False)
@@ -1231,36 +1188,16 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 assert self._tab_rngs_x is not None
                 self._scratch_x_mask.fill(False)
                 self._scratch_z_mask.fill(False)
-                any_x = False
-                any_z = False
-                for b_idx in range(self.batch_size):
-                    t_b = (
-                        raw_targets
-                        if condition_met_mask is None
-                        else [
-                            raw_targets[i]
-                            for i in range(len(raw_targets))
-                            if condition_met_mask[i, b_idx]
-                        ]
-                    )
-                    inst_b = stim.CircuitInstruction(name, t_b, [p_err])
-                    tr_z = self._tab_rngs[b_idx]
-                    tr_x = self._tab_rngs_x[b_idx]
-                    tr_z.do(inst_b)
-                    tr_x.do(inst_b)
-                    for q in {
-                        gt.qubit_value
-                        for gt in t_b
-                        if gt.qubit_value is not None
-                    }:
-                        if tr_z.peek_z(q) == -1:
-                            self._scratch_x_mask[q, b_idx] ^= True
-                            tr_z.x(q)
-                            any_x = True
-                        if tr_x.peek_x(q) == -1:
-                            self._scratch_z_mask[q, b_idx] ^= True
-                            tr_x.z(q)
-                            any_z = True
+                any_x, any_z = exec_sync_correlated_error(
+                    self._tab_rngs,
+                    self._tab_rngs_x,
+                    name,
+                    raw_targets,
+                    p_err,
+                    condition_met_mask,
+                    self._scratch_x_mask,
+                    self._scratch_z_mask,
+                )
                 self._flush_xz(any_x, any_z)
                 return
 
@@ -1309,33 +1246,10 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             return
 
         if self._tab_rngs is not None:
-            is_two_qubit = name in ("DEPOLARIZE2", "PAULI_CHANNEL_2")
-            if condition_met_mask is None:
-                targets_per_shot: list[list[int]] = [
-                    targets for _ in range(self.batch_size)
-                ]
-            elif not is_two_qubit:
-                targets_per_shot = [
-                    [
-                        targets[i]
-                        for i in range(len(targets))
-                        if condition_met_mask[i, b]
-                    ]
-                    for b in range(self.batch_size)
-                ]
-            else:
-                pairs = [
-                    (targets[i], targets[i + 1])
-                    for i in range(0, len(targets), 2)
-                ]
-                targets_per_shot = []
-                for b in range(self.batch_size):
-                    flat_b: list[int] = []
-                    for g_idx, (q1, q2) in enumerate(pairs):
-                        if condition_met_mask[g_idx, b]:
-                            flat_b.append(q1)
-                            flat_b.append(q2)
-                    targets_per_shot.append(flat_b)
+            arity = 2 if name in ("DEPOLARIZE2", "PAULI_CHANNEL_2") else 1
+            targets_per_shot = conditioned_targets_per_shot(
+                targets, arity, self.batch_size, condition_met_mask
+            )
             self._sample_pauli_noise_via_tab_rng(name, targets_per_shot, args)
             return
 
@@ -1849,22 +1763,13 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             p_meas_err = args[0]
             if self._tab_rngs is not None:
                 assert self._tab_rngs_x is not None
-                mpad_op = stim.CircuitInstruction(
-                    "MPAD", [0] * num_m, [p_meas_err]
+                apply_sync_meas_flips(
+                    self._tab_rngs,
+                    self._tab_rngs_x,
+                    self._measurement_columns,
+                    p_meas_err,
+                    num_m,
                 )
-                for b_idx in range(self.batch_size):
-                    tr = self._tab_rngs[b_idx]
-                    tr.do(mpad_op)
-                    self._tab_rngs_x[b_idx].do(mpad_op)
-                    rec = tr.current_measurement_record()
-                    flips = rec[-num_m:]
-                    for k_idx, flipped in enumerate(flips):
-                        if flipped:
-                            self._measurement_columns[-num_m + k_idx][
-                                b_idx
-                            ] = not self._measurement_columns[-num_m + k_idx][
-                                b_idx
-                            ]
             else:
                 flips_2d = (
                     self.np_rng.random((num_m, self.batch_size)) < p_meas_err

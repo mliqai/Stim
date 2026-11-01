@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -44,6 +44,15 @@ from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.reference_chp import ReferenceCHPTableau
 from stimside.util.seeding import derived_seed
+from stimside.util.sync_rng import (
+    apply_sync_meas_flips,
+    build_sync_rngs,
+    conditioned_targets_per_shot,
+    draw_tab_rng_bit,
+    exec_sync_correlated_error,
+    exec_sync_heralded_noise,
+    exec_sync_pauli_batch,
+)
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
 
 _FAULT_MODES: dict[str, Literal["DIRECT", "SELECTOR"]] = {"DIRECT": "DIRECT", "SELECTOR": "SELECTOR"}
@@ -255,54 +264,20 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._tab_rngs_x: list[stim.TableauSimulator] | None = None
             self.np_rng = np.random.default_rng(seed=None if self.seed is None else derived_seed(self.seed, self._batches_completed))
             return
-        base = int(np.random.default_rng().integers(0, 2**63)) if self.seed is None else self.seed
-        n0 = 0 if self.seed is None else self._batches_completed * self.batch_size
-        shot_seeds = [derived_seed(base, n0 + b) for b in range(self.batch_size)]
-        self._shot_np_rngs = [np.random.default_rng(seed=s) for s in shot_seeds]
+        _, self._shot_np_rngs, self._tab_rngs, self._tab_rngs_x = build_sync_rngs(
+            self.seed, self._batches_completed, self.batch_size, self.num_qubits
+        )
         self.np_rng = self._shot_np_rngs[0]
-        self._tab_rngs, self._tab_rngs_x = [], []
-        all_q = list(range(self.num_qubits))
-        for s in shot_seeds:
-            tz, tx = stim.TableauSimulator(seed=s), stim.TableauSimulator(seed=s)
-            tz.set_num_qubits(self.num_qubits + 1)
-            tx.set_num_qubits(self.num_qubits + 1)
-            if all_q:
-                tx.h(*all_q)
-            self._tab_rngs.append(tz)
-            self._tab_rngs_x.append(tx)
-
-    def _exec_tab_rng_op(self, b: int, inst: stim.CircuitInstruction, qs: Iterable[int], xm: NDArray[np.bool_] | None, zm: NDArray[np.bool_] | None, n_rec: int = 0) -> list[bool]:
-        assert self._tab_rngs is not None and self._tab_rngs_x is not None
-        tz, tx = self._tab_rngs[b], self._tab_rngs_x[b]
-        tz.do(inst)
-        tx.do(inst)
-        for q in qs:
-            if xm is not None and tz.peek_z(q) == -1:
-                xm[q, b] ^= True
-                tz.x(q)
-            if zm is not None and tx.peek_x(q) == -1:
-                zm[q, b] ^= True
-                tx.z(q)
-        return tz.current_measurement_record()[-n_rec:] if n_rec > 0 else []
 
     def _draw_tab_rng_bit(self, b_idx: int) -> bool:
         assert self._tab_rngs is not None and self._tab_rngs_x is not None
-        sq, tz, tx = self._tab_scratch_q, self._tab_rngs[b_idx], self._tab_rngs_x[b_idx]
-        tz.h(sq)
-        bit = bool(tz.measure(sq))
-        if bit:
-            tz.x(sq)
-        tx.h(sq)
-        if tx.measure(sq):
-            tx.x(sq)
-        return bit
+        return draw_tab_rng_bit(self._tab_rngs[b_idx], self._tab_rngs_x[b_idx], self._tab_scratch_q)
 
     def _sample_pauli_noise_via_tab_rng(self, op_name: str, targets_per_shot: Sequence[Sequence[int]], gate_args: Sequence[float]) -> None:
+        assert self._tab_rngs is not None and self._tab_rngs_x is not None
         xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
         zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
-        for b_idx, t_b in enumerate(targets_per_shot):
-            if t_b:
-                self._exec_tab_rng_op(b_idx, stim.CircuitInstruction(op_name, t_b, gate_args), set(t_b), xm, zm)
+        exec_sync_pauli_batch(self._tab_rngs, self._tab_rngs_x, op_name, targets_per_shot, gate_args, xm, zm)
         self._apply_pauli_mask("X", xm)
         self._apply_pauli_mask("Z", zm)
 
@@ -685,11 +660,10 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
         zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
         if self._tab_rngs is not None:
-            cols = [np.zeros(self.batch_size, dtype=np.bool_) for _ in qs]
-            for b in range(self.batch_size):
-                rec = self._exec_tab_rng_op(b, op, set(qs), xm, zm, len(qs))
-                for k, v in enumerate(rec):
-                    cols[k][b] = bool(v)
+            assert self._tab_rngs_x is not None
+            _, _, cols = exec_sync_heralded_noise(
+                self._tab_rngs, self._tab_rngs_x, op, set(qs), len(qs), xm, zm
+            )
             self._measurement_columns.extend(cols)
         elif op.name == "HERALDED_ERASE":
             pe = float(op.gate_args_copy()[0]) if op.gate_args_copy() else 0.0
@@ -715,11 +689,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if p_err <= 0.0 or num_m <= 0:
             return
         if self._tab_rngs is not None:
-            mp_op = stim.CircuitInstruction("MPAD", [0] * num_m, [p_err])
-            for b in range(self.batch_size):
-                for k, fl in enumerate(self._exec_tab_rng_op(b, mp_op, (), None, None, num_m)):
-                    if fl:
-                        self._measurement_columns[-num_m + k][b] ^= True
+            assert self._tab_rngs_x is not None
+            apply_sync_meas_flips(self._tab_rngs, self._tab_rngs_x, self._measurement_columns, p_err, num_m)
         else:
             flips = self.np_rng.random((num_m, self.batch_size)) < p_err
             for k in range(num_m):
@@ -915,9 +886,10 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
             zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
             if self._tab_rngs is not None:
-                for b in range(self.batch_size):
-                    t_b = raw_t if condition_met_mask is None else [raw_t[i] for i in range(len(raw_t)) if condition_met_mask[i, b]]
-                    self._exec_tab_rng_op(b, stim.CircuitInstruction(cname, t_b, [p_c]), {gt.qubit_value for gt in t_b if gt.qubit_value is not None}, xm, zm)
+                assert self._tab_rngs_x is not None
+                exec_sync_correlated_error(
+                    self._tab_rngs, self._tab_rngs_x, cname, raw_t, p_c, condition_met_mask, xm, zm
+                )
             else:
                 if p_c <= 0.0:
                     if cname != "ELSE_CORRELATED_ERROR":
@@ -946,11 +918,12 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if not raw or not any(p > 0.0 for p in args):
             return
         arity = 2 if cname in ("DEPOLARIZE2", "PAULI_CHANNEL_2") else 1
-        groups = [raw[i : i + arity] for i in range(0, len(raw), arity)]
         if self._tab_rngs is not None:
-            per_shot = [[q for g_i, grp in enumerate(groups) if (condition_met_mask is None or condition_met_mask[g_i, b]) for q in grp] for b in range(self.batch_size)]
-            self._sample_pauli_noise_via_tab_rng(cname, per_shot, args)
+            self._sample_pauli_noise_via_tab_rng(
+                cname, conditioned_targets_per_shot(raw, arity, self.batch_size, condition_met_mask), args
+            )
             return
+        groups = [raw[i : i + arity] for i in range(0, len(raw), arity)]
         xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
         zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
         u = self.np_rng.random((len(groups), self.batch_size))
