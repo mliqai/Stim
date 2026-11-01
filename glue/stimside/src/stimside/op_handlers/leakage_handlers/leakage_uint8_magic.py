@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 import warnings
 
 import numpy as np
-from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 from stimside.op_handlers.leakage_handlers.leakage_parameters import (
@@ -15,7 +14,7 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageMeasurementParams,
     LeakageParams,
 )
-from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import CompiledLeakageUint8Coset, LeakageUint8Coset, _do_copies_on_fused_step
+from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import CompiledLeakageUint8Coset, LeakageUint8Coset
 from stimside.op_handlers.leakage_handlers.tag_registry import (
     MAGIC_TAGS as _MAGIC_TAGS,
     check_tag_qubits,
@@ -157,36 +156,11 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
                     self.u_measurement_ops.add(op)
         super().handle_op(op, sss)  # type: ignore[arg-type]
 
-    def _update_state_from_peek_Z(self, targets: Sequence[int] | NDArray[np.int_], css: MagicsideSimulator) -> None:  # type: ignore[override]
-        self._ensure_batch_size(css.batch_size)
-        unique_t = list(dict.fromkeys(int(t) for t in targets if int(t) >= 0))
-        if not unique_t:
-            return
-        p1_mat, any_projected = css.peek_pauli_born_batch(unique_t, pauli="Z"), False
-        for idx, q in enumerate(unique_t):
-            comp_mask = self._state[q] < 2
-            if not np.any(comp_mask):
-                continue
-            p1_row = css.peek_pauli_born_batch([q], pauli="Z")[0] if any_projected else p1_mat[idx]
-            new_row, det_one = np.zeros(css.batch_size, dtype=np.uint8), p1_row >= 1.0 - 1e-12
-            new_row[det_one] = 1
-            flip_mask = comp_mask & (p1_row > 1e-12) & ~det_one
-            num_flips = int(np.count_nonzero(flip_mask))
-            if num_flips > 0:
-                if css._shot_np_rngs is not None:
-                    new_row[flip_mask] = np.asarray([css._shot_np_rngs[b].binomial(1, 0.5 if abs(p1_row[b] - 0.5) <= 1e-12 else float(p1_row[b])) for b in np.flatnonzero(flip_mask)], dtype=np.uint8)
-                else:
-                    p_sub = p1_row[flip_mask]
-                    new_row[flip_mask] = css.np_rng.binomial(1, 0.5 if np.allclose(p_sub, 0.5, atol=1e-12) else p_sub, size=num_flips).astype(np.uint8)
-                css.postselect_z_batch(q, flip_mask, new_row)
-                any_projected = True
-            self._state[q, comp_mask] = new_row[comp_mask]
-
     def leakage_measurement(self, op: stim.CircuitInstruction, tss: MagicsideSimulator, params: LeakageMeasurementParams) -> None:  # type: ignore[override]
         if op.name == "MPAD" and op in self.u_measurement_ops:
             copies = split_fused_instruction(op, len(params.targets or ()))
             if len(copies) > 1:
-                _do_copies_on_fused_step(tss, op, copies, lambda s: self._eval_u_mpad(s, tss, params))  # type: ignore[arg-type]
+                tss.do_copies_on_fused_step(op, copies, lambda s: self._eval_u_mpad(s, tss, params))
             else:
                 self._eval_u_mpad(op, tss, params)
             return

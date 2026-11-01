@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ctypes
-from typing import Any, Iterable, Literal, Sequence
+from typing import Any, Callable, Iterable, Literal, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -32,6 +32,7 @@ from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.reference_chp import PackedSymplecticTables, _pauli_image
 from stimside.util.seeding import derived_seed
+from stimside.util.stim_workarounds import broadcast_pauli_errors
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
 
 # Pauli applied to the qubit of a record-controlled 2Q gate (stim only parses these with rec[] controls).
@@ -48,6 +49,13 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     3. Compressed polynomial-space MRQF states D_b = (h, A, ell, Gamma, P) only for active shots with d_b >= 1,
        with O(0) cost on ideal unitary gates and automatic O(1) self-healing eviction back into stim.FlipSimulator
        whenever d_b drops to 0.
+
+    Batched OpHandler seam (also implemented by ``MagicsideSimulator``):
+    - Dispatch & cursor: ``_do_bare_instruction``, ``_next_step_meta``, ``do_copies_on_fused_step``.
+    - Conditioned & unmatched ops: ``do_conditional_clifford``, ``do_conditional_pauli_noise``,
+      ``do_unmatched_noisy_reset_z``, ``apply_pauli``.
+    - State query, projection & direct readout: ``peek_pauli_batch``, ``peek_pauli_born_batch``,
+      ``postselect_z_batch``, ``record_direct_measurements``.
     """
 
     def __init__(
@@ -506,6 +514,24 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         step = self._compiled_ref.compile_and_append_instruction(op)
         self._step_cursor = len(self._compiled_ref.steps)
         return step
+
+    def do_copies_on_fused_step(
+        self,
+        op: stim.CircuitInstruction,
+        copies: list[stim.CircuitInstruction],
+        do_copy: Callable[[stim.CircuitInstruction], None],
+    ) -> None:
+        """Apply the copies of a stim-fused op in sequence on the op's one (no-op) reference step."""
+        self._next_step_meta(op)
+        step_cursor = self._step_cursor - 1
+        used_interactively, self._used_interactively = self._used_interactively, False
+        try:
+            for sub_op in copies:
+                self._step_cursor = step_cursor
+                do_copy(sub_op)
+        finally:
+            self._used_interactively = used_interactively
+        self._step_cursor = step_cursor + 1
 
     ############################################################################
     # Internal Instruction Dispatch
@@ -1172,6 +1198,19 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._py_dirty = True
         if self._use_cpp:
             self._py_dirty = True
+
+    def apply_pauli(
+        self, pauli: Literal["X", "Y", "Z"], mask: NDArray[np.bool_], p: float = 1.0
+    ) -> None:
+        """Inject single-qubit Pauli frames across ``mask`` (sampled with probability ``p`` via ``np_rng`` when ``p < 1``)."""
+        if p <= 0.0:
+            return
+        if p < 1.0:
+            broadcast_pauli_errors(
+                self._flip_simulator, pauli=pauli, mask=mask, p=p, np_rng=self.np_rng
+            )
+        else:
+            self._flip_simulator.broadcast_pauli_errors(pauli=pauli, mask=mask, p=1.0)
 
     def do_conditional_pauli_noise(
         self,
@@ -2062,8 +2101,18 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     # Observable Expectation & State Peeking via Q1 (PauliExpectation)
     ############################################################################
 
+    def peek_pauli_born_batch(
+        self,
+        targets: Sequence[int] | NDArray[np.int_],
+        pauli: Literal["X", "Y", "Z"] = "Z",
+    ) -> NDArray[np.float64]:
+        """Return exact single-qubit Born probabilities ``P(-1)`` of shape ``(len(targets), batch_size)``."""
+        return (1.0 - self.peek_pauli_batch(targets, pauli).astype(np.float64)) * 0.5
+
     def peek_pauli_batch(
-        self, targets: Sequence[int] | NDArray[np.int_], pauli: Literal["X", "Y", "Z"]
+        self,
+        targets: Sequence[int] | NDArray[np.int_],
+        pauli: Literal["X", "Y", "Z"] = "Z",
     ) -> NDArray[np.int8]:
         """Return exact single-qubit Pauli expectations (+1, -1, or 0) of shape (len(targets), batch_size) via Q1."""
         targets_arr = np.ascontiguousarray(targets, dtype=np.int64)

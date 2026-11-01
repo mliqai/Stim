@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Callable, Literal, Sequence, cast
+from typing import TYPE_CHECKING, Literal, Sequence, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -25,29 +25,10 @@ from stimside.op_handlers.leakage_handlers.transition_effects import (
     apply_output_effect,
     sample_coset_batched_groups,
 )
-from stimside.util.stim_workarounds import broadcast_pauli_errors, split_fused_instruction
+from stimside.util.stim_workarounds import split_fused_instruction
 
 if TYPE_CHECKING:
     from stimside.simulator_coset import CosetsideSimulator
-
-
-def _do_copies_on_fused_step(
-    tss: CosetsideSimulator,
-    op: stim.CircuitInstruction,
-    copies: list[stim.CircuitInstruction],
-    do_copy: Callable[[stim.CircuitInstruction], None],
-) -> None:
-    """Apply the copies of a stim-fused op in sequence on the op's one (no-op) reference step."""
-    tss._next_step_meta(op)  # matched (or, interactively, appended) for the fused op
-    step_cursor = tss._step_cursor - 1
-    used_interactively, tss._used_interactively = tss._used_interactively, False
-    try:
-        for sub_op in copies:
-            tss._step_cursor = step_cursor  # each copy re-reads the fused op's step
-            do_copy(sub_op)
-    finally:
-        tss._used_interactively = used_interactively
-    tss._step_cursor = step_cursor + 1
 
 
 @dataclasses.dataclass
@@ -151,39 +132,44 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         self, targets: Sequence[int] | NDArray[np.int_], css: CosetsideSimulator
     ) -> None:
         self._ensure_batch_size(css.batch_size)
-        targets_arr = np.asarray(targets, dtype=np.intp)
-        if len(targets_arr) == 0:
+        unique_targets = list(dict.fromkeys(int(t) for t in targets if int(t) >= 0))
+        if not unique_targets:
             return
 
-        unique_targets = list(dict.fromkeys(int(t) for t in targets_arr if t >= 0))
-        if len(unique_targets) == 0:
-            return
-
-        z_exps = css.peek_pauli_batch(unique_targets, "Z")
+        p1_mat = css.peek_pauli_born_batch(unique_targets, pauli="Z")
         any_projected = False
         for idx, q in enumerate(unique_targets):
             comp_mask = self._state[q, :] < 2
             if not np.any(comp_mask):
                 continue
-            z_row = (
-                css.peek_pauli_batch([q], "Z")[0]
+            p1_row = (
+                css.peek_pauli_born_batch([q], pauli="Z")[0]
                 if any_projected
-                else z_exps[idx]
+                else p1_mat[idx]
             )
             new_row = np.zeros(css.batch_size, dtype=np.uint8)
-            new_row[z_row == -1] = 1
-            flip_mask = comp_mask & (z_row == 0)
+            det_one = p1_row >= 1.0 - 1e-12
+            new_row[det_one] = 1
+            flip_mask = comp_mask & (p1_row > 1e-12) & ~det_one
             num_flips = int(np.count_nonzero(flip_mask))
             if num_flips > 0:
                 if css._shot_np_rngs is not None:
-                    for b_np in np.flatnonzero(flip_mask):
-                        b_idx = int(b_np)
-                        new_row[b_idx] = int(
-                            css._shot_np_rngs[b_idx].binomial(1, 0.5)
-                        )
+                    new_row[flip_mask] = np.asarray(
+                        [
+                            css._shot_np_rngs[int(b)].binomial(
+                                1,
+                                0.5 if abs(p1_row[b] - 0.5) <= 1e-12 else float(p1_row[b]),
+                            )
+                            for b in np.flatnonzero(flip_mask)
+                        ],
+                        dtype=np.uint8,
+                    )
                 else:
+                    p_sub = p1_row[flip_mask]
                     new_row[flip_mask] = css.np_rng.binomial(
-                        1, 0.5, size=num_flips
+                        1,
+                        0.5 if np.allclose(p_sub, 0.5, atol=1e-12) else p_sub,
+                        size=num_flips,
                     ).astype(np.uint8)
                 css.postselect_z_batch(q, flip_mask, new_row)
                 any_projected = True
@@ -427,8 +413,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
             copies = split_fused_instruction(op, copy_len)
             if len(copies) > 1 and not stim.gate_data(op.name).is_unitary:
                 # Noise has a no-op reference step, so loop (RNG draws as for k separate ops).
-                _do_copies_on_fused_step(
-                    tss, op, copies, lambda sub_op: self.leakage_conditioning(sub_op, tss, params)
+                tss.do_copies_on_fused_step(
+                    op, copies, lambda sub_op: self.leakage_conditioning(sub_op, tss, params)
                 )
                 return
             # A unitary's reference step is the fused op, so tile the controls instead of looping.
@@ -582,19 +568,15 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     "DEPOLARIZE1", self._targets_per_shot(effects.depolarize), [0.75]
                 )
             else:
-                broadcast_pauli_errors(
-                    tss._flip_simulator, pauli="X", mask=effects.depolarize, p=0.5, np_rng=tss.np_rng
-                )
-                broadcast_pauli_errors(
-                    tss._flip_simulator, pauli="Z", mask=effects.depolarize, p=0.5, np_rng=tss.np_rng
-                )
+                tss.apply_pauli("X", effects.depolarize, 0.5)
+                tss.apply_pauli("Z", effects.depolarize, 0.5)
         for pauli, arr in (
             ("X", effects.pauli_x),
             ("Y", effects.pauli_y),
             ("Z", effects.pauli_z),
         ):
             if arr is not None and np.any(arr):
-                tss._flip_simulator.broadcast_pauli_errors(pauli=pauli, mask=arr, p=1.0)
+                tss.apply_pauli(pauli, arr)
         for gate, pauli, arr in (
             ("X_ERROR", "X", effects.rand_x),
             ("Z_ERROR", "Z", effects.rand_phase),
@@ -605,9 +587,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                         gate, self._targets_per_shot(arr), [0.5]
                     )
                 else:
-                    broadcast_pauli_errors(
-                        tss._flip_simulator, pauli=pauli, mask=arr, p=0.5, np_rng=tss.np_rng
-                    )
+                    tss.apply_pauli(pauli, arr, 0.5)
 
     def leakage_transition_1(
         self,
@@ -867,9 +847,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     if np.any(leaked_diff):
                         net_x_flip[q, :] ^= leaked_diff
             if np.any(net_x_flip):
-                tss._flip_simulator.broadcast_pauli_errors(
-                    pauli=("Z" if basis == "X" else "X"), mask=net_x_flip, p=1.0
-                )
+                tss.apply_pauli("Z" if basis == "X" else "X", net_x_flip)
         elif replace_mask is None:
             for k_i in range(num_m):
                 m_col = tss._measurement_columns[-num_m + k_i]
@@ -892,8 +870,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         if params.targets:
             copies = split_fused_instruction(op, len(params.targets))
             if len(copies) > 1:
-                _do_copies_on_fused_step(
-                    tss, op, copies, lambda sub_op: self.leakage_measurement(sub_op, tss, params)
+                tss.do_copies_on_fused_step(
+                    op, copies, lambda sub_op: self.leakage_measurement(sub_op, tss, params)
                 )
                 return
         raw_op_targets = op.targets_copy()
@@ -1136,9 +1114,5 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
             to_dep = self._scratch_depolarize
             to_dep.fill(False)
             to_dep[targets_arr, :] = leaked_mask
-            broadcast_pauli_errors(
-                tss._flip_simulator, pauli="X", mask=to_dep, p=0.5, np_rng=tss.np_rng
-            )
-            broadcast_pauli_errors(
-                tss._flip_simulator, pauli="Z", mask=to_dep, p=0.5, np_rng=tss.np_rng
-            )
+            tss.apply_pauli("X", to_dep, 0.5)
+            tss.apply_pauli("Z", to_dep, 0.5)
