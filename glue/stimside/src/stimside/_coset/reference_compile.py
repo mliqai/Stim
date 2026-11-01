@@ -207,9 +207,6 @@ class UnitaryStepMeta(_StepWordsMixin):
     _cocycle_cache: dict[int, InverseCliffordCocycle] = dataclasses.field(default_factory=dict)
     are_groups_disjoint: bool = True
     _packed_words: PackedSymplecticTables | None = None
-    _cpp_cz_qs: tuple[NDArray[np.int64], NDArray[np.int64]] | None = (
-        dataclasses.field(default=None, init=False, repr=False, compare=False)
-    )
     _cpp_cocycle_arrays: (
         tuple[int, int, int, NDArray[np.int64], list[NDArray]] | None
     ) = dataclasses.field(default=None, init=False, repr=False, compare=False)

@@ -175,6 +175,11 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                 any_projected = True
             self._state[q, comp_mask] = new_row[comp_mask]
 
+    def _clear_transient_ones(self, qs: Sequence[int] | NDArray[np.int_]) -> None:
+        for q in dict.fromkeys(int(t) for t in qs if int(t) >= 0):
+            row = self._state[q, :]
+            row[row == 1] = 0
+
     def _filter_targets_1q_mask(
         self,
         targets: Sequence[int] | NDArray[np.int_],
@@ -185,16 +190,16 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         targets_arr = np.asarray(targets, dtype=np.intp)
         allowed_group = allowed_st_list[0]
         valid_qs = targets_arr[targets_arr >= 0]
-        if len(valid_qs) > 0 and (
-            1 in allowed_group or 0 in allowed_group
-        ):
+        peeked = len(valid_qs) > 0 and (1 in allowed_group or 0 in allowed_group)
+        if peeked:
             self._update_state_from_peek_Z(valid_qs, css)
 
         safe_qs = np.where(targets_arr >= 0, targets_arr, 0)
         target_states = self._state[safe_qs, :].copy()  # (len(targets), batch_size)
         is_classical = (targets_arr < 0)[:, None]
         target_states = np.where(is_classical, 0, target_states)
-        self._state[self._state == 1] = 0
+        if peeked:
+            self._clear_transient_ones(valid_qs)
 
         allowed_mask = np.zeros(
             (len(targets_arr), css.batch_size), dtype=np.bool_
@@ -223,11 +228,13 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         targets_np = np.asarray(targets, dtype=np.intp)  # (num_pairs, 2)
         if len(targets_np) == 0:
             return np.zeros((0, css.batch_size), dtype=np.bool_)
+        peeked_qs: list[int] = []
         for i in (0, 1):
             if 1 in allowed_st_list[i] or 0 in allowed_st_list[i]:
                 valid_qs = targets_np[targets_np[:, i] >= 0, i]
                 if len(valid_qs) > 0:
                     self._update_state_from_peek_Z(valid_qs, css)
+                    peeked_qs.extend(int(q) for q in valid_qs)
 
         is_c0 = (targets_np[:, 0] < 0)[:, None]
         is_c1 = (targets_np[:, 1] < 0)[:, None]
@@ -235,7 +242,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         q1_safe = np.where(targets_np[:, 1] >= 0, targets_np[:, 1], 0)
         s0 = np.where(is_c0, 0, self._state[q0_safe, :])
         s1 = np.where(is_c1, 0, self._state[q1_safe, :])
-        self._state[self._state == 1] = 0
+        if peeked_qs:
+            self._clear_transient_ones(peeked_qs)
         allowed_mask = np.zeros((len(targets_np), css.batch_size), dtype=np.bool_)
 
         for n in range(len(allowed_st_list[0])):
@@ -276,11 +284,32 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     sss._do_bare_instruction(op)
                     return
 
-                if gd.is_single_qubit_gate or op_name in (
+                is_1q_or_corr = gd.is_single_qubit_gate or op_name in (
                     "E",
                     "CORRELATED_ERROR",
                     "ELSE_CORRELATED_ERROR",
+                )
+                if not (
+                    is_1q_or_corr
+                    or gd.is_two_qubit_gate
+                    or op_name in ("SPP", "SPP_DAG")
                 ):
+                    sss._do_bare_instruction(op)
+                    return
+
+                qs = [
+                    t.qubit_value
+                    for t in op.targets_copy()
+                    if t.qubit_value is not None
+                ]
+                if not qs or not np.any(self._state[qs, :] >= 2):
+                    if gd.is_unitary:
+                        sss.do_conditional_clifford(op, None)
+                    else:
+                        sss.do_conditional_pauli_noise(op, None)
+                    return
+
+                if is_1q_or_corr:
                     targets = [
                         t.qubit_value if t.qubit_value is not None else -1
                         for t in op.targets_copy()
@@ -306,7 +335,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     cond_mask = self._filter_targets_2q_mask(
                         target_pairs, (("U",), ("U",)), sss
                     )
-                elif op_name in ("SPP", "SPP_DAG"):
+                else:
                     terms = op.target_groups()
                     cond_mask = (
                         np.array(
@@ -319,9 +348,6 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                         if terms
                         else np.zeros((0, sss.batch_size), dtype=np.bool_)
                     )
-                else:
-                    sss._do_bare_instruction(op)
-                    return
 
                 if gd.is_unitary:
                     sss.do_conditional_clifford(op, cond_mask)
@@ -615,9 +641,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     sub_op, tss, params, _advance_step=False
                 )
             return
-        target_mask_1d = np.zeros(self.num_qubits, dtype=np.bool_)
-        target_mask_1d[target_indices] = True
-        sorted_target_indices = np.where(target_mask_1d)[0]
+        sorted_target_indices = np.array(sorted(set(target_indices)), dtype=np.intp)
 
         to_depolarize = self._scratch_depolarize
         to_set_to_one = self._scratch_set_one
@@ -629,9 +653,10 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
             set_zero=to_set_to_zero, set_one=to_set_to_one, depolarize=to_depolarize
         )
 
-        if any(k in (0, 1) for k in params.args_by_input_state.keys()):
+        peeked_01 = any(k in (0, 1) for k in params.args_by_input_state.keys())
+        if peeked_01:
             self._update_state_from_peek_Z(sorted_target_indices, tss)
-        initial_state = self._state.copy()
+        target_states = self._state[sorted_target_indices, :].copy()
 
         if tss._shot_np_rngs is not None or (
             tss.batch_size == 1 and tss.seed is not None
@@ -639,11 +664,11 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
             for input_state in params.args_by_input_state.keys():
                 for b in range(tss.batch_size):
                     in_mask_b = (
-                        initial_state[:, b] < 2
+                        target_states[:, b] < 2
                         if input_state == "U"
-                        else initial_state[:, b] == input_state
+                        else target_states[:, b] == input_state
                     )
-                    ow_qs = np.where(target_mask_1d & in_mask_b)[0]
+                    ow_qs = sorted_target_indices[in_mask_b]
                     if len(ow_qs) == 0:
                         continue
                     rng_b = tss._shot_np_rngs[b] if tss._shot_np_rngs is not None else tss.np_rng
@@ -653,21 +678,23 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     for q_np, out_st in zip(ow_qs, out_b):
                         apply_output_effect(self._state, effects, (int(q_np), b), input_state, out_st)
         else:
-            target_mask = target_mask_1d[:, None]
             for input_state, transitions in params.args_by_input_state.items():
                 total_p = float(sum(p for _, p in transitions))
                 if total_p <= 0.0:
                     continue
                 input_state_mask = (
-                    initial_state < 2 if input_state == "U" else initial_state == input_state
+                    target_states < 2 if input_state == "U" else target_states == input_state
                 )
-                for out_s, q_sub, b_sub in sample_coset_batched_groups(
-                    transitions, target_mask & input_state_mask, total_p, tss.np_rng
+                for out_s, r_sub, b_sub in sample_coset_batched_groups(
+                    transitions, input_state_mask, total_p, tss.np_rng
                 ):
-                    if len(q_sub) > 0 and str(out_s) != str(input_state):
-                        apply_output_effect(self._state, effects, (q_sub, b_sub), input_state, out_s)
+                    if len(r_sub) > 0 and str(out_s) != str(input_state):
+                        apply_output_effect(
+                            self._state, effects, (sorted_target_indices[r_sub], b_sub), input_state, out_s
+                        )
 
-        self._state[self._state == 1] = 0
+        if peeked_01:
+            self._clear_transient_ones(sorted_target_indices)
         self._apply_transition_effects(tss, effects)
 
     def leakage_transition_2(
@@ -695,10 +722,13 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         even_targets_arr = np.asarray(even_targets_list, dtype=np.intp)
         odd_targets_arr = np.asarray(odd_targets_list, dtype=np.intp)
 
+        peeked_2q: list[int] = []
         if any(k[0] in (0, 1) for k in params.args_by_input_state.keys()):
             self._update_state_from_peek_Z(even_targets_list, tss)
+            peeked_2q.extend(even_targets_list)
         if any(k[1] in (0, 1) for k in params.args_by_input_state.keys()):
             self._update_state_from_peek_Z(odd_targets_list, tss)
+            peeked_2q.extend(odd_targets_list)
 
         even_target_states = self._state[even_targets_arr, :].copy()
         odd_target_states = self._state[odd_targets_arr, :].copy()
@@ -790,7 +820,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                             self._state, effects, (q_sub, b_sub), in_s, out_s
                         )
 
-        self._state[self._state == 1] = 0
+        if peeked_2q:
+            self._clear_transient_ones(peeked_2q)
         self._apply_transition_effects(tss, effects)
 
     def _sample_leaked_tab_outcomes(
@@ -955,7 +986,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         )
         if is_mpad and has_01_cond and tss._tab_rngs is None:
             self._update_state_from_peek_Z(targets, tss)
-            self._state[self._state == 1] = 0
+            self._clear_transient_ones(targets)
 
         need_pauli_peek = tss._tab_rngs is not None or is_mpad or has_01_cond
         pauli_states = (

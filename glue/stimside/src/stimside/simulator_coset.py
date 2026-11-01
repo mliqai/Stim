@@ -593,83 +593,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
         if name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
             self._next_step_meta(op)
-            raw_targets = op.targets_copy()
-            ts_targets = [
-                gt.qubit_value if gt.qubit_value is not None else gt.value
-                for gt in raw_targets
-            ]
-            inv_flags = [
-                bool(gt.is_inverted_result_target) for gt in raw_targets
-            ]
-            num_m = len(ts_targets)
-            if num_m == 0:
-                return
-            if self._tab_rngs is not None:
-                assert self._tab_rngs_x is not None
-                self._scratch_x_mask.fill(False)
-                self._scratch_z_mask.fill(False)
-                any_x, any_z, herald_cols = exec_sync_heralded_noise(
-                    self._tab_rngs,
-                    self._tab_rngs_x,
-                    op,
-                    set(ts_targets),
-                    num_m,
-                    self._scratch_x_mask,
-                    self._scratch_z_mask,
-                )
-                self._flush_xz(any_x, any_z)
-                self._measurement_columns.extend(herald_cols)
-            else:
-                args = op.gate_args_copy()
-                self._scratch_x_mask.fill(False)
-                self._scratch_z_mask.fill(False)
-                any_x = False
-                any_z = False
-                if name == "HERALDED_ERASE":
-                    p_erase = args[0] if args else 0.0
-                    for q, inv in zip(ts_targets, inv_flags):
-                        herald_k = self.np_rng.random(self.batch_size) < p_erase
-                        pauli_idx = self.np_rng.integers(
-                            0, 4, size=self.batch_size
-                        )
-                        x_k = herald_k & ((pauli_idx == 1) | (pauli_idx == 2))
-                        z_k = herald_k & ((pauli_idx == 2) | (pauli_idx == 3))
-                        if np.any(x_k):
-                            self._scratch_x_mask[q, :] ^= x_k
-                            any_x = True
-                        if np.any(z_k):
-                            self._scratch_z_mask[q, :] ^= z_k
-                            any_z = True
-                        self._measurement_columns.append(
-                            ~herald_k if inv else herald_k
-                        )
-                else:
-                    pi = args[0] if len(args) > 0 else 0.0
-                    px = args[1] if len(args) > 1 else 0.0
-                    py = args[2] if len(args) > 2 else 0.0
-                    pz = args[3] if len(args) > 3 else 0.0
-                    c_i = pi
-                    c_x = c_i + px
-                    c_y = c_x + py
-                    c_z = c_y + pz
-                    for q, inv in zip(ts_targets, inv_flags):
-                        u = self.np_rng.random(self.batch_size)
-                        herald_k = u < c_z
-                        is_x = (u >= c_i) & (u < c_x)
-                        is_y = (u >= c_x) & (u < c_y)
-                        is_z = (u >= c_y) & (u < c_z)
-                        x_k = is_x | is_y
-                        z_k = is_y | is_z
-                        if np.any(x_k):
-                            self._scratch_x_mask[q, :] ^= x_k
-                            any_x = True
-                        if np.any(z_k):
-                            self._scratch_z_mask[q, :] ^= z_k
-                            any_z = True
-                        self._measurement_columns.append(
-                            ~herald_k if inv else herald_k
-                        )
-                self._flush_xz(any_x, any_z)
+            self._do_heralded_noise(op)
             return
 
         gd = stim.gate_data(name)
@@ -688,6 +612,60 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             return
 
         self._next_step_meta(op)
+
+    def _do_heralded_noise(self, op: stim.CircuitInstruction) -> None:
+        raw_targets = op.targets_copy()
+        if not raw_targets:
+            return
+        qs = [
+            gt.qubit_value if gt.qubit_value is not None else gt.value
+            for gt in raw_targets
+        ]
+        self._scratch_x_mask.fill(False)
+        self._scratch_z_mask.fill(False)
+        if self._tab_rngs is not None:
+            assert self._tab_rngs_x is not None
+            any_x, any_z, cols = exec_sync_heralded_noise(
+                self._tab_rngs,
+                self._tab_rngs_x,
+                op,
+                set(qs),
+                len(qs),
+                self._scratch_x_mask,
+                self._scratch_z_mask,
+            )
+            self._flush_xz(any_x, any_z)
+            self._measurement_columns.extend(cols)
+            return
+        args = op.gate_args_copy()
+        any_x = any_z = False
+        is_erase = op.name == "HERALDED_ERASE"
+        p_erase = args[0] if (is_erase and args) else 0.0
+        ci = args[0] if len(args) > 0 else 0.0
+        cx = ci + (args[1] if len(args) > 1 else 0.0)
+        cy = cx + (args[2] if len(args) > 2 else 0.0)
+        cz = cy + (args[3] if len(args) > 3 else 0.0)
+        for gt, q in zip(raw_targets, qs):
+            if is_erase:
+                hk = self.np_rng.random(self.batch_size) < p_erase
+                pi = self.np_rng.integers(0, 4, size=self.batch_size)
+                xk = hk & ((pi == 1) | (pi == 2))
+                zk = hk & ((pi == 2) | (pi == 3))
+            else:
+                u = self.np_rng.random(self.batch_size)
+                hk = u < cz
+                xk = (u >= ci) & (u < cy)
+                zk = (u >= cx) & (u < cz)
+            if np.any(xk):
+                self._scratch_x_mask[q, :] ^= xk
+                any_x = True
+            if np.any(zk):
+                self._scratch_z_mask[q, :] ^= zk
+                any_z = True
+            self._measurement_columns.append(
+                ~hk if gt.is_inverted_result_target else hk
+            )
+        self._flush_xz(any_x, any_z)
 
     ############################################################################
     # Phase 1 & Phase 2: Unitary Gates, Inverse Clifford Injection & Pauli Noise
@@ -928,44 +906,6 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._sync_py_to_cpp()
                 self._apply_unitary_to_frames(op)
                 lib = self._cpp_lib
-                if name in ("CZ", "ZCZ"):
-                    if step_meta._cpp_cz_qs is None:
-                        step_meta._cpp_cz_qs = (
-                            np.array(
-                                [g[0] for g in step_meta.target_groups], dtype=np.int64
-                            ),
-                            np.array(
-                                [g[1] for g in step_meta.target_groups], dtype=np.int64
-                            ),
-                        )
-                    q0_arr, q1_arr = step_meta._cpp_cz_qs
-                    xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
-                        output_xs=True, output_zs=False
-                    )
-                    _, x2z_w, z2x_w, z2z_w, _, z_kappa = step_meta._get_packed_words(
-                        self._n_words
-                    )
-                    self._scratch_x_mask.fill(False)
-                    self._scratch_z_mask.fill(False)
-                    cm_c = np.ascontiguousarray(condition_met_mask, dtype=np.uint8)
-                    xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
-                    lib.engine_batch_inject_cz(
-                        self._cpp_eng,
-                        len(step_meta.target_groups),
-                        q0_arr.ctypes.data_as(i64_p),
-                        q1_arr.ctypes.data_as(i64_p),
-                        cm_c.ctypes.data_as(u8_p),
-                        xs_c.ctypes.data_as(u8_p),
-                        z2x_w.ctypes.data_as(u64_p),
-                        z2z_w.ctypes.data_as(u64_p),
-                        z_kappa.ctypes.data_as(u8_p),
-                        x2z_w.ctypes.data_as(u64_p),
-                        *self._cpp_out_args(),
-                    )
-                    self._cpp_dirty = True
-                    self._flush_xz(self._any_x_c.value, self._any_z_c.value)
-                    return
-
                 if step_meta._cpp_cocycle_arrays is None:
                     num_g = len(step_meta.target_groups)
                     arity = len(step_meta.target_groups[0])
@@ -1039,51 +979,6 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 return
 
             self._apply_unitary_to_frames(op)
-            if name in ("CZ", "ZCZ"):
-                xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
-                    output_xs=True, output_zs=False
-                )
-                _, _, z2x_w, z2z_w, _, z_kappa = step_meta._get_packed_words(
-                    self._n_words
-                )
-                failed_g_indices = np.flatnonzero(
-                    ~np.all(condition_met_mask, axis=1)
-                )
-                for g_idx_np in failed_g_indices:
-                    g_idx = int(g_idx_np)
-                    q0, q1 = step_meta.target_groups[g_idx]
-                    aw1, bw1, kap1_base = (
-                        z2x_w[q0],
-                        z2z_w[q0],
-                        int(z_kappa[q0]),
-                    )
-                    aw2, bw2, kap2_base = (
-                        z2x_w[q1],
-                        z2z_w[q1],
-                        int(z_kappa[q1]),
-                    )
-                    xs_q0 = xs_base[q0]
-                    xs_q1 = xs_base[q1]
-                    for b_idx_np in np.flatnonzero(~condition_met_mask[g_idx]):
-                        b_idx = int(b_idx_np)
-                        mrqf = self._active_shots.get(b_idx)
-                        if mrqf is None:
-                            mrqf = MRQFState(self.num_qubits, self._n_words)
-                            self._active_shots[b_idx] = mrqf
-                        kap1 = (kap1_base + (int(xs_q0[b_idx]) << 1)) & 3
-                        kap2 = (kap2_base + (int(xs_q1[b_idx]) << 1)) & 3
-                        mrqf.p2_apply_controlled_pauli(
-                            aw1, bw1, kap1, aw2, bw2, kap2
-                        )
-                if self._active_shots and any(
-                    m.d == 0 for m in self._active_shots.values()
-                ):
-                    self._evict_healed_shots(
-                        step_meta,
-                        xs_base=xs_base,
-                    )
-                return
-
             xs_base, zs_base, _, _, _ = self._flip_simulator.to_numpy(
                 output_xs=True, output_zs=True
             )
@@ -1317,259 +1212,48 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             and all(not s.meta.is_random for s in substeps)
             and len({s.meta.q for s in substeps}) == len(substeps)
         )
-
-        if self._use_cpp and self._cpp_lib is not None and self._cpp_eng is not None:
+        use_cpp = bool(
+            self._use_cpp and self._cpp_lib is not None and self._cpp_eng is not None
+        )
+        if use_cpp:
             self._sync_py_to_cpp()
-            lib = self._cpp_lib
 
-            if det_batch:
-                num_sub = len(substeps)
-                q_arr, m_ref_arr, b_sub_words = step_meta.get_det_batch_arrays()
-                needed = num_sub * self.batch_size
-                if self._cpp_m_buf.size < needed:
-                    self._cpp_m_buf = np.empty(needed, dtype=np.bool_)
-                m_mat = self._cpp_m_buf[:needed].reshape(num_sub, self.batch_size)
-
-                xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
-                    output_xs=True, output_zs=False
-                )
-                xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
-                x2z_w, z2z_w = step_meta.get_evict_words(self._n_words)
-                self._scratch_x_mask.fill(False)
-                self._scratch_z_mask.fill(False)
-
-                lib.engine_batch_det_meas_step(
-                    self._cpp_eng,
-                    num_sub,
-                    q_arr.ctypes.data_as(i64_p),
-                    m_ref_arr.ctypes.data_as(u8_p),
-                    b_sub_words.ctypes.data_as(u64_p),
-                    xs_c.ctypes.data_as(u8_p),
-                    m_mat.ctypes.data_as(u8_p),
-                    x2z_w.ctypes.data_as(u64_p),
-                    z2z_w.ctypes.data_as(u64_p),
-                    *self._cpp_out_args(),
-                )
-                self._cpp_dirty = True
-                any_x_accum = bool(self._any_x_c.value)
-                any_z_accum = bool(self._any_z_c.value)
-                self._finish_det_batch(
-                    step_meta, op_override, m_mat, any_x_accum, any_z_accum
-                )
-                return
-
-            xs_c: NDArray[np.uint8] | None = None
-            self._scratch_x_mask.fill(False)
-            self._scratch_z_mask.fill(False)
-            self._any_x_c.value = 0
-            self._any_z_c.value = 0
-
-            def _flush_cpp_accum() -> None:
-                self._flush_xz(self._any_x_c.value, self._any_z_c.value)
-                if self._any_x_c.value:
-                    self._scratch_x_mask.fill(False)
-                    self._any_x_c.value = 0
-                if self._any_z_c.value:
-                    self._scratch_z_mask.fill(False)
-                    self._any_z_c.value = 0
-
-            null_u64 = ctypes.cast(0, u64_p)
-            null_i64 = ctypes.cast(0, i64_p)
-
-            for substep in substeps:
-                if substep.pre_ops:
-                    _flush_cpp_accum()
-                    for pre_op in substep.pre_ops:
-                        self._apply_unitary_to_frames(pre_op)
-                    xs_c = None
-                if xs_c is None:
-                    xs_base_tmp, _, _, _, _ = self._flip_simulator.to_numpy(
-                        output_xs=True, output_zs=False
-                    )
-                    xs_c = np.ascontiguousarray(xs_base_tmp, dtype=np.uint8)
-
-                meta = substep.meta
-                q = meta.q
-                m_ref = int(meta.m_ref)
-                if not meta.is_random:
-                    m_shots = np.empty(self.batch_size, dtype=np.bool_)
-                    lib.engine_batch_mixed_substep(
-                        self._cpp_eng,
-                        0,
-                        q,
-                        m_ref,
-                        0,
-                        meta.beta_Z_words.ctypes.data_as(u64_p),
-                        null_u64,
-                        null_u64,
-                        0,
-                        0,
-                        null_i64,
-                        0,
-                        null_i64,
-                        xs_c.ctypes.data_as(u8_p),
-                        m_shots.ctypes.data_as(u8_p),
-                        *self._cpp_out_args(),
-                    )
-                else:
-                    m_shots = self.np_rng.integers(
-                        0, 2, size=self.batch_size, dtype=np.bool_
-                    )
-                    lib.engine_batch_mixed_substep(
-                        self._cpp_eng,
-                        1,
-                        q,
-                        m_ref,
-                        meta.p,
-                        meta.a_words.ctypes.data_as(u64_p),
-                        meta.b_rot_words.ctypes.data_as(u64_p),
-                        meta.e_p_words.ctypes.data_as(u64_p),
-                        meta.kappa_rot,
-                        len(meta.G_x_indices),
-                        meta.G_x_indices.ctypes.data_as(i64_p),
-                        len(meta.G_z_indices),
-                        meta.G_z_indices.ctypes.data_as(i64_p),
-                        xs_c.ctypes.data_as(u8_p),
-                        m_shots.ctypes.data_as(u8_p),
-                        *self._cpp_out_args(),
-                    )
-                self._cpp_dirty = True
-
-                if step_meta.produces_measurements:
-                    self._measurement_columns.append(
-                        ~m_shots if substep.invert_result else m_shots.copy()
-                    )
-
-                if step_meta.is_reset:
-                    kick_shots = m_shots ^ bool(m_ref)
-                    if np.any(kick_shots):
-                        self._scratch_x_mask[q, :] ^= kick_shots
-                        xs_c[q, :] ^= kick_shots.view(np.uint8)
-                        self._any_x_c.value = 1
-
-                if substep.post_ops:
-                    _flush_cpp_accum()
-                    for post_op in substep.post_ops:
-                        self._apply_unitary_to_frames(post_op)
-                    xs_c = None
-
-            x2z_w, z2z_w = step_meta.get_evict_words(self._n_words)
-            ev_x_c = ctypes.c_int(0)
-            ev_z_c = ctypes.c_int(0)
-            lib.engine_batch_evict(
-                self._cpp_eng,
-                x2z_w.ctypes.data_as(u64_p),
-                z2z_w.ctypes.data_as(u64_p),
-                xs_c.ctypes.data_as(u8_p)
-                if xs_c is not None
-                else ctypes.cast(0, u8_p),
-                ctypes.cast(0, u8_p),
-                self._scratch_x_mask.ctypes.data_as(u8_p),
-                self._scratch_z_mask.ctypes.data_as(u8_p),
-                ctypes.byref(ev_x_c),
-                ctypes.byref(ev_z_c),
-            )
-            if ev_x_c.value:
-                self._any_x_c.value = 1
-            if ev_z_c.value:
-                self._any_z_c.value = 1
-            _flush_cpp_accum()
-            if step_meta.produces_measurements:
-                self._apply_measurement_flip_noise(
-                    step_meta, op_override, len(substeps)
-                )
-            return
-
-        xs_base: NDArray[np.bool_] | None = None
         self._scratch_x_mask.fill(False)
         self._scratch_z_mask.fill(False)
-        any_x_accum = False
-        any_z_accum = False
-
-        def _flush_accum() -> None:
-            nonlocal any_x_accum, any_z_accum
-            self._flush_xz(any_x_accum, any_z_accum)
-            if any_x_accum:
-                self._scratch_x_mask.fill(False)
-            if any_z_accum:
-                self._scratch_z_mask.fill(False)
-            any_x_accum = any_z_accum = False
+        self._any_x_c.value = 0
+        self._any_z_c.value = 0
 
         if det_batch:
-            q_arr, m_ref_arr, b_sub_words = step_meta.get_det_batch_arrays()
-            xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
-                output_xs=True, output_zs=False
+            m_mat = (
+                self._exec_det_batch_cpp(step_meta)
+                if use_cpp
+                else self._exec_det_batch_py(step_meta)
             )
-            m_mat = xs_base[q_arr, :] ^ m_ref_arr[:, None]
-
-            if self._active_shots:
-                active_indices = list(self._active_shots.keys())
-                active_mrqfs = [self._active_shots[b] for b in active_indices]
-                h_mat = np.stack([m.h_words for m in active_mrqfs], axis=0)
-                au_mat = np.stack([m.a_union for m in active_mrqfs], axis=0)
-                xor_bh = b_sub_words[:, None, 0] & h_mat[None, :, 0]
-                ov_words = b_sub_words[:, None, 0] & au_mat[None, :, 0]
-                for w in range(1, self._n_words):
-                    xor_bh ^= b_sub_words[:, None, w] & h_mat[None, :, w]
-                    ov_words |= b_sub_words[:, None, w] & au_mat[None, :, w]
-                bh_mat = (np.bitwise_count(xor_bh) & 1).astype(np.bool_)
-                m_mat[:, active_indices] ^= bh_mat
-                overlap_mat = ov_words != 0
-                if np.any(overlap_mat):
-                    for a_idx_np in np.flatnonzero(np.any(overlap_mat, axis=0)):
-                        a_idx = int(a_idx_np)
-                        b_idx = active_indices[a_idx]
-                        mrqf = active_mrqfs[a_idx]
-                        if mrqf.d == 0:
-                            continue
-                        h_init = mrqf.h_words.copy()
-                        for k_np in np.flatnonzero(overlap_mat[:, a_idx]):
-                            k_idx = int(k_np)
-                            b_k = b_sub_words[k_idx]
-                            if mrqf.d == 0 or not _words_any_overlap(
-                                b_k, mrqf.a_union
-                            ):
-                                if _word_dot_parity(
-                                    b_k, mrqf.h_words ^ h_init
-                                ):
-                                    m_mat[k_idx, b_idx] = not m_mat[
-                                        k_idx, b_idx
-                                    ]
-                                continue
-                            q_k = int(q_arr[k_idx])
-                            m_ref_k = int(m_ref_arr[k_idx])
-                            f_q = int(xs_base[q_k, b_idx])
-                            sigma = (f_q ^ m_ref_k) & 1
-                            m_val, _ = mrqf.p3_measure_diagonal(
-                                b_k,
-                                sigma,
-                                draw_bit_fn=lambda b=b_idx: int(
-                                    self._draw_tab_rng_bit(b)
-                                ),
-                            )
-                            m_mat[k_idx, b_idx] = bool(m_val)
-
-                ev_x, ev_z = self._evict_healed_shots(
-                    step_meta,
-                    xs_base=xs_base,
-                    accum_x_mask=self._scratch_x_mask,
-                    accum_z_mask=self._scratch_z_mask,
-                )
-                any_x_accum |= ev_x
-                any_z_accum |= ev_z
-
             self._finish_det_batch(
-                step_meta, op_override, m_mat, any_x_accum, any_z_accum
+                step_meta,
+                op_override,
+                m_mat,
+                self._any_x_c.value,
+                self._any_z_c.value,
             )
             return
 
-        assert self._tab_rngs is not None
+        def _flush_accum() -> None:
+            self._flush_xz(self._any_x_c.value, self._any_z_c.value)
+            if self._any_x_c.value:
+                self._scratch_x_mask.fill(False)
+                self._any_x_c.value = 0
+            if self._any_z_c.value:
+                self._scratch_z_mask.fill(False)
+                self._any_z_c.value = 0
+
         eff_op_name = (
             op_override.name if op_override is not None else step_meta.op.name
         )
         seg_end_to_len: dict[int, int] = {}
         if (
-            step_meta.produces_measurements
+            not use_cpp
+            and step_meta.produces_measurements
             and eff_op_name in ("MXX", "MYY", "MZZ", "MPP")
             and len(substeps) > 1
         ):
@@ -1591,139 +1275,250 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             if cur_len > 0:
                 seg_end_to_len[len(substeps) - 1] = cur_len
 
+        xs_cache: NDArray[Any] | None = None
         for substep_idx, substep in enumerate(substeps):
             if substep.pre_ops:
                 _flush_accum()
                 for pre_op in substep.pre_ops:
                     self._apply_unitary_to_frames(pre_op)
-                xs_base = None
-
-            meta = substep.meta
-            q = meta.q
-            m_ref = meta.m_ref
-            if xs_base is None:
-                xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
+                xs_cache = None
+            if xs_cache is None:
+                xs_raw, _, _, _, _ = self._flip_simulator.to_numpy(
                     output_xs=True, output_zs=False
                 )
-            f_q_shots = xs_base[q, :].copy()
+                xs_cache = (
+                    np.ascontiguousarray(xs_raw, dtype=np.uint8)
+                    if use_cpp
+                    else xs_raw
+                )
 
-            if not meta.is_random:
-                m_shots = f_q_shots ^ bool(m_ref)
-                if self._active_shots:
-                    b_words = meta.beta_Z_words
-                    for b_idx, mrqf in self._active_shots.items():
-                        if mrqf.d == 0 or not _words_any_overlap(
-                            b_words, mrqf.a_union
-                        ):
-                            if _word_dot_parity(b_words, mrqf.h_words):
-                                m_shots[b_idx] = not m_shots[b_idx]
-                        else:
-                            sigma = (int(f_q_shots[b_idx]) ^ int(m_ref)) & 1
-                            m_val, _ = mrqf.p3_measure_diagonal(
-                                b_words,
-                                sigma,
-                                draw_bit_fn=lambda b=b_idx: int(
-                                    self._draw_tab_rng_bit(b)
-                                ),
-                            )
-                            m_shots[b_idx] = bool(m_val)
-            else:
-                p = meta.p
-                p_word = p >> 6
-                p_bit = p & 63
-                p_mask = np.uint64(1 << p_bit)
-                m_shots = np.zeros(self.batch_size, dtype=np.bool_)
-                delta_shots = np.zeros(self.batch_size, dtype=np.bool_)
-                for b_idx in range(self.batch_size):
-                    mrqf = self._active_shots.get(b_idx)
-                    if mrqf is not None:
-                        if not bool(mrqf.a_union[p_word] & p_mask):
-                            m_b = self._draw_tab_rng_bit(b_idx)
-                            m_shots[b_idx] = m_b
-                            h_p = bool(
-                                (int(mrqf.h_words[p_word]) >> p_bit) & 1
-                            )
-                            delta_shots[b_idx] = (
-                                m_b
-                                ^ bool(f_q_shots[b_idx])
-                                ^ h_p
-                                ^ bool(m_ref)
-                            )
-                        else:
-                            f_q_b = int(f_q_shots[b_idx])
-                            mrqf.p2_apply_quarter_turn(
-                                meta.a_words,
-                                meta.b_rot_words,
-                                meta.kappa_rot,
-                            )
-                            m_eff, _ = mrqf.p3_measure_diagonal(
-                                meta.e_p_words,
-                                0,
-                                draw_bit_fn=lambda b=b_idx, fq=f_q_b: int(
-                                    self._draw_tab_rng_bit(b)
-                                )
-                                ^ fq,
-                            )
-                            m_shots[b_idx] = bool(m_eff ^ f_q_b)
-                            delta_shots[b_idx] = False
-                    else:
-                        m_shots[b_idx] = self._draw_tab_rng_bit(b_idx)
-                        delta_shots[b_idx] = (
-                            m_shots[b_idx] ^ f_q_shots[b_idx] ^ bool(m_ref)
-                        )
-
-                if np.any(delta_shots):
-                    if len(meta.G_x_indices) > 0:
-                        self._scratch_x_mask[meta.G_x_indices, :] ^= (
-                            delta_shots[None, :]
-                        )
-                        xs_base[meta.G_x_indices, :] ^= delta_shots[None, :]
-                        any_x_accum = True
-                    if len(meta.G_z_indices) > 0:
-                        self._scratch_z_mask[meta.G_z_indices, :] ^= (
-                            delta_shots[None, :]
-                        )
-                        any_z_accum = True
+            m_shots = (
+                self._eval_substep_cpp(substep.meta, xs_cache)
+                if use_cpp
+                else self._eval_substep_py(substep.meta, xs_cache)
+            )
 
             if step_meta.produces_measurements:
-                recorded_shots = (
+                self._measurement_columns.append(
                     ~m_shots if substep.invert_result else m_shots.copy()
                 )
-                self._measurement_columns.append(recorded_shots)
                 if substep_idx in seg_end_to_len:
                     self._apply_measurement_flip_noise(
                         step_meta, op_override, seg_end_to_len[substep_idx]
                     )
 
             if step_meta.is_reset:
-                kick_shots = m_shots ^ bool(m_ref)
+                kick_shots = m_shots ^ bool(substep.meta.m_ref)
                 if np.any(kick_shots):
+                    q = substep.meta.q
                     self._scratch_x_mask[q, :] ^= kick_shots
-                    xs_base[q, :] ^= kick_shots
-                    any_x_accum = True
+                    xs_cache[q, :] ^= (
+                        kick_shots.view(np.uint8) if use_cpp else kick_shots
+                    )
+                    self._any_x_c.value = 1
 
             if substep.post_ops:
                 _flush_accum()
                 for post_op in substep.post_ops:
                     self._apply_unitary_to_frames(post_op)
-                xs_base = None
+                xs_cache = None
 
-        if self._active_shots:
+        if use_cpp:
+            assert self._cpp_lib is not None and self._cpp_eng is not None
+            x2z_w, z2z_w = step_meta.get_evict_words(self._n_words)
+            ev_x_c, ev_z_c = ctypes.c_int(0), ctypes.c_int(0)
+            self._cpp_lib.engine_batch_evict(
+                self._cpp_eng,
+                x2z_w.ctypes.data_as(u64_p),
+                z2z_w.ctypes.data_as(u64_p),
+                xs_cache.ctypes.data_as(u8_p)
+                if xs_cache is not None
+                else ctypes.cast(0, u8_p),
+                ctypes.cast(0, u8_p),
+                self._scratch_x_mask.ctypes.data_as(u8_p),
+                self._scratch_z_mask.ctypes.data_as(u8_p),
+                ctypes.byref(ev_x_c),
+                ctypes.byref(ev_z_c),
+            )
+            self._any_x_c.value |= ev_x_c.value
+            self._any_z_c.value |= ev_z_c.value
+        elif self._active_shots:
             ev_x, ev_z = self._evict_healed_shots(
                 step_meta,
-                xs_base=xs_base,
+                xs_base=xs_cache,
                 accum_x_mask=self._scratch_x_mask,
                 accum_z_mask=self._scratch_z_mask,
             )
-            any_x_accum |= ev_x
-            any_z_accum |= ev_z
+            self._any_x_c.value |= int(ev_x)
+            self._any_z_c.value |= int(ev_z)
 
         _flush_accum()
-
         if step_meta.produces_measurements and not seg_end_to_len:
             self._apply_measurement_flip_noise(
-                step_meta, op_override, len(step_meta.substeps)
+                step_meta, op_override, len(substeps)
             )
+
+    def _exec_det_batch_cpp(self, step_meta: MeasStepMeta) -> NDArray[np.bool_]:
+        assert self._cpp_lib is not None and self._cpp_eng is not None
+        num_sub = len(step_meta.substeps)
+        q_arr, m_ref_arr, b_sub_words = step_meta.get_det_batch_arrays()
+        needed = num_sub * self.batch_size
+        if self._cpp_m_buf.size < needed:
+            self._cpp_m_buf = np.empty(needed, dtype=np.bool_)
+        m_mat = self._cpp_m_buf[:needed].reshape(num_sub, self.batch_size)
+        xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
+            output_xs=True, output_zs=False
+        )
+        xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
+        x2z_w, z2z_w = step_meta.get_evict_words(self._n_words)
+        self._cpp_lib.engine_batch_det_meas_step(
+            self._cpp_eng,
+            num_sub,
+            q_arr.ctypes.data_as(i64_p),
+            m_ref_arr.ctypes.data_as(u8_p),
+            b_sub_words.ctypes.data_as(u64_p),
+            xs_c.ctypes.data_as(u8_p),
+            m_mat.ctypes.data_as(u8_p),
+            x2z_w.ctypes.data_as(u64_p),
+            z2z_w.ctypes.data_as(u64_p),
+            *self._cpp_out_args(),
+        )
+        self._cpp_dirty = True
+        return m_mat
+
+    def _exec_det_batch_py(self, step_meta: MeasStepMeta) -> NDArray[np.bool_]:
+        q_arr, m_ref_arr, b_sub_words = step_meta.get_det_batch_arrays()
+        xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
+            output_xs=True, output_zs=False
+        )
+        m_mat = xs_base[q_arr, :] ^ m_ref_arr[:, None]
+        if not self._active_shots:
+            return m_mat
+        active_indices = list(self._active_shots.keys())
+        active_mrqfs = [self._active_shots[b] for b in active_indices]
+        h_mat = np.stack([m.h_words for m in active_mrqfs], axis=0)
+        au_mat = np.stack([m.a_union for m in active_mrqfs], axis=0)
+        xor_bh = b_sub_words[:, None, 0] & h_mat[None, :, 0]
+        ov_words = b_sub_words[:, None, 0] & au_mat[None, :, 0]
+        for w in range(1, self._n_words):
+            xor_bh ^= b_sub_words[:, None, w] & h_mat[None, :, w]
+            ov_words |= b_sub_words[:, None, w] & au_mat[None, :, w]
+        m_mat[:, active_indices] ^= (np.bitwise_count(xor_bh) & 1).astype(np.bool_)
+        overlap_mat = ov_words != 0
+        if np.any(overlap_mat):
+            for a_idx_np in np.flatnonzero(np.any(overlap_mat, axis=0)):
+                a_idx = int(a_idx_np)
+                b_idx = active_indices[a_idx]
+                mrqf = active_mrqfs[a_idx]
+                if mrqf.d == 0:
+                    continue
+                h_init = mrqf.h_words.copy()
+                for k_np in np.flatnonzero(overlap_mat[:, a_idx]):
+                    k_idx = int(k_np)
+                    b_k = b_sub_words[k_idx]
+                    if mrqf.d == 0 or not _words_any_overlap(b_k, mrqf.a_union):
+                        if _word_dot_parity(b_k, mrqf.h_words ^ h_init):
+                            m_mat[k_idx, b_idx] = not m_mat[k_idx, b_idx]
+                        continue
+                    sigma = (int(xs_base[int(q_arr[k_idx]), b_idx]) ^ int(m_ref_arr[k_idx])) & 1
+                    m_val, _ = mrqf.p3_measure_diagonal(
+                        b_k, sigma, draw_bit_fn=lambda b=b_idx: int(self._draw_tab_rng_bit(b))
+                    )
+                    m_mat[k_idx, b_idx] = bool(m_val)
+        ev_x, ev_z = self._evict_healed_shots(
+            step_meta,
+            xs_base=xs_base,
+            accum_x_mask=self._scratch_x_mask,
+            accum_z_mask=self._scratch_z_mask,
+        )
+        self._any_x_c.value |= int(ev_x)
+        self._any_z_c.value |= int(ev_z)
+        return m_mat
+
+    def _eval_substep_cpp(
+        self, meta: Any, xs_c: NDArray[np.uint8]
+    ) -> NDArray[np.bool_]:
+        assert self._cpp_lib is not None and self._cpp_eng is not None
+        if not meta.is_random:
+            m_shots = np.empty(self.batch_size, dtype=np.bool_)
+            null_u64, null_i64 = ctypes.cast(0, u64_p), ctypes.cast(0, i64_p)
+            self._cpp_lib.engine_batch_mixed_substep(
+                self._cpp_eng, 0, meta.q, int(meta.m_ref), 0,
+                meta.beta_Z_words.ctypes.data_as(u64_p),
+                null_u64, null_u64, 0, 0, null_i64, 0, null_i64,
+                xs_c.ctypes.data_as(u8_p), m_shots.ctypes.data_as(u8_p),
+                *self._cpp_out_args(),
+            )
+        else:
+            m_shots = self.np_rng.integers(0, 2, size=self.batch_size, dtype=np.bool_)
+            self._cpp_lib.engine_batch_mixed_substep(
+                self._cpp_eng, 1, meta.q, int(meta.m_ref), meta.p,
+                meta.a_words.ctypes.data_as(u64_p),
+                meta.b_rot_words.ctypes.data_as(u64_p),
+                meta.e_p_words.ctypes.data_as(u64_p),
+                meta.kappa_rot,
+                len(meta.G_x_indices), meta.G_x_indices.ctypes.data_as(i64_p),
+                len(meta.G_z_indices), meta.G_z_indices.ctypes.data_as(i64_p),
+                xs_c.ctypes.data_as(u8_p), m_shots.ctypes.data_as(u8_p),
+                *self._cpp_out_args(),
+            )
+        self._cpp_dirty = True
+        return m_shots
+
+    def _eval_substep_py(
+        self, meta: Any, xs_base: NDArray[np.bool_]
+    ) -> NDArray[np.bool_]:
+        f_q_shots = xs_base[meta.q, :].copy()
+        m_ref = meta.m_ref
+        if not meta.is_random:
+            m_shots = f_q_shots ^ bool(m_ref)
+            if self._active_shots:
+                b_words = meta.beta_Z_words
+                for b_idx, mrqf in self._active_shots.items():
+                    if mrqf.d == 0 or not _words_any_overlap(b_words, mrqf.a_union):
+                        if _word_dot_parity(b_words, mrqf.h_words):
+                            m_shots[b_idx] = not m_shots[b_idx]
+                    else:
+                        sigma = (int(f_q_shots[b_idx]) ^ int(m_ref)) & 1
+                        m_val, _ = mrqf.p3_measure_diagonal(
+                            b_words, sigma, draw_bit_fn=lambda b=b_idx: int(self._draw_tab_rng_bit(b))
+                        )
+                        m_shots[b_idx] = bool(m_val)
+            return m_shots
+
+        p = meta.p
+        p_word, p_bit = p >> 6, p & 63
+        p_mask = np.uint64(1 << p_bit)
+        m_shots = np.zeros(self.batch_size, dtype=np.bool_)
+        delta_shots = np.zeros(self.batch_size, dtype=np.bool_)
+        for b_idx in range(self.batch_size):
+            mrqf = self._active_shots.get(b_idx)
+            if mrqf is not None:
+                if not bool(mrqf.a_union[p_word] & p_mask):
+                    m_b = self._draw_tab_rng_bit(b_idx)
+                    m_shots[b_idx] = m_b
+                    h_p = bool((int(mrqf.h_words[p_word]) >> p_bit) & 1)
+                    delta_shots[b_idx] = m_b ^ bool(f_q_shots[b_idx]) ^ h_p ^ bool(m_ref)
+                else:
+                    f_q_b = int(f_q_shots[b_idx])
+                    mrqf.p2_apply_quarter_turn(meta.a_words, meta.b_rot_words, meta.kappa_rot)
+                    m_eff, _ = mrqf.p3_measure_diagonal(
+                        meta.e_p_words, 0, draw_bit_fn=lambda b=b_idx, fq=f_q_b: int(self._draw_tab_rng_bit(b)) ^ fq
+                    )
+                    m_shots[b_idx] = bool(m_eff ^ f_q_b)
+            else:
+                m_shots[b_idx] = self._draw_tab_rng_bit(b_idx)
+                delta_shots[b_idx] = m_shots[b_idx] ^ f_q_shots[b_idx] ^ bool(m_ref)
+
+        if np.any(delta_shots):
+            if len(meta.G_x_indices) > 0:
+                self._scratch_x_mask[meta.G_x_indices, :] ^= delta_shots[None, :]
+                xs_base[meta.G_x_indices, :] ^= delta_shots[None, :]
+                self._any_x_c.value = 1
+            if len(meta.G_z_indices) > 0:
+                self._scratch_z_mask[meta.G_z_indices, :] ^= delta_shots[None, :]
+                self._any_z_c.value = 1
+        return m_shots
 
     def _finish_det_batch(
         self,

@@ -165,7 +165,7 @@ def test_loader_uses_hidden_tmp_so_and_never_uses_system_tempdir(
 def test_coset_kernels_exports_and_checks_abi_sentinel() -> None:
     coset_kernels._LIB_INSTANCE = None
     lib = coset_kernels.get_coset_kernels_lib()
-    assert lib.coset_kernels_abi_v1() == 1
+    assert lib.coset_kernels_abi_v2() == 2
 
 
 def test_packaging_single_version_source_and_no_sdist_so_globs() -> None:

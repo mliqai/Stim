@@ -32,7 +32,7 @@ def get_coset_kernels_lib() -> ctypes.CDLL:
     if _LIB_INSTANCE is not None:
         return _LIB_INSTANCE
 
-    lib = load_cdll(_resolve_coset_kernels_so, "coset_kernels_abi_v1")
+    lib = load_cdll(_resolve_coset_kernels_so, "coset_kernels_abi_v2")
 
     lib.engine_create.argtypes = [
         ctypes.c_int,
@@ -77,24 +77,6 @@ def get_coset_kernels_lib() -> ctypes.CDLL:
         i32_p,
     ]
     lib.engine_import_shot.restype = None
-
-    lib.engine_batch_inject_cz.argtypes = [
-        void_p,
-        ctypes.c_int,
-        i64_p,
-        i64_p,
-        u8_p,
-        u8_p,
-        u64_p,
-        u64_p,
-        u8_p,
-        u64_p,
-        u8_p,
-        u8_p,
-        int_p,
-        int_p,
-    ]
-    lib.engine_batch_inject_cz.restype = None
 
     lib.engine_batch_inject_general_clifford.argtypes = [
         void_p,

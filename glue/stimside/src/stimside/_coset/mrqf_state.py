@@ -236,7 +236,7 @@ class MRQFState:
         self.P[j] = p
 
     # S4. DropVariable(j)
-    def s4_drop_variable(self, j: int) -> None:
+    def s4_drop_variable(self, j: int, *, recompute_union: bool = True) -> None:
         """Remove variable slot j from A_words, ell, Gamma, and P in-place (Eq. 17)."""
         k = self._d
         if k == 1:
@@ -255,7 +255,8 @@ class MRQFState:
         self._d = k - 1
         self.P.pop(j)
         self._refresh_views()
-        self._recompute_a_union()
+        if recompute_union:
+            self._recompute_a_union()
 
     # S3. Restrict(lambda, epsilon)
     def s3_restrict(
@@ -291,7 +292,7 @@ class MRQFState:
             lam[:j] = self._Gamma_buf[:j, j]
         if j < k - 1:
             lam[j:] = self._Gamma_buf[j + 1 : k, j]
-        self.s4_drop_variable(j)
+        self.s4_drop_variable(j, recompute_union=False)
 
         if c & 1:
             if len(lam) > 0:

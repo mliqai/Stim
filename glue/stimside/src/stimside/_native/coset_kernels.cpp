@@ -132,7 +132,7 @@ struct CppMRQFShot {
         Gamma_buf[s * cap + s] = 0;
     }
 
-    void s4_drop_variable(int j) {
+    void s4_drop_variable(int j, bool recompute_union = true) {
         int k = d;
         if (k == 1) {
             d = 0;
@@ -151,7 +151,9 @@ struct CppMRQFShot {
             std::memmove(&P[j], &P[j + 1], (k - 1 - j) * sizeof(int32_t));
         }
         d = k - 1;
-        recompute_a_union();
+        if (recompute_union) {
+            recompute_a_union();
+        }
     }
 
     void s3_restrict(const uint8_t* lam, int eps) {
@@ -178,7 +180,7 @@ struct CppMRQFShot {
         }
         for (int r = 0; r < j; ++r) lam[r] = Gamma_buf[r * cap + j];
         for (int r = j + 1; r < k; ++r) lam[r - 1] = Gamma_buf[r * cap + j];
-        s4_drop_variable(j);
+        s4_drop_variable(j, false);
         int d_new = d;
         if (c & 1) {
             for (int r = 0; r < d_new; ++r) {
@@ -586,62 +588,7 @@ void engine_import_shot(
     eng->is_active[b] = (d > 0 || words_any_nonzero(in_h, nw)) ? 1 : 0;
 }
 
-// 1A. Fused CZ/ZCZ fastpath conditional clifford injection
-void engine_batch_inject_cz(
-    void* ptr,
-    int num_groups,
-    const int64_t* group_q0,
-    const int64_t* group_q1,
-    const uint8_t* cond_mask,
-    uint8_t* xs_base,
-    const uint64_t* z2x_w,
-    const uint64_t* z2z_w,
-    const uint8_t* z_kappa,
-    const uint64_t* x2z_w,
-    uint8_t* out_evict_x,
-    uint8_t* out_evict_z,
-    int* any_evict_x,
-    int* any_evict_z
-) {
-    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
-    int B = eng->batch_size;
-    int nw = eng->n_words;
-    *any_evict_x = 0;
-    *any_evict_z = 0;
-
-    for (int g = 0; g < num_groups; ++g) {
-        const uint8_t* cm_row = cond_mask + g * B;
-        bool any_failed = false;
-        for (int b = 0; b < B; ++b) {
-            if (!cm_row[b]) { any_failed = true; break; }
-        }
-        if (!any_failed) continue;
-
-        int64_t q0 = group_q0[g];
-        int64_t q1 = group_q1[g];
-        const uint64_t* aw1 = z2x_w + q0 * nw;
-        const uint64_t* bw1 = z2z_w + q0 * nw;
-        int kap1_base = z_kappa[q0];
-        const uint64_t* aw2 = z2x_w + q1 * nw;
-        const uint64_t* bw2 = z2z_w + q1 * nw;
-        int kap2_base = z_kappa[q1];
-        const uint8_t* xs_q0 = xs_base + q0 * B;
-        const uint8_t* xs_q1 = xs_base + q1 * B;
-
-        for (int b = 0; b < B; ++b) {
-            if (!cm_row[b]) {
-                eng->is_active[b] = 1;
-                int kap1 = (kap1_base + (int(xs_q0[b]) << 1)) & 3;
-                int kap2 = (kap2_base + (int(xs_q1[b]) << 1)) & 3;
-                eng->shots[b].p2_apply_controlled_pauli(aw1, bw1, kap1, aw2, bw2, kap2);
-            }
-        }
-    }
-
-    eng->evict_healed_shots(x2z_w, z2z_w, xs_base, nullptr, out_evict_x, out_evict_z, any_evict_x, any_evict_z);
-}
-
-// 1B. Fused general conditional Clifford cocycle injection (H, CX, S, etc.)
+// 1. Fused general conditional Clifford cocycle injection (H, CX, CZ, S, etc.)
 void engine_batch_inject_general_clifford(
     void* ptr,
     int num_groups,
@@ -1096,8 +1043,8 @@ void engine_peek_pauli_batch(
     }
 }
 
-int coset_kernels_abi_v1() {
-    return 1;
+int coset_kernels_abi_v2() {
+    return 2;
 }
 
 } // extern "C"
