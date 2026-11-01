@@ -30,7 +30,7 @@ def get_coset_kernels_lib() -> ctypes.CDLL:
     if _LIB_INSTANCE is not None:
         return _LIB_INSTANCE
 
-    lib = load_cdll(_resolve_coset_kernels_so)
+    lib = load_cdll(_resolve_coset_kernels_so, "coset_kernels_abi_v1")
 
     lib.engine_create.argtypes = [
         ctypes.c_int,

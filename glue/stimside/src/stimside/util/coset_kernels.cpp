@@ -1096,4 +1096,8 @@ void engine_peek_pauli_batch(
     }
 }
 
+int coset_kernels_abi_v1() {
+    return 1;
+}
+
 } // extern "C"

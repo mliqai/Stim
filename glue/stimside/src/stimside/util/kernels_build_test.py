@@ -170,3 +170,52 @@ def test_stale_library_that_stays_loaded_raises_instead_of_being_used(tmp_path: 
     with pytest.raises(RuntimeError, match="restart Python"):
         _kernel_loader.load_cdll(resolve, "tiny_abi_v2")
     assert not hasattr(held, "tiny_abi_v2")
+
+
+def test_loader_uses_hidden_tmp_so_and_never_uses_system_tempdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    util = tmp_path / "src" / "stimside" / "util"
+    util.mkdir(parents=True)
+    (tmp_path / "setup.py").write_text("# dummy\n", encoding="utf-8")
+    cpp = util / "tiny2.cpp"
+    cpp.write_text('extern "C" int tiny2_abi_v1() { return 1; }\n', encoding="utf-8")
+
+    # 1. find_prebuilt_so must ignore both hidden .lib*.tmp.so and anything in tempfile.gettempdir().
+    fake_tmp = tmp_path / "fake_sys_tmp"
+    fake_tmp.mkdir()
+    (fake_tmp / "libtiny2.so").write_bytes(b"bad")
+    (util / ".libtiny2.999.tmp.so").write_bytes(b"partial")
+    monkeypatch.setenv("TMPDIR", str(fake_tmp))
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(fake_tmp))
+    assert _kernel_loader.find_prebuilt_so(util, "libtiny2", cpp) is None
+
+    # 2. Compilation writes to a dot-prefixed temp file invisible to find_prebuilt_so.
+    seen_out: list[str] = []
+    real_run = subprocess.run
+
+    def spy_run(cmd, *a, **kw):
+        out_name = Path(cmd[cmd.index("-o") + 1]).name
+        seen_out.append(out_name)
+        return real_run(cmd, *a, **kw)
+
+    with mock.patch.object(subprocess, "run", side_effect=spy_run):
+        so = _kernel_loader.resolve_so(str(util / "tiny2.py"), "tiny2", force_recompile=True)
+    assert so == util / "libtiny2.so"
+    assert seen_out and all(n.startswith(".libtiny2.") for n in seen_out)
+    assert list(util.glob("*lock*")) == []
+
+    # 3. Unwritable package dir with missing .so raises instead of falling back to /tmp.
+    so.unlink()
+    monkeypatch.setattr(os, "access", lambda p, mode: False)
+    with _forbid_subprocess("must not compile into /tmp when package dir is read-only"):
+        with pytest.raises(PermissionError, match="pip install"):
+            _kernel_loader.resolve_so(str(util / "tiny2.py"), "tiny2")
+
+
+def test_coset_kernels_exports_and_checks_abi_sentinel() -> None:
+    coset_kernels._LIB_INSTANCE = None
+    lib = coset_kernels.get_coset_kernels_lib()
+    assert lib.coset_kernels_abi_v1() == 1

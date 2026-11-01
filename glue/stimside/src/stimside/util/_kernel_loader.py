@@ -5,12 +5,15 @@ from __future__ import annotations
 import _ctypes
 from collections.abc import Callable
 import ctypes
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 
@@ -32,10 +35,6 @@ def find_prebuilt_so(here: Path, lib_stem: str, cpp_path: Path) -> Path | None:
         candidate_dir = Path(sys_entry) / "stimside" / "util"
         if candidate_dir != here and candidate_dir.is_dir():
             search_dirs.append(candidate_dir)
-
-    temp_dir = Path(tempfile.gettempdir())
-    if temp_dir != here:
-        search_dirs.append(temp_dir)
 
     cpp_mtime = cpp_path.stat().st_mtime if cpp_path.exists() else None
     for d in search_dirs:
@@ -95,9 +94,13 @@ def resolve_so(
                 f"and source '{cpp_path.name}' is missing. "
                 f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
             )
-        target_dir = here if os.access(here, os.W_OK) else Path(tempfile.gettempdir())
-        so_path = target_dir / f"lib{name}.so"
-        tmp_so = target_dir / f"lib{name}.{os.getpid()}.tmp.so"
+        if not os.access(here, os.W_OK):
+            raise PermissionError(
+                f"Cannot compile '{so_path.name}' into read-only directory {here}. "
+                f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
+            )
+        so_path = here / f"lib{name}.so"
+        tmp_so = here / f".lib{name}.{os.getpid()}.tmp.so"
         cxx = (
             shutil.which(os.environ.get("CXX", ""))
             or os.environ.get("CXX")
@@ -111,18 +114,31 @@ def resolve_so(
             [cxx, "-O3", "-std=c++17", "-shared", "-fPIC", str(cpp_path), "-o", str(tmp_so)],
         ]
         last_exc: Exception | None = None
-        for cmd in cmd_variants:
+        with cpp_path.open("rb") as lf:
+            if fcntl is not None:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
             try:
-                subprocess.run(cmd, check=True)
-                target_mtime = max(time.time(), cpp_path.stat().st_mtime + 1.0)
-                os.utime(tmp_so, (target_mtime, target_mtime))
-                os.replace(tmp_so, so_path)
-                last_exc = None
-                break
-            except Exception as exc:
-                last_exc = exc
-                if tmp_so.exists():
-                    tmp_so.unlink(missing_ok=True)
+                if (
+                    not force_recompile
+                    and so_path.exists()
+                    and (not in_source_tree or cpp_path.stat().st_mtime <= so_path.stat().st_mtime)
+                ):
+                    return so_path
+                for cmd in cmd_variants:
+                    try:
+                        subprocess.run(cmd, check=True)
+                        target_mtime = max(time.time(), cpp_path.stat().st_mtime + 1.0)
+                        os.utime(tmp_so, (target_mtime, target_mtime))
+                        os.replace(tmp_so, so_path)
+                        last_exc = None
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        if tmp_so.exists():
+                            tmp_so.unlink(missing_ok=True)
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
         if last_exc is not None and (force_recompile or not so_path.exists()):
             raise RuntimeError(
                 f"Failed to compile {cpp_path} with {cmd_variants[0]}. "
