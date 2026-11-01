@@ -699,6 +699,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._scratch_z_mask = np.zeros(
             (self.num_qubits, self.batch_size), dtype=np.bool_
         )
+        self._cpp_m_buf: NDArray[np.bool_] = np.empty(0, dtype=np.bool_)
 
         self._circuit_time = 0
         self._step_cursor = 0
@@ -1522,13 +1523,16 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._apply_unitary_to_frames(op)
                 lib = self._cpp_lib
                 if name in ("CZ", "ZCZ"):
-                    if not hasattr(step_meta, "_cpp_q0"):
-                        step_meta._cpp_q0 = np.array(
-                            [g[0] for g in step_meta.target_groups], dtype=np.int64
+                    if step_meta._cpp_cz_qs is None:
+                        step_meta._cpp_cz_qs = (
+                            np.array(
+                                [g[0] for g in step_meta.target_groups], dtype=np.int64
+                            ),
+                            np.array(
+                                [g[1] for g in step_meta.target_groups], dtype=np.int64
+                            ),
                         )
-                        step_meta._cpp_q1 = np.array(
-                            [g[1] for g in step_meta.target_groups], dtype=np.int64
-                        )
+                    q0_arr, q1_arr = step_meta._cpp_cz_qs
                     xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
                         output_xs=True, output_zs=False
                     )
@@ -1542,8 +1546,8 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                     lib.engine_batch_inject_cz(
                         self._cpp_eng,
                         len(step_meta.target_groups),
-                        step_meta._cpp_q0.ctypes.data_as(i64_p),
-                        step_meta._cpp_q1.ctypes.data_as(i64_p),
+                        q0_arr.ctypes.data_as(i64_p),
+                        q1_arr.ctypes.data_as(i64_p),
                         cm_c.ctypes.data_as(u8_p),
                         xs_c.ctypes.data_as(u8_p),
                         z2x_w.ctypes.data_as(u64_p),
@@ -1556,7 +1560,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                     self._flush_xz(self._any_x_c.value, self._any_z_c.value)
                     return
 
-                if not hasattr(step_meta, "_cpp_cocycle_arrays"):
+                if step_meta._cpp_cocycle_arrays is None:
                     num_g = len(step_meta.target_groups)
                     arity = len(step_meta.target_groups[0])
                     cocycles = [
@@ -1951,29 +1955,15 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             if det_batch:
                 num_sub = len(substeps)
                 q_arr, m_ref_arr, b_sub_words = step_meta.get_det_batch_arrays()
-                if not hasattr(step_meta, "_cpp_q_i64"):
-                    step_meta._cpp_q_i64 = np.ascontiguousarray(
-                        q_arr, dtype=np.int64
-                    )
-                    step_meta._cpp_mref_u8 = np.ascontiguousarray(
-                        m_ref_arr, dtype=np.uint8
-                    )
-                    step_meta._cpp_bsub_u64 = np.ascontiguousarray(
-                        b_sub_words, dtype=np.uint64
-                    )
-                    step_meta._cpp_m_mat = np.empty(
-                        (num_sub, self.batch_size), dtype=np.bool_
-                    )
-                elif step_meta._cpp_m_mat.shape[1] != self.batch_size:
-                    step_meta._cpp_m_mat = np.empty(
-                        (num_sub, self.batch_size), dtype=np.bool_
-                    )
+                needed = num_sub * self.batch_size
+                if self._cpp_m_buf.size < needed:
+                    self._cpp_m_buf = np.empty(needed, dtype=np.bool_)
+                m_mat = self._cpp_m_buf[:needed].reshape(num_sub, self.batch_size)
 
                 xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
                     output_xs=True, output_zs=False
                 )
                 xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
-                m_mat = step_meta._cpp_m_mat
                 x2z_w, z2z_w = step_meta.get_evict_words(self._n_words)
                 self._scratch_x_mask.fill(False)
                 self._scratch_z_mask.fill(False)
@@ -1981,9 +1971,9 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 lib.engine_batch_det_meas_step(
                     self._cpp_eng,
                     num_sub,
-                    step_meta._cpp_q_i64.ctypes.data_as(i64_p),
-                    step_meta._cpp_mref_u8.ctypes.data_as(u8_p),
-                    step_meta._cpp_bsub_u64.ctypes.data_as(u64_p),
+                    q_arr.ctypes.data_as(i64_p),
+                    m_ref_arr.ctypes.data_as(u8_p),
+                    b_sub_words.ctypes.data_as(u64_p),
                     xs_c.ctypes.data_as(u8_p),
                     m_mat.ctypes.data_as(u8_p),
                     x2z_w.ctypes.data_as(u64_p),
@@ -2055,13 +2045,6 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                     m_shots = self.np_rng.integers(
                         0, 2, size=self.batch_size, dtype=np.bool_
                     )
-                    if not hasattr(meta, "_cpp_gx_i64"):
-                        meta._cpp_gx_i64 = np.ascontiguousarray(
-                            meta.G_x_indices, dtype=np.int64
-                        )
-                        meta._cpp_gz_i64 = np.ascontiguousarray(
-                            meta.G_z_indices, dtype=np.int64
-                        )
                     lib.engine_batch_mixed_substep(
                         self._cpp_eng,
                         1,
@@ -2072,10 +2055,10 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                         meta.b_rot_words.ctypes.data_as(u64_p),
                         meta.e_p_words.ctypes.data_as(u64_p),
                         meta.kappa_rot,
-                        len(meta._cpp_gx_i64),
-                        meta._cpp_gx_i64.ctypes.data_as(i64_p),
-                        len(meta._cpp_gz_i64),
-                        meta._cpp_gz_i64.ctypes.data_as(i64_p),
+                        len(meta.G_x_indices),
+                        meta.G_x_indices.ctypes.data_as(i64_p),
+                        len(meta.G_z_indices),
+                        meta.G_z_indices.ctypes.data_as(i64_p),
                         xs_c.ctypes.data_as(u8_p),
                         m_shots.ctypes.data_as(u8_p),
                         *self._cpp_out_args(),

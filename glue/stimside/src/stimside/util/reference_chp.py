@@ -234,8 +234,8 @@ class RandMeasMeta:
     b_rot_words: NDArray[np.uint64]
     e_p_words: NDArray[np.uint64]
     kappa_rot: int
-    G_x_indices: NDArray[np.intp]
-    G_z_indices: NDArray[np.intp]
+    G_x_indices: NDArray[np.int64]
+    G_z_indices: NDArray[np.int64]
     reset_flip_ref: bool = False
 
 
@@ -262,6 +262,12 @@ class UnitaryStepMeta:
     _cocycle_cache: dict[int, InverseCliffordCocycle] = dataclasses.field(default_factory=dict)
     are_groups_disjoint: bool = True
     _packed_words: PackedSymplecticTables | None = None
+    _cpp_cz_qs: tuple[NDArray[np.int64], NDArray[np.int64]] | None = (
+        dataclasses.field(default=None, init=False, repr=False, compare=False)
+    )
+    _cpp_cocycle_arrays: (
+        tuple[int, int, int, NDArray[np.int64], list[NDArray]] | None
+    ) = dataclasses.field(default=None, init=False, repr=False, compare=False)
 
     def get_evict_words(
         self, n_words: int
@@ -295,6 +301,7 @@ class UnitaryStepMeta:
                 group_pws.append(tmp_chp.snapshot_packed())
             self._group_packed_words = group_pws
             self._cocycle_cache.clear()
+            self._cpp_cocycle_arrays = None
         return self._group_packed_words
 
     def _get_packed_words(self, n_words: int) -> PackedSymplecticTables:
@@ -423,7 +430,7 @@ class MeasStepMeta:
     _packed_words: PackedSymplecticTables | None = None
     num_qubits: int = 0
     _det_batch_cache: (
-        tuple[NDArray[np.intp], NDArray[np.bool_], NDArray[np.uint64]] | None
+        tuple[NDArray[np.int64], NDArray[np.bool_], NDArray[np.uint64]] | None
     ) = None
 
     def _get_packed_words(self, n_words: int) -> PackedSymplecticTables:
@@ -438,19 +445,22 @@ class MeasStepMeta:
 
     def get_det_batch_arrays(
         self,
-    ) -> tuple[NDArray[np.intp], NDArray[np.bool_], NDArray[np.uint64]]:
+    ) -> tuple[NDArray[np.int64], NDArray[np.bool_], NDArray[np.uint64]]:
         if self._det_batch_cache is None:
             num_sub = len(self.substeps)
             q_arr = np.fromiter(
-                (s.meta.q for s in self.substeps), dtype=np.intp, count=num_sub
+                (s.meta.q for s in self.substeps), dtype=np.int64, count=num_sub
             )
             m_ref_arr = np.fromiter(
                 (bool(s.meta.m_ref) for s in self.substeps),
                 dtype=np.bool_,
                 count=num_sub,
             )
-            b_sub_words = np.vstack(
-                [s.meta.beta_Z_words for s in self.substeps]  # type: ignore[union-attr]
+            b_sub_words = np.ascontiguousarray(
+                np.vstack(
+                    [s.meta.beta_Z_words for s in self.substeps]  # type: ignore[union-attr]
+                ),
+                dtype=np.uint64,
             )
             self._det_batch_cache = (q_arr, m_ref_arr, b_sub_words)
         return self._det_batch_cache
@@ -701,8 +711,12 @@ class ReferenceCHPTableau:
         p_w, p_b = p >> 6, p & 63
         p_mask = np.uint64(1 << p_b)
 
-        G_x_indices = np.flatnonzero((self.z2x[:, p_w] & p_mask) != 0)
-        G_z_indices = np.flatnonzero((self.x2x[:, p_w] & p_mask) != 0)
+        G_x_indices = np.ascontiguousarray(
+            np.flatnonzero((self.z2x[:, p_w] & p_mask) != 0), dtype=np.int64
+        )
+        G_z_indices = np.ascontiguousarray(
+            np.flatnonzero((self.x2x[:, p_w] & p_mask) != 0), dtype=np.int64
+        )
 
         a_words = aw.copy()
         b_rot_words = self.z2z[q].copy()
