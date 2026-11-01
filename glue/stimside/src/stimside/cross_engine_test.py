@@ -328,7 +328,7 @@ def test_7_end_to_end_2way_shot_for_shot_equivalence():
         MPP(0.05) X0*Z1 Y2*X3
         MRX[LEAKAGE_PROJECTION_Z: (0.05, 0) (0.95, 1) (0.8, 2)] 0 !1
         MRY[LEAKAGE_PROJECTION_Z: (0.05, 0) (0.95, 1) (0.8, 2)] 2 !3
-        I[LEAKAGE_TRANSITION_1: (1.0, 2-->U)] 0 1 2 3
+        I[LEAKAGE_TRANSITION_1: (0.6, 2-->U)] 0 1 2 3
         R 0 1 2 3
         MPAD(0.1) 0 1 1
         MPAD[LEAKAGE_MEASUREMENT: (0.9, 2) : 0 1] 0 1
