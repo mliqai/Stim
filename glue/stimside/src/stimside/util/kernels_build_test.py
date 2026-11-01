@@ -219,3 +219,16 @@ def test_coset_kernels_exports_and_checks_abi_sentinel() -> None:
     coset_kernels._LIB_INSTANCE = None
     lib = coset_kernels.get_coset_kernels_lib()
     assert lib.coset_kernels_abi_v1() == 1
+
+
+def test_packaging_single_version_source_and_no_sdist_so_globs() -> None:
+    root = Path(stimside.__file__).resolve().parents[2]
+    manifest = (root / "MANIFEST.in").read_text(encoding="utf-8")
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    setup_src = (root / "setup.py").read_text(encoding="utf-8")
+    assert "*.so" not in pyproject
+    assert "*.so" not in setup_src
+    assert "global-exclude *.so" in manifest
+    assert 'version = {attr = "stimside.__version__"}' in pyproject
+    assert "__version__" not in setup_src
+    assert 'version = "' not in pyproject

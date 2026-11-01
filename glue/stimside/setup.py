@@ -42,10 +42,8 @@ if importlib.util.find_spec("setuptools") is None:
         if candidate and os.path.isdir(candidate) and candidate not in sys.path:
             site.addsitedir(candidate)
 
-from setuptools import Extension, find_packages, setup
+from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
-
-__version__ = "0.1.0"
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -175,33 +173,8 @@ if __name__ != "__main__":
         return []
 
 else:
-    readme_path = PROJECT_ROOT / "README.md"
-    long_description = (
-        readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
-    )
-
     setup(
-        name="stimside",
-        version=__version__,
-        author="Matt McEwen, Ming Li",
-        author_email="mmcewen@google.com, mliq@google.com",
-        description="Stimside simulator to simulate loss and leakage using Stim.",
-        long_description=long_description,
-        long_description_content_type="text/markdown",
-        python_requires=">=3.10",
-        package_dir={"": "src"},
-        packages=find_packages(where="src"),
-        package_data={
-            "stimside.util": ["*.cpp", "*.h", "*.so"],
-        },
-        include_package_data=True,
         ext_modules=_get_extensions(),
         cmdclass={"build_ext": StimsideBuildExt},
-        install_requires=[
-            "numpy",
-            "stim",
-            "sinter",
-            "pymatching",
-        ],
         options={"build": {"build_base": "python_build_stimside"}},
     )
