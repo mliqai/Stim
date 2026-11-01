@@ -117,3 +117,45 @@ def test_batched_sampler_without_records_counts_leak_errors():
     )
     assert stats.shots == 20
     assert stats.errors == 20
+
+
+def test_6_tableside_batch_size_greater_than_one_and_sampler():
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
+        LeakageUint8 as LeakageUint8Tableau,
+    )
+    from stimside.simulator_tableau import TablesideSimulator
+
+    circuit = stim.Circuit(
+        """
+        R 0 1
+        H 0
+        CX 0 1
+        I[LEAKAGE_TRANSITION_1: (0.5, U-->2)] 0
+        M[LEAKAGE_PROJECTION_Z: (0.05, 0) (0.95, 1) (0.8, 2)] 0 1
+        DETECTOR rec[-1] rec[-2]
+        OBSERVABLE_INCLUDE(0) rec[-1] rec[-2]
+        """
+    )
+    handler = LeakageUint8Tableau().compile_op_handler(circuit=circuit, batch_size=6)
+    sim = TablesideSimulator(
+        circuit,
+        compiled_op_handler=handler,
+        seed=77,
+        batch_size=6,
+        record_unleaked_to_leaked=True,
+    )
+    t_ev = sim.run()
+    assert sim.get_final_measurement_records().shape == (6, 2)
+    assert sim.get_detector_flips().shape == (6, 1)
+    assert sim.get_observable_flips().shape == (6, 1)
+    assert len(t_ev) == 6
+
+    sampler = TablesideSampler(
+        op_handler=LeakageUint8Tableau(),
+        seed=77,
+        batch_size=4,
+        dem_decoder=BaseDecoder(decoder="vacuous"),
+    )
+    compiled = sampler.compiled_sampler_for_task(sinter.Task(circuit=circuit))
+    stats = compiled.sample(8)
+    assert stats.shots == 8

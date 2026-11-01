@@ -4,14 +4,23 @@ Runs with different seeds must not share random streams and consecutive batches 
 correlated seeds, while sync_tableside_rng keeps Tableside and Cosetside in lockstep shot for shot.
 """
 
+import os
+
 import numpy as np
 import pytest
 import stim  # type: ignore[import-untyped]
 
+from stimside.dem_generators.leakage_decoder import BaseDecoder
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
+from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import (
+    LeakageUint8 as LeakageUint8Flip,
+)
 from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
     LeakageUint8 as LeakageUint8Tableau,
 )
+from stimside.sampler_coset import CosetsideSampler
+from stimside.sampler_flip import FlipsideSampler
+from stimside.sampler_tableau import TablesideSampler
 from stimside.simulator_coset import CosetsideSimulator
 from stimside.simulator_tableau import TablesideSimulator
 
@@ -188,3 +197,88 @@ def test_seed_must_be_an_integer_in_the_uint64_range(path):
     ref = _records(path, _RANDOM_12Q, 5, 2)
     for seed in (np.int64(5), np.uint64(5)):
         np.testing.assert_array_equal(_records(path, _RANDOM_12Q, seed, 2), ref)
+
+
+def test_seed_none_is_random_each_run():
+    """Regression test for Point 4 (A5): seed=None produces random outcomes across instances and .clear()."""
+    circuit = stim.Circuit(
+        """
+        R 0
+        X_ERROR(0.5) 0
+        I[LEAKAGE_TRANSITION_1: (0.5, U-->2)] 0
+        M[LEAKAGE_PROJECTION_Z: (0.0, 0) (1.0, 1) (0.5, 2)] 0
+        """
+    )
+    batch_size = 64
+
+    for sync_rng in (False, True):
+        c1 = CosetsideSimulator(
+            circuit,
+            batch_size=batch_size,
+            compiled_op_handler=LeakageUint8Coset().compile_op_handler(
+                circuit=circuit, batch_size=batch_size
+            ),
+            seed=None,
+            sync_tableside_rng=sync_rng,
+        )
+        c1.run()
+        r_c1_a = c1.get_final_measurement_records().copy()
+        c1.clear()
+        c1.run()
+        r_c1_b = c1.get_final_measurement_records().copy()
+
+        c2 = CosetsideSimulator(
+            circuit,
+            batch_size=batch_size,
+            compiled_op_handler=LeakageUint8Coset().compile_op_handler(
+                circuit=circuit, batch_size=batch_size
+            ),
+            seed=None,
+            sync_tableside_rng=sync_rng,
+        )
+        c2.run()
+        r_c2 = c2.get_final_measurement_records().copy()
+
+        assert not np.array_equal(r_c1_a, r_c1_b)
+        assert not np.array_equal(r_c1_a, r_c2)
+
+    t1 = TablesideSimulator(
+        circuit,
+        batch_size=1,
+        compiled_op_handler=LeakageUint8Tableau().compile_op_handler(
+            circuit=circuit, batch_size=1
+        ),
+        seed=None,
+    )
+    bits_t1 = []
+    for _ in range(40):
+        t1.clear()
+        t1.run()
+        bits_t1.append(int(t1.get_final_measurement_records()[0, 0]))
+    assert len(set(bits_t1)) == 2, (
+        "Expected both 0 and 1 across TablesideSimulator.clear() with seed=None"
+    )
+
+
+def test_3_sampler_distinct_seeds_across_compiles_and_workers(monkeypatch):
+    for sampler_cls, handler_cls in (
+        (FlipsideSampler, LeakageUint8Flip),
+        (TablesideSampler, LeakageUint8Tableau),
+        (CosetsideSampler, LeakageUint8Coset),
+    ):
+        sampler = sampler_cls(
+            op_handler=handler_cls(), dem_decoder=BaseDecoder(), seed=42, batch_size=4
+        )
+        s0 = sampler._next_compiled_seed()
+        s1 = sampler._next_compiled_seed()
+        assert s0 == 42
+        assert s1 is not None and s1 != 42
+
+        sampler_w = sampler_cls(
+            op_handler=handler_cls(), dem_decoder=BaseDecoder(), seed=42, batch_size=4
+        )
+        orig_pid = os.getpid()
+        monkeypatch.setattr(os, "getpid", lambda: orig_pid + 99)
+        s_worker = sampler_w._next_compiled_seed()
+        assert s_worker is not None and s_worker != 42 and s_worker != s1
+        monkeypatch.setattr(os, "getpid", lambda: orig_pid)

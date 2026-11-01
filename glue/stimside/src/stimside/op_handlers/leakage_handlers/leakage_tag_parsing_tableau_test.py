@@ -519,3 +519,24 @@ def test_controlled_error_totals_and_conditioned_states_ordering() -> None:
     )
     assert p_self is not None and p_self.args == (("U", 3, 2),)
     assert p_other is not None and p_other.args == ((3, 2, "U"),)
+
+
+def test_1a_tag_registry_widened_leakage_projection_z():
+    from stimside.op_handlers.leakage_handlers.tag_registry import parse_leakage_tag
+
+    allowed = ("M", "MZ", "MR", "MRZ", "MX", "MY", "MRX", "MRY")
+    for g in allowed:
+        c = stim.Circuit(
+            f"{g}[LEAKAGE_PROJECTION_Z: (0.05, 0) (0.95, 1) (0.8, 2)] 0"
+        )
+        for sim_kind in ("flip", "tableau"):
+            parsed = parse_leakage_tag(c[0], simulator=sim_kind)
+            assert parsed is not None
+
+    for bad_gate in ("R", "H", "CX", "MPAD"):
+        c = stim.Circuit(
+            f"{bad_gate}[LEAKAGE_PROJECTION_Z: (0.05, 0) (0.95, 1) (0.8, 2)] 0 1"
+        )
+        for sim_kind in ("flip", "tableau"):
+            with pytest.raises(ValueError):
+                parse_leakage_tag(c[0], simulator=sim_kind)

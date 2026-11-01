@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 
 import numpy as np
+import pytest
 import stim
 
 from stimside._coset.reference_compile import CompiledReferenceCircuit, MeasStepMeta
@@ -79,3 +80,91 @@ def test_correlated_error_occurred_initialized_and_reset_on_clear() -> None:
     assert not np.any(sim._correlated_error_occurred)
     sim.run()
     assert np.all(sim.get_final_measurement_records()[:, 0])
+
+
+@pytest.mark.parametrize("sync_rng", [False, True])
+@pytest.mark.parametrize(
+    "prep_ops,reset_op,meas_op,expected_meas",
+    [
+        ("X 0", "R 0", "M 0", [0]),
+        ("X 0", "MR 0", "M 0", [1, 0]),
+        ("H 0\nZ 0", "RX 0", "MX 0", [0]),
+        ("H 0\nZ 0", "MRX 0", "MX 0", [1, 0]),
+        ("H 0\nS 0\nZ 0", "RY 0", "MY 0", [0]),
+        ("H 0\nS 0\nZ 0", "MRY 0", "MY 0", [1, 0]),
+    ],
+)
+def test_coset_resets_when_m_ref_is_one(
+    sync_rng: bool,
+    prep_ops: str,
+    reset_op: str,
+    meas_op: str,
+    expected_meas: list[int],
+):
+    """Regression test for N1 & N6: CosetsideSimulator resets and measure-resets when m_ref == 1."""
+    circuit = stim.Circuit(f"{prep_ops}\n{reset_op}\n{meas_op}")
+    batch_size = 16
+    handler = LeakageUint8Coset().compile_op_handler(
+        circuit=circuit, batch_size=batch_size
+    )
+    sim = CosetsideSimulator(
+        circuit,
+        compiled_op_handler=handler,
+        batch_size=batch_size,
+        seed=123,
+        sync_tableside_rng=sync_rng,
+    )
+    sim.run()
+    records = sim.get_final_measurement_records()
+    assert records.shape == (batch_size, len(expected_meas))
+    for idx, exp_val in enumerate(expected_meas):
+        assert np.all(records[:, idx] == bool(exp_val))
+
+
+def test_coset_resets_when_m_ref_is_one_with_active_mrqf():
+    """Verify resets when m_ref == 1 and shots have active MRQF states (d >= 1)."""
+    circuit = stim.Circuit(
+        """
+        I[LEAKAGE_TRANSITION_1: (0.5, 0-->2)] 0
+        H 1
+        CZ 0 1
+        X 0
+        MR 0
+        M 0
+        """
+    )
+    batch_size = 64
+    handler = LeakageUint8Coset().compile_op_handler(
+        circuit=circuit, batch_size=batch_size
+    )
+    sim = CosetsideSimulator(
+        circuit,
+        compiled_op_handler=handler,
+        batch_size=batch_size,
+        seed=42,
+    )
+    sim.run()
+    records = sim.get_final_measurement_records()
+    assert np.all(records[:, 1] == False)
+
+
+def test_conditional_pauli_noise_duplicate_targets():
+    """Regression test for Bug 4: conditional X_ERROR(1.0) 0 0 cancels out on unleaked shots."""
+    circuit = stim.Circuit(
+        """
+        I[LEAKAGE_TRANSITION_1: (0.5, U-->2)] 1
+        X_ERROR[CONDITIONED_ON_OTHER: U : 1 1](1.0) 0 0
+        M 0
+        """
+    )
+    handler = LeakageUint8Coset().compile_op_handler(
+        circuit=circuit, batch_size=64
+    )
+    sim = CosetsideSimulator(
+        circuit, compiled_op_handler=handler, batch_size=64, seed=99
+    )
+    sim.run()
+    recs = sim.get_final_measurement_records()[:, 0]
+    assert np.all(recs == False), (
+        "X_ERROR(1.0) 0 0 should apply X^2 = I on unleaked shots"
+    )
