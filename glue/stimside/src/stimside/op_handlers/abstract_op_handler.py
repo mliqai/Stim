@@ -1,5 +1,4 @@
 import abc
-import dataclasses
 from typing import Union, TypeVar, TYPE_CHECKING, Generic
 
 import stim  # type: ignore[import-untyped]
@@ -11,7 +10,6 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
-@dataclasses.dataclass
 class OpHandler(abc.ABC, Generic[T]):
     """An object defining an extra behaviours in a stim circuit.
 
@@ -25,6 +23,7 @@ class OpHandler(abc.ABC, Generic[T]):
     owns and controls, which can hold state specific to that CompiledSampler instance.
     """
 
+    @abc.abstractmethod
     def compile_op_handler(
         self, *, circuit: stim.Circuit, batch_size: int
     ) -> "CompiledOpHandler[T]":

@@ -1,8 +1,6 @@
 import dataclasses
 from typing import ClassVar
 
-import numpy as np
-
 
 @dataclasses.dataclass(frozen=True)
 class LeakageMeasurementParams:
@@ -65,11 +63,3 @@ class LeakageMeasurementParams:
         for prob, state in self.args:
             prob_for_input_state[state] = prob
         return prob_for_input_state
-
-    def sample_projections(
-        self, state: int, num_samples: int, np_rng: np.random.Generator
-    ):
-        """given a state, return samples for readout values with the appropriate probability."""
-        if state not in self.prob_for_input_state:
-            raise ValueError(f"Can't sample projections for unspecified state {state}.")
-        return np_rng.random(num_samples) < self.prob_for_input_state[state]

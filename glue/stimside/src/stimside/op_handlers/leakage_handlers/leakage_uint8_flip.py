@@ -153,17 +153,6 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
         target_mask[target_indices, :] = True
         return target_mask
 
-    def make_pair_target_masks(
-        self, op: stim.CircuitInstruction
-    ) -> tuple[Bool2DArray, Bool2DArray]:
-        """return two bool masks for qubits in the odd and even targets respectively."""
-        target_indices = [t.value for t in op.targets_copy()]
-        odd_target_mask = np.zeros_like(self.state, dtype=bool)
-        even_target_mask = np.zeros_like(self.state, dtype=bool)
-        odd_target_mask[target_indices[::2], :] = 1
-        even_target_mask[target_indices[1::2], :] = 1
-        return odd_target_mask, even_target_mask
-
     def mpad_z_collapse_targets(self, op: stim.CircuitInstruction) -> list[int] | None:
         """Qubits a MPAD[LEAKAGE_MEASUREMENT] with 0/1 keys Z-collapses (else None).
 

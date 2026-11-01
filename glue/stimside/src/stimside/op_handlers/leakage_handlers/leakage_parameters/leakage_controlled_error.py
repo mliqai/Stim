@@ -4,7 +4,6 @@ from typing import ClassVar, Literal
 import numpy as np
 
 Pauli = Literal["X", "Y", "Z"]
-ControlledErrorArg = tuple[float, int, Pauli]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -15,13 +14,11 @@ class LeakageControlledErrorParams:
     from_tag: str
 
     # COMPUTED ATTRIBUTES
-    arg_by_input_state: dict[int, ControlledErrorArg] = dataclasses.field(init=False)
     args_by_input_state: dict[int, tuple[tuple[Pauli, float], ...]] = dataclasses.field(
         init=False
     )
 
     def __post_init__(self):
-        object.__setattr__(self, "arg_by_input_state", self._build_arg_by_input_state())
         object.__setattr__(
             self, "args_by_input_state", self._build_args_by_input_state()
         )
@@ -60,12 +57,6 @@ class LeakageControlledErrorParams:
                 raise ValueError(
                     f"{self.name} total probability {total_p}>1 for state {state}"
                 )
-
-    def _build_arg_by_input_state(self):
-        arg_for_input_state = {}
-        for prob, state, pauli in self.args:
-            arg_for_input_state[state] = (prob, state, pauli)
-        return arg_for_input_state
 
     def _build_args_by_input_state(self):
         args_for_input_state: dict[int, list[tuple[Pauli, float]]] = {}

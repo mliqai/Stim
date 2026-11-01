@@ -61,10 +61,6 @@ class LeakageTransitionZParams:
                 )
             if s0 == s1:
                 raise ValueError(f"{self.name} has identity transition {s0}->{s1}")
-            if s0 in ["V"]:
-                raise ValueError(f"{self.name} has invalid input state {s0}->{s1}")
-            if s1 in ["V"]:
-                raise ValueError(f"{self.name} has invalid output state {s0}->{s1}")
 
     def _build_args_by_input_state(self):
         args_by_input = {}
