@@ -1,4 +1,3 @@
-import itertools as it
 from collections.abc import Iterable
 from typing import Literal
 
@@ -6,6 +5,7 @@ import numpy as np
 import stim  # type: ignore[import-untyped]
 
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
+from stimside.util.circuit import apply_coords_op
 from stimside.util.known_states import (
     _replays,
     _unroll_circuit,
@@ -680,27 +680,7 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
 
     def _do_instruction(self, op: stim.CircuitInstruction):
         """for each instruction, update the state of the simulator."""
-        if op.name == "QUBIT_COORDS":
-            [gt] = op.targets_copy()
-            qubit_idx = gt.qubit_value
-
-            self.qubit_coords[qubit_idx] = [
-                c + s
-                for c, s in zip(
-                    op.gate_args_copy(), it.chain(self.coords_shifts, it.repeat(0))
-                )
-            ]
-
-            self.qubit_tags[qubit_idx] = op.tag
-
-        elif op.name == "SHIFT_COORDS":
-            shifts = op.gate_args_copy()
-            for i, s in enumerate(shifts):
-                if i >= len(self.coords_shifts):
-                    self.coords_shifts.append(s)
-                else:
-                    self.coords_shifts[i] += s
-
+        apply_coords_op(op, self.qubit_coords, self.qubit_tags, self.coords_shifts)
         self.compiled_op_handler.handle_op(op=op, sss=self)
         self._circuit_time += 1
 

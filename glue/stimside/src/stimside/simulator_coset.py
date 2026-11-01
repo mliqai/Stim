@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes
-import itertools as it
 from typing import Any, Callable, Iterable, Literal, Sequence
 
 import numpy as np
@@ -9,6 +8,7 @@ from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
+from stimside.util.circuit import apply_coords_op
 from stimside.util.coset_kernels import (
     get_coset_kernels_lib,
     i8_p,
@@ -1122,26 +1122,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                     )
 
     def _do_instruction(self, op: stim.CircuitInstruction) -> None:
-        if op.name == "QUBIT_COORDS":
-            [gt] = op.targets_copy()
-            qubit_idx = gt.qubit_value
-            self.qubit_coords[qubit_idx] = [
-                c + s
-                for c, s in zip(
-                    op.gate_args_copy(), it.chain(self.coords_shifts, it.repeat(0))
-                )
-            ]
-            self.qubit_tags[qubit_idx] = op.tag
-            self._circuit_time += 1
-            return
-
-        if op.name == "SHIFT_COORDS":
-            shifts = op.gate_args_copy()
-            for i, s in enumerate(shifts):
-                if i >= len(self.coords_shifts):
-                    self.coords_shifts.append(s)
-                else:
-                    self.coords_shifts[i] += s
+        if apply_coords_op(op, self.qubit_coords, self.qubit_tags, self.coords_shifts):
             self._circuit_time += 1
             return
 

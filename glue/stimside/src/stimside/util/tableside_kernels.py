@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes
-import itertools as it
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +18,7 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
 from stimside.op_handlers.leakage_handlers.tag_registry import (
     parse_leakage_tag,
 )
+from stimside.util.circuit import apply_coords_op
 from stimside.util._kernel_loader import (
     find_prebuilt_so as _find_prebuilt_so_candidate,
     load_cdll,
@@ -279,27 +279,12 @@ class PrecompiledTablesideCircuit:
                 self.full_bare_insts.append(op)
                 self.ref_insts.append(op)
                 continue
-            if op_name == "SHIFT_COORDS":
-                shifts = op.gate_args_copy()
-                for i, s_val in enumerate(shifts):
-                    if i >= len(self.final_coords_shifts):
-                        self.final_coords_shifts.append(s_val)
-                    else:
-                        self.final_coords_shifts[i] += s_val
-                self.full_bare_insts.append(op)
-                self.ref_insts.append(op)
-                continue
-            if op_name == "QUBIT_COORDS":
-                [gt] = op.targets_copy()
-                q_idx = gt.qubit_value
-                self.final_qubit_coords[q_idx] = [
-                    c + s
-                    for c, s in zip(
-                        op.gate_args_copy(),
-                        it.chain(self.final_coords_shifts, it.repeat(0)),
-                    )
-                ]
-                self.final_qubit_tags[q_idx] = op.tag
+            if apply_coords_op(
+                op,
+                self.final_qubit_coords,
+                self.final_qubit_tags,
+                self.final_coords_shifts,
+            ):
                 self.full_bare_insts.append(op)
                 self.ref_insts.append(op)
                 continue

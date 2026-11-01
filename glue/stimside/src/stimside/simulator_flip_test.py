@@ -366,3 +366,69 @@ class TestFlipsideSimulator:
         fss.interactive_do(circuit[2:])
         assert fss.get_final_measurement_records().tolist() == [[True, True, False]] * self.batch_size
 
+    def test_multi_target_qubit_coords_and_shift_coords_across_engines(self) -> None:
+        from stimside.op_handlers.abstract_op_handler import _TrivialOpHandler
+        from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
+        from stimside.simulator_coset import CosetsideSimulator
+        from stimside.simulator_magic import MagicsideSimulator
+        from stimside.simulator_tableau import TablesideSimulator
+
+        circuit = stim.Circuit(
+            "QUBIT_COORDS[data](1, 2) 0 1\n"
+            "SHIFT_COORDS(10, 0, 5)\n"
+            "QUBIT_COORDS[anc](3, 4, 5) 2 3\n"
+            "M 0 1 2 3"
+        )
+        triv = _TrivialOpHandler()
+
+        tss_int = TablesideSimulator(
+            circuit=circuit,
+            compiled_op_handler=triv.compile_op_handler(circuit=circuit, batch_size=1),
+            batch_size=1,
+            seed=1,
+        )
+        tss_int.interactive_do(circuit)
+        tss_int.finish_interactive_run()
+
+        sims = [
+            self.make_simulator(circuit),
+            TablesideSimulator(
+                circuit=circuit,
+                compiled_op_handler=triv.compile_op_handler(circuit=circuit, batch_size=1),
+                batch_size=2,
+                seed=1,
+            ),
+            tss_int,
+            CosetsideSimulator(
+                circuit=circuit,
+                compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=2),
+                batch_size=2,
+                seed=1,
+            ),
+            MagicsideSimulator(circuit=circuit, batch_size=2, seed=1),
+        ]
+        want_coords = {
+            0: [1.0, 2.0],
+            1: [1.0, 2.0],
+            2: [13.0, 4.0, 10.0],
+            3: [13.0, 4.0, 10.0],
+        }
+        for sim in sims:
+            if sim is not tss_int:
+                sim.run()
+            assert sim.qubit_coords == want_coords
+            assert sim.qubit_tags == {0: "data", 1: "data", 2: "anc", 3: "anc"}
+            assert sim.coords_shifts == [10.0, 0.0, 5.0]
+
+        q_sim = MagicsideSimulator(
+            circuit=stim.Circuit(
+                "QUBIT_COORDS(1, 2) 0 1\nSHIFT_COORDS(10, 0, 5)\nQUBIT_COORDS(3, 4, 5) 2 3\nM 0 1 2 3"
+            ),
+            batch_size=2,
+            seed=1,
+            backend="QUERY",
+        )
+        q_sim.run()
+        assert q_sim.qubit_coords == want_coords
+        assert q_sim.coords_shifts == [10.0, 0.0, 5.0]
+

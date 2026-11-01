@@ -1,4 +1,3 @@
-import itertools as it
 import weakref
 from typing import Literal, Iterable
 
@@ -14,6 +13,7 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageTransition1Params,
     LeakageTransition2Params,
 )
+from stimside.util.circuit import apply_coords_op
 from stimside.util.known_states import _replays, _unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.seeding import derived_seed
@@ -424,31 +424,7 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         """for each instruction, update the state of the simulator."""
 
         # first handle simulator specific stuff
-        if op.name == "QUBIT_COORDS":
-            [gt] = op.targets_copy()  # unpack the single target
-            qubit_idx = gt.qubit_value
-
-            self.qubit_coords[qubit_idx] = [
-                c + s
-                for c, s in zip(
-                    op.gate_args_copy(), it.chain(self.coords_shifts, it.repeat(0))
-                )
-            ]
-
-            self.qubit_tags[qubit_idx] = op.tag
-            self._new_circuit.append(op)
-            if self._construct_reference_circuit:
-                self._new_reference_circuit.append(op)
-            self._circuit_time += 1
-            return
-
-        elif op.name == "SHIFT_COORDS":
-            shifts = op.gate_args_copy()
-            for i, s in enumerate(shifts):
-                if i >= len(self.coords_shifts):
-                    self.coords_shifts.append(s)
-                else:
-                    self.coords_shifts[i] += s
+        if apply_coords_op(op, self.qubit_coords, self.qubit_tags, self.coords_shifts):
             self._new_circuit.append(op)
             if self._construct_reference_circuit:
                 self._new_reference_circuit.append(op)

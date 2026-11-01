@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import itertools as it
 import math
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
@@ -14,6 +13,7 @@ import stim  # type: ignore[import-untyped]
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler, _TrivialCompiledOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageConditioningParams, LeakageMeasurementParams
 from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS
+from stimside.util.circuit import apply_coords_op
 from stimside.util.known_states import _replays, _unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.magic_compile import (
@@ -449,18 +449,6 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._batches_completed += 1
         return self.get_unleaked_to_leaked_records() if self.record_unleaked_to_leaked else None
 
-    def _apply_coord_op(self, op: stim.CircuitInstruction) -> None:
-        if op.name == "QUBIT_COORDS":
-            for gt in op.targets_copy():
-                self.qubit_coords[gt.qubit_value] = [c + s for c, s in zip(op.gate_args_copy(), it.chain(self.coords_shifts, it.repeat(0)))]
-                self.qubit_tags[gt.qubit_value] = op.tag
-        elif op.name == "SHIFT_COORDS":
-            for i, s in enumerate(op.gate_args_copy()):
-                if i >= len(self.coords_shifts):
-                    self.coords_shifts.append(s)
-                else:
-                    self.coords_shifts[i] += s
-
     def _finish_compiled_batch(
         self, cp: DirectPlan | SelectorPlan, recs: NDArray[np.bool_], tabs: list[ReferenceCHPTableau],
         exps: list[ShotExpansion], sel_bits: list[NDArray[np.bool_] | None],
@@ -472,7 +460,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._live_ref_tab = clone_reference_chp(tabs[0])
         self._live_exps = exps
         for op in self._unrolled_ops:
-            self._apply_coord_op(op)
+            apply_coords_op(op, self.qubit_coords, self.qubit_tags, self.coords_shifts)
         self._circuit_time = len(self._unrolled_ops)
 
     def _ensure_query_plan(self) -> PreparedQueryPlan:
@@ -695,8 +683,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if op.tag.startswith("CLIFFORD_FAULT"):
             for slot_idx, ch in (self._inline_faults.get(t, ()) if t < n else ((-1, c) for c in parse_clifford_fault_instruction(op, t))):
                 self._fire_fault_channel_live(slot_idx, ch)
-        elif op.name in ("QUBIT_COORDS", "SHIFT_COORDS"):
-            self._apply_coord_op(op)
+        elif apply_coords_op(op, self.qubit_coords, self.qubit_tags, self.coords_shifts):
+            pass
         else:
             self._compiled_op_handler.handle_op(op=op, sss=self)
         self._circuit_time += 1
