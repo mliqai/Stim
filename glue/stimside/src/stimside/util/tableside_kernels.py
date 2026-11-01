@@ -844,9 +844,6 @@ class CppTablesideRunner:
     ) -> str:
         if count <= 0:
             return ""
-        needed = 64 + count * 12
-        if len(self._fmt_buf) < needed:
-            self._fmt_buf = ctypes.create_string_buffer(max(65536, needed))
         if len(gate_args) > 1:
             op_prefix = f"{op_name}(" + ",".join(str(a) for a in gate_args) + ")"
             has_arg = 0
@@ -855,6 +852,9 @@ class CppTablesideRunner:
             op_prefix = op_name
             has_arg = 1 if len(gate_args) == 1 else 0
             arg0 = float(gate_args[0]) if has_arg else 0.0
+        needed = len(op_prefix) + 64 + count * 12
+        if len(self._fmt_buf) < needed:
+            self._fmt_buf = ctypes.create_string_buffer(max(65536, needed))
         n_bytes = self.lib.fast_format_stim_op(
             op_prefix.encode("ascii"),
             has_arg,

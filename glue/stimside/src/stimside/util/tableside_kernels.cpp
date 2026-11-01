@@ -234,7 +234,7 @@ int fast_format_stim_op(
     while (*op_name) *p++ = *op_name++;
     if (has_arg) {
         *p++ = '(';
-        p += std::snprintf(p, 32, "%.6g", arg0);
+        p += std::snprintf(p, 32, "%.17g", arg0);
         *p++ = ')';
     }
     for (int i = 0; i < count; ++i) {

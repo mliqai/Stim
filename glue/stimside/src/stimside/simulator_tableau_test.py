@@ -621,3 +621,21 @@ def test_batched_detection_events_are_relative_to_the_circuit_reference(
         tss.get_final_measurement_records()
     assert tss.get_detector_flips()[:, 0].tolist() == [True] * 4
     assert tss.get_final_measurement_records()[:, 0].tolist() == [False] * 4
+
+
+def test_cpp_format_op_round_trips_high_precision_gate_args():
+    p_filt = 0.12345678901234568
+    p_meas = 0.09876543210987654
+    circuit = stim.Circuit(
+        f"I[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\n"
+        f"X_ERROR({p_filt!r}) 0 1\n"
+        f"M[LEAKAGE_PROJECTION_Z: ({p_meas!r}, 2)] 0 1"
+    )
+    tss = _leakage_tss(circuit, batch_size=1)
+    tss.run()
+    x_err_args = [
+        inst.gate_args_copy()[0]
+        for inst in tss._new_circuit
+        if inst.name == "X_ERROR"
+    ]
+    assert x_err_args == [p_filt, p_meas]
