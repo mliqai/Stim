@@ -159,9 +159,9 @@ _ITEM_ANALYSIS_META: dict[
         _Analysis,
         bool,
         bool,
-        MarginalLeakageDemGenerator | None,
-        stim.Circuit | None,
-        NDArray[np.bool_] | None,
+        MarginalLeakageDemGenerator,
+        stim.Circuit,
+        NDArray[np.bool_],
         ShotLeakageEvents | None,
     ],
 ] = {}
@@ -172,9 +172,9 @@ def _register_item_analysis(
     analysis: _Analysis,
     decompose_errors: bool,
     reweight_only: bool,
-    generator: MarginalLeakageDemGenerator | None = None,
-    circuit: stim.Circuit | None = None,
-    record_1d: NDArray[np.bool_] | None = None,
+    generator: MarginalLeakageDemGenerator,
+    circuit: stim.Circuit,
+    record_1d: NDArray[np.bool_],
     leakage_events_1d: ShotLeakageEvents | None = None,
 ) -> None:
     oid = id(obj)
@@ -202,9 +202,9 @@ def _get_item_analysis_meta(
     _Analysis,
     bool,
     bool,
-    MarginalLeakageDemGenerator | None,
-    stim.Circuit | None,
-    NDArray[np.bool_] | None,
+    MarginalLeakageDemGenerator,
+    stim.Circuit,
+    NDArray[np.bool_],
 ] | None:
     entry = _ITEM_ANALYSIS_META.get(id(obj))
     if entry is not None and entry[0]() is obj:
@@ -992,7 +992,7 @@ class MarginalLeakageDemGenerator(DemGenerator):
         )
         assert self._circuit is not None
         if records_arr.ndim == 1:
-            single_out = items[0].copy() if isinstance(items[0], np.ndarray) else items[0]
+            single_out = items[0]
             _register_item_analysis(
                 single_out,
                 analysis,
