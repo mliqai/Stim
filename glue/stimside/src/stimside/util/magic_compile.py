@@ -38,7 +38,7 @@ __all__ = [
     "CompiledRecord", "LeftUnitaryEvent", "LeftSppEvent", "LeftResetXEvent", "RightRotEvent",
     "FrameEvent", "CoordinateCompilation", "DirectPlan", "SelectorPlan", "TrajectoryRunResult",
     "clone_reference_chp", "decompose_clifford_exact", "eval_decomposition_unitary_le",
-    "gf2_symplectic_defect_rank", "parse_clifford_fault_tag", "parse_clifford_fault_instruction",
+    "parse_clifford_fault_tag", "parse_clifford_fault_instruction",
     "extract_circuit_faults", "compile_pauli_product", "apply_spp_to_reference_chp",
     "compile_coordinates", "compile_open_block", "compile_direct", "run_direct",
     "compile_selector", "sample_selector_activations", "run_selector",
@@ -139,7 +139,6 @@ class CompiledPauliAxis:
     a_words: NDArray[np.uint64]
     b_words: NDArray[np.uint64]
     kappa: int
-    n_qubits: int | None = None
 
     def as_tuple(self) -> tuple[NDArray[np.uint64], NDArray[np.uint64], int]:
         return (self.a_words, self.b_words, self.kappa)
@@ -204,10 +203,6 @@ class ExactCliffordDecomposition:
         object.__setattr__(self, "v", int(self.v) & 7)
         if not self.targets:
             object.__setattr__(self, "targets", tuple(range(self.num_qubits)))
-
-    @property
-    def omega_power(self) -> int:
-        return self.v
 
     @property
     def global_scalar(self) -> complex:
@@ -355,47 +350,6 @@ def decompose_clifford_exact(
         shift_v = int(round(math.atan2(ratio.imag, ratio.real) / (math.pi / 4.0))) & 7
         dec = ExactCliffordDecomposition(k, (v_acc + shift_v) & 7, p0_spec, r_specs_out, t_tup)
     return dec
-
-
-def gf2_symplectic_defect_rank(
-    gate_or_tableau: str | stim.Tableau,
-    targets: Sequence[int] | None = None,
-) -> int:
-    """Compute `rank_{F_2}(S_F - I_{2k})` for Eq. `eq:defect` verification."""
-    del targets
-    if isinstance(gate_or_tableau, str):
-        tab = stim.Tableau.from_named_gate(_canonical_clifford_gate_name_and_arity(gate_or_tableau)[0])
-    elif isinstance(gate_or_tableau, stim.Tableau):
-        tab = gate_or_tableau
-    else:
-        raise TypeError(f"Expected str or stim.Tableau, got {type(gate_or_tableau)!r}")
-
-    k = len(tab)
-    if k == 0:
-        return 0
-    work = np.eye(2 * k, dtype=np.uint8)
-    for q in range(k):
-        px, pz = tab.x_output(q), tab.z_output(q)
-        for j in range(k):
-            vx, vz = px[j], pz[j]
-            work[j, q] ^= 1 if vx in (1, 2) else 0
-            work[k + j, q] ^= 1 if vx in (2, 3) else 0
-            work[j, k + q] ^= 1 if vz in (1, 2) else 0
-            work[k + j, k + q] ^= 1 if vz in (2, 3) else 0
-
-    rank = 0
-    for col in range(2 * k):
-        nz = np.flatnonzero(work[rank:, col])
-        if len(nz) == 0:
-            continue
-        piv = rank + int(nz[0])
-        if piv != rank:
-            work[[rank, piv]] = work[[piv, rank]]
-        for r in np.flatnonzero(work[:, col]):
-            if int(r) != rank:
-                work[int(r)] ^= work[rank]
-        rank += 1
-    return rank
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +621,6 @@ class LeakageBarrierRecord:
     meas_index_start: int = 0
     num_measurements: int = 0
     params: LeakageParams | None = None
-    n_qubits: int | None = None
 
 
 CompiledRecord: TypeAlias = (
@@ -757,7 +710,7 @@ def compile_pauli_product(
         a_acc ^= aw
         b_acc ^= bw
     kap_acc = validate_hermitian_pauli(a_acc, b_acc, kap_acc)
-    return CompiledPauliAxis(np.ascontiguousarray(a_acc), np.ascontiguousarray(b_acc), kap_acc, ref_chp.num_qubits)
+    return CompiledPauliAxis(np.ascontiguousarray(a_acc), np.ascontiguousarray(b_acc), kap_acc)
 
 
 def _compile_clifford_factors(
@@ -1026,7 +979,7 @@ def _validate_and_emit_non_magic_tagged_op(
     canon_name = _canonical_gate_data(op.name).name
     n_meas = _instruction_num_measurements(op, canon_name)
     out_records.append(
-        LeakageBarrierRecord(op, step_index, tag_prefix, next_meas_idx, n_meas, params, num_qubits)
+        LeakageBarrierRecord(op, step_index, tag_prefix, next_meas_idx, n_meas, params)
     )
     return next_meas_idx + n_meas
 
@@ -1037,7 +990,7 @@ def _slice_axis_to_qubits(ax: CompiledPauliAxis, n_qubits: int) -> CompiledPauli
     b_d = np.ascontiguousarray(ax.b_words[:n_w].copy(), dtype=np.uint64)
     a_d[-1] &= tm
     b_d[-1] &= tm
-    return CompiledPauliAxis(a_words=a_d, b_words=b_d, kappa=ax.kappa, n_qubits=n_qubits)
+    return CompiledPauliAxis(a_words=a_d, b_words=b_d, kappa=ax.kappa)
 
 
 def _restrict_tableau_to_data(
@@ -1442,7 +1395,7 @@ def _canonical_unsigned_axis(ax: CompiledPauliAxis) -> tuple[CompiledPauliAxis, 
     if diff == 0:
         return ax, False
     if diff == 2:
-        return CompiledPauliAxis(ax.a_words, ax.b_words, ab_par, ax.n_qubits), True
+        return CompiledPauliAxis(ax.a_words, ax.b_words, ab_par), True
     raise ValueError(f"Non-Hermitian CompiledPauliAxis: {ax}")
 
 
@@ -1478,8 +1431,6 @@ def _walsh_expand_subblock(
     axes: Sequence[CompiledPauliAxis],
     poly_items: Sequence[tuple[int, int]],
     global_v_mod8: int,
-    *,
-    n_qubits_exact: bool = True,
 ) -> CompiledPauliBlock:
     """Compute exact 2^r Walsh-Hadamard Pauli sum for `r` commuting axes."""
     r = len(axes)
@@ -1487,7 +1438,7 @@ def _walsh_expand_subblock(
     if r == 0:
         return CompiledPauliBlock(
             n_qubits=n_qubits, mode="pauli_sum", global_scalar=OMEGA_POWERS[global_v_mod8 & 7],
-            is_unitary=True, is_identity=True, n_qubits_exact=n_qubits_exact,
+            is_unitary=True, is_identity=True,
         )
     dim = 1 << r
     s_grid = np.arange(dim, dtype=np.uint64)
@@ -1526,30 +1477,7 @@ def _walsh_expand_subblock(
         b_words=np.ascontiguousarray(prod_b[nz_masks], dtype=np.uint64),
         kappas=np.ascontiguousarray(prod_k[nz_masks], dtype=np.uint8),
         global_scalar=1.0 + 0.0j, is_unitary=True, is_identity=False,
-        n_qubits_exact=n_qubits_exact,
     )
-
-
-def _extract_record_nq_hint(rec: CompiledRecord) -> int | None:
-    if isinstance(rec, CompiledOpenBlockRecord):
-        return rec.block.n_qubits if rec.block.n_qubits_exact else None
-    if isinstance(rec, LeakageBarrierRecord):
-        return rec.n_qubits
-    cand_axes: Sequence[CompiledPauliAxis | None] = ()
-    if isinstance(rec, MagicTermRecord):
-        cand_axes = rec.term.axes
-    elif isinstance(rec, (MeasurementRecord, ResetRecord)):
-        cand_axes = (rec.obs_axis,)
-    elif isinstance(rec, (CorrelatedNoiseRecord, FeedbackPauliRecord)):
-        cand_axes = (rec.axis,)
-    elif isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord)):
-        cand_axes = rec.branch_axes
-    elif isinstance(rec, DirectFaultSlotRecord):
-        cand_axes = tuple(ax for bf in rec.branch_factors for ax in (bf.p0, *bf.r_axes))
-    for ax in cand_axes:
-        if ax is not None and ax.n_qubits is not None:
-            return ax.n_qubits
-    return None
 
 
 def compile_open_block(
@@ -1570,22 +1498,9 @@ def compile_open_block(
         rec_seq: Sequence[CompiledRecord] = records.raw_records
     else:
         rec_seq = records
-
     if n_qubits is None:
-        exact_hint: int | None = None
-        inferred_nq = 1
-        for rec in rec_seq:
-            hint = _extract_record_nq_hint(rec)
-            if hint is not None:
-                exact_hint = hint
-                break
-            if isinstance(rec, MagicTermRecord) and rec.term.axes:
-                inferred_nq = max(inferred_nq, rec.term.axes[0].a_words.shape[0] * 64)
-            elif isinstance(rec, CompiledOpenBlockRecord):
-                inferred_nq = max(inferred_nq, rec.block.n_qubits)
-        n_q, nq_exact = (exact_hint, True) if exact_hint is not None else (inferred_nq, False)
-    else:
-        n_q, nq_exact = int(n_qubits), True
+        raise ValueError("compile_open_block requires explicit n_qubits when records is not CoordinateCompilation")
+    n_q = int(n_qubits)
 
     out_records: list[CompiledRecord] = []
     cur_axes: list[CompiledPauliAxis] = []
@@ -1631,10 +1546,10 @@ def compile_open_block(
         if r == 0:
             block_obj = CompiledPauliBlock(
                 n_qubits=n_q, mode="pauli_sum", global_scalar=OMEGA_POWERS[v0],
-                is_unitary=True, is_identity=True, n_qubits_exact=nq_exact,
+                is_unitary=True, is_identity=True,
             )
         elif budget >= 2 and r <= c2_max_rank and (1 << r) <= max(4096, budget * 16):
-            cand = _walsh_expand_subblock(n_q, axes_tup, sorted_items, v0, n_qubits_exact=nq_exact)
+            cand = _walsh_expand_subblock(n_q, axes_tup, sorted_items, v0)
             assert cand.coeffs is not None
             if len(cand.coeffs) <= budget:
                 block_obj = cand
@@ -1649,7 +1564,7 @@ def compile_open_block(
             block_obj = CompiledPauliBlock(
                 n_qubits=n_q, mode="sequential", steps=tuple(seq_steps),
                 global_scalar=OMEGA_POWERS[v_seq], is_unitary=True,
-                is_identity=(len(seq_steps) == 0), n_qubits_exact=nq_exact,
+                is_identity=(len(seq_steps) == 0),
             )
 
         out_records.append(CompiledOpenBlockRecord(block_obj, axes_tup))

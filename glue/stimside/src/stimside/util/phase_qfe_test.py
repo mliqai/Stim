@@ -1303,8 +1303,7 @@ def test_m1_p1_sequence_terms_and_compiled_block_validation() -> None:
         kappas=np.array([0], dtype=np.uint8),
     )
     blk_seq_dirty = CompiledPauliBlock(
-        n_qubits=64,
-        n_qubits_exact=False,
+        n_qubits=3,
         mode="sequential",
         steps=(
             CompiledPauliBlockStep(

@@ -530,36 +530,6 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
         )
 
     ############################################################################
-    # mask methods: make and manipulate random masks (2D bool arrays)
-    ############################################################################
-
-    def _make_random_mask(self, p: float, shape: tuple[int, int]) -> Bool2DArray:
-        """returns a new mask (a 2D bool array of the given shape)
-
-        Each element is true with probability p
-        """
-        out = self._flip_simulator.generate_bernoulli_samples(
-            p=p, num_samples=np.prod(shape), bit_packed=False, out=None
-        )
-        return out.reshape(shape)
-
-    def _fill_random_mask(self, p: float, array: Bool2DArray) -> None:
-        """given an existing mask, fill it with new random samples.
-
-        because generate_bernoulli_samples demands a 1D bool array, this is only
-        allowed if the array you're handing in is contiguous and can be reshaped to 1D
-        without making a copy.
-        """
-        view = array.reshape(-1)
-        if view.base is not array:
-            raise ValueError(
-                "received an array that numpy cannot reshape without making a copy. "
-            )
-        self._flip_simulator.generate_bernoulli_samples(
-            p=p, num_samples=np.prod(view.shape), bit_packed=False, out=view
-        )
-
-    ############################################################################
     # known states methods:
     ############################################################################
 

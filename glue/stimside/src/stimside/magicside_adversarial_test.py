@@ -30,7 +30,7 @@ def _axis_1q(q: int, pauli: str, n_qubits: int, neg: bool = False) -> mc.Compile
     a_w = bit if pauli in ("X", "Y") else zero
     b_w = bit if pauli in ("Z", "Y") else zero
     kap = ((1 if pauli == "Y" else 0) + (2 if neg else 0)) & 3
-    return mc.CompiledPauliAxis(a_w, b_w, kap, n_qubits)
+    return mc.CompiledPauliAxis(a_w, b_w, kap)
 
 
 @pytest.mark.parametrize("budget", [1, 64])

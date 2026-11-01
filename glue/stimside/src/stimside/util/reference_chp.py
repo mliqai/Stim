@@ -764,33 +764,6 @@ class ReferenceCHPTableau:
             reset_flip_ref=reset_flip_ref,
         )
 
-    def peek_pauli_expectation(
-        self, pauli_terms: Sequence[tuple[int, str]]
-    ) -> list[int]:
-        """Read-only evaluation of Pauli expectation <psi| prod_{(q, P)} P_q |psi> in {+1, -1, 0} by accumulating row products into temporary scratch vectors without mutating internal tables."""
-        if len(pauli_terms) == 0:
-            return [1]
-        aw_acc = np.zeros(self.n_words, dtype=np.uint64)
-        bw_acc = np.zeros(self.n_words, dtype=np.uint64)
-        kap_acc = 0
-        tabs = (self.x2x, self.x2z, self.z2x, self.z2z, self.x_kap, self.z_kap)
-        for q, p_char in pauli_terms:
-            p_upper = p_char.upper()
-            if p_upper == "I":
-                continue
-            if p_upper not in ("X", "Y", "Z"):
-                raise ValueError(f"Unrecognised Pauli character: {p_char}")
-            aw_t, bw_t, kap_t = _pauli_image(p_upper, q, *tabs)
-
-            dp_acc = int(np.bitwise_count(bw_acc & aw_t).sum()) & 1
-            aw_acc ^= aw_t
-            bw_acc ^= bw_t
-            kap_acc = (kap_acc + kap_t + (dp_acc << 1)) & 3
-
-        if np.any(aw_acc):
-            return [0]
-        return [-1 if (kap_acc & 3) == 2 else 1]
-
 
 class CompiledReferenceCircuit:
     """Precompiles a stim.Circuit into a Phase 0 reference step tape without stim.Tableau conjugation."""

@@ -49,7 +49,6 @@ from stimside.util.magic_compile import (
     eval_decomposition_unitary_le,
     extract_circuit_faults,
     extract_data_expansion,
-    gf2_symplectic_defect_rank,
     parse_clifford_fault_tag,
     reconstruct_statevector,
     run_direct,
@@ -506,13 +505,13 @@ def _reconstruct_unitary_via_qfe_primitives(
         comp = PhaseQFEComponent.zero(n)
         comp.h_words[0] = np.uint64(x)
         comp.check_invariants()
-        exp = ShotExpansion.from_component(comp, weight=OMEGA_POWERS[decomp.omega_power])
+        exp = ShotExpansion.from_component(comp, weight=OMEGA_POWERS[decomp.v])
         exp = apply_pauli(exp, p0_a, p0_b, p0_k)
         for ra, rb, rk in r_axes:
             exp = apply_quarter_turn(exp, ra, rb, rk, sign=1)
             exp.check_invariants()
         U_qfe[:, x] = exp.to_statevector(endian="little")
-    return decomp.omega_power, U_qfe
+    return decomp.v, U_qfe
 
 
 def test_decompose_clifford_exact_all_stim_gates() -> None:
@@ -661,6 +660,32 @@ def test_v1_3_zero_rank_branching_and_eq_defect_bound() -> None:
     )
     r_pm = run_direct(compile_direct(c_pauli_magic, c2_budget=1), pauli_noise_trace=[1, 1, 1, 1])
     assert r_pm.expansion.d == 0 and r_pm.expansion.chi > 1
+
+    def gf2_symplectic_defect_rank(gate_name: str) -> int:
+        tab = stim.Tableau.from_named_gate(gate_name)
+        k = len(tab)
+        work = np.eye(2 * k, dtype=np.uint8)
+        for q in range(k):
+            px, pz = tab.x_output(q), tab.z_output(q)
+            for j in range(k):
+                vx, vz = px[j], pz[j]
+                work[j, q] ^= 1 if vx in (1, 2) else 0
+                work[k + j, q] ^= 1 if vx in (2, 3) else 0
+                work[j, k + q] ^= 1 if vz in (1, 2) else 0
+                work[k + j, k + q] ^= 1 if vz in (2, 3) else 0
+        rank = 0
+        for col in range(2 * k):
+            nz = np.flatnonzero(work[rank:, col])
+            if len(nz) == 0:
+                continue
+            piv = rank + int(nz[0])
+            if piv != rank:
+                work[[rank, piv]] = work[[piv, rank]]
+            for r in np.flatnonzero(work[:, col]):
+                if int(r) != rank:
+                    work[int(r)] ^= work[rank]
+            rank += 1
+        return rank
 
     # (d) Eq. eq:defect: d <= min(N, sum_j gf2_symplectic_defect_rank(F_j)) on N=6 and N=70
     for N_test, q_map in ((6, (0, 1, 2, 3, 4, 5)), (70, (0, 15, 63, 64, 65, 69))):
@@ -1636,13 +1661,15 @@ def test_malformed_gate_args_and_programmatic_channels_raise() -> None:
         with pytest.raises(ValueError):
             run_selector(sp_ok, atol=bad_atol)
 
-    # PROJECT.md contract: compile_open_block(records, *, budget=64) without explicit n_qubits
+    # compile_open_block accepts CoordinateCompilation directly or explicit n_qubits
     from stimside.util.phase_qfe import apply_compiled_block
 
     c_3q = stim.Circuit("H 0 1 2\nI[T] 0 1\nI[CCZ] 0 1 2")
     coord_3q = compile_coordinates(c_3q)
+    with pytest.raises(ValueError, match="n_qubits"):
+        compile_open_block(coord_3q.raw_records, budget=64)
     for recs_3q in (
-        compile_open_block(coord_3q.raw_records, budget=64),
+        compile_open_block(coord_3q.raw_records, n_qubits=3, budget=64),
         compile_open_block(coord_3q, budget=64),
     ):
         assert len(recs_3q) == 1 and isinstance(recs_3q[0], CompiledOpenBlockRecord)
@@ -1650,7 +1677,7 @@ def test_malformed_gate_args_and_programmatic_channels_raise() -> None:
         out_3q = apply_compiled_block(ShotExpansion.zero(3), recs_3q[0].block)
         assert isinstance(out_3q, ShotExpansion) and abs(out_3q.norm_sq() - 1.0) < 1e-12
 
-    # Manual CompiledPauliAxis without n_qubits hint also works when word count matches
+    # Manual CompiledPauliAxis with explicit n_qubits
     manual_ax = CompiledPauliAxis(
         a_words=np.array([1], dtype=np.uint64),
         b_words=np.array([0], dtype=np.uint64),
@@ -1658,6 +1685,7 @@ def test_malformed_gate_args_and_programmatic_channels_raise() -> None:
     )
     recs_man = compile_open_block(
         [MagicTermRecord(MagicPhaseTerm(axes=(manual_ax,), kind="T", epsilon=1))],
+        n_qubits=3,
         budget=64,
     )
     assert len(recs_man) == 1 and isinstance(recs_man[0], CompiledOpenBlockRecord)

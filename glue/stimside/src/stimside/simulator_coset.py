@@ -123,44 +123,38 @@ class MRQFState:
     def A_words(self) -> NDArray[np.uint64]:
         return self._A_view
 
-    @A_words.setter
-    def A_words(self, val: NDArray[np.uint64]) -> None:
-        arr = np.asarray(val, dtype=np.uint64)
-        d_new = arr.shape[0]
-        self._ensure_capacity(d_new)
-        self._d = d_new
-        if d_new > 0:
-            self._A_buf[:d_new] = arr
-        self._refresh_views()
-        self._recompute_a_union()
-
     @property
     def ell(self) -> NDArray[np.uint8]:
         return self._ell_view
-
-    @ell.setter
-    def ell(self, val: NDArray[np.uint8]) -> None:
-        arr = np.asarray(val, dtype=np.uint8)
-        d_new = arr.shape[0]
-        self._ensure_capacity(d_new)
-        self._d = d_new
-        if d_new > 0:
-            self._ell_buf[:d_new] = arr
-        self._refresh_views()
 
     @property
     def Gamma(self) -> NDArray[np.uint8]:
         return self._Gamma_view
 
-    @Gamma.setter
-    def Gamma(self, val: NDArray[np.uint8]) -> None:
-        arr = np.asarray(val, dtype=np.uint8)
-        d_new = arr.shape[0]
-        self._ensure_capacity(d_new)
-        self._d = d_new
-        if d_new > 0:
-            self._Gamma_buf[:d_new, :d_new] = arr
-        self._refresh_views()
+    @classmethod
+    def from_arrays(
+        cls,
+        num_qubits: int,
+        *,
+        A_words: NDArray[np.uint64],
+        ell: NDArray[np.uint8],
+        Gamma: NDArray[np.uint8],
+        P: Sequence[int],
+        h_words: NDArray[np.uint64] | None = None,
+    ) -> "MRQFState":
+        d = len(P)
+        st = cls(num_qubits, _init_cap=max(4, d))
+        st._d = d
+        st.P = list(P)
+        if h_words is not None:
+            np.copyto(st.h_words, np.asarray(h_words, dtype=np.uint64))
+        if d > 0:
+            st._A_buf[:d] = np.asarray(A_words, dtype=np.uint64)
+            st._ell_buf[:d] = np.asarray(ell, dtype=np.uint8)
+            st._Gamma_buf[:d, :d] = np.asarray(Gamma, dtype=np.uint8)
+        st._refresh_views()
+        st._recompute_a_union()
+        return st
 
     def _ensure_capacity(self, need_d: int) -> None:
         if need_d <= self._cap:
@@ -214,25 +208,8 @@ class MRQFState:
         clone._refresh_views()
         return clone
 
-    def _sync_external_if_needed(self) -> None:
-        if (
-            self._d != len(self.P)
-            or self.A_words.base is not self._A_buf
-            or self.ell.base is not self._ell_buf
-        ):
-            k = len(self.P)
-            self._ensure_capacity(k)
-            if k > 0:
-                self._A_buf[:k] = self.A_words
-                self._ell_buf[:k] = self.ell
-                self._Gamma_buf[:k, :k] = self.Gamma
-            self._d = k
-            self._refresh_views()
-        self._recompute_a_union()
-
     def check_invariants(self) -> None:
         """Verify Check C.1: shapes, principal-row identity A_{P, :} = I_d, symmetric zero-diagonal Gamma, ell in Z_4."""
-        self._sync_external_if_needed()
         d = len(self.P)
         assert self._d == d
         assert self.h_words.shape == (self.n_words,)
@@ -319,7 +296,6 @@ class MRQFState:
     # S4. DropVariable(j)
     def s4_drop_variable(self, j: int) -> None:
         """Remove variable slot j from A_words, ell, Gamma, and P in-place (Eq. 17)."""
-        self._sync_external_if_needed()
         k = self._d
         if k == 1:
             self._d = 0
@@ -344,7 +320,6 @@ class MRQFState:
         self, lam: NDArray[np.uint8] | Sequence[int], eps: int
     ) -> tuple[bool, float]:
         """Impose affine equation lam^T u = eps (mod 2) on the support (Eq. 16)."""
-        self._sync_external_if_needed()
         d = self._d
         first_nz = -1
         for idx in range(d):
@@ -367,7 +342,6 @@ class MRQFState:
     # S5. EliminateZero(j)
     def s5_eliminate_zero(self, j: int) -> tuple[bool, int]:
         """Sum out redundant variable j with A_j = 0 coherently (Eq. 19-20)."""
-        self._sync_external_if_needed()
         c = int(self._ell_buf[j])
         k = self._d
         lam = np.empty(k - 1, dtype=np.uint8)
@@ -384,7 +358,7 @@ class MRQFState:
                 ).astype(np.uint8)
                 outer = lam[:, None] & lam[None, :]
                 np.fill_diagonal(outer, 0)
-                self.Gamma ^= outer
+                self.Gamma[:, :] ^= outer
             return True, 1
 
         if np.any(lam):
@@ -816,7 +790,6 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         lib = self._cpp_lib
         lib.engine_clear(self._cpp_eng)
         for b, st in self._active_shots.items():
-            st._sync_external_if_needed()
             d = st._d
             in_A = np.ascontiguousarray(st._A_buf[: max(1, d)], dtype=np.uint64)
             in_ell = np.ascontiguousarray(st._ell_buf[: max(1, d)], dtype=np.uint8)

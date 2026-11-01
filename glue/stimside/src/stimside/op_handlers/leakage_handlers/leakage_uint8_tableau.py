@@ -16,7 +16,7 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
 )
 from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
 from stimside.simulator_tableau import TablesideSimulator
-from stimside.util.numpy_types import Bool2DArray, Int2DArray
+from stimside.util.numpy_types import Int2DArray
 from stimside.util.stim_workarounds import split_fused_instruction
 
 
@@ -89,16 +89,6 @@ class CompiledLeakageUint8(CompiledOpHandler[TablesideSimulator]):
             self.state.fill(0)
         else:
             self.state = np.zeros(self.num_qubits, dtype=np.uint8)
-
-    def make_target_mask(self, op: stim.CircuitInstruction) -> Bool2DArray:
-        """return a bool mask that is true if this qubit is in the op targets."""
-        target_indices = [
-            t.qubit_value if t.qubit_value is not None else t.value
-            for t in op.targets_copy()
-        ]
-        target_mask = np.zeros_like(self.state, dtype=bool)
-        target_mask[target_indices] = 1
-        return target_mask
 
     def _update_state_from_peek_Z(
         self, targets: list[int] | NDArray[np.int_], tss: TablesideSimulator
@@ -552,7 +542,8 @@ class CompiledLeakageUint8(CompiledOpHandler[TablesideSimulator]):
                     self.leakage_transition_1(sub_op, tss, params)
                 return
 
-        target_mask = self.make_target_mask(op)
+        target_mask = np.zeros_like(self.state, dtype=bool)
+        target_mask[[t.qubit_value if t.qubit_value is not None else t.value for t in raw_t]] = True
         sync_rng = getattr(tss, "_sync_tableside_rng", False)
 
         if 0 in params.args_by_input_state or 1 in params.args_by_input_state:

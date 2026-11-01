@@ -46,7 +46,8 @@ class TestCompiledLeakageUint8:
             circuit=circuit, batch_size=self.batch_size
         )
 
-        mask = cti.make_target_mask(op)
+        mask = np.zeros_like(cti.state, dtype=bool)
+        mask[cti._get_target_indices(op), :] = True
 
         expected_mask = np.zeros((circuit.num_qubits, self.batch_size), dtype=bool)
         expected_mask[0, :] = True

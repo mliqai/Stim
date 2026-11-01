@@ -43,39 +43,6 @@ def _do_copies_on_fused_step(
     tss._step_cursor = step_cursor + 1
 
 
-class LeakageStateArray(np.ndarray):
-    """2D uint8 array view (num_qubits, batch_size) that also supports 1D broadcasting and scalar truth checks."""
-
-    def __eq__(self, other: object) -> NDArray[np.bool_]:  # type: ignore[override]
-        if (
-            isinstance(other, np.ndarray)
-            and self.ndim == 2
-            and other.ndim == 1
-            and other.shape[0] == self.shape[0]
-        ):
-            return super().__eq__(other[:, None]).view(LeakageStateArray)  # type: ignore[return-value]
-        res = super().__eq__(other)
-        if isinstance(res, np.ndarray):
-            return res.view(LeakageStateArray)  # type: ignore[return-value]
-        return res  # type: ignore[return-value]
-
-    def __ne__(self, other: object) -> NDArray[np.bool_]:  # type: ignore[override]
-        if (
-            isinstance(other, np.ndarray)
-            and self.ndim == 2
-            and other.ndim == 1
-            and other.shape[0] == self.shape[0]
-        ):
-            return super().__ne__(other[:, None]).view(LeakageStateArray)  # type: ignore[return-value]
-        res = super().__ne__(other)
-        if isinstance(res, np.ndarray):
-            return res.view(LeakageStateArray)  # type: ignore[return-value]
-        return res  # type: ignore[return-value]
-
-    def __bool__(self) -> bool:
-        return bool(np.all(np.asarray(self)))
-
-
 @dataclasses.dataclass
 class LeakageUint8Coset(OpHandler[CosetsideSimulator]):
     """Batched uint8 leakage OpHandler for CosetsideSimulator reusing tableside tag parsers.
@@ -145,7 +112,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
     def state(self) -> NDArray[np.uint8]:
         if self.batch_size == 1:
             return self._state[:, 0]
-        return self._state.view(LeakageStateArray)
+        return self._state
 
     @state.setter
     def state(self, val: NDArray[np.uint8]) -> None:
@@ -170,18 +137,6 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
         self._state = np.zeros(
             (self.num_qubits, self.batch_size), dtype=np.uint8
         )
-
-    def make_target_mask(self, op: stim.CircuitInstruction) -> NDArray[np.bool_]:
-        target_indices = [
-            t.qubit_value for t in op.targets_copy() if t.qubit_value is not None
-        ]
-        if self.batch_size == 1:
-            mask_1d = np.zeros(self.num_qubits, dtype=np.bool_)
-            mask_1d[target_indices] = True
-            return mask_1d
-        mask_2d = np.zeros((self.num_qubits, self.batch_size), dtype=np.bool_)
-        mask_2d[target_indices, :] = True
-        return mask_2d
 
     def _update_state_from_peek_Z(
         self, targets: Sequence[int] | NDArray[np.int_], css: CosetsideSimulator

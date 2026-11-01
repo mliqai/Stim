@@ -720,7 +720,6 @@ class CompiledPauliBlock:
     global_scalar: complex = 1.0 + 0.0j
     is_unitary: bool = True
     is_identity: bool = False
-    n_qubits_exact: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -1390,8 +1389,7 @@ def _validate_compiled_block(block: CompiledPauliBlock, n_qubits: int | None) ->
     eff_nq = int(block.n_qubits) if n_qubits is None else n_qubits
     nw = n_words_for_qubits(eff_nq)
     if n_qubits is not None and block.n_qubits != n_qubits:
-        if block.n_qubits_exact or n_words_for_qubits(block.n_qubits) != nw:
-            raise ValueError(f"Block n_qubits={block.n_qubits} != expansion n_qubits={n_qubits}")
+        raise ValueError(f"Block n_qubits={block.n_qubits} != expansion n_qubits={n_qubits}")
     if block.mode not in ("pauli_sum", "sequential"):
         raise ValueError(f"Unknown CompiledPauliBlock mode: {block.mode!r}")
     _coerce_finite_complex(block.global_scalar, "block.global_scalar")

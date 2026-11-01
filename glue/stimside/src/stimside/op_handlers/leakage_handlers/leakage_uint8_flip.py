@@ -146,13 +146,6 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
         self._op_pair_targets_cache[op] = pairs
         return pairs
 
-    def make_target_mask(self, op: stim.CircuitInstruction) -> Bool2DArray:
-        """return a bool mask that is true if this qubit is in the op targets."""
-        target_indices = self._get_target_indices(op)
-        target_mask = np.zeros_like(self.state, dtype=bool)
-        target_mask[target_indices, :] = True
-        return target_mask
-
     def mpad_z_collapse_targets(self, op: stim.CircuitInstruction) -> list[int] | None:
         """Qubits a MPAD[LEAKAGE_MEASUREMENT] with 0/1 keys Z-collapses (else None).
 
@@ -637,7 +630,8 @@ class CompiledLeakageUint8(CompiledOpHandler[FlipsideSimulator]):
             )
 
         state_before_op = self.state.copy()
-        target_mask = self.make_target_mask(op)
+        target_mask = np.zeros_like(self.state, dtype=bool)
+        target_mask[target_indices, :] = True
         raw_in_0_mask, raw_in_1_mask = fss._get_current_known_state_masks(
             pauli="Z", circuit_time=eval_time
         )

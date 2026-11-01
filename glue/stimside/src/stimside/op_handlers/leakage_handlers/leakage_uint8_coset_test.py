@@ -63,13 +63,19 @@ class TestCompiledLeakageUint8Coset:
         assert np.all(tss._compiled_op_handler.state == 0)
 
     def test_make_target_mask(self) -> None:
+        def _make_target_mask(cti: CompiledLeakageUint8Coset, op: stim.CircuitInstruction) -> np.ndarray:
+            qs = [t.qubit_value for t in op.targets_copy() if t.qubit_value is not None]
+            mask = np.zeros_like(cti.state, dtype=bool)
+            mask[qs] = True
+            return mask
+
         circuit = stim.Circuit("CX 0 1 2 3")
         op = circuit[0]
 
         cti: CompiledLeakageUint8Coset = LeakageUint8Coset().compile_op_handler(
             circuit=circuit, batch_size=1
         )
-        mask = cti.make_target_mask(op)
+        mask = _make_target_mask(cti, op)
         expected_mask = np.zeros(circuit.num_qubits, dtype=bool)
         expected_mask[[0, 1, 2, 3]] = True
         assert np.array_equal(mask, expected_mask)
@@ -77,7 +83,7 @@ class TestCompiledLeakageUint8Coset:
         cti_batched = LeakageUint8Coset().compile_op_handler(
             circuit=circuit, batch_size=16
         )
-        mask_2d = cti_batched.make_target_mask(op)
+        mask_2d = _make_target_mask(cti_batched, op)
         assert mask_2d.shape == (4, 16)
         assert np.all(mask_2d)
 
@@ -233,8 +239,8 @@ class TestCompiledLeakageUint8Coset:
 
         assert tss.peek_z(0) == 1
         assert tss.peek_z(1) == -1
-        assert tss._compiled_op_handler.state[2] == 2
-        assert tss._compiled_op_handler.state[3] == 3
+        assert np.all(tss._compiled_op_handler.state[2] == 2)
+        assert np.all(tss._compiled_op_handler.state[3] == 3)
 
         tss.interactive_do(circuit[3])
         tss.finish_interactive_run()
@@ -246,7 +252,7 @@ class TestCompiledLeakageUint8Coset:
         assert not np.all(records[:, 3] == 0)
         assert not np.all(records[:, 3] == 1)
         assert np.all(
-            tss._compiled_op_handler.state == np.array([0, 0, 2, 3])
+            tss._compiled_op_handler.state.T == np.array([0, 0, 2, 3])
         )
 
     @pytest.mark.parametrize("op_batch", [1, 64])
@@ -266,8 +272,8 @@ class TestCompiledLeakageUint8Coset:
 
         assert tss.peek_z(0) == 1
         assert tss.peek_z(1) == -1
-        assert tss._compiled_op_handler.state[2] == 2
-        assert tss._compiled_op_handler.state[3] == 3
+        assert np.all(tss._compiled_op_handler.state[2] == 2)
+        assert np.all(tss._compiled_op_handler.state[3] == 3)
 
         tss.interactive_do(circuit[3])
         tss.finish_interactive_run()
@@ -279,7 +285,7 @@ class TestCompiledLeakageUint8Coset:
         assert not np.all(records[:, 3] == 0)
         assert not np.all(records[:, 3] == 1)
         assert np.all(
-            tss._compiled_op_handler.state == np.array([0, 0, 2, 3])
+            tss._compiled_op_handler.state.T == np.array([0, 0, 2, 3])
         )
 
     @pytest.mark.parametrize("op_batch", [1, 64])
@@ -299,7 +305,7 @@ class TestCompiledLeakageUint8Coset:
         )
         tss_a.run()
         records = tss_a.get_final_measurement_records()
-        assert tss_a._compiled_op_handler.state[0] == 2
+        assert np.all(tss_a._compiled_op_handler.state[0] == 2)
         assert np.all(records[:, 0] == 0)
 
         # Turning universal conditioning on U off allows CZ 0 1 to entangle 0 and 1
@@ -310,7 +316,7 @@ class TestCompiledLeakageUint8Coset:
         )
         tss_a_off.run()
         records_off = tss_a_off.get_final_measurement_records()
-        assert tss_a_off._compiled_op_handler.state[0] == 2
+        assert np.all(tss_a_off._compiled_op_handler.state[0] == 2)
         assert np.any(records_off[:, 0] == 0)
         assert np.any(records_off[:, 0] == 1)
 
@@ -331,7 +337,7 @@ class TestCompiledLeakageUint8Coset:
         )
         tss_b.run()
         records_b = tss_b.get_final_measurement_records()
-        assert tss_b._compiled_op_handler.state[0] == 2
+        assert np.all(tss_b._compiled_op_handler.state[0] == 2)
         assert np.all(records_b[:, 0] == 0)
 
         # Part c: CONDITIONED_ON_OTHER
@@ -350,8 +356,8 @@ class TestCompiledLeakageUint8Coset:
         )
         tss_c.run()
         records_c = tss_c.get_final_measurement_records()
-        assert tss_c._compiled_op_handler.state[0] == 2
-        assert tss_c._compiled_op_handler.state[2] == 2
+        assert np.all(tss_c._compiled_op_handler.state[0] == 2)
+        assert np.all(tss_c._compiled_op_handler.state[2] == 2)
         assert np.all(records_c[:, :] == 0)
 
     def test_surface_code_statistical_equivalence_and_speedup(self) -> None:
@@ -682,7 +688,7 @@ class TestCompiledLeakageUint8Coset:
             )
             sim_tuple.run()
             assert np.all(
-                sim_tuple._compiled_op_handler.state == np.array([2, 3])
+                sim_tuple._compiled_op_handler.state.T == np.array([2, 3])
             )
 
         # Verify non-ascending pair targets (3 2 1 0) with asymmetric output states (0_1) in batched mode
@@ -809,19 +815,23 @@ class TestCompiledLeakageUint8Coset:
         st2.check_invariants()
 
         # 3. Direct S5.4 branches (c=0, lam=0 -> eta=2; c=2, lam=0 -> FAIL, eta=0) and C.5 postselection failure
-        st_s5 = MRQFState(num_qubits=2)
-        st_s5.A_words = np.array([[0]], dtype=np.uint64)
-        st_s5.ell = np.array([0], dtype=np.uint8)
-        st_s5.Gamma = np.zeros((1, 1), dtype=np.uint8)
-        st_s5.P = [-1]
+        st_s5 = MRQFState.from_arrays(
+            2,
+            A_words=np.array([[0]], dtype=np.uint64),
+            ell=np.array([0], dtype=np.uint8),
+            Gamma=np.zeros((1, 1), dtype=np.uint8),
+            P=[-1],
+        )
         ok0, eta0 = st_s5.s5_eliminate_zero(0)
         assert ok0 and eta0 == 2
 
-        st_s5_fail = MRQFState(num_qubits=2)
-        st_s5_fail.A_words = np.array([[0]], dtype=np.uint64)
-        st_s5_fail.ell = np.array([2], dtype=np.uint8)
-        st_s5_fail.Gamma = np.zeros((1, 1), dtype=np.uint8)
-        st_s5_fail.P = [-1]
+        st_s5_fail = MRQFState.from_arrays(
+            2,
+            A_words=np.array([[0]], dtype=np.uint64),
+            ell=np.array([2], dtype=np.uint8),
+            Gamma=np.zeros((1, 1), dtype=np.uint8),
+            P=[-1],
+        )
         ok2, eta2 = st_s5_fail.s5_eliminate_zero(0)
         assert not ok2 and eta2 == 0
 
@@ -917,8 +927,23 @@ class TestCompiledLeakageUint8Coset:
         st_big.check_invariants()
 
     def test_reference_chp_peek_pauli_expectation_readonly(self) -> None:
-        """Verify ReferenceCHPTableau.peek_pauli_expectation is 100% read-only."""
-        from stimside.util.reference_chp import ReferenceCHPTableau
+        """Verify read-only Pauli expectation accumulation via _pauli_image leaves tableau unchanged."""
+        from stimside.util.reference_chp import ReferenceCHPTableau, _pauli_image
+
+        def _peek_pauli_expectation(
+            chp: ReferenceCHPTableau, pauli_terms: list[tuple[int, str]]
+        ) -> list[int]:
+            aw_acc = np.zeros(chp.n_words, dtype=np.uint64)
+            bw_acc = np.zeros(chp.n_words, dtype=np.uint64)
+            kap_acc = 0
+            tabs = (chp.x2x, chp.x2z, chp.z2x, chp.z2z, chp.x_kap, chp.z_kap)
+            for q, p_char in pauli_terms:
+                aw_t, bw_t, kap_t = _pauli_image(p_char.upper(), q, *tabs)
+                dp_acc = int(np.bitwise_count(bw_acc & aw_t).sum()) & 1
+                aw_acc ^= aw_t
+                bw_acc ^= bw_t
+                kap_acc = (kap_acc + kap_t + (dp_acc << 1)) & 3
+            return [0] if np.any(aw_acc) else [-1 if kap_acc == 2 else 1]
 
         chp = ReferenceCHPTableau(6)
         chp.do_unitary("H", [0, 2])
@@ -927,18 +952,18 @@ class TestCompiledLeakageUint8Coset:
         chp.do_unitary("X", [5])
 
         table_snapshot = chp.snapshot_packed()
-        res_1q = [chp.peek_pauli_expectation([(q, "Z")])[0] for q in range(6)]
+        res_1q = [_peek_pauli_expectation(chp, [(q, "Z")])[0] for q in range(6)]
         for a, b in zip(chp.snapshot_packed(), table_snapshot):
             assert np.array_equal(a, b)
         assert res_1q[5] == -1
         assert res_1q[0] == 0
 
-        res_bell = chp.peek_pauli_expectation([(0, "Z"), (1, "Z")])
-        res_ghz = chp.peek_pauli_expectation([(2, "X"), (3, "X"), (4, "Y")])
-        res_multi = chp.peek_pauli_expectation(
-            [(0, "Z"), (1, "Z"), (2, "X"), (3, "X"), (4, "Y"), (5, "Z")]
+        res_bell = _peek_pauli_expectation(chp, [(0, "Z"), (1, "Z")])
+        res_ghz = _peek_pauli_expectation(chp, [(2, "X"), (3, "X"), (4, "Y")])
+        res_multi = _peek_pauli_expectation(
+            chp, [(0, "Z"), (1, "Z"), (2, "X"), (3, "X"), (4, "Y"), (5, "Z")]
         )
-        res_anticomm = chp.peek_pauli_expectation([(0, "X"), (5, "Z")])
+        res_anticomm = _peek_pauli_expectation(chp, [(0, "X"), (5, "Z")])
         for a, b in zip(chp.snapshot_packed(), table_snapshot):
             assert np.array_equal(a, b)
         assert res_bell == [1]
