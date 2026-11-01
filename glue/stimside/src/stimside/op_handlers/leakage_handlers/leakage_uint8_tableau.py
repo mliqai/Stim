@@ -54,7 +54,7 @@ class LeakageUint8(OpHandler["TablesideSimulator"]):
     def compile_op_handler(
             self, *, circuit: stim.Circuit, batch_size: int
             ) -> "CompiledLeakageUint8":
-        from stimside.util.tableside_kernels import get_precompiled_circuit
+        from stimside._tableau.runner import get_precompiled_circuit
 
         pre = get_precompiled_circuit(circuit, self.unconditional_condition_on_U)
         check_tag_qubits(pre.parsed_ops, circuit.num_qubits)

@@ -19,9 +19,7 @@ ALLOWED_LAYER_DEPS: dict[str, set[str]] = {
 
 # Pre-existing runtime layering violations; shrinks monotonically to empty by end of Phase 4.
 ALLOWLIST: set[tuple[str, str]] = {
-    ("stimside.util.tableside_kernels", "stimside._native.tableside_kernels"),
-    ("stimside.util.tableside_kernels", "stimside.op_handlers.leakage_handlers.leakage_parameters"),
-    ("stimside.util.tableside_kernels", "stimside.op_handlers.leakage_handlers.tag_registry"),
+    ("stimside.op_handlers.leakage_handlers.leakage_uint8_tableau", "stimside._tableau.runner"),
 }
 
 

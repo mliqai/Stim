@@ -132,7 +132,7 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             and hasattr(compiled_op_handler, "ops_to_params")
             and hasattr(compiled_op_handler, "unconditional_condition_on_U")
         ):
-            from stimside.util.tableside_kernels import get_precompiled_circuit
+            from stimside._tableau.runner import get_precompiled_circuit
 
             self._precompiled_circuit = get_precompiled_circuit(
                 circuit, bool(getattr(compiled_op_handler, "unconditional_condition_on_U"))
@@ -199,7 +199,7 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
         if can_use_fast:
             if self._sync_tableside_rng:
-                from stimside.util.tableside_kernels import run_tableside_sync_rng
+                from stimside._tableau.runner import run_tableside_sync_rng
 
                 run_tableside_sync_rng(self, pre)
             else:
