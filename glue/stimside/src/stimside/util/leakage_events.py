@@ -26,6 +26,8 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
+from stimside.util.known_states import _unroll_circuit
+
 
 class LeakageEvent(NamedTuple):
     """A change of one qubit's leakage state in one shot.
@@ -96,8 +98,7 @@ def unrolled_to_flattened_indices(
     mapped ops must agree in name, tag and targets, and in gate args except for
     ``DETECTOR``/``QUBIT_COORDS`` (whose coordinates ``flattened()`` shifts).
     """
-    unrolled: list[stim.CircuitInstruction] = []
-    _unroll_ops(circuit, unrolled)
+    unrolled = _unroll_circuit(circuit)
     flat_ops = list(circuit.flattened())
     flat_idx = np.full(len(unrolled), -1, dtype=np.int64)
     f = -1
@@ -134,13 +135,3 @@ def unrolled_to_flattened_indices(
             f"circuit.flattened() has {len(flat_ops)} ops, more than the unrolled circuit maps to."
         )
     return flat_idx
-
-
-def _unroll_ops(circuit: stim.Circuit, out: list[stim.CircuitInstruction]) -> None:
-    for item in circuit:
-        if isinstance(item, stim.CircuitRepeatBlock):
-            body: list[stim.CircuitInstruction] = []
-            _unroll_ops(item.body_copy(), body)
-            out.extend(body * item.repeat_count)
-        else:
-            out.append(item)

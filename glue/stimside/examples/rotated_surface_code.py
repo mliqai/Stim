@@ -63,12 +63,6 @@ class TaskMetadata:
                             return_circuit.append(op)
                         else:
                             raise ValueError(f"Do not know what to do with measurement op {op.name}")
-                        
-                        # mpad_tag = "LEAKAGE_MEASUREMENT: (0.01, 0) (0.01, 1) (0.99, 2):"
-                        # for target in op.targets_copy():
-                        #     mpad_tag += " " + str(target.value)
-                        # return_circuit.append(stim.CircuitInstruction("MPAD", [0 for _ in range(len(op.targets_copy()))], tag=mpad_tag))
-
                     elif op.name == "DEPOLARIZE1":
                         return_circuit.append(stim.CircuitInstruction(op.name, op.targets_copy(), [op.gate_args_copy()[0]/3]))
                     elif op.name == "DEPOLARIZE2":
@@ -79,9 +73,6 @@ class TaskMetadata:
                     loop_body = op.body_copy()
                     for _ in range(op.repeat_count):
                         return_circuit.append(_mod_circuit(loop_body))
-                else:
-                    return_circuit.append(op)
-                    print(op)
 
             return return_circuit
 

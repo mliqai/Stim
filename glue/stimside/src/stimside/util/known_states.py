@@ -354,10 +354,3 @@ def convert_paulis_to_arrays(
         codes == 6,
     )
 
-
-def print_known_states_and_circuit(known_states, circuit):
-    for i, op in enumerate(_unroll_circuit(circuit)):
-        print("\t", [str(q) for q in known_states[i]])
-        print(i, ":", op)
-        print("\t", [str(q) for q in known_states[i + 1]])
-

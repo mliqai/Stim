@@ -47,4 +47,3 @@ class UnleakedToLeakedRecordsMixin:
 
     get_unleaked_to_leaked_op_indices = get_unleaked_to_leaked_records  # alias
     unleaked_to_leaked_records = property(get_unleaked_to_leaked_records)
-    unleaked_to_leaked_op_indices = property(get_unleaked_to_leaked_records)

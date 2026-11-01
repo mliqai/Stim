@@ -53,11 +53,11 @@ struct OpDescC {
     int32_t aux_offset;
     int32_t aux_count;
     int32_t gate_id;
-    int32_t reset_basis;      // 0=None, 1=+X, 3=+Y, 5=+Z
-    int32_t ctrl_leg0_basis;  // 0=None, 1=+X, 3=+Y, 5=+Z
-    int32_t ctrl_leg1_basis;  // 0=None, 1=+X, 3=+Y, 5=+Z
+    int32_t reset_basis;      // 0=None, 1=X, 2=Y, 3=Z
+    int32_t ctrl_leg0_basis;  // 0=None, 1=X, 2=Y, 3=Z
+    int32_t ctrl_leg1_basis;  // 0=None, 1=X, 2=Y, 3=Z
     int32_t cond_base_fires;
-    int32_t cond_subkind;     // 0=other, 3=noisy_gate, 4=1q_unitary, 5=2q_unitary, 6=heralded_or_noisy_nonmeas
+    int32_t cond_subkind;     // 0=other, 3=noisy_gate, 4=1q_unitary, 5=2q_unitary
     int32_t cond_channel_id;
 };
 
@@ -620,7 +620,7 @@ static TraceResult* trace_flows_impl(
     };
 
     auto do_bare = [&](ActiveFlow& f, const OpDescC& op, const int32_t* t_ptr, int32_t t_cnt, int32_t subkind) {
-        if (subkind == 3 || subkind == 6) {  // heralded or noisy non-measurement
+        if (subkind == 3) {  // noisy non-measurement
             return;
         }
         if (subkind == 4) {  // 1Q unitary
@@ -958,7 +958,7 @@ static TraceResult* trace_flows_impl(
                             }
                             continue;
                         }
-                        if (op.cond_subkind == 3 || op.cond_subkind == 6) {
+                        if (op.cond_subkind == 3) {
                             if (traj && op.cond_channel_id >= 0 && q0 >= 0) {
                                 f.sites.push_back(get_site_id(f.j, 0, q0, q1, op.cond_channel_id));
                             }

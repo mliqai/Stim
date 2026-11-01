@@ -921,7 +921,6 @@ class MarginalLeakageDemGenerator(DemGenerator):
             loss_oracle=loss_oracle,
         )
         self._circuit: stim.Circuit | None = None
-        self._analysis: _Analysis | None = None
         self._analyses: dict[bool, _Analysis] = {}
 
     def _get_analysis(
@@ -930,16 +929,13 @@ class MarginalLeakageDemGenerator(DemGenerator):
         if self._circuit is None or circuit != self._circuit:
             self._circuit = circuit.copy()
             self._analyses = {}
-            self._analysis = None
         if decompose_errors not in self._analyses:
             builder = _Builder(circuit, self.unconditional_condition_on_U)
             analysis = builder.build(decompose_errors=decompose_errors, oracle=self.loss_oracle)
             if self.loss_oracle and builder.leakage_swap_ops and not self._analyses:
                 warnings.warn(_LEAKAGE_SWAP_ORACLE_WARNING, UserWarning, stacklevel=3)
             self._analyses[decompose_errors] = analysis
-        analysis = self._analyses[decompose_errors]
-        self._analysis = analysis
-        return analysis
+        return self._analyses[decompose_errors]
 
     def base_dem(
         self, circuit: stim.Circuit, *, decompose_errors: bool | None = None

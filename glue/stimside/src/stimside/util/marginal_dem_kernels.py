@@ -193,7 +193,6 @@ def get_marginal_dem_kernels_lib() -> ctypes.CDLL:
     ]
     lib.marginal_build_envelopes.restype = void_p
 
-    lib.marginal_envelope_result_get_counts = None
     lib.marginal_envelope_result_get_total_entries.argtypes = [void_p]
     lib.marginal_envelope_result_get_total_entries.restype = ctypes.c_int32
 
@@ -244,6 +243,22 @@ def get_marginal_dem_kernels_lib() -> ctypes.CDLL:
     lib.marginal_free_batch_result.argtypes = [void_p]
     lib.marginal_free_batch_result.restype = None
 
+    lib.marginal_dem_text_has_hyperedge.argtypes = [ctypes.c_char_p, ctypes.c_int64]
+    lib.marginal_dem_text_has_hyperedge.restype = ctypes.c_int32
+    lib.marginal_decompose_dem_text.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_int64,
+        ctypes.c_char_p,
+        ctypes.c_int64,
+    ]
+    lib.marginal_decompose_dem_text.restype = void_p
+    lib.marginal_text_result_size.argtypes = [void_p]
+    lib.marginal_text_result_size.restype = ctypes.c_int64
+    lib.marginal_text_result_data.argtypes = [void_p]
+    lib.marginal_text_result_data.restype = void_p
+    lib.marginal_free_text_result.argtypes = [void_p]
+    lib.marginal_free_text_result.restype = None
+
     _LIB_INSTANCE = lib
     return lib
 
@@ -260,47 +275,15 @@ def _ptr_u8(arr: NDArray[np.uint8]) -> u8_p:
     return arr.ctypes.data_as(u8_p) if arr.size > 0 else ctypes.cast(None, u8_p)
 
 
-_DECOMPOSE_LIB: ctypes.CDLL | None = None
-
-
-def get_decompose_dem_lib() -> ctypes.CDLL:
-    """The kernel library with the graph-like DEM decomposition entry points bound.
-
-    Raises (OSError, RuntimeError, AttributeError, FileNotFoundError) if the
-    library cannot be loaded or lacks the entry points; callers fall back to Python.
-    """
-    global _DECOMPOSE_LIB
-    if _DECOMPOSE_LIB is not None:
-        return _DECOMPOSE_LIB
-    lib = get_marginal_dem_kernels_lib()
-    lib.marginal_dem_text_has_hyperedge.argtypes = [ctypes.c_char_p, ctypes.c_int64]
-    lib.marginal_dem_text_has_hyperedge.restype = ctypes.c_int32
-    lib.marginal_decompose_dem_text.argtypes = [
-        ctypes.c_char_p,
-        ctypes.c_int64,
-        ctypes.c_char_p,
-        ctypes.c_int64,
-    ]
-    lib.marginal_decompose_dem_text.restype = void_p
-    lib.marginal_text_result_size.argtypes = [void_p]
-    lib.marginal_text_result_size.restype = ctypes.c_int64
-    lib.marginal_text_result_data.argtypes = [void_p]
-    lib.marginal_text_result_data.restype = void_p
-    lib.marginal_free_text_result.argtypes = [void_p]
-    lib.marginal_free_text_result.restype = None
-    _DECOMPOSE_LIB = lib
-    return lib
-
-
 def dem_text_has_hyperedge_cpp(dem_text: bytes) -> bool:
     """Whether a flattened DEM's text has a p > 0 error component with > 2 detectors."""
-    lib = get_decompose_dem_lib()
+    lib = get_marginal_dem_kernels_lib()
     return bool(lib.marginal_dem_text_has_hyperedge(dem_text, len(dem_text)))
 
 
 def decompose_dem_text_cpp(dem_text: bytes, base_text: bytes | None) -> str:
     """Text of the graph-like decomposition of a flattened DEM's text (see `_decompose_dem_graphlike`)."""
-    lib = get_decompose_dem_lib()
+    lib = get_marginal_dem_kernels_lib()
     res_ptr = lib.marginal_decompose_dem_text(
         dem_text,
         len(dem_text),
