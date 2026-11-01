@@ -63,10 +63,6 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._tableau_simulator_inst = stim.TableauSimulator(seed=self._tab_seed)
         return self._tableau_simulator_inst
 
-    @_tableau_simulator.setter
-    def _tableau_simulator(self, val: stim.TableauSimulator | None) -> None:
-        self._tableau_simulator_inst = val
-
     @property
     def _compiled_m2d_converter(self) -> stim.CompiledMeasurementsToDetectionEventsConverter:
         if self._compiled_m2d_converter_inst is None:
@@ -75,10 +71,6 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             else:
                 self._compiled_m2d_converter_inst = self.circuit.compile_m2d_converter()
         return self._compiled_m2d_converter_inst  # type: ignore[return-value]
-
-    @_compiled_m2d_converter.setter
-    def _compiled_m2d_converter(self, val: object) -> None:
-        self._compiled_m2d_converter_inst = val
 
     def __init__(
         self,
@@ -123,9 +115,8 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
         shot_seed = derived_seed(seed, 0) if seed is not None else None
         self.np_rng = np.random.default_rng(seed=shot_seed)
-        self._rng = self.np_rng if seed is not None else np.random.default_rng(seed=None)
 
-        self._tab_seed = shot_seed if shot_seed is not None else int(self._rng.integers(0, 2**63))
+        self._tab_seed = shot_seed if shot_seed is not None else int(self.np_rng.integers(0, 2**63))
         self._tableau_simulator_inst: stim.TableauSimulator | None = None
         self._new_circuit = stim.Circuit()
         self._construct_reference_circuit = construct_reference_circuit
@@ -295,7 +286,6 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if self.seed is not None:
             shot_seed = derived_seed(self.seed, self._shot_counter)
             self.np_rng = np.random.default_rng(seed=shot_seed)
-            self._rng = self.np_rng
             self._tab_seed = shot_seed
             self._tableau_simulator_inst = (
                 stim.TableauSimulator(seed=shot_seed) if self._running_tableau else None
@@ -303,7 +293,7 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             if self._cpp_runner is not None:
                 self._cpp_runner.clear(shot_seed)
         else:
-            self._tab_seed = int(self._rng.integers(0, 2**63))
+            self._tab_seed = int(self.np_rng.integers(0, 2**63))
             self._tableau_simulator_inst = (
                 stim.TableauSimulator(seed=self._tab_seed)
                 if self._running_tableau
@@ -602,7 +592,7 @@ class TablesideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._final_measurement_records = np.array([self.current_tableau_measurement_record()])
         else:
             self._final_measurement_records = self._new_circuit.compile_sampler(
-                    seed=int(self._rng.integers(0, 2**63))
+                    seed=int(self.np_rng.integers(0, 2**63))
                 ).sample(shots=self.batch_size, bit_packed=False)
             for meas_idx, p0, p1, is_inverted in self._asymmetric_readout_postproc:
                 col = self._final_measurement_records[:, meas_idx]

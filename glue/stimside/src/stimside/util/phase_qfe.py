@@ -365,7 +365,7 @@ class PhaseQFEComponent:
         return _compute_a_union(self.A_words, self.d, self.n_words)
 
     @classmethod
-    def zero_state(cls, n_qubits: int) -> PhaseQFEComponent:
+    def zero(cls, n_qubits: int) -> PhaseQFEComponent:
         if n_qubits < 1:
             raise ValueError(f"n_qubits must be >= 1, got {n_qubits}")
         nw = n_words_for_qubits(n_qubits)
@@ -375,12 +375,8 @@ class PhaseQFEComponent:
         )
 
     @classmethod
-    def zero(cls, n_qubits: int) -> PhaseQFEComponent:
-        return cls.zero_state(n_qubits)
-
-    @classmethod
     def computational_basis_state(cls, n_qubits: int, bits: Sequence[int | bool] | NDArray[Any]) -> PhaseQFEComponent:
-        comp = cls.zero_state(n_qubits)
+        comp = cls.zero(n_qubits)
         comp.h_words = coerce_pauli_words(bits, n_qubits)
         return comp
 
@@ -525,7 +521,7 @@ class ShotExpansion:
         self.a_union = _compute_a_union(self.A_words, self.d, self.n_words)
 
     @classmethod
-    def zero_state(
+    def zero(
         cls, n_qubits: int, *, atol: float = DEFAULT_ATOL
     ) -> ShotExpansion:
         if not _is_valid_int(n_qubits) or n_qubits < 1:
@@ -538,12 +534,6 @@ class ShotExpansion:
             np.zeros((1, 0), dtype=np.uint8), np.zeros(0, dtype=np.uint8),
             0.0, atol,
         )
-
-    @classmethod
-    def zero(
-        cls, n_qubits: int, *, atol: float = DEFAULT_ATOL
-    ) -> ShotExpansion:
-        return cls.zero_state(n_qubits, atol=atol)
 
     @classmethod
     def from_component(
@@ -730,7 +720,6 @@ class CompiledPauliBlock:
     global_scalar: complex = 1.0 + 0.0j
     is_unitary: bool = True
     is_identity: bool = False
-    cache_key: tuple[Any, ...] = ()
     n_qubits_exact: bool = True
 
 

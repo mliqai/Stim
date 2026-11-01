@@ -36,26 +36,6 @@ _REC_FIRST_PAULI = {"CX": "X", "CNOT": "X", "ZCX": "X", "CY": "Y", "ZCY": "Y"}
 _REC_SECOND_PAULI = {"XCZ": "X", "YCZ": "Y"}
 
 
-def _as_compiled(op: stim.CircuitInstruction) -> stim.CircuitInstruction:
-    """`op` as CompiledReferenceCircuit stores it on its step, to match interactive ops against.
-
-    A two-qubit unitary with rec/sweep-controlled pairs is stored as its qubit pairs only (unless it
-    has none); do_conditional_clifford handles the controlled pairs live from the interactive op.
-    """
-    gd = stim.gate_data(op.name)
-    raw = op.targets_copy()
-    if gd.is_unitary and gd.is_two_qubit_gate and any(t.qubit_value is None for t in raw):
-        quantum = [
-            q
-            for a, b in zip(raw[::2], raw[1::2])
-            if a.qubit_value is not None and b.qubit_value is not None
-            for q in (a.qubit_value, b.qubit_value)
-        ]
-        if quantum:
-            return stim.CircuitInstruction(op.name, quantum, op.gate_args_copy())
-    return op
-
-
 def _word_dot_parity(
     u_words: NDArray[np.uint64], v_words: NDArray[np.uint64]
 ) -> int:
@@ -415,12 +395,11 @@ class MRQFState:
             return True, 2
         return False, 0
 
-    # P1. ApplyPauli(a, b, kappa)
+    # P1. ApplyPauli(a, b)
     def p1_apply_pauli(
         self,
         a_words: NDArray[np.uint64],
         b_words: NDArray[np.uint64],
-        kappa: int = 0,
     ) -> None:
         """Apply P(a, b, kappa) to |chi> in O(d * n_words) time (Eq. 7)."""
         if self._d > 0 and _words_any_overlap(b_words, self.a_union):
@@ -709,15 +688,9 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._use_cpp = self._tab_rngs is None
         if self._use_cpp:
             self._cpp_lib = get_coset_kernels_lib()
-            cpp_seed = (
-                int(self.seed)
-                if self.seed is not None
-                else int(self.np_rng.integers(0, 2**31))
-            )
             self._cpp_eng = self._cpp_lib.engine_create(
                 self.num_qubits,
                 self.batch_size,
-                cpp_seed,
                 self._shot_tiebreak_rng.ctypes.data_as(u64_p),
             )
 
@@ -925,7 +898,8 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             )
 
     def _draw_tab_rng_bit(self, b_idx: int) -> bool:
-        if self._tab_rngs is not None and self._tab_rngs_x is not None:
+        if self._tab_rngs is not None:
+            assert self._tab_rngs_x is not None
             tr_z = self._tab_rngs[b_idx]
             tr_x = self._tab_rngs_x[b_idx]
             sq = self._tab_scratch_q
@@ -1102,7 +1076,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             # op's name and targets, so tags (which op handlers remove) and arguments aren't compared.
             if not self._used_interactively or (
                 step.op.name == op.name
-                and _as_compiled(op).targets_copy() == step.op.targets_copy()
+                and op.targets_copy() == step.op.targets_copy()
             ):
                 self._step_cursor += 1
                 return step
@@ -1235,7 +1209,8 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             num_m = len(ts_targets)
             if num_m == 0:
                 return
-            if self._tab_rngs is not None and self._tab_rngs_x is not None:
+            if self._tab_rngs is not None:
+                assert self._tab_rngs_x is not None
                 herald_cols = [
                     np.zeros(self.batch_size, dtype=np.bool_)
                     for _ in range(num_m)
@@ -1461,6 +1436,9 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._active_shots[b_idx] = mrqf
 
         for factor in cocycle.factors:
+            if factor.kind == "P1":
+                mrqf.p1_apply_pauli(factor.a_words, factor.b_words)
+                continue
             gamma = (
                 int(
                     np.count_nonzero(
@@ -1496,8 +1474,6 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                     factor.b2_words,
                     kappa2_shot,
                 )
-            elif factor.kind == "P1":
-                mrqf.p1_apply_pauli(factor.a_words, factor.b_words, kappa_shot)
             else:
                 mrqf.p2_apply_quarter_turn(
                     factor.a_words, factor.b_words, kappa_shot
@@ -1537,7 +1513,8 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                         self._broadcast_flips(pauli, [tq.qubit_value], active[None, :])
                 if not isinstance(step_meta, UnitaryStepMeta):
                     return
-                op = step_meta.op
+                assert step_meta.quantum_op is not None
+                op = step_meta.quantum_op
                 if condition_met_mask is not None:
                     condition_met_mask = condition_met_mask[quant_indices, :]
 
@@ -1568,8 +1545,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
         if condition_group_fn is None and step_meta.are_groups_disjoint:
             if self._use_cpp and self._cpp_lib is not None and self._cpp_eng is not None:
-                if self._py_dirty or (not self._cpp_dirty and len(self._active_shots) > 0):
-                    self._sync_py_to_cpp()
+                self._sync_py_to_cpp()
                 self._apply_unitary_to_frames(op)
                 lib = self._cpp_lib
                 if name in ("CZ", "ZCZ"):
@@ -1818,7 +1794,8 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 )
             p_err = float(args[0]) if len(args) > 0 else 0.0
             raw_targets = op.targets_copy()
-            if self._tab_rngs is not None and self._tab_rngs_x is not None:
+            if self._tab_rngs is not None:
+                assert self._tab_rngs_x is not None
                 self._scratch_x_mask.fill(False)
                 self._scratch_z_mask.fill(False)
                 any_x = False
@@ -1995,8 +1972,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         )
 
         if self._use_cpp and self._cpp_lib is not None and self._cpp_eng is not None:
-            if self._py_dirty or (not self._cpp_dirty and len(self._active_shots) > 0):
-                self._sync_py_to_cpp()
+            self._sync_py_to_cpp()
             lib = self._cpp_lib
 
             if det_batch:
@@ -2459,7 +2435,8 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         )
         if len(args) > 0 and args[0] > 0.0:
             p_meas_err = args[0]
-            if self._tab_rngs is not None and self._tab_rngs_x is not None:
+            if self._tab_rngs is not None:
+                assert self._tab_rngs_x is not None
                 mpad_op = stim.CircuitInstruction(
                     "MPAD", [0] * num_m, [p_meas_err]
                 )
@@ -2547,8 +2524,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             and self._cpp_lib is not None
             and self._cpp_eng is not None
         ):
-            if self._py_dirty or (not self._cpp_dirty and len(self._active_shots) > 0):
-                self._sync_py_to_cpp()
+            self._sync_py_to_cpp()
             xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
                 output_xs=True, output_zs=False
             )
@@ -2729,8 +2705,7 @@ class CosetsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         )
 
         if self._use_cpp and self._cpp_lib is not None and self._cpp_eng is not None:
-            if self._py_dirty or (not self._cpp_dirty and len(self._active_shots) > 0):
-                self._sync_py_to_cpp(keep_py_dirty=self._py_dirty)
+            self._sync_py_to_cpp(keep_py_dirty=self._py_dirty)
             xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
             zs_c = np.ascontiguousarray(zs_base, dtype=np.uint8)
             out = np.empty((len(targets_arr), self.batch_size), dtype=np.int8)

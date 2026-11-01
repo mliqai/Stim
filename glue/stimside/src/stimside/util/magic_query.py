@@ -12,7 +12,7 @@ from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 from stimside.util import magic_compile as _mc
-from stimside.util.magic_compile import OMEGA_POWERS, CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _plan_noise_max_choices, _sample_categorical_branch, clone_reference_chp, compile_direct, compile_open_block, compile_selector, extract_data_expansion
+from stimside.util.magic_compile import OMEGA_POWERS, CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _sample_categorical_branch, clone_reference_chp, compile_direct, compile_open_block, compile_selector, extract_data_expansion
 from stimside.util.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, eliminate_zero_amplitude, first_set_bit_in_words, make_principal, merge_frames, n_words_for_qubits, project_diagonal, restrict_amplitude, tail_mask, unit_bit_words, validate_atol
 from stimside.util.reference_chp import ReferenceCHPTableau
 
@@ -21,8 +21,8 @@ __all__ = ["QueryBudgetExceededError", "QueryBudget", "QueryDiagnostics", "Query
 _SQRT2, _EMPTY_DEPS = math.sqrt(2.0), ((), (), ())
 _PAULI_1Q_STR, _PAULI_4_STR = {"I": 0, "X": 1, "Y": 2, "Z": 3}, {"I": 0, "X": 2, "Y": 3, "Z": 4}
 _PAULI_2Q_STR = {a + b: i for i, (a, b) in enumerate((p, q) for p in "IXYZ" for q in "IXYZ")}
-_QUERY_ALIASES = {"mass": "mass", "acceptance": "acceptance", "fidelity": "fidelity", "target_overlap": "fidelity", "prefix_probs": "prefix_probs", "sample_measurements": "sample_measurements", "sampled_measurements": "sample_measurements"}
-_VALID_REAL_KEYS = frozenset({"faults", "fault_trace", "measurements", "requested_outcomes", "paulis", "pauli_noise", "pauli_noise_trace", "resets", "reset_outcomes", "sweep", "sweep_bits"})
+_VALID_QUERIES = frozenset({"mass", "acceptance", "fidelity", "prefix_probs", "sample_measurements"})
+_VALID_REAL_KEYS = frozenset({"faults", "measurements", "requested_outcomes", "paulis", "pauli_noise", "resets", "reset_outcomes", "sweep", "sweep_bits"})
 
 class QueryBudgetExceededError(RuntimeError):
     """Raised when `Q1`/`Q2` contraction exceeds `QueryBudget` with `on_budget_exceeded == 'raise'`."""
@@ -44,7 +44,7 @@ class QueryBudget:
                 raise ValueError(f"{fn} must be >= {lo}, got {iv}")
             object.__setattr__(self, fn, iv)
         mode = self.on_budget_exceeded.strip().lower() if isinstance(self.on_budget_exceeded, str) else ""
-        if mode not in ("raise", "error", "fallback", "fallback_stream", "stream"):
+        if mode not in ("raise", "error", "fallback", "fallback_stream"):
             raise ValueError(f"on_budget_exceeded must be 'raise' or 'fallback', got {self.on_budget_exceeded!r}")
         object.__setattr__(self, "on_budget_exceeded", "raise" if mode in ("raise", "error") else "fallback")
 
@@ -331,7 +331,7 @@ def _bell_steps_for(ref_data: ReferenceCHPTableau, rt: ReferenceCHPTableau, outp
             dst, src = getattr(j_ref, attr), getattr(ref_data, attr)[:n]
             dst[:n].fill(0)
             dst[:n, :src.shape[1]], dst[n:] = src, _scatter_pairs(getattr(rt, attr)[:k], p_R, n + k)
-        j_ref.x_kap[:n], j_ref.z_kap[:n], j_ref.x_kap[n:], j_ref.z_kap[n:], j_ref._inv_dirty = ref_data.x_kap[:n], ref_data.z_kap[:n], (-rt.x_kap[:k]) & np.uint8(3), (-rt.z_kap[:k]) & np.uint8(3), True
+        j_ref.x_kap[:n], j_ref.z_kap[:n], j_ref.x_kap[n:], j_ref.z_kap[n:] = ref_data.x_kap[:n], ref_data.z_kap[:n], (-rt.x_kap[:k]) & np.uint8(3), (-rt.z_kap[:k]) & np.uint8(3)
         bcache.pop(next(iter(bcache))) if len(bcache) >= 16 else None
         bcache[key] = tuple((mr.rot_axis, (unit_bit_words(first_set_bit_in_words(mr.obs_axis.a_words), nw_j), 0) if mr.rot_axis is not None else (mr.obs_axis.b_words, (mr.obs_axis.kappa >> 1) & 1)) for j, q in enumerate(output_qubits) for pch in ("X", "Z") for mr in (_compile_pauli_measurement_c15(j_ref, [(q, pch), (n + j, pch)], invert_result=False, flip_prob=0.0, meas_index=0),))
     return bcache[key]
@@ -405,7 +405,7 @@ def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_c
             fpos = next((i for i, rec in enumerate(compiled.records) if any((q >> 6) < ax.a_words.shape[0] and ((int((ax.a_words | ax.b_words)[q >> 6]) >> (q & 63)) & 1) for ax in axes_of(rec) for q in s_grp)), len(compiled.records))
             bfacs = tuple(CompiledCliffordFactorList(0, CompiledPauliAxis(unit_bit_words(sq, nw_op), z0, 0), ()) for sq in s_grp)
             sel_ins.setdefault(fpos, []).append(DirectFaultSlotRecord(s_idx, compiled.fault_channels[s_idx], bfacs, np.empty(0, dtype=np.float64)))
-    ops, dyn, noise_meta, nc, rc, cs = [], [], {}, 0, 0, ()
+    ops, dyn, noise_meta, rc, cs = [], [], {}, 0, ()
     for r_i, rec in enumerate(compiled.records):
         ops.extend((sr, None, ((sr.slot_index,), (), ())) for sr in sel_ins.get(r_i, ()))
         if isinstance(rec, CompiledOpenBlockRecord):
@@ -418,7 +418,7 @@ def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_c
             di = rec.current_meas_count + rec.source_index if rec.source_kind == "rec" else rec.source_index
             ops.append((rec, di, ((), (di,), ()) if rec.source_kind == "rec" else ((), (), (di,))))
         elif isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord, CorrelatedNoiseRecord)):
-            ni, nc = (rec.noise_index if rec.noise_index is not None else nc), nc + 1
+            ni = rec.noise_index
             is_corr, prior = isinstance(rec, CorrelatedNoiseRecord), (cs if getattr(rec, "is_else", False) else ())
             noise_meta[ni], cs = ("CORRELATED_ERROR" if is_corr else rec.kind), ((*prior, ni) if is_corr else cs)
             dyn.append((len(ops), rec, (ni, prior) if is_corr else ni))
@@ -558,12 +558,12 @@ def _unpack_realization(plan: PreparedQueryPlan, realization: Mapping[Any, Any] 
     if any(isinstance(k, str) for k in realization):
         if set(realization) - _VALID_REAL_KEYS:
             raise ValueError(f"Unknown realization keys: {sorted(map(str, set(realization) - _VALID_REAL_KEYS))}")
-        raw_f, raw_m = realization.get("faults", realization.get("fault_trace")), realization.get("measurements", realization.get("requested_outcomes"))
-        raw_p, raw_r = realization.get("paulis", realization.get("pauli_noise", realization.get("pauli_noise_trace"))), realization.get("resets", realization.get("reset_outcomes"))
+        raw_f, raw_m = realization.get("faults"), realization.get("measurements", realization.get("requested_outcomes"))
+        raw_p, raw_r = realization.get("paulis", realization.get("pauli_noise")), realization.get("resets", realization.get("reset_outcomes"))
         raw_s = realization.get("sweep_bits", realization.get("sweep"))
     else:
         raw_f, raw_m, raw_p, raw_r, raw_s = realization, None, None, None, None
-    cp, n_meta, max_c = plan.compiled_plan, plan._state["noise"], _plan_noise_max_choices(plan.compiled_plan)
+    cp, n_meta, max_c = plan.compiled_plan, plan._state["noise"], plan.compiled_plan.noise_channel_max_choices
     if isinstance(raw_p, Mapping):
         conv_p: dict[Any, Any] = {}
         for k, v in raw_p.items():
@@ -790,9 +790,9 @@ def EvaluateQueries(plan: PreparedQueryPlan, realization: Mapping[Any, Any] | No
     """`Q2`: Evaluate global scalar-network queries against `plan` for a given `realization`."""
     if not isinstance(plan, PreparedQueryPlan):
         raise TypeError(f"Expected PreparedQueryPlan, got {type(plan)!r}")
-    if isinstance(queries, (str, bytes)) or not isinstance(queries, Sequence) or not queries or any(not isinstance(q, str) or q not in _QUERY_ALIASES for q in queries):
+    if isinstance(queries, (str, bytes)) or not isinstance(queries, Sequence) or not queries or any(not isinstance(q, str) or q not in _VALID_QUERIES for q in queries):
         raise ValueError(f"Invalid or unknown query metrics: {queries!r}")
-    q_set, cond, comp_target = frozenset(_QUERY_ALIASES[q] for q in queries), bool(conditional), (_compile_target_spec(target_spec, plan.output_qubits, plan.atol) if target_spec is not None else plan._state["target"])
+    q_set, cond, comp_target = frozenset(queries), bool(conditional), (_compile_target_spec(target_spec, plan.output_qubits, plan.atol) if target_spec is not None else plan._state["target"])
     if "fidelity" in q_set and comp_target is None:
         raise ValueError("target_spec must be provided when querying 'fidelity'")
     norm_acc, (faults, meas, paulis, resets, sweep) = _normalize_acceptance_spec(acceptance_spec if acceptance_spec is not None else plan.acceptance_spec, plan.num_measurements), _unpack_realization(plan, realization)

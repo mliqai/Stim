@@ -841,8 +841,8 @@ class TestCompiledLeakageUint8Coset:
             st_mw.p2_apply_quarter_turn(aw, bw, kap)
             st_mw.check_invariants()
         d_before = st_mw.d
-        st_mw.p1_apply_pauli(aw, bw, kap)
-        st_mw.p1_apply_pauli(aw, bw, kap)
+        st_mw.p1_apply_pauli(aw, bw)
+        st_mw.p1_apply_pauli(aw, bw)
         st_mw.p2_apply_quarter_turn(aw, bw, kap)
         st_mw.p2_apply_quarter_turn(aw, bw, (kap + 2) & 3)
         assert st_mw.d == d_before

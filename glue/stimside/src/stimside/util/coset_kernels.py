@@ -35,7 +35,6 @@ def get_coset_kernels_lib() -> ctypes.CDLL:
     lib.engine_create.argtypes = [
         ctypes.c_int,
         ctypes.c_int,
-        ctypes.c_uint64,
         u64_p,
     ]
     lib.engine_create.restype = void_p

@@ -131,9 +131,9 @@ def test_unseeded_tableside_draws_63_bit_seeds():
     sim = TablesideSimulator(
         circuit, compiled_op_handler=handler, batch_size=4
     )
-    real, highs, seeds = sim._rng, [], [sim._tab_seed]
+    real, highs, seeds = sim.np_rng, [], [sim._tab_seed]
 
-    class _Spy:  # records the upper bound of each integer drawn from sim._rng
+    class _Spy:  # records the upper bound of each integer drawn from sim.np_rng
         def __getattr__(self, name):
             return getattr(real, name)
 
@@ -141,7 +141,7 @@ def test_unseeded_tableside_draws_63_bit_seeds():
             highs.append(high)
             return real.integers(low, high, *args, **kwargs)
 
-    sim._rng = _Spy()
+    sim.np_rng = _Spy()
     sim.clear()
     seeds.append(sim._tab_seed)
     sim.run()

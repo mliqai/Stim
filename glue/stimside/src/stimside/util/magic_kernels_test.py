@@ -70,8 +70,8 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
         assert int(lib1.magic_abi_v1()) == 1
 
         with pytest.raises(TypeError, match="use_cpp_kernels"):
-            pq.ShotExpansion.zero_state(2, use_cpp_kernels=False)  # type: ignore[call-arg]
-        exp = pq.ShotExpansion.zero_state(2)
+            pq.ShotExpansion.zero(2, use_cpp_kernels=False)  # type: ignore[call-arg]
+        exp = pq.ShotExpansion.zero(2)
         pq.apply_pauli(exp, [1, 0], [0, 0], 0)
         assert pq._CACHED_MAGIC_LIB is not None and pq._CACHED_MAGIC_LIB is lib1
 
@@ -110,7 +110,7 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
 
 def test_zero_size_raw_abi_contiguity_guard_and_rejection() -> None:
     with pytest.raises(ValueError):
-        pq.ShotExpansion.zero_state(0)
+        pq.ShotExpansion.zero(0)
 
     lib = mk.get_magic_kernels_lib()
     null_d = ctypes.cast(0, ctypes.POINTER(ctypes.c_double))
@@ -193,7 +193,7 @@ def test_all_eight_kernels_word_boundaries_in_place_and_log_mass(n_qubits: int) 
     u_mid = pq.unit_bit_words(q_m, nw)
     b_f, b_m, b_l = 1 << loc[q_f], 1 << loc[q_m], 1 << loc[q_l]
 
-    cpp = pq.ShotExpansion.zero_state(n_qubits)
+    cpp = pq.ShotExpansion.zero(n_qubits)
     cpp.log_mass = -3.75
     psi = np.zeros(1 << len(qs), dtype=np.complex128)
     psi[0] = 1.0
@@ -258,7 +258,7 @@ def test_all_eight_kernels_word_boundaries_in_place_and_log_mass(n_qubits: int) 
 def test_high_chi_k1_first_seen_order_and_exact_cancellation() -> None:
     rng = np.random.default_rng(2026)
     n_q = 8
-    base = pq.ShotExpansion.zero_state(n_q)
+    base = pq.ShotExpansion.zero(n_q)
     for q in (0, 3, 6):
         base = pq.apply_quarter_turn(base, pq.unit_bit_words(q, 1), np.zeros(1, dtype=np.uint64), 0)
 
@@ -304,7 +304,7 @@ def test_measure_expansion_rng_lockstep_and_embedding_invariance() -> None:
     def _run_meas_seq(n_qubits: int, qs: list[int], seed: int) -> tuple[list[pq.MeasurementResult], float]:
         nw = pq.n_words_for_qubits(n_qubits)
         z0 = np.zeros(nw, dtype=np.uint64)
-        exp = pq.ShotExpansion.zero_state(n_qubits)
+        exp = pq.ShotExpansion.zero(n_qubits)
         for q in qs[:3]:
             uq = pq.unit_bit_words(q, nw)
             exp = pq.apply_quarter_turn(exp, uq, z0, 0)

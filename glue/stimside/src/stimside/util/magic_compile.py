@@ -42,7 +42,7 @@ __all__ = [
     "extract_circuit_faults", "compile_pauli_product", "apply_spp_to_reference_chp",
     "compile_coordinates", "compile_open_block", "compile_direct", "run_direct",
     "compile_selector", "sample_selector_activations", "run_selector",
-    "extract_data_expansion", "trace_selectors", "reconstruct_statevector",
+    "extract_data_expansion", "reconstruct_statevector",
 ]
 
 _INV_SQRT2: float = math.ldexp(1.0, -1) * math.sqrt(2.0)
@@ -56,14 +56,13 @@ _PHASE4_ARR: NDArray[np.complex128] = np.array(_PHASE4, dtype=np.complex128)
 _OMEGA_ARR: NDArray[np.complex128] = np.array(OMEGA_POWERS, dtype=np.complex128)
 _PAU_ABK: dict[str, tuple[int, int, int]] = {"I": (0, 0, 0), "X": (1, 0, 0), "Z": (0, 1, 0), "Y": (1, 1, 1)}
 
-# Verified exact F = OMEGA_POWERS[v] * R(r_specs[-1]) ... R(r_specs[0]) * P(p0_spec) over all 55 1Q/2Q Stim gates
+# Verified exact F = OMEGA_POWERS[v] * R(r_specs[-1]) ... R(r_specs[0]) * P(p0_spec) over all 46 canonical 1Q/2Q Stim gates
 DECOMP_1Q: dict[str, tuple[int, str, tuple[str, ...]]] = {
-    "I": (0, "+I", ()), "I_": (0, "+I", ()), "X": (0, "+X", ()), "Y": (0, "+Y", ()), "Z": (0, "+Z", ()),
-    "H": (0, "+X", ("+Y",)), "H_XZ": (0, "+X", ("+Y",)), "H_NXZ": (0, "+X", ("-Y",)),
+    "I": (0, "+I", ()), "X": (0, "+X", ()), "Y": (0, "+Y", ()), "Z": (0, "+Z", ()),
+    "H": (0, "+X", ("+Y",)), "H_NXZ": (0, "+X", ("-Y",)),
     "H_XY": (0, "+X", ("-Z",)), "H_NXY": (0, "+X", ("+Z",)),
     "H_YZ": (0, "+Z", ("+X",)), "H_NYZ": (0, "+Y", ("+X",)),
-    "S": (1, "+I", ("-Z",)), "SQRT_Z": (1, "+I", ("-Z",)),
-    "S_DAG": (7, "+I", ("+Z",)), "SQRT_Z_DAG": (7, "+I", ("+Z",)),
+    "S": (1, "+I", ("-Z",)), "S_DAG": (7, "+I", ("+Z",)),
     "SQRT_X": (1, "+I", ("-X",)), "SQRT_X_DAG": (7, "+I", ("+X",)),
     "SQRT_Y": (1, "+I", ("-Y",)), "SQRT_Y_DAG": (7, "+I", ("+Y",)),
     "C_XYZ": (0, "+I", ("-X", "-Z")), "C_ZYX": (0, "+I", ("+Z", "+X")),
@@ -76,21 +75,20 @@ DECOMP_2Q: dict[str, tuple[int, str, tuple[str, ...]]] = {
     "SQRT_XX": (1, "+II", ("-XX",)), "SQRT_XX_DAG": (7, "+II", ("+XX",)),
     "SQRT_YY": (1, "+II", ("-YY",)), "SQRT_YY_DAG": (7, "+II", ("+YY",)),
     "SQRT_ZZ": (1, "+II", ("-ZZ",)), "SQRT_ZZ_DAG": (7, "+II", ("+ZZ",)),
-    "CZ": (1, "+II", ("+ZZ", "-ZI", "-IZ")), "ZCZ": (1, "+II", ("+ZZ", "-ZI", "-IZ")),
-    "CX": (1, "+II", ("+ZX", "-ZI", "-IX")), "CNOT": (1, "+II", ("+ZX", "-ZI", "-IX")),
-    "ZCX": (1, "+II", ("+ZX", "-ZI", "-IX")),
-    "CY": (1, "+II", ("+ZY", "-ZI", "-IY")), "ZCY": (1, "+II", ("+ZY", "-ZI", "-IY")),
+    "CZ": (1, "+II", ("+ZZ", "-ZI", "-IZ")),
+    "CX": (1, "+II", ("+ZX", "-ZI", "-IX")),
+    "CY": (1, "+II", ("+ZY", "-ZI", "-IY")),
     "XCX": (1, "+II", ("+XX", "-XI", "-IX")), "XCY": (1, "+II", ("+XY", "-XI", "-IY")),
     "XCZ": (1, "+II", ("+XZ", "-XI", "-IZ")), "YCX": (1, "+II", ("+YX", "-YI", "-IX")),
     "YCY": (1, "+II", ("+YY", "-YI", "-IY")), "YCZ": (1, "+II", ("+YZ", "-YI", "-IZ")),
     "SWAP": (1, "+II", ("-ZZ", "-YY", "-XX")),
     "ISWAP": (0, "+II", ("+XX", "+YY")), "ISWAP_DAG": (0, "+II", ("-XX", "-YY")),
-    "CZSWAP": (0, "+IZ", ("-XY", "+YX")), "SWAPCZ": (0, "+IZ", ("-XY", "+YX")),
+    "CZSWAP": (0, "+IZ", ("-XY", "+YX")),
     "CXSWAP": (2, "+XY", ("-IY", "-XY", "-YX", "+YI")), "SWAPCX": (2, "+YX", ("-YI", "-YX", "-XY", "+IY")),
 }
 CONTROLLED_PAULI_2Q_AXES: dict[str, tuple[str, str]] = {
-    "CZ": ("Z", "Z"), "ZCZ": ("Z", "Z"), "CX": ("Z", "X"), "CNOT": ("Z", "X"), "ZCX": ("Z", "X"),
-    "CY": ("Z", "Y"), "ZCY": ("Z", "Y"), "XCX": ("X", "X"), "XCY": ("X", "Y"), "XCZ": ("X", "Z"),
+    "CZ": ("Z", "Z"), "CX": ("Z", "X"), "CY": ("Z", "Y"),
+    "XCX": ("X", "X"), "XCY": ("X", "Y"), "XCZ": ("X", "Z"),
     "YCX": ("Y", "X"), "YCY": ("Y", "Y"), "YCZ": ("Y", "Z"),
 }
 
@@ -108,20 +106,14 @@ def _coerce_strict_int(val: object, label: str, *, allow_bool: bool = False) -> 
 def _canonical_gate_data(gate_name: str) -> stim.GateData:
     if not isinstance(gate_name, str) or not gate_name.strip():
         raise ValueError(f"Invalid gate name: {gate_name!r}")
-    lookup = "I" if gate_name.strip() == "I_" else gate_name.strip()
     try:
-        return stim.gate_data(lookup)
+        return stim.gate_data(gate_name.strip())
     except (IndexError, KeyError, ValueError) as exc:
         raise ValueError(f"Unknown Stim gate {gate_name!r}") from exc
 
 
 def _canonical_clifford_gate_name_and_arity(gate_name: str) -> tuple[str, int]:
-    s = gate_name.strip() if isinstance(gate_name, str) else ""
-    if s in DECOMP_1Q:
-        return ("I" if s == "I_" else _canonical_gate_data(s).name), 1
-    if s in DECOMP_2Q:
-        return _canonical_gate_data(s).name, 2
-    gd = _canonical_gate_data(s)
+    gd = _canonical_gate_data(gate_name)
     if not gd.is_unitary or not (gd.is_single_qubit_gate or gd.is_two_qubit_gate):
         raise ValueError(f"Gate {gate_name!r} is not a 1Q or 2Q unitary Clifford gate")
     return gd.name, (1 if gd.is_single_qubit_gate else 2)
@@ -304,14 +296,8 @@ def decompose_clifford_exact(
 ) -> ExactCliffordDecomposition:
     """Decompose a named 1Q/2Q Stim Clifford or `stim.Tableau` with exact `omega**v` phase."""
     if isinstance(gate_or_tableau, str):
-        s = gate_or_tableau.strip()
-        if s in DECOMP_1Q:
-            k, (v, p0_spec, r_specs) = 1, DECOMP_1Q[s]
-        elif s in DECOMP_2Q:
-            k, (v, p0_spec, r_specs) = 2, DECOMP_2Q[s]
-        else:
-            canon_name, k = _canonical_clifford_gate_name_and_arity(s)
-            v, p0_spec, r_specs = (DECOMP_1Q if k == 1 else DECOMP_2Q)[canon_name]
+        canon_name, k = _canonical_clifford_gate_name_and_arity(gate_or_tableau)
+        v, p0_spec, r_specs = (DECOMP_1Q if k == 1 else DECOMP_2Q)[canon_name]
         t_tup = _validate_decomp_targets(targets, k, gate_or_tableau)
         if not inverse:
             return ExactCliffordDecomposition(k, v, p0_spec, r_specs, t_tup)
@@ -601,11 +587,6 @@ class MagicTermRecord:
 class CompiledOpenBlockRecord:
     block: CompiledPauliBlock
     axes: tuple[CompiledPauliAxis, ...]
-    poly_masks: NDArray[np.uint64]
-    poly_coeffs_mod8: NDArray[np.uint8]
-    global_v_mod8: int
-    raw_terms: tuple[MagicPhaseTerm, ...]
-    cache_key: tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -621,7 +602,7 @@ class PauliNoiseRecord:
     kind: str
     probs: tuple[float, ...]
     branch_axes: tuple[CompiledPauliAxis, ...]
-    noise_index: int | None = None
+    noise_index: int
 
 
 @dataclass(frozen=True)
@@ -630,7 +611,7 @@ class HeraldedNoiseRecord:
     meas_index: int
     probs: tuple[float, ...]
     branch_axes: tuple[CompiledPauliAxis | None, ...]
-    noise_index: int | None = None
+    noise_index: int
 
 
 @dataclass(frozen=True)
@@ -638,7 +619,7 @@ class CorrelatedNoiseRecord:
     is_else: bool
     prob: float
     axis: CompiledPauliAxis
-    noise_index: int | None = None
+    noise_index: int
 
 
 @dataclass(frozen=True)
@@ -747,7 +728,6 @@ def clone_reference_chp(ref_chp: ReferenceCHPTableau) -> ReferenceCHPTableau:
     out.x2x[:], out.x2z[:] = x2x, x2z
     out.z2x[:], out.z2z[:] = z2x, z2z
     out.x_kap[:], out.z_kap[:] = x_kap, z_kap
-    out._inv_dirty = True
     for attr in ("_frame_events", "_selector_plan_meta"):
         if hasattr(ref_chp, attr):
             setattr(out, attr, getattr(ref_chp, attr))
@@ -870,7 +850,6 @@ def apply_spp_to_reference_chp(
                 arr_k[q] = np.uint8((kap_fac + int(arr_k[q]) + (dot << 1)) & 3)
                 arr_x[q] ^= bar_P.a_words
                 arr_z[q] ^= bar_P.b_words
-    ref_chp._inv_dirty = True
 
 
 def _apply_right_rot_to_ref_chp(
@@ -889,7 +868,6 @@ def _apply_right_rot_to_ref_chp(
             arr_k[idx] = (fac_kap + arr_k[idx] + (dp << np.uint8(1))) & np.uint8(3)
             arr_x[idx] ^= rot_a
             arr_z[idx] ^= rot_b
-    ref_chp._inv_dirty = True
 
 
 def _compile_pauli_measurement_c15(
@@ -961,10 +939,7 @@ _ANNOTATION_GATES: frozenset[str] = frozenset(
     {"TICK", "QUBIT_COORDS", "SHIFT_COORDS", "DETECTOR", "OBSERVABLE_INCLUDE"}
 )
 _FEEDBACK_2Q_GATES: dict[str, tuple[str, str]] = {
-    "CX": ("Z", "X"), "CNOT": ("Z", "X"), "ZCX": ("Z", "X"),
-    "CY": ("Z", "Y"), "ZCY": ("Z", "Y"),
-    "CZ": ("Z", "Z"), "ZCZ": ("Z", "Z"),
-    "XCZ": ("X", "Z"), "YCZ": ("Y", "Z"),
+    "CX": ("Z", "X"), "CY": ("Z", "Y"), "CZ": ("Z", "Z"), "XCZ": ("X", "Z"), "YCZ": ("Y", "Z"),
 }
 _PAULI_2Q_ORDER: tuple[str, ...] = tuple(
     p0 + p1 for p0 in "IXYZ" for p1 in "IXYZ" if not (p0 == "I" and p1 == "I")
@@ -1048,7 +1023,7 @@ def _validate_and_emit_non_magic_tagged_op(
                         f"of tag target count {len(tag_targets)} in {op!r}"
                     )
 
-    canon_name = _canonical_gate_data(op.name).name if op.name != "I_" else "I"
+    canon_name = _canonical_gate_data(op.name).name
     n_meas = _instruction_num_measurements(op, canon_name)
     out_records.append(
         LeakageBarrierRecord(op, step_index, tag_prefix, next_meas_idx, n_meas, params, num_qubits)
@@ -1089,7 +1064,6 @@ def _restrict_tableau_to_data(
     else:
         data_tab.x_kap[:] = ref_sel.x_kap[:n_data]
         data_tab.z_kap[:] = ref_sel.z_kap[:n_data]
-    data_tab._inv_dirty = True
     return data_tab
 
 
@@ -1098,7 +1072,7 @@ def _count_gadget_pauli_selectors(flat_ops: Sequence[stim.CircuitInstruction]) -
     for op in flat_ops:
         if op.tag != "":
             continue
-        cname = _canonical_gate_data(op.name).name if op.name != "I_" else "I"
+        cname = _canonical_gate_data(op.name).name
         if cname in _CAT_NOISE_META:
             arity, k_br = _CAT_NOISE_META[cname]
             total += k_br * (len(op.targets_copy()) // arity)
@@ -1255,7 +1229,7 @@ def _compile_circuit_pass(
                 )
         else:
             name = op.name
-            canon_name = _canonical_gate_data(name).name if name != "I_" else "I"
+            canon_name = _canonical_gate_data(name).name
             args = op.gate_args_copy()
             targs = op.targets_copy()
 
@@ -1504,7 +1478,6 @@ def _walsh_expand_subblock(
     axes: Sequence[CompiledPauliAxis],
     poly_items: Sequence[tuple[int, int]],
     global_v_mod8: int,
-    cache_key: tuple[Any, ...],
     *,
     n_qubits_exact: bool = True,
 ) -> CompiledPauliBlock:
@@ -1514,7 +1487,7 @@ def _walsh_expand_subblock(
     if r == 0:
         return CompiledPauliBlock(
             n_qubits=n_qubits, mode="pauli_sum", global_scalar=OMEGA_POWERS[global_v_mod8 & 7],
-            is_unitary=True, is_identity=True, cache_key=cache_key, n_qubits_exact=n_qubits_exact,
+            is_unitary=True, is_identity=True, n_qubits_exact=n_qubits_exact,
         )
     dim = 1 << r
     s_grid = np.arange(dim, dtype=np.uint64)
@@ -1553,7 +1526,7 @@ def _walsh_expand_subblock(
         b_words=np.ascontiguousarray(prod_b[nz_masks], dtype=np.uint64),
         kappas=np.ascontiguousarray(prod_k[nz_masks], dtype=np.uint8),
         global_scalar=1.0 + 0.0j, is_unitary=True, is_identity=False,
-        cache_key=cache_key, n_qubits_exact=n_qubits_exact,
+        n_qubits_exact=n_qubits_exact,
     )
 
 
@@ -1619,18 +1592,18 @@ def compile_open_block(
     cur_axis_map: dict[tuple[bytes, bytes], int] = {}
     cur_poly: dict[int, int] = {}
     cur_v_mod8: int = 0
-    cur_raw_terms: list[MagicPhaseTerm] = []
+    has_terms: bool = False
 
     def _reset_cur() -> None:
-        nonlocal cur_v_mod8
+        nonlocal cur_v_mod8, has_terms
         cur_axes.clear()
         cur_axis_map.clear()
         cur_poly.clear()
-        cur_raw_terms.clear()
+        has_terms = False
         cur_v_mod8 = 0
 
     def _flush() -> None:
-        if not cur_raw_terms and cur_v_mod8 == 0 and not cur_poly:
+        if not has_terms and cur_v_mod8 == 0 and not cur_poly:
             return
         surviving = {m: (c & 7) for m, c in cur_poly.items() if (c & 7) != 0 and m != 0}
         v0 = cur_v_mod8 & 7
@@ -1652,24 +1625,16 @@ def compile_open_block(
             (sum(1 << new_u for old_u, new_u in old_to_new.items() if (m >> old_u) & 1), c)
             for m, c in surviving.items()
         )
-        poly_masks = np.array([m for m, _ in sorted_items], dtype=np.uint64)
-        poly_coeffs = np.array([c for _, c in sorted_items], dtype=np.uint8)
-        axes_tup, raw_tup = tuple(pruned_axes), tuple(cur_raw_terms)
-        ckey = (
-            n_q, v0,
-            tuple((ax.a_words.tobytes(), ax.b_words.tobytes(), ax.kappa) for ax in axes_tup),
-            tuple(sorted_items),
-        )
-
+        axes_tup = tuple(pruned_axes)
         r = len(axes_tup)
         block_obj: CompiledPauliBlock | None = None
         if r == 0:
             block_obj = CompiledPauliBlock(
                 n_qubits=n_q, mode="pauli_sum", global_scalar=OMEGA_POWERS[v0],
-                is_unitary=True, is_identity=True, cache_key=ckey, n_qubits_exact=nq_exact,
+                is_unitary=True, is_identity=True, n_qubits_exact=nq_exact,
             )
         elif budget >= 2 and r <= c2_max_rank and (1 << r) <= max(4096, budget * 16):
-            cand = _walsh_expand_subblock(n_q, axes_tup, sorted_items, v0, ckey, n_qubits_exact=nq_exact)
+            cand = _walsh_expand_subblock(n_q, axes_tup, sorted_items, v0, n_qubits_exact=nq_exact)
             assert cand.coeffs is not None
             if len(cand.coeffs) <= budget:
                 block_obj = cand
@@ -1684,10 +1649,10 @@ def compile_open_block(
             block_obj = CompiledPauliBlock(
                 n_qubits=n_q, mode="sequential", steps=tuple(seq_steps),
                 global_scalar=OMEGA_POWERS[v_seq], is_unitary=True,
-                is_identity=(len(seq_steps) == 0), cache_key=ckey, n_qubits_exact=nq_exact,
+                is_identity=(len(seq_steps) == 0), n_qubits_exact=nq_exact,
             )
 
-        out_records.append(CompiledOpenBlockRecord(block_obj, axes_tup, poly_masks, poly_coeffs, v0, raw_tup, ckey))
+        out_records.append(CompiledOpenBlockRecord(block_obj, axes_tup))
         _reset_cur()
 
     for rec in rec_seq:
@@ -1732,7 +1697,7 @@ def compile_open_block(
             u_indices.append(u_idx)
             neg_flags.append(neg_f)
 
-        cur_raw_terms.append(term)
+        has_terms = True
         if term.kind in ("T", "Z8_DIAG"):
             m0, c_val = 1 << u_indices[0], int(term.epsilon) & 7
             if neg_flags[0]:
@@ -1924,27 +1889,6 @@ def _normalize_choice_map(
     return out_seq
 
 
-def _plan_noise_max_choices(plan: DirectPlan | SelectorPlan) -> tuple[int, ...]:
-    if plan.noise_channel_max_choices:
-        return plan.noise_channel_max_choices
-    out: dict[int, int] = {}
-    cursor = 0
-    for rec in plan.records:
-        if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord, CorrelatedNoiseRecord)):
-            idx = rec.noise_index if rec.noise_index is not None else cursor
-            cursor += 1
-            out[idx] = 1 if isinstance(rec, CorrelatedNoiseRecord) else len(rec.probs)
-    if isinstance(plan, SelectorPlan) and plan.gadgetize_pauli_noise:
-        ch_ids = plan.noise_selector_channel_indices or tuple(range(len(plan.noise_selector_groups)))
-        for (_, _, s_grp), idx in zip(plan.noise_selector_groups, ch_ids):
-            out[idx] = len(s_grp)
-    n_tot = (
-        plan.total_noise_channels if isinstance(plan, SelectorPlan) and plan.total_noise_channels
-        else (max(out) + 1 if out else 0)
-    )
-    return tuple(out.get(i, 1) for i in range(n_tot))
-
-
 def _prepare_run_maps(
     plan: DirectPlan | SelectorPlan,
     *,
@@ -1964,13 +1908,12 @@ def _prepare_run_maps(
     fault_id_to_slot = {
         (ch.slot_id if ch.slot_id is not None else idx): idx for idx, ch in enumerate(plan.fault_channels)
     }
-    n_resets = plan.num_resets or sum(isinstance(rec, ResetRecord) for rec in plan.records)
     meas_bounds = (1,) * plan.num_measurements
     f_map = _normalize_choice_map(
         fault_trace, fault_max, "fault_trace", key_to_slot=fault_id_to_slot, allow_none_zero=True
     )
-    n_map = _normalize_choice_map(pauli_noise_trace, _plan_noise_max_choices(plan), "pauli_noise_trace")
-    r_map = _normalize_choice_map(reset_outcomes, (1,) * n_resets, "reset_outcomes", allow_bool_values=True)
+    n_map = _normalize_choice_map(pauli_noise_trace, plan.noise_channel_max_choices, "pauli_noise_trace")
+    r_map = _normalize_choice_map(reset_outcomes, (1,) * plan.num_resets, "reset_outcomes", allow_bool_values=True)
     c_map = _normalize_choice_map(
         requested_outcomes, meas_bounds, "requested_outcomes", allow_bool_values=True, mapping_only=True
     )
@@ -2105,7 +2048,7 @@ def _execute_compiled_records(
     quantum_outcomes: dict[int, int] = {}
     readout_flips: dict[int, bool] = {}
     born_masses: list[tuple[int | None, float, float, float]] = []
-    noise_cursor, reset_cursor = 0, 0
+    reset_cursor = 0
     correlated_occurred, zero_mass = False, False
     peak_chi, peak_d = max(1, exp.chi), exp.d
 
@@ -2131,8 +2074,7 @@ def _execute_compiled_records(
                 peak_chi, peak_d = max(peak_chi, exp.chi), max(peak_d, exp.d)
 
         elif isinstance(rec, PauliNoiseRecord):
-            ch_idx = rec.noise_index if rec.noise_index is not None else noise_cursor
-            noise_cursor += 1
+            ch_idx = rec.noise_index
             c_n = noise_map.get(ch_idx, 0) if noise_map is not None else _sample_categorical_branch(rec.probs, rng)
             chosen_noise.append(c_n)
             recorded_noise_map[ch_idx] = c_n
@@ -2140,8 +2082,7 @@ def _execute_compiled_records(
                 exp = apply_pauli(exp, rec.branch_axes[c_n - 1])
 
         elif isinstance(rec, HeraldedNoiseRecord):
-            ch_idx = rec.noise_index if rec.noise_index is not None else noise_cursor
-            noise_cursor += 1
+            ch_idx = rec.noise_index
             m_idx = rec.meas_index
             p_herald = min(1.0, max(0.0, float(sum(rec.probs))))
             req_h = req_c_map.get(m_idx)
@@ -2190,8 +2131,7 @@ def _execute_compiled_records(
                 exp = apply_pauli(exp, rec.branch_axes[c_h - 1])
 
         elif isinstance(rec, CorrelatedNoiseRecord):
-            ch_idx = rec.noise_index if rec.noise_index is not None else noise_cursor
-            noise_cursor += 1
+            ch_idx = rec.noise_index
             if not rec.is_else:
                 correlated_occurred = False
             if correlated_occurred:
@@ -2362,13 +2302,8 @@ def _sample_selector_activations_from_maps(
 
     noise_choice_map: dict[int, int] = {}
     if plan.gadgetize_pauli_noise and plan.noise_selector_groups:
-        ch_indices = (
-            plan.noise_selector_channel_indices
-            if len(plan.noise_selector_channel_indices) == len(plan.noise_selector_groups)
-            else tuple(range(len(plan.noise_selector_groups)))
-        )
         corr_active = False
-        for (g_kind, probs_g, s_grp), ch_idx in zip(plan.noise_selector_groups, ch_indices):
+        for (g_kind, probs_g, s_grp), ch_idx in zip(plan.noise_selector_groups, plan.noise_selector_channel_indices):
             if g_kind == "CAT":
                 c_n = noise_map.get(ch_idx, 0) if noise_map is not None else _sample_categorical_branch(probs_g, rng_obj)
                 noise_choice_map[ch_idx] = c_n
@@ -2544,9 +2479,6 @@ def extract_data_expansion(
 
     assert isinstance(plan_or_tableau, ReferenceCHPTableau)
     return _restrict_tableau_to_data(plan_or_tableau, n_data, sel_arr), data_exp
-
-
-trace_selectors = extract_data_expansion
 
 
 # ---------------------------------------------------------------------------

@@ -1,9 +1,7 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
-#include <immintrin.h>
-#endif
 
 extern "C" {
 
@@ -244,7 +242,7 @@ struct CppMRQFShot {
         s4_drop_variable(f);
     }
 
-    void p1_apply_pauli(const uint64_t* a_words, const uint64_t* b_words, int kappa) {
+    void p1_apply_pauli(const uint64_t* a_words, const uint64_t* b_words) {
         if (d > 0 && words_any_overlap(b_words, a_union.data(), n_words)) {
             for (int r = 0; r < d; ++r) {
                 int t = word_dot_parity(&A_buf[r * n_words], b_words, n_words);
@@ -418,7 +416,6 @@ struct BatchedMRQFEngine {
     int num_qubits;
     int batch_size;
     int n_words;
-    std::vector<uint64_t> owned_rng_states;
     uint64_t* shot_rng_states;
     std::vector<CppMRQFShot> shots;
     std::vector<uint8_t> is_active;
@@ -426,22 +423,19 @@ struct BatchedMRQFEngine {
     std::vector<uint64_t> tmp_words_1;
     std::vector<uint64_t> tmp_words_2;
 
-    BatchedMRQFEngine(int nq, int bs, uint64_t seed, uint64_t* ext_rng_states)
+    BatchedMRQFEngine(int nq, int bs, uint64_t* ext_rng_states)
         : num_qubits(nq),
           batch_size(bs),
           n_words((nq + 63) / 64 > 0 ? (nq + 63) / 64 : 1),
-          owned_rng_states(bs),
+          shot_rng_states(ext_rng_states),
           shots(bs),
           is_active(bs, 0),
           scratch_delta(bs, 0),
           tmp_words_1(n_words, 0),
           tmp_words_2(n_words, 0) {
-        uint64_t base = seed ? seed : 123456789ULL;
         for (int b = 0; b < bs; ++b) {
-            owned_rng_states[b] = ((base + 1ULL) * 0x9e3779b97f4a7c15ULL) ^ (uint64_t(b) * 0xbf58476d1ce4e5b9ULL);
             shots[b].init(n_words, 64);
         }
-        shot_rng_states = ext_rng_states ? ext_rng_states : owned_rng_states.data();
     }
 
     int draw_bit(int b) {
@@ -501,8 +495,8 @@ struct BatchedMRQFEngine {
     }
 };
 
-void* engine_create(int num_qubits, int batch_size, uint64_t seed, uint64_t* ext_rng_states) {
-    return new BatchedMRQFEngine(num_qubits, batch_size, seed, ext_rng_states);
+void* engine_create(int num_qubits, int batch_size, uint64_t* ext_rng_states) {
+    return new BatchedMRQFEngine(num_qubits, batch_size, ext_rng_states);
 }
 
 void engine_destroy(void* ptr) {
@@ -511,7 +505,7 @@ void engine_destroy(void* ptr) {
 
 void engine_set_rng_states(void* ptr, uint64_t* ext_rng_states) {
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
-    eng->shot_rng_states = ext_rng_states ? ext_rng_states : eng->owned_rng_states.data();
+    eng->shot_rng_states = ext_rng_states;
 }
 
 void engine_clear(void* ptr) {
@@ -698,6 +692,14 @@ void engine_batch_inject_general_clifford(
             for (int f = 0; f < n_factors; ++f) {
                 int gf = g * n_factors + f;
                 uint8_t kind = factor_kinds[gf];
+                const uint64_t* aw1 = factor_a1_w + gf * nw;
+                const uint64_t* bw1 = factor_b1_w + gf * nw;
+
+                if (kind == 0) {
+                    mrqf.p1_apply_pauli(aw1, bw1);
+                    continue;
+                }
+
                 const uint8_t* lx1 = factor_lx1 + gf * arity;
                 const uint8_t* lz1 = factor_lz1 + gf * arity;
                 int gamma1 = 0;
@@ -708,12 +710,8 @@ void engine_batch_inject_general_clifford(
                     gamma1 ^= (lx1[r] & fz) ^ (lz1[r] & fx);
                 }
                 int kap1_shot = (int(factor_kap1[gf]) + ((gamma1 & 1) << 1)) & 3;
-                const uint64_t* aw1 = factor_a1_w + gf * nw;
-                const uint64_t* bw1 = factor_b1_w + gf * nw;
 
-                if (kind == 0) {
-                    mrqf.p1_apply_pauli(aw1, bw1, kap1_shot);
-                } else if (kind == 1) {
+                if (kind == 1) {
                     mrqf.p2_apply_quarter_turn(aw1, bw1, kap1_shot);
                 } else {
                     const uint8_t* lx2 = factor_lx2 + gf * arity;

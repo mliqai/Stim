@@ -18,8 +18,8 @@ from stimside.util.magic_query import QueryBudget, QueryBudgetExceededError
 def test_statevector_and_branch_mass_across_fault_modes_and_backends() -> None:
     circ = stim.Circuit("H 0 1 2\nI[T] 0\nI[T_DAG] 1\nI[CCZ] 0 1 2\nCX 0 2")
     want = None
-    for fm in ("DIRECT", "SELECTOR", "method_a", "method_b"):
-        for be in ("STREAM", "QUERY", "event_stream", "q1_q2"):
+    for fm in ("DIRECT", "SELECTOR", "direct", "selector"):
+        for be in ("STREAM", "QUERY", "stream", "query"):
             sim = MagicsideSimulator(circ, batch_size=1, fault_mode=fm, backend=be)
             assert sim.run() is None
             psi = sim.get_statevector(0)

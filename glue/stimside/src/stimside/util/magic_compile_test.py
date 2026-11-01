@@ -88,8 +88,7 @@ def exact_stim_gate_local_c128(gate_name: str) -> np.ndarray:
     unitary lies in `{0, 1/2, 1/sqrt(2), 1} * exp(i * k * pi / 4)`, allowing exact
     algebraic promotion to `complex128` (`< 1e-15`) verified against `complex64` (`< 5e-8`).
     """
-    gd_name = "I" if gate_name == "I_" else gate_name
-    u32 = stim.gate_data(gd_name).unitary_matrix.astype(np.complex128)
+    u32 = stim.gate_data(gate_name).unitary_matrix.astype(np.complex128)
     u64 = np.zeros_like(u32, dtype=np.complex128)
     for r in range(u32.shape[0]):
         for c in range(u32.shape[1]):
@@ -267,7 +266,7 @@ def dense_simulate_trajectory_le(
             return
         if tag.startswith("CLIFFORD_FAULT"):
             parsed = parse_clifford_fault_tag(tag)
-            arity = 1 if parsed[0][1] in DECOMP_1Q else 2
+            arity = 1 if stim.gate_data(parsed[0][1]).is_single_qubit_gate else 2
             qs = [t.qubit_value for t in targs]
             for off in range(0, len(qs), arity):
                 grp = qs[off : off + arity]
@@ -286,13 +285,14 @@ def dense_simulate_trajectory_le(
                 psi = fac @ psi
             return
 
-        if name in DECOMP_1Q:
-            U_loc = exact_stim_gate_local_c128(name)
+        cname = stim.gate_data(name).name
+        if cname in DECOMP_1Q:
+            U_loc = exact_stim_gate_local_c128(cname)
             for t in targs:
                 psi = embed_unitary_le(U_loc, [t.qubit_value], n) @ psi
             return
 
-        if name in DECOMP_2Q:
+        if cname in DECOMP_2Q:
             for off in range(0, len(targs), 2):
                 t0, t1 = targs[off], targs[off + 1]
                 if t0.is_qubit_target and t1.is_qubit_target:
@@ -516,10 +516,10 @@ def _reconstruct_unitary_via_qfe_primitives(
 
 
 def test_decompose_clifford_exact_all_stim_gates() -> None:
-    """Verify all 55 1Q & 2Q Stim Clifford gates retain exact `omega^v` (`< 1e-14`)."""
-    gates_1q = list(DECOMP_1Q.keys())
-    gates_2q = list(DECOMP_2Q.keys())
-    assert len(gates_1q) + len(gates_2q) == 55
+    """Verify all 46 canonical 1Q & 2Q Stim Clifford gates + 8 aliases retain exact `omega^v` (`< 1e-14`)."""
+    gates_1q = list(DECOMP_1Q.keys()) + ["H_XZ", "SQRT_Z", "SQRT_Z_DAG"]
+    gates_2q = list(DECOMP_2Q.keys()) + ["ZCZ", "CNOT", "ZCX", "ZCY", "SWAPCZ"]
+    assert len(DECOMP_1Q) + len(DECOMP_2Q) == 46
 
     for g1 in gates_1q:
         U_oracle = exact_stim_gate_local_c128(g1)
@@ -704,7 +704,7 @@ def test_v1_3_zero_rank_branching_and_eq_defect_bound() -> None:
 # Group B: V1.2b Full Stim Trajectories & V1.4 DIRECT vs SELECTOR Equivalence
 # ---------------------------------------------------------------------------
 
-_ALL_1Q_GATES = tuple(g for g in DECOMP_1Q if g != "I_")
+_ALL_1Q_GATES = tuple(DECOMP_1Q.keys())
 _ALL_2Q_GATES = tuple(DECOMP_2Q.keys())
 _MEAS_1Q_GATES = ("M", "MZ", "MX", "MY")
 _MEAS_2Q_GATES = ("MXX", "MYY", "MZZ")
@@ -1055,7 +1055,7 @@ def test_v1_4_selector_all_9_controlled_paulis_and_clifford_phases() -> None:
     """`V1.4`: Verify 1-gate `CCZ` shortcut on all 9 2Q controlled Paulis + all Clifford phases `v in {0..7}`."""
     # (a) All 9 2Q controlled Paulis + 4 Stim aliases on both (0, 1) and (1, 0) in a 3Q magic circuit
     cp_gates = ("CZ", "CX", "CY", "XCX", "XCY", "XCZ", "YCX", "YCY", "YCZ", "CNOT", "ZCX", "ZCY", "ZCZ")
-    assert set(CONTROLLED_PAULI_2Q_AXES.keys()) == set(cp_gates)
+    assert set(CONTROLLED_PAULI_2Q_AXES.keys()) == {"CZ", "CX", "CY", "XCX", "XCY", "XCZ", "YCX", "YCY", "YCZ"}
 
     for g_cp in cp_gates:
         for q0, q1 in ((0, 1), (1, 0)):

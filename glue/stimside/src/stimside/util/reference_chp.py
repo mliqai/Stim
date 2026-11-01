@@ -256,6 +256,7 @@ class UnitaryStepMeta:
     gate_name: str
     num_qubits: int
     target_groups: list[tuple[int, ...]]
+    quantum_op: stim.CircuitInstruction | None = None
     _group_ops: list[stim.CircuitInstruction] | None = None
     _group_packed_words: list[PackedSymplecticTables] | None = None
     _cocycle_cache: dict[int, InverseCliffordCocycle] = dataclasses.field(default_factory=dict)
@@ -1051,11 +1052,12 @@ class CompiledReferenceCircuit:
                     self.steps.append(step)
                     return step
                 targets = quantum_targets
-                op = stim.CircuitInstruction(
+                quantum_op = stim.CircuitInstruction(
                     name, quantum_targets, op.gate_args_copy()
                 )
             else:
                 targets = [t.qubit_value for t in raw_t]
+                quantum_op = op
             arity = 2 if gd.is_two_qubit_gate else 1
             groups = [
                 tuple(targets[i : i + arity])
@@ -1080,6 +1082,7 @@ class CompiledReferenceCircuit:
                 gate_name=name,
                 num_qubits=self.num_qubits,
                 target_groups=groups,
+                quantum_op=quantum_op,
                 _group_packed_words=group_packed_words,
                 _packed_words=packed_after,
                 are_groups_disjoint=is_disjoint,
