@@ -15,7 +15,7 @@ from stimside.dem_generators.dem_generator_marginal import (
     _PAULI_STRINGS,
     _PAULI_TO_ID,
     MarginalLeakageDemGenerator,
-    _Builder,
+    Builder,
 )
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import (
@@ -460,7 +460,7 @@ def test_source_known_state_of_a_qubit_absent_from_the_reference_is_plus_z():
         MPAD[LEAKAGE_MEASUREMENT: (1.0, 2): 0 2] 0 0
         """
     )
-    builder = _Builder(circuit, True)
+    builder = Builder(circuit, True)
     builder.build()
     sources = builder._find_sources()
     builder._set_source_known_states(sources)
@@ -1837,8 +1837,8 @@ def test_surface_code_marginal_dem_cpp_speed_and_edge_reweights_equivalence():
 
 
 def _reference_update_dem(analysis, raised_row) -> stim.DetectorErrorModel:
-    """Pure-Python oracle for _Analysis.generate_batch(reweight_only=True) on one shot."""
-    from stimside.dem_generators.dem_generator_marginal import _sym_to_targets, _xor
+    """Pure-Python oracle for Analysis.generate_batch(reweight_only=True) on one shot."""
+    from stimside.dem_generators.graphlike import prob_xor, sym_to_targets
 
     flags = np.flatnonzero(raised_row).tolist()
     raised = set(flags)
@@ -1849,14 +1849,14 @@ def _reference_update_dem(analysis, raised_row) -> stim.DetectorErrorModel:
             continue
         for idx in range(analysis.flag_env_offsets[f], analysis.flag_env_offsets[f + 1]):
             sym = analysis.symptoms[int(analysis.flag_env_sym_ids[idx])]
-            combined[sym] = _xor(combined.get(sym, 0.0), float(analysis.flag_env_probs[idx]))
+            combined[sym] = prob_xor(combined.get(sym, 0.0), float(analysis.flag_env_probs[idx]))
     sym_index = {sym: idx for idx, sym in enumerate(analysis.symptoms)}
     update = stim.DetectorErrorModel()
     for sym, p in combined.items():
         if p > 0:
-            p_tot = _xor(float(analysis.base_sym_probs[sym_index[sym]]), p)
+            p_tot = prob_xor(float(analysis.base_sym_probs[sym_index[sym]]), p)
             if p_tot > 0:
-                update.append("error", p_tot, _sym_to_targets(sym))
+                update.append("error", p_tot, sym_to_targets(sym))
     return update
 
 
@@ -1957,14 +1957,14 @@ def test_decode_with_generated_dems_plain_reweight_sequence_preserves_baseline()
 
 
 def test_decompose_dem_graphlike_uses_known_graphlike_edges():
-    from stimside.dem_generators.dem_decoding import _decompose_dem_graphlike
+    from stimside.dem_generators.graphlike import decompose_dem_graphlike
 
     dem = stim.DetectorErrorModel(
         "error(0.01) D0 D2 L0\n"
         "error(0.01) D1 D3\n"
         "error(0.2) D0 D1 D2 D3 L0\n"
     )
-    decomposed = _decompose_dem_graphlike(dem)
+    decomposed = decompose_dem_graphlike(dem)
     # Must decompose D0 D1 D2 D3 L0 into existing graphlike edges (D0 D2 L0 ^ D1 D3),
     # not introduce non-existent edges (D0 D1, D2 D3).
     m = pymatching.Matching.from_detector_error_model(decomposed)
@@ -2052,7 +2052,7 @@ def test_sliced_indexed_and_plain_list_dems_preserve_metadata_and_transform_when
     assert isinstance(out_indexed, np.ndarray)
     assert out_indexed.ndim == 2 and out_indexed.shape[1] == 3
 
-    # Sliced _GeneratedDemList with bit_packed_dets=None
+    # Sliced GeneratedDemList with bit_packed_dets=None
     out_sliced = decode_with_generated_dems(
         "pymatching", raw_dems[:1], None, decompose_errors=True, reweight_only=True
     )
@@ -2079,7 +2079,7 @@ def test_sliced_indexed_and_plain_list_dems_preserve_metadata_and_transform_when
 
 
 def test_non_pymatching_decoder_and_all_none_reweights():
-    from stimside.dem_generators.dem_generator_marginal import _decompose_hyperedge_component
+    from stimside.dem_generators.graphlike import decompose_hyperedge_component
 
     class RecordingDecoder(sinter.Decoder):
         def __init__(self) -> None:
@@ -2136,9 +2136,9 @@ def test_non_pymatching_decoder_and_all_none_reweights():
         (0, 2): ((0, 2), ()),
         (1, 3): ((1, 3), ()),
     }
-    res_4 = _decompose_hyperedge_component((0, 1, 2, 3), (0,), known)
+    res_4 = decompose_hyperedge_component((0, 1, 2, 3), (0,), known)
     assert {d for d, _ in res_4} == {(0, 2), (1, 3)}
-    res_6 = _decompose_hyperedge_component((0, 1, 2, 3, 4, 5), (), known)
+    res_6 = decompose_hyperedge_component((0, 1, 2, 3, 4, 5), (), known)
     assert {d for d, _ in res_6} == {(0, 2), (1, 3), (4, 5)}
 
 
@@ -2147,13 +2147,13 @@ def test_non_pymatching_decoder_and_all_none_reweights():
 def test_kept_candidates_reproduce_flag_envelopes(which, decompose_errors):
     import dataclasses
 
-    from stimside.dem_generators.dem_generator_marginal import _Builder
+    from stimside.dem_generators.dem_generator_marginal import Builder
 
     circuit = (
         REP_CIRCUIT if which == "rep" else _make_surface_code_leakage_circuit(3, 2)
     )
-    plain = _Builder(circuit, True).build(decompose_errors=decompose_errors)
-    kept = _Builder(circuit, True).build(
+    plain = Builder(circuit, True).build(decompose_errors=decompose_errors)
+    kept = Builder(circuit, True).build(
         decompose_errors=decompose_errors, keep_candidates=True
     )
     cand_names = {
@@ -2271,7 +2271,7 @@ def test_item_analysis_registry_evicts_on_gc_including_empty_reweight() -> None:
     import weakref
     from stimside.dem_generators.dem_generator_marginal import (
         _ITEM_ANALYSIS_META,
-        _get_item_analysis_meta,
+        get_item_analysis_meta,
     )
 
     sc = _make_surface_code_leakage_circuit(distance=3, rounds=2)
@@ -2283,7 +2283,7 @@ def test_item_analysis_registry_evicts_on_gc_including_empty_reweight() -> None:
         recs[1, flags[0]] = True
         dems = gen(sc, recs, decompose_errors=dec, reweight_only=rew)
         ids = {id(x) for x in dems}
-        assert all(_get_item_analysis_meta(x) is not None for x in dems)
+        assert all(get_item_analysis_meta(x) is not None for x in dems)
         del dems, gen
         gc.collect()
         assert gen_ref() is None
@@ -2293,7 +2293,7 @@ def test_item_analysis_registry_evicts_on_gc_including_empty_reweight() -> None:
     rec_1d = np.zeros(sc.num_measurements, dtype=bool)
     rec_1d[gen_many._get_analysis(sc, False).flag_records[0]] = True
     live = [gen_many(sc, rec_1d) for _ in range(300)]
-    assert len(live) == 300 and all(_get_item_analysis_meta(d) is not None for d in live)
+    assert len(live) == 300 and all(get_item_analysis_meta(d) is not None for d in live)
     live_ids = {id(d) for d in live}
     live.clear()
     gc.collect()

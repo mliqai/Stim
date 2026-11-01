@@ -14,7 +14,7 @@ from stimside.dem_generators import (
 )
 from stimside.dem_generators.dem_decoding import decode_with_generated_dems
 from stimside.dem_generators.dem_generator_marginal import (
-    _Builder,
+    Builder,
     _match_shot_sources,
 )
 from stimside.dem_generators.dem_generator_marginal_test import (
@@ -191,7 +191,7 @@ def test_regeneration_and_slicing_carry_the_leakage_events():
 
 
 def _source_weights(circuit: stim.Circuit) -> list[list[float]]:
-    builder = _Builder(circuit, True)
+    builder = Builder(circuit, True)
     builder._find_flags()
     builder._build_touch_lists()
     sources = builder._find_sources()

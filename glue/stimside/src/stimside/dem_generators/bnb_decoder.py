@@ -36,18 +36,18 @@ import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
 from stimside.dem_generators.dem_decoding import (
-    _decode_with_edge_reweights,
-    _is_pymatching_decoder,
+    decode_with_edge_reweights,
+    is_pymatching_decoder,
 )
 from stimside.dem_generators.dem_generator_marginal import (
+    Analysis,
+    Builder,
     MarginalLeakageDemGenerator,
-    _Analysis,
-    _Builder,
 )
 from stimside.dem_generators.leakage_decoder import (
     CompiledLeakageDecoder,
     LeakageDecoder,
-    _check_decoder,
+    check_decoder,
 )
 from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageMeasurementParams,
@@ -165,7 +165,7 @@ def _fewest_branch(
     return min(hits, key=lambda r: (len(rows[r]), r)) if hits else None
 
 
-def _search_dem(analysis: _Analysis) -> stim.DetectorErrorModel:
+def _search_dem(analysis: Analysis) -> stim.DetectorErrorModel:
     """``matching_base_dem`` with its placeholder edges at ``_PLACEHOLDER_WEIGHT``."""
     num_base = len(analysis.baseline)
     p_placeholder = 1.0 / (1.0 + math.exp(_PLACEHOLDER_WEIGHT))
@@ -180,7 +180,7 @@ def _search_dem(analysis: _Analysis) -> stim.DetectorErrorModel:
 
 
 def _edge_factors(
-    sym_probs: dict[int, float], analysis: _Analysis
+    sym_probs: dict[int, float], analysis: Analysis
 ) -> tuple[NDArray[np.int32], NDArray[np.float64]]:
     """(sorted edge ids, prod over the symptoms on each edge of 1 - 2p)."""
     offs, ids = analysis.sym_edge_offsets, analysis.sym_edge_ids
@@ -214,7 +214,7 @@ def _has_fork_matching() -> bool:
 
 
 def _flag_symptoms(
-    a: _Analysis, priors: str
+    a: Analysis, priors: str
 ) -> tuple[list[list[dict[int, float]]], list[dict[int, float] | None]]:
     """Per flag: each candidate's prior-scaled symptom probabilities, and their disjoint average.
 
@@ -337,7 +337,7 @@ class BranchAndBoundDecoder(LeakageDecoder):
             raise ValueError(f"max_mwpm_calls must be >= 1, got {max_mwpm_calls}.")
         if max_queue is not None and max_queue < 1:
             raise ValueError(f"max_queue must be None or >= 1, got {max_queue}.")
-        dec_name = _check_decoder(decoder, "BranchAndBoundDecoder")
+        dec_name = check_decoder(decoder, "BranchAndBoundDecoder")
         self.dem_gen = dem_gen
         self.decoder = decoder
         self.max_mwpm_calls = max_mwpm_calls
@@ -405,7 +405,7 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
         self.num_detectors = circuit.num_detectors
         self.num_observables = circuit.num_observables
         self.stats: Counter[str] = Counter()
-        builder = _Builder(circuit, unconditional_condition_on_U)
+        builder = Builder(circuit, unconditional_condition_on_U)
         analysis = builder.build(decompose_errors=True, keep_candidates=True)
         self.analysis = analysis
         self.search_dem = _search_dem(analysis)
@@ -414,8 +414,8 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
         self._warn_if_equivalent_to_marginal(circuit)
         # A non-PyMatching decoder decodes the accepted node's undecomposed DEM
         # (hyperedges kept), built from this analysis' symptoms.
-        self.hyper_analysis: _Analysis | None = None
-        if not _is_pymatching_decoder(decoder):
+        self.hyper_analysis: Analysis | None = None
+        if not is_pymatching_decoder(decoder):
             hyper = builder.build(decompose_errors=False, keep_candidates=True)
             for field in (
                 "flag_records",
@@ -443,7 +443,7 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
             self._matcher = pymatching.Matching.from_detector_error_model(self.search_dem)
         return self._matcher
 
-    def _build_tables(self, a: _Analysis, priors: str) -> None:
+    def _build_tables(self, a: Analysis, priors: str) -> None:
         cand_syms, env_syms = _flag_symptoms(a, priors)
         offs, ids = a.sym_edge_offsets, a.sym_edge_ids
         num_flags = len(a.flag_records)
@@ -646,7 +646,7 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
         )
         rw_list = []
         # One array per distinct accepted graph: a non-PyMatching decoder then
-        # compiles once per graph and batch (_decode_with_edge_reweights groups
+        # compiles once per graph and batch (decode_with_edge_reweights groups
         # the shots by array identity).
         shared: dict[tuple[Any, ...], NDArray[np.float64]] = {}
         groups: dict[tuple[Any, ...], list[int]] = {}
@@ -660,8 +660,8 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
             groups.setdefault(key, []).append(s)
         if self.hyper_analysis is not None:
             return self._decode_hyper(groups, bit_packed_detection_event_data)
-        decoder = self._get_matcher() if _is_pymatching_decoder(self.decoder) else self.decoder
-        return _decode_with_edge_reweights(
+        decoder = self._get_matcher() if is_pymatching_decoder(self.decoder) else self.decoder
+        return decode_with_edge_reweights(
             decoder, rw_list, bit_packed_detection_event_data, base_dem=self.search_dem
         )
 

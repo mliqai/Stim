@@ -79,6 +79,17 @@ from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 from stimside.dem_generators.dem_generator_base import DemGenerator
+from stimside.dem_generators.graphlike import (
+    Symptom,
+    canonical_symptom_from_components,
+    collect_known_graphlike,
+    graphlike_components,
+    inst_symptom,
+    prob_xor,
+    raw_inst_components,
+    sym_to_targets,
+    symptom_components,
+)
 from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageConditioningParams,
     LeakageMeasurementParams,
@@ -156,7 +167,7 @@ _ITEM_ANALYSIS_META: dict[
     int,
     tuple[
         weakref.ReferenceType[Any],
-        _Analysis,
+        Analysis,
         bool,
         bool,
         MarginalLeakageDemGenerator,
@@ -169,7 +180,7 @@ _ITEM_ANALYSIS_META: dict[
 
 def _register_item_analysis(
     obj: Any,
-    analysis: _Analysis,
+    analysis: Analysis,
     decompose_errors: bool,
     reweight_only: bool,
     generator: MarginalLeakageDemGenerator,
@@ -196,10 +207,10 @@ def _register_item_analysis(
     )
 
 
-def _get_item_analysis_meta(
+def get_item_analysis_meta(
     obj: Any,
 ) -> tuple[
-    _Analysis,
+    Analysis,
     bool,
     bool,
     MarginalLeakageDemGenerator,
@@ -212,7 +223,7 @@ def _get_item_analysis_meta(
     return None
 
 
-def _get_item_leakage_events(obj: Any) -> ShotLeakageEvents | None:
+def get_item_leakage_events(obj: Any) -> ShotLeakageEvents | None:
     """The leakage events of the shot an item was generated for (loss-oracle mode), else None."""
     entry = _ITEM_ANALYSIS_META.get(id(obj))
     if entry is not None and entry[0]() is obj:
@@ -220,54 +231,14 @@ def _get_item_leakage_events(obj: Any) -> ShotLeakageEvents | None:
     return None
 
 
-Symptom = tuple[tuple[int, ...], tuple[int, ...]]  # (detector ids, observable ids)
-
-
-def _is_compound_symptom(sym: Any) -> bool:
-    return (
-        bool(sym)
-        and isinstance(sym[0], tuple)
-        and bool(sym[0])
-        and isinstance(sym[0][0], tuple)
-    )
-
-
-def _symptom_components(sym: Any) -> tuple[Symptom, ...]:
-    if _is_compound_symptom(sym):
-        return sym
-    if sym == ((), ()):
-        return ()
-    return (sym,)
-
-
-def _canonical_symptom_from_components(comps: Sequence[Symptom]) -> Any:
-    non_empty = [c for c in comps if c[0] or c[1]]
-    if not non_empty:
-        return ((), ())
-    if len(non_empty) == 1:
-        return non_empty[0]
-    return tuple(sorted(non_empty))
-
-
-def _sym_to_targets(sym: Any) -> list[stim.DemTarget]:
-    comps = _symptom_components(sym)
-    targets: list[stim.DemTarget] = []
-    for idx, (dets, obs) in enumerate(comps):
-        if idx > 0:
-            targets.append(stim.target_separator())
-        targets.extend(stim.target_relative_detector_id(d) for d in dets)
-        targets.extend(stim.target_logical_observable_id(o) for o in obs)
-    return targets
-
-
-class _GeneratedDemList(list):
+class GeneratedDemList(list):
     """A list of per-shot DEMs or edge_reweights arrays carrying circuit/baseline metadata."""
 
     def __init__(
         self,
         items: Sequence[Any],
         *,
-        analysis: _Analysis | None = None,
+        analysis: Analysis | None = None,
         generator: MarginalLeakageDemGenerator | None = None,
         circuit: stim.Circuit | None = None,
         records: NDArray[np.bool_] | None = None,
@@ -291,7 +262,7 @@ class _GeneratedDemList(list):
     def __getitem__(self, index: Any) -> Any:
         res = super().__getitem__(index)
         if isinstance(index, slice):
-            return _GeneratedDemList(
+            return GeneratedDemList(
                 res,
                 analysis=self.analysis,
                 generator=self._generator,
@@ -391,7 +362,7 @@ def _condition_groups(
     return [([t], [t.qubit_value]) for t in targets]  # CONDITIONED_ON_SELF
 
 
-_LEAKAGE_SWAP_UNSUPPORTED = (
+LEAKAGE_SWAP_UNSUPPORTED = (
     "SWAP[LEAKAGE_SWAP] is an unsupported feature of MarginalLeakageDemGenerator (and so of "
     "MarginalDecoder and BranchAndBoundDecoder): it does not model leakage moving between "
     "qubits. Only MarginalLeakageDemGenerator(loss_oracle=True) accepts it, with a warning."
@@ -403,11 +374,11 @@ _LEAKAGE_SWAP_ORACLE_WARNING = (
 )
 
 
-def _has_leakage_swap(circuit: stim.Circuit) -> bool:
+def has_leakage_swap(circuit: stim.Circuit) -> bool:
     """Whether ``circuit`` (REPEAT blocks included) has a ``SWAP[LEAKAGE_SWAP]``."""
     for op in circuit:
         if isinstance(op, stim.CircuitRepeatBlock):
-            if _has_leakage_swap(op.body_copy()):
+            if has_leakage_swap(op.body_copy()):
                 return True
         elif op.name == "SWAP" and op.tag == "LEAKAGE_SWAP":
             return True
@@ -445,218 +416,10 @@ def _stripped(op: stim.CircuitInstruction, args=None) -> stim.CircuitInstruction
     )
 
 
-def _symptom(inst: stim.DemInstruction) -> Symptom:
-    dets: set[int] = set()
-    obs: set[int] = set()
-    for t in inst.targets_copy():
-        if t.is_relative_detector_id():
-            dets ^= {t.val}
-        elif t.is_logical_observable_id():
-            obs ^= {t.val}
-    return tuple(sorted(dets)), tuple(sorted(obs))
-
-
-def _raw_inst_components(inst: stim.DemInstruction) -> list[Symptom]:
-    """Extract separator-delimited (detectors, observables) components of a DEM instruction."""
-    comps: list[Symptom] = []
-    dets: set[int] = set()
-    obs: set[int] = set()
-    for t in inst.targets_copy():
-        if t.is_separator():
-            if dets or obs:
-                comps.append((tuple(sorted(dets)), tuple(sorted(obs))))
-            dets.clear()
-            obs.clear()
-        elif t.is_relative_detector_id():
-            dets ^= {t.val}
-        elif t.is_logical_observable_id():
-            obs ^= {t.val}
-    if dets or obs:
-        comps.append((tuple(sorted(dets)), tuple(sorted(obs))))
-    return comps
-
-
-def _collect_known_graphlike(
-    *dems: stim.DetectorErrorModel | None,
-) -> dict[tuple[int, ...], Symptom]:
-    """Collect known 1- and 2-detector components from DEM(s) for hyperedge decomposition."""
-    known: dict[tuple[int, ...], Symptom] = {}
-    for dem in dems:
-        if dem is None:
-            continue
-        for inst in dem.flattened():
-            if inst.type != "error":
-                continue
-            args = inst.args_copy()
-            if not args or args[0] <= 0:
-                continue
-            for dets, obs in _raw_inst_components(inst):
-                if 1 <= len(dets) <= 2 and dets not in known:
-                    known[dets] = (dets, obs)
-    return known
-
-
-def _decompose_hyperedge_component(
-    dets: tuple[int, ...],
-    obs: tuple[int, ...],
-    known_graphlike: dict[tuple[int, ...], Symptom] | None = None,
-) -> list[Symptom]:
-    """Decompose a >2-detector component into <=2-detector components using Stim's algorithm."""
-    n = len(dets)
-    if n == 0:
-        return []
-    if n <= 2:
-        return [(dets, obs)]
-
-    if known_graphlike:
-        target_obs = set(obs)
-        out: list[Symptom] = []
-
-        def _search(start: int, used_mask: int, cur_obs: set[int]) -> bool:
-            while start < n and ((used_mask >> start) & 1):
-                start += 1
-            if start >= n:
-                return cur_obs == target_obs
-            used_mask |= 1 << start
-            d0 = dets[start]
-            for k in range(start + 1, n + 1):
-                if k < n:
-                    if (used_mask >> k) & 1:
-                        continue
-                    key: tuple[int, ...] = (d0, dets[k])
-                    next_mask = used_mask | (1 << k)
-                else:
-                    key = (d0,)
-                    next_mask = used_mask
-                match = known_graphlike.get(key)
-                if match is not None:
-                    if _search(start + 1, next_mask, cur_obs ^ set(match[1])):
-                        out.append(match)
-                        return True
-            return False
-
-        if n < 64 and _search(0, 0, set()):
-            out.reverse()
-            return out
-
-        # Fallback: find a disjoint subset of known graphlike edges covering the
-        # maximum number of detectors (minimizing missed detectors), then add
-        # remnant edge(s) for any remaining missed detectors.
-        if n <= 16:
-            best_missed = n + 1
-            best_peeled: list[Symptom] = []
-            best_missed_dets: list[int] = []
-            cur_peeled: list[Symptom] = []
-            cur_missed_dets: list[int] = []
-
-            def _search_cover(start: int, used_mask: int) -> None:
-                nonlocal best_missed, best_peeled, best_missed_dets
-                if len(cur_missed_dets) >= best_missed:
-                    return
-                while start < n and ((used_mask >> start) & 1):
-                    start += 1
-                if start >= n:
-                    best_missed = len(cur_missed_dets)
-                    best_peeled = list(cur_peeled)
-                    best_missed_dets = list(cur_missed_dets)
-                    return
-                used_mask |= 1 << start
-                d0 = dets[start]
-                for k in range(start + 1, n):
-                    if (used_mask >> k) & 1:
-                        continue
-                    match = known_graphlike.get((d0, dets[k]))
-                    if match is not None:
-                        cur_peeled.append(match)
-                        _search_cover(start + 1, used_mask | (1 << k))
-                        cur_peeled.pop()
-                        if best_missed == 0:
-                            return
-                match_single = known_graphlike.get((d0,))
-                if match_single is not None:
-                    cur_peeled.append(match_single)
-                    _search_cover(start + 1, used_mask)
-                    cur_peeled.pop()
-                    if best_missed == 0:
-                        return
-                if len(cur_missed_dets) + 1 < best_missed:
-                    cur_missed_dets.append(d0)
-                    _search_cover(start + 1, used_mask)
-                    cur_missed_dets.pop()
-
-            _search_cover(0, 0)
-            peeled = best_peeled
-            missed = tuple(best_missed_dets)
-            rem_obs = set(obs)
-            for _, o in peeled:
-                rem_obs ^= set(o)
-        else:
-            done = [False] * n
-            rem_obs = set(obs)
-            peeled = []
-            for k in range(n):
-                if not done[k]:
-                    for k2 in range(k + 1, n):
-                        if not done[k2]:
-                            match = known_graphlike.get((dets[k], dets[k2]))
-                            if match is not None:
-                                done[k] = done[k2] = True
-                                peeled.append(match)
-                                rem_obs ^= set(match[1])
-                                break
-            for k in range(n):
-                if not done[k]:
-                    match = known_graphlike.get((dets[k],))
-                    if match is not None:
-                        done[k] = True
-                        peeled.append(match)
-                        rem_obs ^= set(match[1])
-            missed = tuple(dets[k] for k in range(n) if not done[k])
-
-        if len(missed) <= 2:
-            if missed:
-                peeled.append((missed, tuple(sorted(rem_obs))))
-            elif rem_obs and peeled:
-                d0, o0 = peeled[0]
-                peeled[0] = (d0, tuple(sorted(set(o0) ^ rem_obs)))
-            return peeled
-        for idx in range(0, len(missed), 2):
-            peeled.append(
-                (missed[idx : idx + 2], tuple(sorted(rem_obs)) if idx == 0 else ())
-            )
-        return peeled
-
-    return [
-        (dets[idx : idx + 2], obs if idx == 0 else ()) for idx in range(0, n, 2)
-    ]
-
-
-def _graphlike_components(
-    inst: stim.DemInstruction,
-    known_graphlike: dict[tuple[int, ...], Symptom] | None = None,
-) -> list[Symptom]:
-    """Extract graphlike (<=2 detector) symptom components from a DEM error instruction."""
-    comps: list[Symptom] = []
-    for d_sorted, o_sorted in _raw_inst_components(inst):
-        if len(d_sorted) <= 2:
-            if d_sorted:
-                comps.append((d_sorted, o_sorted))
-        else:
-            comps.extend(
-                _decompose_hyperedge_component(d_sorted, o_sorted, known_graphlike)
-            )
-    return comps
-
-
-def _xor(p: float, q: float) -> float:
-    """Probability that exactly one of two independent mechanisms fires."""
-    return p + q - 2 * p * q
-
-
-def _same_shot_dems(a: _Analysis, b: _Analysis) -> bool:
+def _same_shot_dems(a: Analysis, b: Analysis) -> bool:
     """Whether two analyses of one circuit give every shot the same DEM content (in any order)."""
 
-    def envelopes(x: _Analysis) -> list[dict[Any, float]]:
+    def envelopes(x: Analysis) -> list[dict[Any, float]]:
         offs = x.flag_env_offsets.tolist()
         ids, probs = x.flag_env_sym_ids.tolist(), x.flag_env_probs.tolist()
         return [
@@ -700,7 +463,7 @@ class _Source:
 
 
 @dataclasses.dataclass
-class _Analysis:
+class Analysis:
     """Per-circuit data needed to build per-shot DEMs (plain, picklable data)."""
 
     num_measurements: int
@@ -733,7 +496,7 @@ class _Analysis:
     )  # (flattened op index of a LEAKAGE_TRANSITION_2, qubit) -> its pair partner
     leakage_swap_ops: frozenset[int] = frozenset()  # flattened op indices of SWAP[LEAKAGE_SWAP]
     unrolled_to_flat: NDArray[np.int64] | None = None
-    # Kept only by `_Builder.build(keep_candidates=True)` (else None): the
+    # Kept only by `Builder.build(keep_candidates=True)` (else None): the
     # inputs of `build_envelopes_cpp`, i.e. each flag's candidate flows and
     # their (unnormalized) weights, each flow's sites, and each site's
     # (symptom id, probability) entries.
@@ -760,7 +523,7 @@ class _Analysis:
 
     def _get_sym_targets(self) -> list[list[stim.DemTarget]]:
         if self._sym_targets is None:
-            self._sym_targets = [_sym_to_targets(sym) for sym in self.symptoms]
+            self._sym_targets = [sym_to_targets(sym) for sym in self.symptoms]
         return self._sym_targets
 
     def generate_batch(
@@ -905,16 +668,16 @@ class MarginalLeakageDemGenerator(DemGenerator):
             loss_oracle=loss_oracle,
         )
         self._circuit: stim.Circuit | None = None
-        self._analyses: dict[bool, _Analysis] = {}
+        self._analyses: dict[bool, Analysis] = {}
 
     def _get_analysis(
         self, circuit: stim.Circuit, decompose_errors: bool
-    ) -> _Analysis:
+    ) -> Analysis:
         if self._circuit is None or circuit != self._circuit:
             self._circuit = circuit.copy()
             self._analyses = {}
         if decompose_errors not in self._analyses:
-            builder = _Builder(circuit, self.unconditional_condition_on_U)
+            builder = Builder(circuit, self.unconditional_condition_on_U)
             analysis = builder.build(decompose_errors=decompose_errors, oracle=self.loss_oracle)
             if self.loss_oracle and builder.leakage_swap_ops and not self._analyses:
                 warnings.warn(_LEAKAGE_SWAP_ORACLE_WARNING, UserWarning, stacklevel=3)
@@ -1021,7 +784,7 @@ class MarginalLeakageDemGenerator(DemGenerator):
                         shot_events[shot_idx] if shot_events is not None else None
                     ),
                 )
-        return _GeneratedDemList(
+        return GeneratedDemList(
             items,
             analysis=analysis,
             generator=self,
@@ -1034,7 +797,7 @@ class MarginalLeakageDemGenerator(DemGenerator):
 
 
 def _match_shot_sources(
-    analysis: _Analysis, events: ShotLeakageEvents
+    analysis: Analysis, events: ShotLeakageEvents
 ) -> tuple[list[int], int]:
     """(sorted indices of the sources that leaked in a shot, number of ignored events).
 
@@ -1088,8 +851,8 @@ def _match_shot_sources(
     return sorted(matched), ignored
 
 
-class _Builder:
-    """Analyses a circuit once; only the resulting _Analysis is kept."""
+class Builder:
+    """Analyses a circuit once; only the resulting Analysis is kept."""
 
     def __init__(self, circuit: stim.Circuit, uc: bool) -> None:
         self.uc = uc
@@ -1138,9 +901,9 @@ class _Builder:
         decompose_errors: bool = False,
         oracle: bool = False,
         keep_candidates: bool = False,
-    ) -> _Analysis:
+    ) -> Analysis:
         if self.leakage_swap_ops and not oracle:
-            raise NotImplementedError(_LEAKAGE_SWAP_UNSUPPORTED)
+            raise NotImplementedError(LEAKAGE_SWAP_UNSUPPORTED)
         if oracle:
             self._check_oracle_supported()
         for clamp in (False, True):
@@ -1239,13 +1002,13 @@ class _Builder:
         if decompose_errors:
             has_hyperedge = any(
                 inst.type == "error"
-                and any(len(d) > 2 for d, _ in _raw_inst_components(inst))
+                and any(len(d) > 2 for d, _ in raw_inst_components(inst))
                 for inst in baseline.flattened()
             )
             if has_hyperedge:
-                known_base = _collect_known_graphlike(baseline)
+                known_base = collect_known_graphlike(baseline)
                 for sym in symptoms:
-                    for dets, obs in _symptom_components(sym):
+                    for dets, obs in symptom_components(sym):
                         if 1 <= len(dets) <= 2 and dets not in known_base:
                             known_base[dets] = (dets, obs)
                 decomposed_base = stim.DetectorErrorModel()
@@ -1254,14 +1017,14 @@ class _Builder:
                         decomposed_base.append(inst)
                         continue
                     p = float(inst.args_copy()[0])
-                    raw_comps = _raw_inst_components(inst)
+                    raw_comps = raw_inst_components(inst)
                     if any(len(d) > 2 for d, _ in raw_comps):
-                        comps = _graphlike_components(inst, known_base)
+                        comps = graphlike_components(inst, known_base)
                     else:
                         comps = [(d, o) for d, o in raw_comps if d]
-                    sym = _canonical_symptom_from_components(comps)
+                    sym = canonical_symptom_from_components(comps)
                     if sym != ((), ()):
-                        decomposed_base.append("error", p, _sym_to_targets(sym))
+                        decomposed_base.append("error", p, sym_to_targets(sym))
                 baseline = decomposed_base
 
         (
@@ -1314,7 +1077,7 @@ class _Builder:
                     entry_probs if has_entries else np.empty(0, dtype=np.float64)
                 ),
             )
-        analysis = _Analysis(
+        analysis = Analysis(
             num_measurements=self.num_measurements,
             baseline=baseline,
             matching_base_dem=matching_base_dem,
@@ -1377,7 +1140,7 @@ class _Builder:
 
     def _check_reused_qubit_ops(
         self,
-        analysis: _Analysis,
+        analysis: Analysis,
         reused: set[int],
         decompose_errors: bool,
         oracle: bool,
@@ -1390,7 +1153,7 @@ class _Builder:
         """
 
         def separating_changes_dems(split: set[int]) -> bool:
-            twin = object.__new__(_Builder)
+            twin = object.__new__(Builder)
             vars(twin).update(vars(self))
             twin.check_reuse = False
             twin.ops, twin.params, first = [], [], []
@@ -2016,16 +1779,16 @@ class _Builder:
             site_id = int(inst.tag[len(prefix) :])
             p = float(inst.args_copy()[0])
             if decompose_errors:
-                raw_comps = _raw_inst_components(inst)
+                raw_comps = raw_inst_components(inst)
                 if any(len(d) > 2 for d, _ in raw_comps):
                     if known_graphlike is None:
-                        known_graphlike = _collect_known_graphlike(baseline, dem)
-                    comps = _graphlike_components(inst, known_graphlike)
+                        known_graphlike = collect_known_graphlike(baseline, dem)
+                    comps = graphlike_components(inst, known_graphlike)
                 else:
                     comps = [(d, o) for d, o in raw_comps if d]
-                sym = _canonical_symptom_from_components(comps)
+                sym = canonical_symptom_from_components(comps)
             else:
-                sym = _symptom(inst)
+                sym = inst_symptom(inst)
             if sym == ((), ()):
                 continue
             sym_id = sym_to_id.get(sym)
@@ -2069,7 +1832,7 @@ class _Builder:
         first_sym_for_edge: dict[int, Symptom] = {}
 
         for sym in symptoms:
-            for dets, obs in _symptom_components(sym):
+            for dets, obs in symptom_components(sym):
                 if 1 <= len(dets) <= 2:
                     edge_key = (dets[0], -1) if len(dets) == 1 else (dets[0], dets[1])
                     eid = edge_to_id.get(edge_key)
@@ -2100,26 +1863,26 @@ class _Builder:
                 continue
             p = float(inst.args_copy()[0])
             if decompose_errors:
-                raw_comps = _raw_inst_components(inst)
+                raw_comps = raw_inst_components(inst)
                 if any(len(d) > 2 for d, _ in raw_comps):
                     if known_base_graphlike is None:
-                        known_base_graphlike = _collect_known_graphlike(baseline)
-                    comps = _graphlike_components(inst, known_base_graphlike)
+                        known_base_graphlike = collect_known_graphlike(baseline)
+                    comps = graphlike_components(inst, known_base_graphlike)
                 else:
                     comps = [(d, o) for d, o in raw_comps if d]
-                sym = _canonical_symptom_from_components(comps)
+                sym = canonical_symptom_from_components(comps)
             else:
-                sym = _symptom(inst)
+                sym = inst_symptom(inst)
                 comps = [sym]
             sid = sym_to_id.get(sym)
             if sid is not None:
-                base_sym_probs[sid] = _xor(float(base_sym_probs[sid]), p)
+                base_sym_probs[sid] = prob_xor(float(base_sym_probs[sid]), p)
             for dets, _ in comps:
                 if 1 <= len(dets) <= 2:
                     edge_key = (dets[0], -1) if len(dets) == 1 else (dets[0], dets[1])
                     eid = edge_to_id.get(edge_key)
                     if eid is not None:
-                        base_edge_probs[eid] = _xor(float(base_edge_probs[eid]), p)
+                        base_edge_probs[eid] = prob_xor(float(base_edge_probs[eid]), p)
                         edge_in_baseline[eid] = True
 
         matching_base_dem = baseline.copy()

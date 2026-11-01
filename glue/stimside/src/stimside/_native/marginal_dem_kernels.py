@@ -282,7 +282,7 @@ def dem_text_has_hyperedge_cpp(dem_text: bytes) -> bool:
 
 
 def decompose_dem_text_cpp(dem_text: bytes, base_text: bytes | None) -> str:
-    """Text of the graph-like decomposition of a flattened DEM's text (see `_decompose_dem_graphlike`)."""
+    """Text of the graph-like decomposition of a flattened DEM's text (see `decompose_dem_graphlike`)."""
     lib = get_marginal_dem_kernels_lib()
     res_ptr = lib.marginal_decompose_dem_text(
         dem_text,

@@ -5,22 +5,22 @@ import pytest
 import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
-from stimside.dem_generators import dem_decoding
-from stimside.dem_generators.dem_decoding import (
-    _decompose_dem_graphlike,
-    _decompose_dem_graphlike_cpp,
-    _decompose_dem_graphlike_py,
-    decode_with_generated_dems,
-)
+from stimside.dem_generators import graphlike
+from stimside.dem_generators.dem_decoding import decode_with_generated_dems
 from stimside.dem_generators.dem_generator_marginal import MarginalLeakageDemGenerator
 from stimside.dem_generators.dem_generator_marginal_test import (
     _make_surface_code_leakage_circuit,
 )
+from stimside.dem_generators.graphlike import (
+    decompose_dem_graphlike,
+    decompose_dem_graphlike_cpp,
+    decompose_dem_graphlike_py,
+)
 
 
 def _assert_identical(dem, base_dem=None):
-    py = _decompose_dem_graphlike_py(dem, base_dem)
-    cpp = _decompose_dem_graphlike_cpp(dem, base_dem)
+    py = decompose_dem_graphlike_py(dem, base_dem)
+    cpp = decompose_dem_graphlike_cpp(dem, base_dem)
     assert str(cpp) == str(py)
     assert cpp == py
 
@@ -127,7 +127,7 @@ def test_decoding_with_forced_python_decomposition_gives_same_predictions(monkey
     )
     decoder = sinter.BUILT_IN_DECODERS["pymatching"]
     cpp = decode_with_generated_dems(decoder, gen(circuit, records), dets, decompose_errors=True)
-    monkeypatch.setattr(dem_decoding, "_CPP_DECOMPOSITION_UNAVAILABLE", True)
+    monkeypatch.setattr(graphlike, "_CPP_DECOMPOSITION_UNAVAILABLE", True)
     py = decode_with_generated_dems(decoder, gen(circuit, records), dets, decompose_errors=True)
     np.testing.assert_array_equal(cpp, py)
 
@@ -136,16 +136,16 @@ def test_falls_back_to_python_with_a_warning(monkeypatch):
     def broken(*args, **kwargs):
         raise OSError("no kernel library")
 
-    monkeypatch.setattr(dem_decoding, "_decompose_dem_graphlike_cpp", broken)
-    monkeypatch.setattr(dem_decoding, "_CPP_DECOMPOSITION_UNAVAILABLE", False)
+    monkeypatch.setattr(graphlike, "decompose_dem_graphlike_cpp", broken)
+    monkeypatch.setattr(graphlike, "_CPP_DECOMPOSITION_UNAVAILABLE", False)
     dem = stim.DetectorErrorModel("error(0.1) D0 D1\nerror(0.1) D0 D1 D2")
     with pytest.warns(RuntimeWarning, match="Python DEM decomposition"):
-        out = _decompose_dem_graphlike(dem)
-    assert out == _decompose_dem_graphlike_py(dem)
-    assert dem_decoding._CPP_DECOMPOSITION_UNAVAILABLE
+        out = decompose_dem_graphlike(dem)
+    assert out == decompose_dem_graphlike_py(dem)
+    assert graphlike._CPP_DECOMPOSITION_UNAVAILABLE
 
 
 def test_dem_without_hyperedges_is_returned_unchanged():
     dem = stim.DetectorErrorModel("error(0.1) D0 D1\nerror(0.1) D2 L0")
-    assert _decompose_dem_graphlike_cpp(dem) is dem
-    assert _decompose_dem_graphlike_py(dem) is dem
+    assert decompose_dem_graphlike_cpp(dem) is dem
+    assert decompose_dem_graphlike_py(dem) is dem

@@ -18,16 +18,16 @@ import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
 from stimside.dem_generators.dem_decoding import (
-    _decompose_dem_graphlike,
-    _warn_if_pymatching_hyperedge,
     decode_with_generated_dems,
+    warn_if_pymatching_hyperedge,
 )
 from stimside.dem_generators.dem_generator_base import DemGenerator
 from stimside.dem_generators.dem_generator_marginal import (
+    LEAKAGE_SWAP_UNSUPPORTED,
     MarginalLeakageDemGenerator,
-    _LEAKAGE_SWAP_UNSUPPORTED,
-    _has_leakage_swap,
+    has_leakage_swap,
 )
+from stimside.dem_generators.graphlike import decompose_dem_graphlike
 from stimside.util.leakage_events import ShotLeakageEvents
 
 
@@ -150,7 +150,7 @@ def as_leakage_decoder(dem_decoder: object, owner: str) -> LeakageDecoder:
     )
 
 
-def _check_decoder(decoder: sinter.Decoder | str, owner: str) -> str:
+def check_decoder(decoder: sinter.Decoder | str, owner: str) -> str:
     """Validates a ``decoder`` setting; returns its name for the default name."""
     if decoder is None:
         raise ValueError(f"{owner} requires a decoder.")
@@ -186,7 +186,7 @@ class BaseDecoder(LeakageDecoder):
                 "BaseDecoder requires dem to be a stim.DetectorErrorModel or None, "
                 f"got {type(dem).__name__}."
             )
-        dec_name = _check_decoder(decoder, "BaseDecoder")
+        dec_name = check_decoder(decoder, "BaseDecoder")
         self.dem = dem
         self.decoder = decoder
         self.decompose_errors = decompose_errors
@@ -218,9 +218,9 @@ class BaseDecoder(LeakageDecoder):
                 f"circuit has num_observables={task.circuit.num_observables}."
             )
         if self.decompose_errors:
-            dem = _decompose_dem_graphlike(dem)
+            dem = decompose_dem_graphlike(dem)
         else:
-            _warn_if_pymatching_hyperedge(decoder, dem)
+            warn_if_pymatching_hyperedge(decoder, dem)
         return _CompiledBaseDecoder(decoder.compile_decoder_for_dem(dem=dem))
 
 
@@ -335,7 +335,7 @@ class MarginalDecoder(LeakageDecoder):
                 "MarginalDecoder requires dem_gen to be a MarginalLeakageDemGenerator "
                 f"or None, got {type(dem_gen).__name__}."
             )
-        dec_name = _check_decoder(decoder, "MarginalDecoder")
+        dec_name = check_decoder(decoder, "MarginalDecoder")
         self.dem_gen = dem_gen
         self.decoder = decoder
         self.decompose_errors = decompose_errors
@@ -370,8 +370,8 @@ class MarginalDecoder(LeakageDecoder):
         # A loss_oracle dem_gen accepts SWAP[LEAKAGE_SWAP] with a warning when it analyses the
         # circuit; a weighted one rejects it, here rather than at the first decode. (To reject it
         # with every dem_gen, drop the `not self.dem_gen.loss_oracle` condition.)
-        if not self.dem_gen.loss_oracle and _has_leakage_swap(task.circuit):
-            raise NotImplementedError(_LEAKAGE_SWAP_UNSUPPORTED)
+        if not self.dem_gen.loss_oracle and has_leakage_swap(task.circuit):
+            raise NotImplementedError(LEAKAGE_SWAP_UNSUPPORTED)
         decoder = self.decoder
         if isinstance(decoder, str):
             decoder = sinter.BUILT_IN_DECODERS[decoder]

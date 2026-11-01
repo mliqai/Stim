@@ -1,9 +1,7 @@
 """Decoding helpers for per-shot DEMs produced by the DEM generators.
 
 ``decode_with_generated_dems`` decodes a batch with the DEM(s) or PyMatching
-``edge_reweights`` returned by a ``dem_gen`` callable, and
-``_decompose_dem_graphlike`` decomposes hyperedges into graph-like components
-(C++ kernel when it can be loaded, else the Python reference implementation).
+``edge_reweights`` returned by a ``dem_gen`` callable.
 """
 
 from __future__ import annotations
@@ -19,21 +17,23 @@ import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
 from stimside.dem_generators.dem_generator_marginal import (
-    _GeneratedDemList,
-    _canonical_symptom_from_components,
-    _collect_known_graphlike,
-    _get_item_analysis_meta,
-    _get_item_leakage_events,
-    _graphlike_components,
-    _raw_inst_components,
-    _sym_to_targets,
-    _xor,
+    GeneratedDemList,
+    get_item_analysis_meta,
+    get_item_leakage_events,
+)
+from stimside.dem_generators.graphlike import (
+    decompose_dem_graphlike,
+    dem_has_hyperedge,
+    graphlike_components,
+    inst_canonical_symptom,
+    prob_xor,
+    sym_to_targets,
 )
 
 _MAX_PYMATCHING_WEIGHT = float((1 << 24) - 1)
 
 
-def _is_pymatching_decoder(decoder: object) -> bool:
+def is_pymatching_decoder(decoder: object) -> bool:
     if isinstance(decoder, str):
         return "pymatching" in decoder.lower()
     cls_name = type(decoder).__name__.lower()
@@ -47,31 +47,10 @@ def _matching_supports_edge_reweights() -> bool:
     return "edge_reweights" in inspect.signature(pymatching.Matching.decode_batch).parameters
 
 
-def _dem_has_hyperedge(dem: stim.DetectorErrorModel) -> bool:
-    """Return True if any error component in ``dem`` affects >2 detectors."""
-    for inst in dem.flattened():
-        if inst.type != "error":
-            continue
-        args = inst.args_copy()
-        if not args or args[0] <= 0:
-            continue
-        dets: set[int] = set()
-        for t in inst.targets_copy():
-            if t.is_separator():
-                if len(dets) > 2:
-                    return True
-                dets.clear()
-            elif t.is_relative_detector_id():
-                dets ^= {t.val}
-        if len(dets) > 2:
-            return True
-    return False
-
-
-def _warn_if_pymatching_hyperedge(
+def warn_if_pymatching_hyperedge(
     decoder: object, dem: stim.DetectorErrorModel
 ) -> None:
-    if _is_pymatching_decoder(decoder) and _dem_has_hyperedge(dem):
+    if is_pymatching_decoder(decoder) and dem_has_hyperedge(dem):
         warnings.warn(
             "DetectorErrorModel contains undecomposed hyperedge error mechanisms "
             "with >2 detectors while decoding with pymatching; pass "
@@ -79,77 +58,6 @@ def _warn_if_pymatching_hyperedge(
             UserWarning,
             stacklevel=3,
         )
-
-
-def _decompose_dem_graphlike_py(
-    dem: stim.DetectorErrorModel,
-    base_dem: stim.DetectorErrorModel | None = None,
-) -> stim.DetectorErrorModel:
-    """Python reference implementation of ``_decompose_dem_graphlike``."""
-    if not _dem_has_hyperedge(dem):
-        return dem
-    known_graphlike = _collect_known_graphlike(base_dem, dem)
-    out = stim.DetectorErrorModel()
-    for inst in dem.flattened():
-        if inst.type != "error":
-            out.append(inst)
-            continue
-        p = float(inst.args_copy()[0])
-        comps = _graphlike_components(inst, known_graphlike)
-        sym = _canonical_symptom_from_components(comps)
-        if sym == ((), ()):
-            continue
-        out.append("error", p, _sym_to_targets(sym))
-    return out
-
-
-_CPP_DECOMPOSITION_UNAVAILABLE = False
-
-
-def _decompose_dem_graphlike_cpp(
-    dem: stim.DetectorErrorModel,
-    base_dem: stim.DetectorErrorModel | None = None,
-) -> stim.DetectorErrorModel:
-    """C++ port of ``_decompose_dem_graphlike_py`` (identical output DEM)."""
-    from stimside._native.marginal_dem_kernels import (
-        decompose_dem_text_cpp,
-        dem_text_has_hyperedge_cpp,
-    )
-
-    dem_text = str(dem.flattened()).encode("utf-8")
-    if not dem_text_has_hyperedge_cpp(dem_text):
-        return dem
-    base_text = (
-        None if base_dem is None else str(base_dem.flattened()).encode("utf-8")
-    )
-    return stim.DetectorErrorModel(decompose_dem_text_cpp(dem_text, base_text))
-
-
-def _decompose_dem_graphlike(
-    dem: stim.DetectorErrorModel,
-    base_dem: stim.DetectorErrorModel | None = None,
-) -> stim.DetectorErrorModel:
-    """Ensure every error instruction in ``dem`` is decomposed into <=2-detector components.
-
-    Uses the C++ kernel when it can be loaded and the Python implementation
-    (``_decompose_dem_graphlike_py``) otherwise; both give the same DEM.
-    """
-    global _CPP_DECOMPOSITION_UNAVAILABLE
-    if not _CPP_DECOMPOSITION_UNAVAILABLE:
-        try:
-            return _decompose_dem_graphlike_cpp(dem, base_dem)
-        except (OSError, RuntimeError, AttributeError) as exc:
-            _CPP_DECOMPOSITION_UNAVAILABLE = True
-            warnings.warn(
-                f"Falling back to the Python DEM decomposition ({exc!r}).",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-    return _decompose_dem_graphlike_py(dem, base_dem)
-
-
-def _inst_canonical_symptom(inst: stim.DemInstruction) -> Any:
-    return _canonical_symptom_from_components(_raw_inst_components(inst))
 
 
 def _apply_reweight_update_dem(
@@ -160,11 +68,11 @@ def _apply_reweight_update_dem(
     for inst in update_dem.flattened():
         if inst.type != "error":
             continue
-        sym = _inst_canonical_symptom(inst)
+        sym = inst_canonical_symptom(inst)
         if sym == ((), ()):
             continue
         p = float(inst.args_copy()[0])
-        updates[sym] = _xor(updates.get(sym, 0.0), p)
+        updates[sym] = prob_xor(updates.get(sym, 0.0), p)
 
     if not updates:
         return base_dem
@@ -175,19 +83,19 @@ def _apply_reweight_update_dem(
         if inst.type != "error":
             out.append(inst)
             continue
-        sym = _inst_canonical_symptom(inst)
+        sym = inst_canonical_symptom(inst)
         if sym == ((), ()):
             continue
         p = float(inst.args_copy()[0])
-        base_syms[sym] = _xor(base_syms.get(sym, 0.0), p)
+        base_syms[sym] = prob_xor(base_syms.get(sym, 0.0), p)
 
     for sym, p_base in base_syms.items():
         p_final = updates.pop(sym, p_base)
         if p_final > 0:
-            out.append("error", p_final, _sym_to_targets(sym))
+            out.append("error", p_final, sym_to_targets(sym))
     for sym, p_new in updates.items():
         if p_new > 0:
-            out.append("error", p_new, _sym_to_targets(sym))
+            out.append("error", p_new, sym_to_targets(sym))
     return out
 
 
@@ -216,13 +124,13 @@ def _extract_graphlike_edges(
         p = float(inst.args_copy()[0])
         if p <= 0.0:
             continue
-        for dets, obs in _graphlike_components(inst):
+        for dets, obs in graphlike_components(inst):
             if not (1 <= len(dets) <= 2):
                 continue
             edge = (dets[0], -1) if len(dets) == 1 else (dets[0], dets[1])
             if edge not in first_obs:
                 first_obs[edge] = obs
-            probs[edge] = _xor(probs.get(edge, 0.0), p)
+            probs[edge] = prob_xor(probs.get(edge, 0.0), p)
     return probs, first_obs
 
 
@@ -242,7 +150,7 @@ def _ensure_base_dem_has_reweight_edges(
     base_dem: stim.DetectorErrorModel,
     rw_list: Sequence[NDArray[np.float64] | None],
 ) -> stim.DetectorErrorModel:
-    eff_base = _decompose_dem_graphlike(base_dem)
+    eff_base = decompose_dem_graphlike(base_dem)
     existing_probs, existing_obs = _extract_graphlike_edges(eff_base)
     missing_edges: set[tuple[int, int]] = set()
     for rw in rw_list:
@@ -300,7 +208,7 @@ def _apply_edge_reweights_to_dem(
     return out
 
 
-def _decode_with_edge_reweights(
+def decode_with_edge_reweights(
     decoder: Any,
     reweights: NDArray[np.float64] | Sequence[NDArray[np.float64] | None],
     bit_packed_dets: NDArray[np.uint8],
@@ -351,7 +259,7 @@ def _decode_with_edge_reweights(
             rw_list.append(seen_arrays[rid])
 
     if not hasattr(decoder, "decode_batch") and (
-        not _is_pymatching_decoder(decoder) or not _matching_supports_edge_reweights()
+        not is_pymatching_decoder(decoder) or not _matching_supports_edge_reweights()
     ):
         eff_base_dem = base_dem or (
             analysis.matching_base_dem if analysis is not None else None
@@ -370,7 +278,7 @@ def _decode_with_edge_reweights(
             shots_by_rw.setdefault(key, []).append(shot_idx)
             rw_by_key[key] = rw_item
         out: NDArray[np.uint8] | None = None
-        graphlike_base = _decompose_dem_graphlike(eff_base_dem)
+        graphlike_base = decompose_dem_graphlike(eff_base_dem)
         base_edges = _extract_graphlike_edges(graphlike_base)
         for key, shots in shots_by_rw.items():
             dem_for_group = _apply_edge_reweights_to_dem(
@@ -470,12 +378,12 @@ def decode_with_generated_dems(
     # directly from the generator's fast C++ pipeline so we don't combine with
     # baseline and diff again.
     single_imeta = (
-        _get_item_analysis_meta(dems)
+        get_item_analysis_meta(dems)
         if isinstance(dems, (stim.DetectorErrorModel, np.ndarray))
         else None
     )
     regenerated_from_gen = False
-    if isinstance(dems, _GeneratedDemList) and dems._generator is not None:
+    if isinstance(dems, GeneratedDemList) and dems._generator is not None:
         eff_dec = dec_flag or dems.decompose_errors
         eff_rew = rew_flag or dems.reweight_only
         if (eff_dec, eff_rew) != (dems.decompose_errors, dems.reweight_only):
@@ -504,15 +412,15 @@ def decode_with_generated_dems(
                 rec_inst,
                 decompose_errors=eff_dec,
                 reweight_only=eff_rew,
-                leakage_events=_get_item_leakage_events(dems),
+                leakage_events=get_item_leakage_events(dems),
             )
-            single_imeta = _get_item_analysis_meta(dems)
+            single_imeta = get_item_analysis_meta(dems)
         dec_flag, rew_flag = eff_dec, eff_rew
         regenerated_from_gen = True
     elif not isinstance(dems, (stim.DetectorErrorModel, np.ndarray)):
         dems_seq_check = dems if isinstance(dems, list) else list(dems)
         if dems_seq_check:
-            metas = [_get_item_analysis_meta(x) for x in dems_seq_check]
+            metas = [get_item_analysis_meta(x) for x in dems_seq_check]
             first_m = metas[0]
             if (
                 first_m is not None
@@ -534,7 +442,7 @@ def decode_with_generated_dems(
                     rec_2d = np.stack([m[5] for m in metas if m is not None and m[5] is not None], axis=0)
                     events_2d = [
                         ev
-                        for ev in (_get_item_leakage_events(x) for x in dems_seq_check)
+                        for ev in (get_item_leakage_events(x) for x in dems_seq_check)
                         if ev is not None
                     ]
                     dems = gen_inst(
@@ -566,7 +474,7 @@ def decode_with_generated_dems(
             return dems
         single_analysis = single_imeta[0] if single_imeta is not None else None
         if (
-            not _is_pymatching_decoder(decoder)
+            not is_pymatching_decoder(decoder)
             and not hasattr(decoder, "decode_batch")
         ):
             if (
@@ -580,12 +488,12 @@ def decode_with_generated_dems(
                     single_imeta[5],
                     decompose_errors=True,
                     reweight_only=False,
-                    leakage_events=_get_item_leakage_events(dems),
+                    leakage_events=get_item_leakage_events(dems),
                 )
                 return decode_with_generated_dems(
                     decoder, dem_full, dets_2d, decompose_errors=True
                 )
-        return _decode_with_edge_reweights(
+        return decode_with_edge_reweights(
             decoder,
             dems,
             dets_2d,
@@ -602,13 +510,13 @@ def decode_with_generated_dems(
                 return dems
             analysis = getattr(dems, "analysis", None)
             if analysis is None and first_non_none is not None:
-                imeta = _get_item_analysis_meta(first_non_none)
+                imeta = get_item_analysis_meta(first_non_none)
                 if imeta is not None:
                     analysis = imeta[0]
             if (
-                not _is_pymatching_decoder(decoder)
+                not is_pymatching_decoder(decoder)
                 and not hasattr(decoder, "decode_batch")
-                and isinstance(dems, _GeneratedDemList)
+                and isinstance(dems, GeneratedDemList)
                 and dems._generator is not None
             ):
                 # Fallback to decomposed full DEMs for non-pymatching decoders
@@ -623,7 +531,7 @@ def decode_with_generated_dems(
                 return decode_with_generated_dems(
                     decoder, dems_full, dets_2d, decompose_errors=True
                 )
-            return _decode_with_edge_reweights(
+            return decode_with_edge_reweights(
                 decoder,
                 dems_seq,  # type: ignore[arg-type]
                 dets_2d,
@@ -643,7 +551,7 @@ def decode_with_generated_dems(
         if (
             dec_flag
             and rew_flag
-            and (dets_2d is None or _is_pymatching_decoder(decoder))
+            and (dets_2d is None or is_pymatching_decoder(decoder))
             and eff_base_dem is not None
         ):
             if dets_2d is None:
@@ -670,11 +578,11 @@ def decode_with_generated_dems(
         if is_rew_single and eff_base_dem is not None:
             dem_single = _apply_reweight_update_dem(eff_base_dem, dem_single)
         if dec_flag:
-            dem_single = _decompose_dem_graphlike(dem_single, base_dem=eff_base_dem)
+            dem_single = decompose_dem_graphlike(dem_single, base_dem=eff_base_dem)
         if dets_2d is None:
             return dem_single
         if not dec_flag:
-            _warn_if_pymatching_hyperedge(decoder, dem_single)
+            warn_if_pymatching_hyperedge(decoder, dem_single)
         return decoder.compile_decoder_for_dem(dem=dem_single).decode_shots_bit_packed(
             bit_packed_detection_event_data=dets_2d
         )
@@ -692,7 +600,7 @@ def decode_with_generated_dems(
     elif not dems_list:
         return []
 
-    imeta0 = _get_item_analysis_meta(dems_list[0])
+    imeta0 = get_item_analysis_meta(dems_list[0])
     analysis = getattr(dems, "analysis", None) or (
         imeta0[0] if imeta0 is not None else None
     )
@@ -710,7 +618,7 @@ def decode_with_generated_dems(
         shots_by_dem.setdefault(id(dem), []).append(shot)
 
     # If both decompose_errors and reweight_only are requested on plain DEMs with PyMatching (or bit_packed_dets is None):
-    if dec_flag and rew_flag and (dets_2d is None or _is_pymatching_decoder(decoder)):
+    if dec_flag and rew_flag and (dets_2d is None or is_pymatching_decoder(decoder)):
         unique_ids = list(shots_by_dem.keys())
         resolved_by_id: dict[int, stim.DetectorErrorModel] = {}
         for did in unique_ids:
@@ -718,12 +626,12 @@ def decode_with_generated_dems(
             raw_d = dems_list[shot0]
             if (rew_flag or is_reweight_dems) and gen_base_dem is not None:
                 raw_d = _apply_reweight_update_dem(gen_base_dem, raw_d)
-            resolved_by_id[did] = _decompose_dem_graphlike(
+            resolved_by_id[did] = decompose_dem_graphlike(
                 raw_d, base_dem=gen_base_dem
             )
 
         ref_dem = (
-            _decompose_dem_graphlike(gen_base_dem)
+            decompose_dem_graphlike(gen_base_dem)
             if gen_base_dem is not None
             else resolved_by_id[unique_ids[0]]
         )
@@ -771,7 +679,7 @@ def decode_with_generated_dems(
             rw_per_shot = [rw_by_id[id(d)] for d in dems_list]
             if dets_2d is None:
                 return rw_per_shot
-            return _decode_with_edge_reweights(
+            return decode_with_edge_reweights(
                 decoder,
                 rw_per_shot,
                 dets_2d,
@@ -785,7 +693,7 @@ def decode_with_generated_dems(
             if (rew_flag or is_reweight_dems) and gen_base_dem is not None:
                 dem_item = _apply_reweight_update_dem(gen_base_dem, dem_item)
             if dec_flag:
-                dem_item = _decompose_dem_graphlike(dem_item, base_dem=gen_base_dem)
+                dem_item = decompose_dem_graphlike(dem_item, base_dem=gen_base_dem)
             transformed_by_id[did] = dem_item
         return [transformed_by_id[id(d)] for d in dems_list]
 
@@ -795,9 +703,9 @@ def decode_with_generated_dems(
         if (rew_flag or is_reweight_dems) and gen_base_dem is not None:
             dem_item = _apply_reweight_update_dem(gen_base_dem, dem_item)
         if dec_flag:
-            dem_item = _decompose_dem_graphlike(dem_item, base_dem=gen_base_dem)
+            dem_item = decompose_dem_graphlike(dem_item, base_dem=gen_base_dem)
         else:
-            _warn_if_pymatching_hyperedge(decoder, dem_item)
+            warn_if_pymatching_hyperedge(decoder, dem_item)
         predictions = decoder.compile_decoder_for_dem(
             dem=dem_item
         ).decode_shots_bit_packed(
