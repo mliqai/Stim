@@ -89,6 +89,58 @@ def _reset_value(s_in: object, s_out: object) -> int | None:
     return None
 
 
+def _sample_flip_hits(
+    in_mask: NDArray[np.bool_] | None,
+    num_rows: int,
+    batch_size: int,
+    transitions: tuple[tuple[object, float], ...],
+    total_p: float,
+    np_rng: np.random.Generator,
+) -> list[tuple[object, NDArray[np.intp], NDArray[np.intp]]]:
+    """Sample `(branch_out, row_idx, b_idx)` groups preserving Flip's sparse RNG order."""
+    if total_p <= 0.0:
+        return []
+    if in_mask is None:
+        m_total = num_rows * batch_size
+        n_hits = (
+            m_total if total_p >= 1.0 - 1e-12 else int(np_rng.binomial(m_total, total_p))
+        )
+        if n_hits == 0:
+            return []
+        if n_hits == m_total:
+            row_idx = np.repeat(np.arange(num_rows, dtype=np.intp), batch_size)
+            b_idx = np.tile(np.arange(batch_size, dtype=np.intp), num_rows)
+        else:
+            flat_idx = np_rng.choice(m_total, size=n_hits, replace=False)
+            row_idx, b_idx = flat_idx // batch_size, flat_idx % batch_size
+    else:
+        m_total = int(np.count_nonzero(in_mask))
+        if m_total == 0:
+            return []
+        n_hits = (
+            m_total if total_p >= 1.0 - 1e-12 else int(np_rng.binomial(m_total, total_p))
+        )
+        if n_hits == 0:
+            return []
+        elig_rows, elig_bs = np.where(in_mask)
+        if n_hits == m_total:
+            row_idx, b_idx = elig_rows, elig_bs
+        else:
+            chosen = np_rng.choice(m_total, size=n_hits, replace=False)
+            row_idx, b_idx = elig_rows[chosen], elig_bs[chosen]
+
+    if len(transitions) == 1:
+        return [(transitions[0][0], row_idx, b_idx)]
+    cond_probs = [p / total_p for _, p in transitions]
+    br_idx = np_rng.choice(len(transitions), size=n_hits, p=cond_probs)
+    out = []
+    for b_i, (out_val, _) in enumerate(transitions):
+        sel = br_idx == b_i
+        if np.any(sel):
+            out.append((out_val, row_idx[sel], b_idx[sel]))
+    return out
+
+
 @dataclasses.dataclass
 class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
 
@@ -301,7 +353,7 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
             ),
         ):
             target_indices = np.unique(self._get_target_indices(op))
-            was_unleaked = (self.state[target_indices, :] < 2).copy()
+            was_unleaked = self.state[target_indices, :] < 2
         else:
             target_indices = None
             was_unleaked = None
@@ -417,41 +469,12 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                 fss.broadcast_pauli_errors(error_mask=mask, p=p, pauli=pauli)
             else:
                 total_p = sum(p for _, p in branches)
-                if total_p <= 0.0:
-                    continue
-                n_hits = (
-                    n_active
-                    if total_p >= 1.0 - 1e-12
-                    else int(fss.np_rng.binomial(n_active, total_p))
-                )
-                if n_hits == 0:
-                    continue
-                elig_p, elig_b = np.where(active_pairs)
-                if n_hits < n_active:
-                    chosen = fss.np_rng.choice(n_active, size=n_hits, replace=False)
-                    hit_p, hit_b = elig_p[chosen], elig_b[chosen]
-                else:
-                    hit_p, hit_b = elig_p, elig_b
-                hit_t1 = t1_arr[hit_p]
-
-                if len(branches) == 1:
-                    pauli = branches[0][0]
+                for pauli_obj, row_hit, b_hit in _sample_flip_hits(
+                    active_pairs, len(t1_arr), self.batch_size, branches, total_p, fss.np_rng
+                ):
                     mask = np.zeros_like(self.state, dtype=bool)
-                    np.logical_xor.at(mask, (hit_t1, hit_b), True)
-                    fss.broadcast_pauli_errors(error_mask=mask, p=1.0, pauli=pauli)
-                else:
-                    cond_probs = [p / total_p for _, p in branches]
-                    br_idx = fss.np_rng.choice(
-                        len(branches), size=n_hits, p=cond_probs
-                    )
-                    for b_i, (pauli, _) in enumerate(branches):
-                        sel = br_idx == b_i
-                        if np.any(sel):
-                            mask = np.zeros_like(self.state, dtype=bool)
-                            np.logical_xor.at(mask, (hit_t1[sel], hit_b[sel]), True)
-                            fss.broadcast_pauli_errors(
-                                error_mask=mask, p=1.0, pauli=pauli
-                            )
+                    np.logical_xor.at(mask, (t1_arr[row_hit], b_hit), True)
+                    fss.broadcast_pauli_errors(error_mask=mask, p=1.0, pauli=pauli_obj)  # type: ignore[arg-type]
 
     def leakage_transition_1(
         self,
@@ -476,12 +499,7 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                 self.leakage_transition_1(sub_op, fss, params)
             return
 
-        initial_state = (
-            self.state.copy()
-            if len(params.args_by_input_state) > 1
-            else self.state
-        )
-        sub_state = initial_state[target_indices, :]
+        sub_state = self.state[target_indices, :]
         reads_z, resets_z = self._z_legs(params)[0]
         z_ref: NDArray[np.bool_] | None = None
         if reads_z or resets_z:
@@ -500,81 +518,33 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
         reset_to_one: Bool2DArray | None = None
 
         for input_state, transitions in params.args_by_input_state.items():
-            total_p = sum(p for _, p in transitions)
-            if total_p <= 0.0:
+            if (
+                input_state != "U"
+                and not any_initially_leaked
+                and isinstance(input_state, int)
+                and input_state >= 2
+            ):
                 continue
-
-            if input_state == "U" and not any_initially_leaked:
-                M = num_targets * self.batch_size
-                n_hits = (
-                    M
-                    if total_p >= 1.0 - 1e-12
-                    else int(fss.np_rng.binomial(M, total_p))
-                )
-                if n_hits == 0:
-                    continue
-                if n_hits == M:
-                    row_idx = np.repeat(
-                        np.arange(num_targets, dtype=np.intp), self.batch_size
-                    )
-                    b_idx = np.tile(
-                        np.arange(self.batch_size, dtype=np.intp), num_targets
-                    )
-                else:
-                    flat_idx = fss.np_rng.choice(M, size=n_hits, replace=False)
-                    row_idx = flat_idx // self.batch_size
-                    b_idx = flat_idx % self.batch_size
-            else:
-                if input_state != "U" and not any_initially_leaked and isinstance(input_state, int) and input_state >= 2:
-                    continue
-                in_mask = (
-                    (sub_state < 2)
-                    if input_state == "U"
-                    else (sub_state == input_state)
-                )
-                M = int(np.count_nonzero(in_mask))
-                if M == 0:
-                    continue
-                n_hits = (
-                    M
-                    if total_p >= 1.0 - 1e-12
-                    else int(fss.np_rng.binomial(M, total_p))
-                )
-                if n_hits == 0:
-                    continue
-                elig_rows, elig_bs = np.where(in_mask)
-                if n_hits == M:
-                    row_idx, b_idx = elig_rows, elig_bs
-                else:
-                    chosen = fss.np_rng.choice(M, size=n_hits, replace=False)
-                    row_idx = elig_rows[chosen]
-                    b_idx = elig_bs[chosen]
-
-            q_all = target_indices[row_idx]
-
-            if len(transitions) == 1:
-                branch_groups = [(transitions[0][0], q_all, b_idx)]
-            else:
-                cond_probs = [p / total_p for _, p in transitions]
-                br_idx = fss.np_rng.choice(
-                    len(transitions), size=n_hits, p=cond_probs
-                )
-                branch_groups = []
-                for b_i, (out_st, _) in enumerate(transitions):
-                    sel = br_idx == b_i
-                    if np.any(sel):
-                        branch_groups.append((out_st, q_all[sel], b_idx[sel]))
-
-            for out_st, q_hit, b_hit in branch_groups:
+            dense_u = input_state == "U" and not any_initially_leaked
+            in_mask = (
+                None
+                if dense_u
+                else ((sub_state < 2) if input_state == "U" else (sub_state == input_state))
+            )
+            total_p = sum(p for _, p in transitions)
+            for out_st, row_hit, b_hit in _sample_flip_hits(
+                in_mask, num_targets, self.batch_size, transitions, total_p, fss.np_rng
+            ):
                 if out_st == input_state:
                     continue
+                q_hit = target_indices[row_hit]
                 if out_st == "U":
                     self.state[q_hit, b_hit] = 0
                     if to_depolarize is None:
                         to_depolarize = np.zeros_like(self.state, dtype=bool)
                     to_depolarize[q_hit, b_hit] = True
                 else:
-                    out_int = int(out_st)
+                    out_int = int(out_st)  # type: ignore[arg-type]
                     self.state[q_hit, b_hit] = 0 if out_int < 2 else out_int
                     if out_int < 2:
                         if to_reset is None or reset_to_one is None:
@@ -684,11 +654,10 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
             if input_state <= 1 and self._depolarize_on_leak:
                 to_depolarize[overwrite_mask] |= (output_states >= 2) & changed
 
-            new_st = output_states.copy()
-            new_st[new_st == 1] = 0
-            # Only overwrite entries that actually transitioned (or keep existing state)
             cur_vals = self.state[overwrite_mask]
-            cur_vals[changed] = new_st[changed].astype(np.uint8)
+            cur_vals[changed] = np.where(
+                output_states[changed] == 1, 0, output_states[changed]
+            ).astype(np.uint8)
             self.state[overwrite_mask] = cur_vals
 
         if is_reset and self._depolarize_on_leak:
@@ -734,13 +703,8 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
             fss.do_on_flip_simulator(op)
             return
 
-        initial_state = (
-            self.state.copy()
-            if len(params.args_by_input_state) > 1
-            else self.state
-        )
-        even_target_states = initial_state[even_targets, :]
-        odd_target_states = initial_state[odd_targets, :]
+        even_target_states = self.state[even_targets, :]
+        odd_target_states = self.state[odd_targets, :]
         z_legs = self._z_legs(params)
         z_ref: NDArray[np.bool_] | None = None
         if any(r or s for r, s in z_legs):
@@ -770,87 +734,34 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
         reset_to_one: Bool2DArray | None = None
 
         for input_state, transitions in params.args_by_input_state.items():
-            total_p = sum(p for _, p in transitions)
-            if total_p <= 0.0:
+            if not any_initially_leaked and (
+                (isinstance(input_state[0], int) and input_state[0] >= 2)
+                or (isinstance(input_state[1], int) and input_state[1] >= 2)
+            ):
                 continue
-
-            if input_state == ("U", "U") and not any_initially_leaked:
-                M = num_pairs * self.batch_size
-                n_hits = (
-                    M
-                    if total_p >= 1.0 - 1e-12
-                    else int(fss.np_rng.binomial(M, total_p))
-                )
-                if n_hits == 0:
-                    continue
-                if n_hits == M:
-                    pair_idx = np.repeat(
-                        np.arange(num_pairs, dtype=np.intp), self.batch_size
-                    )
-                    b_idx = np.tile(
-                        np.arange(self.batch_size, dtype=np.intp), num_pairs
-                    )
-                else:
-                    flat_idx = fss.np_rng.choice(M, size=n_hits, replace=False)
-                    pair_idx = flat_idx // self.batch_size
-                    b_idx = flat_idx % self.batch_size
+            dense_uu = input_state == ("U", "U") and not any_initially_leaked
+            if dense_uu:
+                in_mask = None
             else:
-                if not any_initially_leaked and (
-                    (isinstance(input_state[0], int) and input_state[0] >= 2)
-                    or (isinstance(input_state[1], int) and input_state[1] >= 2)
-                ):
-                    continue
                 check_0 = (
-                    (even_target_states < 2)
+                    even_target_states < 2
                     if input_state[0] == "U"
-                    else (even_target_states == input_state[0])
+                    else even_target_states == input_state[0]
                 )
                 check_1 = (
-                    (odd_target_states < 2)
+                    odd_target_states < 2
                     if input_state[1] == "U"
-                    else (odd_target_states == input_state[1])
+                    else odd_target_states == input_state[1]
                 )
-                target_state_mask = np.logical_and(check_0, check_1)
-                M = int(np.count_nonzero(target_state_mask))
-                if M == 0:
-                    continue
-                n_hits = (
-                    M
-                    if total_p >= 1.0 - 1e-12
-                    else int(fss.np_rng.binomial(M, total_p))
-                )
-                if n_hits == 0:
-                    continue
-                elig_pairs, elig_bs = np.where(target_state_mask)
-                if n_hits == M:
-                    pair_idx, b_idx = elig_pairs, elig_bs
-                else:
-                    chosen = fss.np_rng.choice(M, size=n_hits, replace=False)
-                    pair_idx = elig_pairs[chosen]
-                    b_idx = elig_bs[chosen]
-
-            q0_all = even_targets[pair_idx]
-            q1_all = odd_targets[pair_idx]
-
-            if len(transitions) == 1:
-                branch_groups = [(transitions[0][0], q0_all, q1_all, b_idx)]
-            else:
-                cond_probs = [p / total_p for _, p in transitions]
-                br_idx = fss.np_rng.choice(
-                    len(transitions), size=n_hits, p=cond_probs
-                )
-                branch_groups = []
-                for b_i, (out_pair, _) in enumerate(transitions):
-                    sel = br_idx == b_i
-                    if np.any(sel):
-                        branch_groups.append(
-                            (out_pair, q0_all[sel], q1_all[sel], b_idx[sel])
-                        )
-
-            for out_pair, q0_hit, q1_hit, b_hit in branch_groups:
+                in_mask = check_0 & check_1
+            total_p = sum(p for _, p in transitions)
+            for out_pair_obj, pair_hit, b_hit in _sample_flip_hits(
+                in_mask, num_pairs, self.batch_size, transitions, total_p, fss.np_rng
+            ):
+                out_pair: tuple[object, object] = out_pair_obj  # type: ignore[assignment]
                 for leg_in, leg_out, q_hit in (
-                    (input_state[0], out_pair[0], q0_hit),
-                    (input_state[1], out_pair[1], q1_hit),
+                    (input_state[0], out_pair[0], even_targets[pair_hit]),
+                    (input_state[1], out_pair[1], odd_targets[pair_hit]),
                 ):
                     if leg_out == leg_in:
                         continue
@@ -883,7 +794,7 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                             to_pauli_Z = np.zeros_like(self.state, dtype=bool)
                         np.logical_xor.at(to_pauli_Z, (q_hit, b_hit), True)
                     else:
-                        out_int = int(leg_out)
+                        out_int = int(leg_out)  # type: ignore[arg-type]
                         self.state[q_hit, b_hit] = 0 if out_int < 2 else out_int
                         if out_int >= 2 and self._depolarize_on_leak and leg_in in ("U", 0, 1):
                             if to_depolarize is None:
@@ -958,6 +869,7 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
 
         m_idx = fss._flip_simulator.num_measurements
         ref_slice = fss.ref_measurements[m_idx : m_idx + len(targets)]
+        cached_xs_zs: tuple[NDArray[np.bool_], NDArray[np.bool_]] | None = None
 
         if is_mpad:
             mpad_ref = fss._mpad_ref_z.get(m_idx)
@@ -993,11 +905,12 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
             is_known = (clean_plus | clean_minus)[targets]
             _, known_state_mask = fss._get_current_known_state_masks(pauli=pauli)
             if np.all(is_known):
-                target_computational_states = known_state_mask[targets, :].copy()
+                target_computational_states = known_state_mask[targets, :]
             else:
                 xs, zs, _, _, _ = fss._flip_simulator.to_numpy(
                     output_xs=True, output_zs=True
                 )
+                cached_xs_zs = (xs, zs)
                 if pauli == "X":
                     basis_flips = zs[targets, :]
                 elif pauli == "Y":
@@ -1007,7 +920,7 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                 ref_states = (ref_slice[:, None] ^ inv_arr) ^ basis_flips
                 target_computational_states = np.where(
                     is_known[:, None], known_state_mask[targets, :], ref_states
-                ).copy()
+                )
             if len(set(int(q) for q in targets)) < len(targets):
                 first_occ_f: dict[int, int] = {}
                 for k_i, q_np in enumerate(targets):
@@ -1077,9 +990,12 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
             leaked_targets_mask = np.logical_and(target_mask, self.state >= 2)
 
             if is_reset:
-                xs, zs, _, _, _ = fss._flip_simulator.to_numpy(
-                    output_xs=True, output_zs=True
-                )
+                if cached_xs_zs is not None:
+                    xs, zs = cached_xs_zs
+                else:
+                    xs, zs, _, _, _ = fss._flip_simulator.to_numpy(
+                        output_xs=True, output_zs=True
+                    )
                 reset_flip_x = np.logical_and(unleaked_targets_mask, xs)
                 reset_flip_z = np.logical_and(unleaked_targets_mask, zs)
                 if np.any(reset_flip_x):

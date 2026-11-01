@@ -222,17 +222,11 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
         outcomes = np.zeros((len(t_qubits), self.batch_size), dtype=np.bool_)
         if tss._tab_rngs is not None:
             for b in range(self.batch_size):
-                tr, tr_x, st_b = tss._tab_rngs[b], tss._tab_rngs_x[b], states[:, b]  # type: ignore[index]
+                st_b = states[:, b]
                 for mask_g, pr in [(st_b < 2, p_u)] + [(st_b == n, params.prob_for_input_state[n]) for n in range(2, 10) if n in params.prob_for_input_state]:
-                    q_list = [int(t_qubits[k]) for k in np.flatnonzero(mask_g)]
-                    if q_list and pr > 0.0:
-                        inst_g = stim.CircuitInstruction("X_ERROR", q_list, [pr])
-                        tr.do(inst_g)
-                        tr_x.do(inst_g)
-                        for k_i, q_g in zip(np.flatnonzero(mask_g), q_list):
-                            if tr.peek_z(q_g) == -1:
-                                tr.x(q_g)
-                                outcomes[int(k_i), b] = True
+                    idx_g = np.flatnonzero(mask_g)
+                    if len(idx_g) and pr > 0.0:
+                        outcomes[idx_g, b] = self._tab_flips(tss, b, [t_qubits[k] for k in idx_g], pr)  # type: ignore[arg-type]
         elif np.any(probs > 0.0):
             pos = probs > 0.0
             outcomes[pos] = tss.np_rng.random(int(np.count_nonzero(pos))) < probs[pos]

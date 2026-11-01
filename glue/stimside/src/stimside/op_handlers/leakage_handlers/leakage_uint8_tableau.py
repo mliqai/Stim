@@ -20,6 +20,12 @@ from stimside.op_handlers.leakage_handlers.leakage_tag_parsing_tableau import (
     parse_leakage_in_circuit,
 )
 from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
+from stimside.op_handlers.leakage_handlers.transition_effects import (
+    TransitionEffectMasks,
+    apply_output_effect,
+    emit_tableau_transition_effects,
+    sample_tableau_transitions,
+)
 from stimside.util.numpy_types import Int2DArray
 from stimside.util.stim_workarounds import split_fused_instruction
 
@@ -128,7 +134,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
 
         if z_dephase_qubits and tss.batch_size > 1:
             tss._new_circuit.append(
-                self._construct_stim_instruction("Z_ERROR", z_dephase_qubits, [0.5])
+                stim.CircuitInstruction("Z_ERROR", z_dephase_qubits, [0.5])
             )
 
         self.state[targets_in_qubit_space] = new_state
@@ -257,15 +263,6 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         targets_np = np.asarray(targets)
         return targets_np[allowed_mask].flatten()
 
-    def _construct_stim_instruction(
-        self,
-        op_name: str,
-        targets: list[int] | list[stim.GateTarget] | np.ndarray,
-        gate_args_copy: list[float] = [],
-    ) -> stim.CircuitInstruction:
-        """construct a stim CircuitInstruction from name, targets, and args."""
-        return stim.CircuitInstruction(op_name, targets, gate_args_copy)
-
     def handle_op(self, op: stim.CircuitInstruction, sss: TablesideSimulator):
         """handle a single stim CircuitInstruction."""
         if op not in self.claimed_ops_keys:
@@ -313,19 +310,16 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                     sss._do_bare_instruction(op)
                     return
                 if len(filtered_targets) > 0:
-                    op_new = self._construct_stim_instruction(
-                        op_name, filtered_targets, op.gate_args_copy()
+                    sss._do_bare_instruction(
+                        stim.CircuitInstruction(op_name, filtered_targets, op.gate_args_copy())
                     )
-                    sss._do_bare_instruction(op_new)
                 elif op_name in (
                     "E",
                     "CORRELATED_ERROR",
                     "ELSE_CORRELATED_ERROR",
                 ):
                     sss._do_bare_instruction(
-                        self._construct_stim_instruction(
-                            op_name, [], op.gate_args_copy()
-                        )
+                        stim.CircuitInstruction(op_name, [], op.gate_args_copy())
                     )
                 return
             else:
@@ -345,7 +339,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                     if (t.qubit_value if t.qubit_value is not None else t.value) >= 0
                 ]
             )
-            was_unleaked = (self.state[target_indices] < 2).copy()
+            was_unleaked = self.state[target_indices] < 2
             old_states = self.state[target_indices].copy() if rec_ev else None
         else:
             target_indices = None
@@ -386,7 +380,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         states move with them), then swap their leakage states, pair by pair from left to right.
         """
         tss._do_bare_instruction(
-            self._construct_stim_instruction(op.name, op.targets_copy(), op.gate_args_copy())
+            stim.CircuitInstruction(op.name, op.targets_copy(), op.gate_args_copy())
         )
         targets = [t.qubit_value for t in op.targets_copy()]
         for q0, q1 in zip(targets[::2], targets[1::2]):
@@ -446,7 +440,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                             targets=sub_other,
                             from_tag=params.from_tag,
                         )
-                        sub_op = self._construct_stim_instruction(
+                        sub_op = stim.CircuitInstruction(
                             op.name, grp, op.gate_args_copy()
                         )
                         self.leakage_conditioning(sub_op, tss, sub_params)
@@ -490,9 +484,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
 
         if len(filtered_targets) > 0:
             tss._do_bare_instruction(
-                self._construct_stim_instruction(
-                    op.name, filtered_targets, op.gate_args_copy()
-                )
+                stim.CircuitInstruction(op.name, filtered_targets, op.gate_args_copy())
             )
         elif op.name in (
             "E",
@@ -500,9 +492,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
             "ELSE_CORRELATED_ERROR",
         ):
             tss._do_bare_instruction(
-                self._construct_stim_instruction(
-                    op.name, [], op.gate_args_copy()
-                )
+                stim.CircuitInstruction(op.name, [], op.gate_args_copy())
             )
 
     def leakage_transition_1(
@@ -521,7 +511,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
             qs_list = [t.qubit_value for t in raw_t if t.qubit_value is not None]
             if len(set(qs_list)) < len(qs_list):
                 for t in raw_t:
-                    sub_op = self._construct_stim_instruction(
+                    sub_op = stim.CircuitInstruction(
                         op.name, [t], op.gate_args_copy()
                     )
                     self.leakage_transition_1(sub_op, tss, params)
@@ -535,94 +525,26 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
             self._update_state_from_peek_Z(np.where(target_mask)[0], tss)
 
         initial_state = self.state.copy()
-
-        to_depolarize = np.zeros_like(self.state, dtype=bool)
-        to_set_to_one = np.zeros_like(self.state, dtype=bool)
-        to_set_to_zero = np.zeros_like(self.state, dtype=bool)
+        effects = TransitionEffectMasks.zeros(self.state.shape, two_qubit=False)
 
         for input_state in params.args_by_input_state.keys():
-            if input_state == "U":
-                input_state_mask = initial_state < 2
-            else:
-                input_state_mask = initial_state == input_state
-
-            overwrite_mask = np.logical_and(target_mask, input_state_mask)
-
-            samples_to_take = np.count_nonzero(overwrite_mask)
-            if samples_to_take == 0:
+            in_mask = initial_state < 2 if input_state == "U" else initial_state == input_state
+            target_qs = np.where(target_mask & in_mask)[0]
+            if len(target_qs) == 0:
                 continue
-
-            transitions = params.args_by_input_state[input_state]
-            total_p = sum(p for _, p in transitions)
-            if not sync_rng and total_p <= 0.0:
+            sampled = sample_tableau_transitions(
+                params, input_state, len(target_qs), tss.np_rng, sync_rng=sync_rng
+            )
+            if sampled is None:
                 continue
-
-            if not sync_rng and total_p < 0.05 and len(transitions) >= 1:
-                n_hits = int(tss.np_rng.binomial(samples_to_take, total_p))
-                if n_hits == 0:
-                    continue
-                overwrite_indices = np.where(overwrite_mask)[0]
-                chosen_indices = overwrite_indices[
-                    tss.np_rng.choice(samples_to_take, size=n_hits, replace=False)
-                ]
-                overwrite_mask = np.zeros_like(self.state, dtype=bool)
-                overwrite_mask[chosen_indices] = True
-                if len(transitions) == 1:
-                    output_states = np.full(n_hits, str(transitions[0][0]))
-                else:
-                    cond_probs = [p / total_p for _, p in transitions]
-                    br_idx = tss.np_rng.choice(len(transitions), size=n_hits, p=cond_probs)
-                    output_states = np.array([str(transitions[int(b)][0]) for b in br_idx])
-            else:
-                output_states = params.sample_transitions_from_state(
-                    input_state=input_state, num_samples=samples_to_take, np_rng=tss.np_rng
-                ).astype(str)
-
-            target_qs = np.where(overwrite_mask)[0]
-            for k, q_np in enumerate(target_qs):
-                q = int(q_np)
-                out_st = str(output_states[k])
-                if out_st == str(input_state):
-                    self.state[q] = 0 if input_state in (0, 1, "U") else int(input_state)
-                    continue
-                in_is_leaked = int(initial_state[q]) >= 2
-                if out_st == "0":
-                    to_set_to_zero[q] |= True
-                    self.state[q] = 0
-                elif out_st == "1":
-                    to_set_to_one[q] |= True
-                    self.state[q] = 0
-                elif out_st == "U":
-                    if in_is_leaked:
-                        to_set_to_zero[q] |= True
-                    to_depolarize[q] |= True
-                    self.state[q] = 0
-                else:
-                    out_int = int(out_st)
-                    self.state[q] = 0 if out_int < 2 else out_int
+            sel, output_states = sampled
+            if not isinstance(sel, slice):
+                target_qs = target_qs[np.sort(sel)]
+            for q_np, out_st in zip(target_qs, output_states):
+                apply_output_effect(self.state, effects, int(q_np), input_state, out_st)
 
         self.state[self.state == 1] = 0
-
-        idx_to_set_to_zero = np.where(to_set_to_zero)[0]
-        if len(idx_to_set_to_zero) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction("R", idx_to_set_to_zero)
-            )
-        idx_to_set_to_one = np.where(to_set_to_one)[0]
-        if len(idx_to_set_to_one) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction("R", idx_to_set_to_one)
-            )
-            tss._do_bare_instruction(
-                self._construct_stim_instruction("X", idx_to_set_to_one)
-            )
-        idx_to_depolarize = np.where(to_depolarize)[0]
-        if len(idx_to_depolarize) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction(
-                    "DEPOLARIZE1", idx_to_depolarize, [0.75]
-                )
-            )
+        emit_tableau_transition_effects(tss, effects)
 
     def leakage_transition_2(
         self,
@@ -641,7 +563,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         ]
         if len(targets_list) > 2 and len(set(targets_list)) < len(targets_list):
             for grp in op.target_groups():
-                sub_op = self._construct_stim_instruction(
+                sub_op = stim.CircuitInstruction(
                     op.name, grp, op.gate_args_copy()
                 )
                 self.leakage_transition_2(sub_op, tss, params)
@@ -659,171 +581,44 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         initial_state = self.state.copy()
         even_target_states = initial_state[targets_even]
         odd_target_states = initial_state[targets_odd]
-
-        to_depolarize = np.zeros_like(self.state, dtype=bool)
-        to_pauli_X = np.zeros_like(self.state, dtype=bool)
-        to_pauli_Y = np.zeros_like(self.state, dtype=bool)
-        to_pauli_Z = np.zeros_like(self.state, dtype=bool)
-
-        to_set_to_one = np.zeros_like(self.state, dtype=bool)
-        to_set_to_zero = np.zeros_like(self.state, dtype=bool)
-
-        # for accumulating which qubits need to have their X / Z randomized (for 'V')
-        to_randomize_X = np.zeros_like(self.state, dtype=bool)
-        randomize_phase = np.zeros_like(self.state, dtype=bool)
+        effects = TransitionEffectMasks.zeros(self.state.shape, two_qubit=True)
 
         for input_state in params.args_by_input_state.keys():
-            if input_state[0] == "U":
-                even_target_state_checks = even_target_states < 2
-            else:
-                even_target_state_checks = even_target_states == input_state[0]
-
-            if input_state[1] == "U":
-                odd_target_state_checks = odd_target_states < 2
-            else:
-                odd_target_state_checks = odd_target_states == input_state[1]
-
-            trigger_mask = np.logical_and(
-                even_target_state_checks, odd_target_state_checks
+            even_checks = (
+                even_target_states < 2
+                if input_state[0] == "U"
+                else even_target_states == input_state[0]
             )
+            odd_checks = (
+                odd_target_states < 2
+                if input_state[1] == "U"
+                else odd_target_states == input_state[1]
+            )
+            trigger_mask = even_checks & odd_checks
             samples_to_take = int(np.count_nonzero(trigger_mask))
             if samples_to_take == 0:
                 continue
-
-            transitions = params.args_by_input_state[input_state]
-            total_p = sum(p for _, p in transitions)
-            if not sync_rng and total_p <= 0.0:
+            sampled = sample_tableau_transitions(
+                params, input_state, samples_to_take, tss.np_rng, sync_rng=sync_rng
+            )
+            if sampled is None:
                 continue
-
+            sel, output_states = sampled
             triggered_pairs = np.column_stack(
                 (targets_even[trigger_mask], targets_odd[trigger_mask])
-            )
-
-            if not sync_rng and total_p < 0.05 and len(transitions) >= 1:
-                n_hits = int(tss.np_rng.binomial(samples_to_take, total_p))
-                if n_hits == 0:
-                    continue
-                chosen = tss.np_rng.choice(samples_to_take, size=n_hits, replace=False)
-                triggered_pairs = triggered_pairs[chosen]
-                samples_to_take = n_hits
-                if len(transitions) == 1:
-                    out_pair = transitions[0][0]
-                    output_states = np.tile(
-                        np.array([str(out_pair[0]), str(out_pair[1])]),
-                        (n_hits, 1),
-                    )
-                else:
-                    cond_probs = [p / total_p for _, p in transitions]
-                    br_idx = tss.np_rng.choice(len(transitions), size=n_hits, p=cond_probs)
-                    output_states = np.array(
-                        [[str(transitions[int(b)][0][0]), str(transitions[int(b)][0][1])] for b in br_idx]
-                    )
-            else:
-                output_states = params.sample_transitions_from_state(
-                    input_state=input_state, num_samples=samples_to_take, np_rng=tss.np_rng
-                ).astype(str)
-
-            for k in range(samples_to_take):
+            )[sel]
+            for pair, out_pair in zip(triggered_pairs, output_states):
                 for leg in (0, 1):
-                    q = int(triggered_pairs[k, leg])
-                    in_st = input_state[leg]
-                    out_st = output_states[k, leg]
-                    if out_st == str(in_st):
-                        self.state[q] = 0 if in_st in (0, 1, "U") else int(in_st)
-                        continue
-                    in_is_leaked = not (in_st in (0, 1, "U"))
-
-                    if out_st == "0":
-                        to_set_to_zero[q] |= True
-                        self.state[q] = 0
-                    elif out_st == "1":
-                        to_set_to_one[q] |= True
-                        self.state[q] = 0
-                    elif out_st == "V":
-                        to_set_to_zero[q] |= True
-                        to_randomize_X[q] |= True
-                        randomize_phase[q] |= True
-                        self.state[q] = 0
-                    elif out_st == "D":
-                        if in_is_leaked:
-                            to_set_to_zero[q] |= True
-                        to_depolarize[q] |= True
-                        self.state[q] = 0
-                    elif out_st == "U":
-                        if in_is_leaked:
-                            to_set_to_zero[q] |= True
-                        to_depolarize[q] |= True
-                        self.state[q] = 0
-                    elif out_st == "X":
-                        if in_is_leaked:
-                            to_set_to_zero[q] |= True
-                        to_pauli_X[q] ^= True
-                        self.state[q] = 0
-                    elif out_st == "Y":
-                        if in_is_leaked:
-                            to_set_to_zero[q] |= True
-                        to_pauli_Y[q] ^= True
-                        self.state[q] = 0
-                    elif out_st == "Z":
-                        if in_is_leaked:
-                            to_set_to_zero[q] |= True
-                        to_pauli_Z[q] ^= True
-                        self.state[q] = 0
-                    else:
-                        out_int = int(out_st)
-                        self.state[q] = 0 if out_int < 2 else out_int
+                    apply_output_effect(
+                        self.state,
+                        effects,
+                        int(pair[leg]),
+                        input_state[leg],
+                        out_pair[leg],
+                    )
 
         self.state[self.state == 1] = 0
-
-        idx_to_set_to_zero = np.where(to_set_to_zero)[0]
-        if len(idx_to_set_to_zero) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction("R", idx_to_set_to_zero)
-            )
-        idx_to_set_to_one = np.where(to_set_to_one)[0]
-        if len(idx_to_set_to_one) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction("R", idx_to_set_to_one)
-            )
-            tss._do_bare_instruction(
-                self._construct_stim_instruction("X", idx_to_set_to_one)
-            )
-        idx_to_depolarize = np.where(to_depolarize)[0]
-        if len(idx_to_depolarize) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction(
-                    "DEPOLARIZE1", idx_to_depolarize, [0.75]
-                )
-            )
-        idx_to_pauli_X = np.where(to_pauli_X)[0]
-        if len(idx_to_pauli_X) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction("X", idx_to_pauli_X)
-            )
-        idx_to_pauli_Y = np.where(to_pauli_Y)[0]
-        if len(idx_to_pauli_Y) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction("Y", idx_to_pauli_Y)
-            )
-        idx_to_pauli_Z = np.where(to_pauli_Z)[0]
-        if len(idx_to_pauli_Z) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction("Z", idx_to_pauli_Z)
-            )
-        idx_to_randomize_X = np.where(to_randomize_X)[0]
-        if len(idx_to_randomize_X) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction(
-                    "X_ERROR", idx_to_randomize_X, [0.5]
-                )
-            )
-        idx_to_randomize_phase = np.where(randomize_phase)[0]
-        if len(idx_to_randomize_phase) > 0:
-            tss._do_bare_instruction(
-                self._construct_stim_instruction(
-                    "Z_ERROR", idx_to_randomize_phase, [0.5]
-                )
-            )
+        emit_tableau_transition_effects(tss, effects)
 
     def leakage_measurement(
         self,
@@ -861,7 +656,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
 
         if not is_mpad and len(set(targets)) < len(targets):
             for t in raw_op_targets:
-                sub_op = self._construct_stim_instruction(
+                sub_op = stim.CircuitInstruction(
                     op.name, [t], op.gate_args_copy()
                 )
                 self.leakage_measurement(sub_op, tss, params)
@@ -875,7 +670,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         is_reset_meas = op.name in ("MR", "MRZ", "MRX", "MRY")
         if basis_rot_gate is not None:
             tss._do_bare_only_on_tableau(
-                self._construct_stim_instruction(basis_rot_gate, targets)
+                stim.CircuitInstruction(basis_rot_gate, targets)
             )
 
         n_qbt = max(
@@ -910,11 +705,11 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                 for q_d, q_a in zip(targets_in_qubit_space, anc_comp):
                     cx_targets.extend([int(q_d), int(q_a)])
                 tss._do_bare_only_on_tableau(
-                    self._construct_stim_instruction("CX", cx_targets)
+                    stim.CircuitInstruction("CX", cx_targets)
                 )
                 if p0 > 0:
                     tss._do_bare_only_on_tableau(
-                        self._construct_stim_instruction("X_ERROR", anc_comp, [p0])
+                        stim.CircuitInstruction("X_ERROR", anc_comp, [p0])
                     )
             else:
                 # Asymmetric readout probabilities on 0 vs 1 (or MPAD)
@@ -929,9 +724,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                     targets_new[idx_of_targets_in_qubit_space] = anc_comp
                     if p0 > 0:
                         tss._do_bare_only_on_tableau(
-                            self._construct_stim_instruction(
-                                "X_ERROR", anc_comp, [p0]
-                            )
+                            stim.CircuitInstruction("X_ERROR", anc_comp, [p0])
                         )
                 elif is_mpad and tss.batch_size > 1 and hasattr(tss, "_asymmetric_readout_postproc"):
                     # batch_size > 1 frame-samples _new_circuit, so the readout must follow each shot's own Z value:
@@ -946,7 +739,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                     for q_d, q_a in zip(targets_in_qubit_space, anc_comp):
                         cx_targets.extend([int(q_d), int(q_a)])
                     tss._do_bare_only_on_tableau(
-                        self._construct_stim_instruction("CX", cx_targets)
+                        stim.CircuitInstruction("CX", cx_targets)
                     )
                     base_meas_idx = tss._new_circuit.num_measurements
                     for i_pos in idx_of_targets_in_qubit_space:
@@ -991,7 +784,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                         for q_d, q_a in zip(targets_in_qubit_space, anc_comp):
                             cx_targets.extend([int(q_d), int(q_a)])
                         tss._do_bare_only_on_tableau(
-                            self._construct_stim_instruction("CX", cx_targets)
+                            stim.CircuitInstruction("CX", cx_targets)
                         )
 
                     m0_mask = pauli_states == 1
@@ -1000,20 +793,18 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
 
                     if np.any(m0_mask) and p0 > 0:
                         tss._do_bare_only_on_tableau(
-                            self._construct_stim_instruction(
+                            stim.CircuitInstruction(
                                 "X_ERROR", anc_comp_arr[m0_mask], [p0]
                             )
                         )
                     if np.any(m1_mask):
                         if is_mpad:
                             tss._do_bare_only_on_tableau(
-                                self._construct_stim_instruction(
-                                    "X", anc_comp_arr[m1_mask]
-                                )
+                                stim.CircuitInstruction("X", anc_comp_arr[m1_mask])
                             )
                         if 1.0 - p1 > 0:
                             tss._do_bare_only_on_tableau(
-                                self._construct_stim_instruction(
+                                stim.CircuitInstruction(
                                     "X_ERROR", anc_comp_arr[m1_mask], [1.0 - p1]
                                 )
                             )
@@ -1022,7 +813,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                             x_error_prob = 0.5 * p0 + 0.5 * p1
                             if x_error_prob > 0:
                                 tss._do_bare_only_on_tableau(
-                                    self._construct_stim_instruction(
+                                    stim.CircuitInstruction(
                                         "X_ERROR",
                                         anc_comp_arr[mflip_mask],
                                         [x_error_prob],
@@ -1052,14 +843,12 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                                 x_error_prob = 0.5 * p0 + 0.5 * (1.0 - p1)
                             else:
                                 tss._do_bare_only_on_tableau(
-                                    self._construct_stim_instruction(
-                                        "X", anc_comp_arr[mflip_mask]
-                                    )
+                                    stim.CircuitInstruction("X", anc_comp_arr[mflip_mask])
                                 )
                                 x_error_prob = 0.5 * (1.0 - p0) + 0.5 * p1
                             if x_error_prob > 0:
                                 tss._do_bare_only_on_tableau(
-                                    self._construct_stim_instruction(
+                                    stim.CircuitInstruction(
                                         "X_ERROR",
                                         anc_comp_arr[mflip_mask],
                                         [x_error_prob],
@@ -1080,7 +869,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
             else:
                 leaked_meas_targets = leaked_qubits
                 tss._do_bare_only_on_tableau(
-                    self._construct_stim_instruction("R", leaked_meas_targets)
+                    stim.CircuitInstruction("R", leaked_meas_targets)
                 )
             for n in range(2, int(np.max(target_leakage_state)) + 1):
                 if n in target_leakage_state and n in params.prob_for_input_state:
@@ -1089,7 +878,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                     ]
                     if params.prob_for_input_state[n] > 0:
                         tss._do_bare_only_on_tableau(
-                            self._construct_stim_instruction(
+                            stim.CircuitInstruction(
                                 "X_ERROR", idx_n, [params.prob_for_input_state[n]]
                             )
                         )
@@ -1107,16 +896,14 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
             else:
                 m_targets.append(int(q_new))
 
-        tss._do_bare_only_on_tableau(
-            self._construct_stim_instruction("M", m_targets)
-        )
+        tss._do_bare_only_on_tableau(stim.CircuitInstruction("M", m_targets))
         if is_reset_meas and len(targets_in_qubit_space) > 0:
             tss._do_bare_only_on_tableau(
-                self._construct_stim_instruction("R", targets_in_qubit_space)
+                stim.CircuitInstruction("R", targets_in_qubit_space)
             )
         if basis_rot_gate is not None:
             tss._do_bare_only_on_tableau(
-                self._construct_stim_instruction(basis_rot_gate, targets)
+                stim.CircuitInstruction(basis_rot_gate, targets)
             )
         if is_mpad:
             tss._append_to_new_reference_circuit(op)
@@ -1126,13 +913,11 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                 for i, q in enumerate(targets)
             ]
             tss._append_to_new_reference_circuit(
-                self._construct_stim_instruction(op.name, ref_m_targets)
+                stim.CircuitInstruction(op.name, ref_m_targets)
             )
             if len(leaked_qubits) > 0:
                 tss._do_bare_only_on_tableau(
-                    self._construct_stim_instruction(
-                        "DEPOLARIZE1", leaked_qubits, [0.75]
-                    )
+                    stim.CircuitInstruction("DEPOLARIZE1", leaked_qubits, [0.75])
                 )
 
 
