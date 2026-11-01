@@ -898,17 +898,17 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[CosetsideSimulator]):
                             elif out_st == "X":
                                 if in_is_leaked:
                                     to_set_to_zero[q, b] |= True
-                                to_pauli_X[q, b] |= True
+                                to_pauli_X[q, b] ^= True
                                 self._state[q, b] = 0
                             elif out_st == "Y":
                                 if in_is_leaked:
                                     to_set_to_zero[q, b] |= True
-                                to_pauli_Y[q, b] |= True
+                                to_pauli_Y[q, b] ^= True
                                 self._state[q, b] = 0
                             elif out_st == "Z":
                                 if in_is_leaked:
                                     to_set_to_zero[q, b] |= True
-                                to_pauli_Z[q, b] |= True
+                                to_pauli_Z[q, b] ^= True
                                 self._state[q, b] = 0
                             else:
                                 out_int = int(out_st)

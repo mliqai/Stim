@@ -772,17 +772,17 @@ class CompiledLeakageUint8(CompiledOpHandler[TablesideSimulator]):
                     elif out_st == "X":
                         if in_is_leaked:
                             to_set_to_zero[q] |= True
-                        to_pauli_X[q] |= True
+                        to_pauli_X[q] ^= True
                         self.state[q] = 0
                     elif out_st == "Y":
                         if in_is_leaked:
                             to_set_to_zero[q] |= True
-                        to_pauli_Y[q] |= True
+                        to_pauli_Y[q] ^= True
                         self.state[q] = 0
                     elif out_st == "Z":
                         if in_is_leaked:
                             to_set_to_zero[q] |= True
-                        to_pauli_Z[q] |= True
+                        to_pauli_Z[q] ^= True
                         self.state[q] = 0
                     else:
                         out_int = int(out_st)

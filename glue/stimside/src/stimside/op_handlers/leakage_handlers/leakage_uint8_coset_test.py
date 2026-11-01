@@ -1728,3 +1728,79 @@ class TestCompiledLeakageUint8Coset:
                 np.testing.assert_array_equal(recs[:, 1], ~leaked, err_msg=noise)
                 assert not np.any(recs[:, 2]), noise
 
+    @pytest.mark.parametrize("pauli", ["X", "Y", "Z"])
+    def test_transition_2_overlapping_input_keys_xor_pauli_outputs_in_sync_and_batched(
+        self, pauli: str
+    ) -> None:
+        from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8 as LeakageUint8Flip
+        from stimside.simulator_flip import FlipsideSimulator
+
+        prep_meas = "H 0\n" if pauli == "Z" else ""
+        circuit = stim.Circuit(
+            f"R 0 1\n{prep_meas}"
+            f"II_ERROR[LEAKAGE_TRANSITION_2: (1.0, U_0-->{pauli}_0) (1.0, U_U-->{pauli}_0)] 0 1\n"
+            f"{prep_meas}M 0"
+        )
+        flip = FlipsideSimulator(
+            circuit=circuit,
+            compiled_op_handler=LeakageUint8Flip().compile_op_handler(
+                circuit=circuit, batch_size=4
+            ),
+            batch_size=4,
+        )
+        flip.run()
+        expected = np.zeros((4, 1), dtype=bool)
+        np.testing.assert_array_equal(flip.get_final_measurement_records(), expected)
+
+        from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+        from stimside.simulator_magic import MagicsideSimulator
+
+        for sync in (False, True):
+            tab = TablesideSimulator(
+                circuit=circuit,
+                compiled_op_handler=LeakageUint8Tableau().compile_op_handler(
+                    circuit=circuit, batch_size=4
+                ),
+                batch_size=4,
+                seed=7,
+                sync_tableside_rng=sync,
+            )
+            tab.run()
+            np.testing.assert_array_equal(
+                tab.get_final_measurement_records(),
+                expected,
+                err_msg=f"tableau pauli={pauli}, sync={sync}",
+            )
+
+            cos = CosetsideSimulator(
+                circuit=circuit,
+                compiled_op_handler=LeakageUint8Coset().compile_op_handler(
+                    circuit=circuit, batch_size=4
+                ),
+                batch_size=4,
+                seed=7,
+                sync_tableside_rng=sync,
+            )
+            cos.run()
+            np.testing.assert_array_equal(
+                cos.get_final_measurement_records(),
+                expected,
+                err_msg=f"coset pauli={pauli}, sync={sync}",
+            )
+
+            mag = MagicsideSimulator(
+                circuit=circuit,
+                compiled_op_handler=LeakageUint8Magic().compile_op_handler(
+                    circuit=circuit, batch_size=4
+                ),
+                batch_size=4,
+                seed=7,
+                sync_tableside_rng=sync,
+            )
+            mag.run()
+            np.testing.assert_array_equal(
+                mag.get_final_measurement_records(),
+                expected,
+                err_msg=f"magic pauli={pauli}, sync={sync}",
+            )
+
