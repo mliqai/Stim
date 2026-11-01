@@ -110,17 +110,25 @@ class StimsideBuildExt(build_ext):
                         raise
 
 
+_EXTENSIONS = (
+    ("stimside._native.libcoset_kernels", "src/stimside/_native/coset_kernels.cpp"),
+    ("stimside._native.libtableside_kernels", "src/stimside/_native/tableside_kernels.cpp"),
+    ("stimside._native.libmarginal_dem_kernels", "src/stimside/_native/marginal_dem_kernels.cpp"),
+    ("stimside._native.libmagic_kernels", "src/stimside/_native/magic_kernels.cpp"),
+)
+
+
 def _get_extensions() -> list[Extension]:
     compile_args, link_args = _KERNEL_LOADER.get_cpp_compile_and_link_args()
     return [
         Extension(
-            name=f"stimside._native.lib{name}",
-            sources=[f"src/stimside/_native/{name}.cpp"],
+            name=ext_name,
+            sources=[cpp_src],
             language="c++",
             extra_compile_args=compile_args,
             extra_link_args=link_args,
         )
-        for name in _KERNEL_LOADER.KERNEL_NAMES
+        for ext_name, cpp_src in _EXTENSIONS
     ]
 
 

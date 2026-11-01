@@ -19,7 +19,6 @@ OutState = int | Literal["U", "V", "X", "Y", "Z", "D"]
 InPairState = tuple[InState, InState]
 OutPairState = tuple[OutState, OutState]
 Transition2ArgInput = tuple[float, InPairState, OutPairState]
-Transition2Arg = tuple[OutPairState, float]
 
 OUT_ERROR_STATES = ["X", "Y", "Z", "D"]
 _OUT_PAIR_STR_STATES = frozenset((*OUT_ERROR_STATES, "U", "V"))

@@ -46,7 +46,6 @@ from stimside._magic.compile import (
     compile_pauli_product,
     compile_selector,
     decompose_clifford_exact,
-    eval_decomposition_unitary_le,
     extract_circuit_faults,
     extract_data_expansion,
     parse_clifford_fault_tag,

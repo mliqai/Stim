@@ -19,13 +19,6 @@ import time
 from types import ModuleType
 from typing import Any
 
-KERNEL_NAMES: tuple[str, ...] = (
-    "coset_kernels",
-    "tableside_kernels",
-    "marginal_dem_kernels",
-    "magic_kernels",
-)
-
 AbiSpec = tuple[str, Sequence[Any], Any]
 
 
