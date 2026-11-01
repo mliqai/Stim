@@ -344,33 +344,6 @@ def _check_shared_geometry(
     return nw, tm
 
 
-def _canonicalize_rows_inplace(
-    h_2d: NDArray[np.uint64], ell_2d: NDArray[np.uint8],
-    A_words: NDArray[np.uint64], Gamma: NDArray[np.uint8],
-    pivots: NDArray[np.int32], ell_odd: NDArray[np.uint8],
-) -> tuple[NDArray[np.intp], NDArray[np.complex128]]:
-    """Clear `h_2d[:, pivots]` in-place; return `(dirty_indices, phase_factors)`."""
-    if h_2d.shape[0] == 0 or pivots.shape[0] == 0:
-        return np.zeros(0, dtype=np.intp), np.zeros(0, dtype=np.complex128)
-    s = get_bits_at_qubits(h_2d, pivots)
-    idx = np.flatnonzero(np.any(s != 0, axis=1))
-    if len(idx) == 0:
-        return idx, np.zeros(0, dtype=np.complex128)
-    s_d, ell_d = s[idx], ell_2d[idx]
-    s_i = s_d.astype(np.int32)
-    q_mod4 = (
-        np.sum(s_i * ell_d.astype(np.int32), axis=1)
-        + 2 * np.sum((s_i @ np.triu(Gamma, 1).astype(np.int32)) * s_i, axis=1)
-    ) & 3
-    for r in range(pivots.shape[0]):
-        sel_r = idx[s_d[:, r] != 0]
-        if len(sel_r) > 0:
-            h_2d[sel_r] ^= A_words[r]
-    polar = ((s_d @ Gamma) ^ (s_d & ell_odd[None, :])) & np.uint8(1)
-    ell_2d[idx] = (ell_d + (polar << np.uint8(1))) & np.uint8(3)
-    return idx, _PHASE4[q_mod4]
-
-
 @dataclass
 class PhaseQFEComponent:
     """Normalized Phase-QFE component on `n_qubits` qubits with dimension `d`."""
@@ -466,26 +439,10 @@ class PhaseQFEComponent:
             if require_canonical_offset and np.any(get_bits_at_qubits(self.h_words[None, :], self.pivots) != 0):
                 raise ValueError("Non-canonical offset: h_p != 0 at pivot")
 
-    def canonical_offset(self) -> complex:
-        """Clear `h[pivots]` in-place and return exact scalar phase factor in `{1, i, -1, -i}`."""
-        if self.d == 0:
-            return 1.0 + 0.0j
-        ell_2d = self.ell.copy()[None, :]
-        idx, phases = _canonicalize_rows_inplace(
-            self.h_words[None, :], ell_2d, self.A_words, self.Gamma, self.pivots, self.ell & np.uint8(1)
-        )
-        if len(idx) == 0:
-            return 1.0 + 0.0j
-        self.ell = np.ascontiguousarray(ell_2d[0])
-        return complex(phases[0])
-
     def geometry_key(self) -> bytes:
         header = np.array([self.n_qubits, self.d], dtype=np.int64).tobytes()
         ell_par = np.ascontiguousarray(self.ell & np.uint8(1)).tobytes()
         return header + self.A_words.tobytes() + self.Gamma.tobytes() + ell_par + self.pivots.tobytes()
-
-    def key(self) -> tuple[bytes, bytes, bytes]:
-        return (self.geometry_key(), self.h_words.tobytes(), self.ell.tobytes())
 
     def to_statevector(self, *, endian: Literal["little", "big"] = "little") -> NDArray[np.complex128]:
         """Materialize dense `2**n_qubits` statevector (for small-N verification)."""
@@ -632,7 +589,7 @@ class ShotExpansion:
             (ref_comp.ell & np.uint8(1)).copy(), 0.0, atol,
             _is_canonical_merged=(len(terms) <= 1),
         )
-        return merge_frames(exp) if merge else exp  # type: ignore[return-value]
+        return merge_frames(exp) if merge else exp
 
     def copy(self) -> ShotExpansion:
         assert self.ell_odd is not None
@@ -691,7 +648,6 @@ class ShotExpansion:
             return 0.0
         do_canon = (not self._is_canonical_merged) if canonicalize_first is None else bool(canonicalize_first)
         exp = merge_frames(self) if (do_canon and self.chi > 1) else self
-        assert isinstance(exp, ShotExpansion)
         if exp.chi == 0:
             return 0.0
         re, im = exp.weights.real, exp.weights.imag
@@ -865,31 +821,29 @@ def apply_reference_tableau_to_statevector(
 # ---------------------------------------------------------------------------
 
 
-def drop_variable(target: PhaseQFEComponent | ShotExpansion, col: int) -> None:
+def drop_variable(target: ShotExpansion, col: int) -> None:
     """`H0`: Delete binary generator variable `col` in-place (`d -> d - 1`)."""
+    if not isinstance(target, ShotExpansion):
+        raise TypeError(f"Unsupported target type: {type(target)!r}")
     c = int(col)
     if c < 0 or c >= target.d:
         raise ValueError(f"Column index {c} out of range for d={target.d}")
     target.A_words = np.ascontiguousarray(np.delete(target.A_words, c, axis=0))
     target.Gamma = np.ascontiguousarray(np.delete(np.delete(target.Gamma, c, axis=0), c, axis=1))
     target.pivots = np.ascontiguousarray(np.delete(target.pivots, c))
-    if isinstance(target, PhaseQFEComponent):
-        target.ell = np.ascontiguousarray(np.delete(target.ell, c))
-        target.d -= 1
-    elif isinstance(target, ShotExpansion):
-        target.ell = np.ascontiguousarray(np.delete(target.ell, c, axis=1))
-        assert target.ell_odd is not None
-        target.ell_odd = np.ascontiguousarray(np.delete(target.ell_odd, c))
-        target.d -= 1
-        target._refresh_a_union()
-        if target.chi > 1:
-            target._is_canonical_merged = False
-    else:
-        raise TypeError(f"Unsupported target type: {type(target)!r}")
+    target.ell = np.ascontiguousarray(np.delete(target.ell, c, axis=1))
+    assert target.ell_odd is not None
+    target.ell_odd = np.ascontiguousarray(np.delete(target.ell_odd, c))
+    target.d -= 1
+    target._refresh_a_union()
+    if target.chi > 1:
+        target._is_canonical_merged = False
 
 
-def add_column(target: PhaseQFEComponent | ShotExpansion, src: int, dst: int) -> None:
+def add_column(target: ShotExpansion, src: int, dst: int) -> None:
     """`H1`: Column addition `A_dst ^= A_src` with exact mod-4 `Q` pullback in-place."""
+    if not isinstance(target, ShotExpansion):
+        raise TypeError(f"Unsupported target type: {type(target)!r}")
     r, s = int(src), int(dst)
     if r < 0 or r >= target.d or s < 0 or s >= target.d:
         raise ValueError(f"Column indices ({r}, {s}) out of range for d={target.d}")
@@ -899,18 +853,12 @@ def add_column(target: PhaseQFEComponent | ShotExpansion, src: int, dst: int) ->
     src_row = target.Gamma[r, :].copy()
     target.A_words[s] ^= target.A_words[r]
 
-    if isinstance(target, PhaseQFEComponent):
-        parity = int(target.ell[r]) & 1
-        target.ell[s] = np.uint8((int(target.ell[s]) + int(target.ell[r]) + 2 * old_edge) & 3)
-    elif isinstance(target, ShotExpansion):
-        assert target.ell_odd is not None
-        parity = int(target.ell_odd[r]) & 1
-        if target.chi > 0:
-            target.ell[:, s] = (target.ell[:, s] + target.ell[:, r] + np.uint8(2 * old_edge)) & np.uint8(3)
-        target.ell_odd[s] ^= np.uint8(parity)
-        target._refresh_a_union()
-    else:
-        raise TypeError(f"Unsupported target type: {type(target)!r}")
+    assert target.ell_odd is not None
+    parity = int(target.ell_odd[r]) & 1
+    if target.chi > 0:
+        target.ell[:, s] = (target.ell[:, s] + target.ell[:, r] + np.uint8(2 * old_edge)) & np.uint8(3)
+    target.ell_odd[s] ^= np.uint8(parity)
+    target._refresh_a_union()
 
     mask = np.ones(target.d, dtype=bool)
     mask[r] = False
@@ -924,9 +872,11 @@ def add_column(target: PhaseQFEComponent | ShotExpansion, src: int, dst: int) ->
 
 
 def make_principal(
-    target: PhaseQFEComponent | ShotExpansion, col: int, pivot_qubit: int | None = None
+    target: ShotExpansion, col: int, pivot_qubit: int | None = None
 ) -> int:
     """`H2`: Clear bit `pivot_qubit` from all columns `!= col` and record pivot."""
+    if not isinstance(target, ShotExpansion):
+        raise TypeError(f"Unsupported target type: {type(target)!r}")
     c = int(col)
     if c < 0 or c >= target.d:
         raise ValueError(f"Column index {c} out of range for d={target.d}")
@@ -950,34 +900,19 @@ def make_principal(
 
 
 def restrict_amplitude(
-    target: PhaseQFEComponent | ShotExpansion,
+    target: ShotExpansion,
     lam: Sequence[int] | NDArray[np.integer],
     eps: int | Sequence[int] | NDArray[np.integer],
     *,
     scale: float = _INV_SQRT2,
-) -> complex | None:
+) -> None:
     """`H3`: Restrict to affine hyperplane `lam . u = eps (mod 2)` in-place."""
-    if not isinstance(target, (PhaseQFEComponent, ShotExpansion)):
+    if not isinstance(target, ShotExpansion):
         raise TypeError(f"Unsupported target type: {type(target)!r}")
     lam_arr = (np.asarray(lam, dtype=np.uint8) & np.uint8(1)).ravel()
     if lam_arr.shape != (target.d,):
         raise ValueError(f"lam length {lam_arr.shape[0]} does not match d={target.d}")
     nz = np.flatnonzero(lam_arr)
-
-    if isinstance(target, PhaseQFEComponent):
-        eps_bit = int(eps) & 1  # type: ignore[arg-type]
-        if len(nz) == 0:
-            return (1.0 + 0.0j) if eps_bit == 0 else 0.0j
-        f = int(nz[0])
-        for k in nz[1:]:
-            add_column(target, f, int(k))
-        factor = complex(_PHASE4[(eps_bit * int(target.ell[f])) & 3]) * scale
-        if eps_bit == 1:
-            target.h_words ^= target.A_words[f]
-            target.ell = np.ascontiguousarray((target.ell + (target.Gamma[f, :] << np.uint8(1))) & np.uint8(3))
-        drop_variable(target, f)
-        return factor
-
     if np.ndim(eps) == 0:
         eps_vec = np.full(target.chi, int(eps) & 1, dtype=np.uint8)  # type: ignore[arg-type]
     else:
@@ -990,7 +925,7 @@ def restrict_amplitude(
             target.weights = np.ascontiguousarray(target.weights[keep])
             target.h_words = np.ascontiguousarray(target.h_words[keep])
             target.ell = np.ascontiguousarray(target.ell[keep])
-        return None
+        return
     f = int(nz[0])
     for k in nz[1:]:
         add_column(target, f, int(k))
@@ -1001,7 +936,6 @@ def restrict_amplitude(
             target.h_words[ones] ^= target.A_words[f]
             target.ell[ones] = (target.ell[ones] + (target.Gamma[f, :] << np.uint8(1))[None, :]) & np.uint8(3)
     drop_variable(target, f)
-    return None
 
 
 def _xor_hollow_outer_inplace(Gamma: NDArray[np.uint8], lam: NDArray[np.uint8]) -> None:
@@ -1010,9 +944,9 @@ def _xor_hollow_outer_inplace(Gamma: NDArray[np.uint8], lam: NDArray[np.uint8]) 
     Gamma ^= upd
 
 
-def eliminate_zero_amplitude(target: PhaseQFEComponent | ShotExpansion, col: int) -> complex | None:
+def eliminate_zero_amplitude(target: ShotExpansion, col: int) -> None:
     """`H4`: Analytically contract a zero amplitude column `A_words[col] == 0` in-place."""
-    if not isinstance(target, (PhaseQFEComponent, ShotExpansion)):
+    if not isinstance(target, ShotExpansion):
         raise TypeError(f"Unsupported target type: {type(target)!r}")
     c = int(col)
     if c < 0 or c >= target.d:
@@ -1020,19 +954,6 @@ def eliminate_zero_amplitude(target: PhaseQFEComponent | ShotExpansion, col: int
     if words_any_nonzero(target.A_words[c]):
         raise ValueError(f"eliminate_zero_amplitude requires A_words[{c}] == 0, got non-zero column")
     lam = np.delete(target.Gamma[c, :], c).copy()
-
-    if isinstance(target, PhaseQFEComponent):
-        c0 = int(target.ell[c]) & 3
-        drop_variable(target, c)
-        if (c0 & 1) != 0:
-            if target.d > 0:
-                target.ell = np.ascontiguousarray((target.ell.astype(np.int16) - c0 * lam.astype(np.int16)) & 3, dtype=np.uint8)
-                _xor_hollow_outer_inplace(target.Gamma, lam)
-            return _OMEGA if c0 == 1 else _OMEGA_CONJ
-        if np.any(lam != 0):
-            return restrict_amplitude(target, lam, c0 >> 1, scale=1.0)
-        return complex(_SQRT2, 0.0) if c0 == 0 else 0.0j
-
     assert target.ell_odd is not None
     c_odd = int(target.ell_odd[c]) & 1
     c_vec = target.ell[:, c].copy() if target.chi > 0 else np.zeros(0, dtype=np.uint8)
@@ -1046,7 +967,7 @@ def eliminate_zero_amplitude(target: PhaseQFEComponent | ShotExpansion, col: int
         if target.d > 0:
             target.ell_odd ^= lam & np.uint8(1)
             _xor_hollow_outer_inplace(target.Gamma, lam)
-        return None
+        return
     eps_vec = (c_vec >> np.uint8(1)) & np.uint8(1)
     if np.any(lam != 0):
         restrict_amplitude(target, lam, eps_vec, scale=1.0)
@@ -1055,7 +976,6 @@ def eliminate_zero_amplitude(target: PhaseQFEComponent | ShotExpansion, col: int
         target.weights = np.ascontiguousarray(target.weights[keep] * _SQRT2)
         target.h_words = np.ascontiguousarray(target.h_words[keep])
         target.ell = np.ascontiguousarray(target.ell[keep])
-    return None
 
 
 # ---------------------------------------------------------------------------

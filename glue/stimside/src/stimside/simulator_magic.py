@@ -637,7 +637,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             assert isinstance(rec, CompiledOpenBlockRecord)
             for s in range(self.batch_size):
                 if self._live_exps[s].chi > 0:
-                    self._live_exps[s] = apply_compiled_block(self._live_exps[s], rec.block, check_unitary=True, atol=self.atol)  # type: ignore[assignment]
+                    self._live_exps[s] = apply_compiled_block(self._live_exps[s], rec.block, check_unitary=True, atol=self.atol)
                     if mc_cap is not None and self._live_exps[s].chi > mc_cap:
                         raise QueryBudgetExceededError(f"Expansion exceeded max_components={mc_cap} (got chi={self._live_exps[s].chi})")
 
@@ -660,7 +660,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if not inverse and fac.p0 is not None:
             exp = apply_pauli(exp, fac.p0)
         for ra in (reversed(fac.r_axes) if inverse else fac.r_axes):
-            exp = apply_quarter_turn(exp, ra, sign=-1 if inverse else 1, check_unitary=True, atol=self.atol)  # type: ignore[assignment]
+            exp = apply_quarter_turn(exp, ra, sign=-1 if inverse else 1, check_unitary=True, atol=self.atol)
         if inverse and fac.p0 is not None:
             exp = apply_pauli(exp, fac.p0)
         if fac.v:
@@ -863,7 +863,6 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 req_b = 0 if p1 <= K1_CANCEL_REL_TOL else (1 if p1 >= 1.0 - K1_CANCEL_REL_TOL else (int(self._draw_tab_rng_bit(b)) if abs(p1 - 0.5) <= 1e-12 else int(self._shot_np_rngs[b].random() < p1)))  # type: ignore[index]
             m_res = measure_expansion(exp, obs, rng=self.np_rng, requested_bit=req_b, renormalize=True, keep_rotated_frame=(rec.rot_axis is not None), atol=self.atol)
             post = m_res.post_state
-            assert isinstance(post, ShotExpansion)
             zin = m_res.z0 + m_res.z1
             if zin > 0.0:
                 self._branch_masses[b] *= (m_res.z1 if m_res.outcome else m_res.z0) / zin
@@ -1102,7 +1101,6 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             if self._live_exps[b].chi == 0:
                 continue
             m_res = measure_expansion(self._live_exps[b], obs, requested_bit=int(desired_bits[b]) & 1, renormalize=True, keep_rotated_frame=False, atol=self.atol)
-            assert isinstance(m_res.post_state, ShotExpansion)
             self._live_exps[b] = m_res.post_state
             zin = m_res.z0 + m_res.z1
             if zin > 0.0:
@@ -1133,7 +1131,6 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 else:
                     m_b = (int(self._draw_tab_rng_bit(b)) if abs(pb - 0.5) <= 1e-12 else int(self._shot_np_rngs[b].random() < pb)) if self._tab_rngs is not None else int(float(self.np_rng.random()) < pb)  # type: ignore[index]
                     m_res = measure_expansion(self._live_exps[b], obs, requested_bit=m_b, renormalize=True, keep_rotated_frame=False, atol=self.atol)
-                    assert isinstance(m_res.post_state, ShotExpansion)
                     self._live_exps[b] = m_res.post_state
                 if m_b != int(reset_one_mask[q, b]) and self._live_exps[b].chi > 0:
                     self._live_exps[b] = apply_pauli(self._live_exps[b], kick)

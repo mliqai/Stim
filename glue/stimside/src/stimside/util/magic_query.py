@@ -241,7 +241,6 @@ def _contract_choi(left_se: _ScaledExpansion, right_se: _ScaledExpansion, n_op: 
     work._refresh_a_union()
     work._is_canonical_merged = False
     merged = merge_frames(work)
-    assert isinstance(merged, ShotExpansion)
     if (m & 1) and merged.chi > 0:
         merged.weights = np.ascontiguousarray(merged.weights * _SQRT2)
     out_se = _normalize_frexp(merged, left_se.log2_scale + right_se.log2_scale + (m >> 1))
@@ -271,7 +270,7 @@ def _compile_target_spec(target_spec: Any, output_qubits: tuple[int, ...], atol:
         exp_c = ShotExpansion.zero(k, atol=atol)
         for rec in t_plan.records:
             for sb in ((rec,) if isinstance(rec, CompiledOpenBlockRecord) else compile_open_block((rec,), n_qubits=k, budget=64, c2_max_rank=8)):
-                exp_c = apply_compiled_block(exp_c, sb.block, check_unitary=True, atol=atol) if isinstance(sb, CompiledOpenBlockRecord) else exp_c  # type: ignore[assignment]
+                exp_c = apply_compiled_block(exp_c, sb.block, check_unitary=True, atol=atol) if isinstance(sb, CompiledOpenBlockRecord) else exp_c
         target_spec = (t_plan.final_tableau, exp_c)
     elif isinstance(target_spec, (PhaseQFEComponent, ShotExpansion)):
         target_spec = (ReferenceCHPTableau(target_spec.n_qubits), target_spec)
@@ -300,7 +299,6 @@ def _compile_target_spec(target_spec: Any, output_qubits: tuple[int, ...], atol:
     if k == 0:
         return "empty"
     merged_t = merge_frames(exp_t.copy())
-    assert isinstance(merged_t, ShotExpansion)
     nrm = merged_t.norm_sq()
     if not math.isfinite(nrm) or nrm <= 1e-15 or merged_t.chi == 0:
         raise ValueError("target_spec ShotExpansion has zero or non-finite norm")
@@ -358,7 +356,7 @@ def _compute_partial_trace_fidelity_mass(ref_data: ReferenceCHPTableau, exp_data
         if j_se.exp.chi == 0:
             return _FP_ZERO
         ctx.bump_op()
-        w_exp = apply_quarter_turn(j_se.exp, rot_ax.a_words, rot_ax.b_words, rot_ax.kappa, sign=1, check_unitary=True, atol=atol) if rot_ax is not None else j_se.exp  # type: ignore[assignment]
+        w_exp = apply_quarter_turn(j_se.exp, rot_ax.a_words, rot_ax.b_words, rot_ax.kappa, sign=1, check_unitary=True, atol=atol) if rot_ax is not None else j_se.exp
         ctx.check_exp(w_exp, is_choi=False)
         z_pre, (p_exp, z0_r) = w_exp.norm_sq(), project_diagonal(w_exp, bd, sg, 0)
         z0_f, tol_z = float(z0_r), atol * max(1.0, abs(z_pre))
@@ -453,18 +451,18 @@ def _apply_leaf(se: _ScaledExpansion, leaf: tuple[Any, Any, Any], ctx: _EvalCtx,
         return se
     z_pre, exp, nw, (rec, aux, _) = se.exp.norm_sq(), se.exp.copy(), se.exp.n_words, leaf
     if isinstance(rec, CompiledPauliBlock):
-        exp = apply_compiled_block(exp, aux if is_choi else rec, check_unitary=True, atol=ctx.atol)  # type: ignore[assignment]
+        exp = apply_compiled_block(exp, aux if is_choi else rec, check_unitary=True, atol=ctx.atol)
     elif isinstance(rec, DirectFaultSlotRecord) and ctx.faults.get(rec.slot_index, 0) > 0:
         fac = rec.branch_factors[ctx.faults[rec.slot_index] - 1]
         if fac.p0 is not None:
-            exp = apply_pauli(exp, *_ax_tup(fac.p0, nw))  # type: ignore[assignment]
+            exp = apply_pauli(exp, *_ax_tup(fac.p0, nw))
         for ra in fac.r_axes:
-            exp = apply_quarter_turn(exp, *_ax_tup(ra, nw), sign=1, check_unitary=True, atol=ctx.atol)  # type: ignore[assignment]
+            exp = apply_quarter_turn(exp, *_ax_tup(ra, nw), sign=1, check_unitary=True, atol=ctx.atol)
             ctx.check_exp(exp, is_choi=is_choi, enforce_terms=enforce_terms)
         if fac.v:
             exp.weights = np.ascontiguousarray(exp.weights * OMEGA_POWERS[fac.v])
     elif isinstance(rec, FeedbackPauliRecord) and (ctx.meas.get(aux, 0) if rec.source_kind == "rec" else ctx.sweep.get(aux, 0)):
-        exp = apply_pauli(exp, *_ax_tup(rec.axis, nw))  # type: ignore[assignment]
+        exp = apply_pauli(exp, *_ax_tup(rec.axis, nw))
     _check_unitary_norm(z_pre, exp.norm_sq() if exp.chi > 0 else 0.0, ctx.atol, "_apply_leaf")
     out_se = _normalize_frexp(exp, se.log2_scale)
     ctx.check_exp(out_se.exp, is_choi=is_choi, enforce_terms=enforce_terms)
@@ -664,7 +662,7 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
                 ax = (rec.branch_axes[cb - 1] if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord)) else rec.axis) if (cb is not None and cb > 0 and not isinstance(rec, MPadRecord)) else None
                 if ax is not None:
                     ctx.bump_op()
-                    sk = _normalize_frexp(apply_pauli(ket.exp.copy(), *_ax_tup(ax, ket.exp.n_words)), ket.log2_scale)  # type: ignore[arg-type]
+                    sk = _normalize_frexp(apply_pauli(ket.exp.copy(), *_ax_tup(ax, ket.exp.n_words)), ket.log2_scale)
                     ctx.check_exp(sk.exp, is_choi=False)
                 else:
                     sk = ket
@@ -674,14 +672,13 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
             ctx.bump_op()
             nw, z_in_r, work = ket.exp.n_words, ket.exp.norm_sq(), ket.exp.copy()
             if rec.rot_axis is not None:
-                work = apply_quarter_turn(work, *_ax_tup(rec.rot_axis, nw), sign=1, check_unitary=True, atol=ctx.atol)  # type: ignore[assignment]
+                work = apply_quarter_turn(work, *_ax_tup(rec.rot_axis, nw), sign=1, check_unitary=True, atol=ctx.atol)
                 ctx.check_exp(work, is_choi=False)
                 b_diag, sig = unit_bit_words(first_set_bit_in_words(rec.obs_axis.a_words), nw), 0
             else:
                 _, b_diag, kp = _ax_tup(rec.obs_axis, nw)
                 sig = (kp >> 1) & 1
             (e0, z0_r), (e1, z1_r) = project_diagonal(work, b_diag, sig, 0), project_diagonal(work, b_diag, sig, 1)
-            assert isinstance(e0, ShotExpansion) and isinstance(e1, ShotExpansion)
             z0_f, z1_f, tol_z, z0_c, z1_c = float(z0_r), float(z1_r), ctx.atol * max(1.0, abs(z_in_r)), max(0.0, float(z0_r)), max(0.0, float(z1_r))
             if not (math.isfinite(z0_f) and math.isfinite(z1_f) and math.isfinite(z_in_r)) or z0_f < -tol_z or z1_f < -tol_z or abs((z0_c + z1_c) - z_in_r) > tol_z:
                 raise FloatingPointError(f"Born mass conservation violated: z0={z0_f}, z1={z1_f}, z_in={z_in_r}, atol={ctx.atol}")
@@ -689,7 +686,7 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
             for qb, eb, zb_c in ((0, e0, z0_c), (1, e1, z1_c)):
                 if z_in_r > 0.0 and zb_c > K1_CANCEL_REL_TOL * z_in_r and eb.chi > 0:
                     eb.weights = np.ascontiguousarray(eb.weights * (1.0 / math.sqrt(zb_c)))
-                    eb = apply_pauli(eb, *_ax_tup(rec.reset_kick_axis, nw)) if (isinstance(rec, ResetRecord) and bool(qb) != rec.reset_flip_ref) else eb  # type: ignore[assignment]
+                    eb = apply_pauli(eb, *_ax_tup(rec.reset_kick_axis, nw)) if (isinstance(rec, ResetRecord) and bool(qb) != rec.reset_flip_ref) else eb
                     sk = _normalize_frexp(eb, 0)
                     ctx.check_exp(sk.exp, is_choi=False)
                     brs.append((qb, sk, zb_c / (z0_c + z1_c)))

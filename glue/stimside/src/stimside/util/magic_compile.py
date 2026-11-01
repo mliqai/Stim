@@ -20,7 +20,7 @@ from stimside.op_handlers.leakage_handlers.tag_registry import TAG_REGISTRY, che
 import stimside.util.phase_qfe as _pq
 from stimside.util.phase_qfe import (
     DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep,
-    ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion,
+    ImpossiblePostselectionError, ShotExpansion,
     _apply_local_unitary_c128, apply_compiled_block, apply_pauli, apply_quarter_turn,
     apply_reference_tableau_to_statevector, first_set_bit_in_words, get_bit_in_words,
     merge_frames, n_words_for_qubits, pauli_multiply, project_diagonal, tail_mask,
@@ -2013,10 +2013,8 @@ def _measure_with_readout_and_postselection(
             exp, obs_axis, rng=rng, requested_bit=req_q, p_flip=p, invert_result=invert_result,
             renormalize=True, keep_rotated_frame=True, atol=atol,
         )
-        post = m_res.post_state
-        assert isinstance(post, ShotExpansion)
         return (
-            post, m_res.outcome, bool(m_res.reported_outcome), bool(m_res.readout_flipped),
+            m_res.post_state, m_res.outcome, bool(m_res.reported_outcome), bool(m_res.readout_flipped),
             (m_res.z0, m_res.z1, m_res.input_norm_sq), False,
         )
 
@@ -2037,14 +2035,12 @@ def _measure_with_readout_and_postselection(
             exp, obs_axis.a_words, np.ascontiguousarray(obs_axis.b_words ^ e_p_w),
             (obs_axis.kappa + 1) & 3, sign=1, check_unitary=True, atol=tol,
         )
-        assert isinstance(work_exp, ShotExpansion)
         b_diag, sig_diag = e_p_w, 0
     else:
         work_exp, b_diag, sig_diag = exp, obs_axis.b_words, (obs_axis.kappa >> 1) & 1
 
     exp0, z0_raw = _pq.project_diagonal(work_exp, b_diag, sig_diag, 0)
     exp1, z1_raw = _pq.project_diagonal(work_exp, b_diag, sig_diag, 1)
-    assert isinstance(exp0, ShotExpansion) and isinstance(exp1, ShotExpansion)
 
     scale_z = max(1.0, z_in)
     if not (math.isfinite(z0_raw) and math.isfinite(z1_raw)):
@@ -2541,7 +2537,7 @@ def extract_data_expansion(
         kap_herm = ((w_kap - 1) & 3) if odd_ph else w_kap
         if words_any_nonzero(w_a) or words_any_nonzero(w_b) or kap_herm != 0:
             data_exp = apply_pauli(data_exp, CompiledPauliAxis(w_a, w_b, kap_herm))
-            data_exp = merge_frames(data_exp)  # type: ignore[assignment]
+            data_exp = merge_frames(data_exp)
         if odd_ph and data_exp.chi > 0:
             data_exp.weights = np.ascontiguousarray(data_exp.weights * 1.0j)
         return clone_reference_chp(plan_meta.data_final_tableau), data_exp

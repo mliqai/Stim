@@ -22,7 +22,6 @@ from stimside.util.phase_qfe import (
     apply_pauli,
     apply_pauli_t,
     apply_quarter_turn,
-    apply_reference_tableau_to_statevector,
     coerce_pauli_words,
     drop_variable,
     eliminate_zero_amplitude,
@@ -31,7 +30,6 @@ from stimside.util.phase_qfe import (
     measure_expansion,
     merge_frames,
     n_words_for_qubits,
-    pack_bit_vector,
     pauli_multiply,
     project_diagonal,
     restrict_amplitude,
@@ -234,13 +232,10 @@ def test_h0_drop_variable() -> None:
             expected_pivots = np.delete(comp.pivots, j)
 
             exp = ShotExpansion.from_component(comp, weight=0.7 - 0.3j)
-            drop_variable(comp, j)
             drop_variable(exp, j)
 
-            comp.check_invariants()
             exp.check_invariants()
-            assert np.array_equal(comp.pivots, expected_pivots)
-            assert np.max(np.abs(_SQRT2 * comp.to_statevector() - ket_before)) < 1e-14
+            assert np.array_equal(exp.pivots, expected_pivots)
             assert (
                 np.max(
                     np.abs(
@@ -256,7 +251,7 @@ def test_h1_add_column_all_mod4_cases() -> None:
     n, d = 5, 3
     base = random_valid_component(rng, n, d)
     with pytest.raises(ValueError):
-        add_column(base.copy(), 1, 1)
+        add_column(ShotExpansion.from_component(base), 1, 1)
 
     for r, s in [(0, 1), (2, 0)]:
         k = 3 - r - s
@@ -275,16 +270,10 @@ def test_h1_add_column_all_mod4_cases() -> None:
                 n, comp.h_words, comp.A_words, comp.ell, comp.Gamma
             )
             exp = ShotExpansion.from_component(comp)
-
-            add_column(comp, r, s)
             add_column(exp, r, s)
 
-            assert int(comp.Gamma[r, s]) == (g_rs ^ (ell_r & 1))
-            assert int(comp.ell[s]) == ((ell_s + ell_r + 2 * g_rs) & 3)
-            ket_after = formal_qfe_ket_le(
-                n, comp.h_words, comp.A_words, comp.ell, comp.Gamma
-            )
-            assert np.max(np.abs(ket_after - ket_before)) < 1e-14
+            assert int(exp.Gamma[r, s]) == (g_rs ^ (ell_r & 1))
+            assert int(exp.ell[0, s]) == ((ell_s + ell_r + 2 * g_rs) & 3)
             ket_exp = formal_qfe_ket_le(
                 n, exp.h_words[0], exp.A_words, exp.ell[0], exp.Gamma
             )
@@ -308,13 +297,10 @@ def test_h2_make_principal() -> None:
             n, comp.h_words, comp.A_words, comp.ell, comp.Gamma
         )
         exp = ShotExpansion.from_component(comp)
-        make_principal(comp, j, p)
         make_principal(exp, j, p)
 
-        comp.check_invariants()
         exp.check_invariants()
-        assert int(comp.pivots[j]) == p
-        assert np.max(np.abs(comp.to_statevector() - ket_before)) < 1e-14
+        assert int(exp.pivots[j]) == p
         assert np.max(np.abs(exp.to_statevector() - ket_before)) < 1e-14
 
     comp_zero_bit = PhaseQFEComponent.zero(4)
@@ -324,7 +310,7 @@ def test_h2_make_principal() -> None:
     comp_zero_bit.pivots = np.array([-1], dtype=np.int32)
     comp_zero_bit.d = 1
     with pytest.raises(ValueError):
-        make_principal(comp_zero_bit, 0, 2)
+        make_principal(ShotExpansion.from_component(comp_zero_bit), 0, 2)
 
 
 def test_h3_restrict_amplitude_all_three_cases() -> None:
@@ -334,13 +320,13 @@ def test_h3_restrict_amplitude_all_three_cases() -> None:
         comp = random_valid_component(rng, n, d)
         lam0 = np.zeros(d, dtype=np.uint8)
 
-        c1 = comp.copy()
-        g1 = restrict_amplitude(c1, lam0, 0)
-        assert g1 == 1.0 + 0.0j and c1.d == d
+        e1 = ShotExpansion.from_component(comp)
+        restrict_amplitude(e1, lam0, 0)
+        assert e1.chi == 1 and complex(e1.weights[0]) == 1.0 + 0.0j and e1.d == d
 
-        c2 = comp.copy()
-        g2 = restrict_amplitude(c2, lam0, 1)
-        assert g2 == 0.0j and c2.d == d
+        e2 = ShotExpansion.from_component(comp)
+        restrict_amplitude(e2, lam0, 1)
+        assert e2.chi == 0 and e2.d == d
 
     for d in [1, 2, 4]:
         for weight_target in [w for w in (1, 2, 4) if w <= d]:
@@ -368,15 +354,11 @@ def test_h3_restrict_amplitude_all_three_cases() -> None:
                             expected[x] = before[x]
 
                     exp = ShotExpansion.from_component(comp)
-                    g = restrict_amplitude(comp, lam, eps)
                     restrict_amplitude(exp, lam, eps)
 
-                    assert isinstance(g, complex)
-                    assert abs(abs(g) - _INV_SQRT2) < 1e-14
-                    assert comp.d == d - 1
-                    comp.check_invariants()
+                    assert exp.chi == 1 and abs(abs(complex(exp.weights[0])) - _INV_SQRT2) < 1e-14
+                    assert exp.d == d - 1
                     exp.check_invariants()
-                    assert np.max(np.abs(g * comp.to_statevector() - expected)) < 1e-14
                     assert np.max(np.abs(exp.to_statevector() - expected)) < 1e-14
 
 
@@ -419,32 +401,22 @@ def test_h4_eliminate_zero_amplitude_all_four_cases() -> None:
                         n, comp.h_words, comp.A_words, comp.ell, comp.Gamma
                     )
                     exp = ShotExpansion.from_component(comp)
-
-                    g = eliminate_zero_amplitude(comp, j)
                     eliminate_zero_amplitude(exp, j)
-                    assert isinstance(g, complex)
-                    comp.check_invariants()
                     exp.check_invariants()
 
                     if c0 & 1:
-                        assert abs(abs(g) - 1.0) < 1e-14
+                        assert exp.chi == 1 and abs(abs(exp.weights[0]) - 1.0) < 1e-14
                     elif np.any(lam):
-                        assert abs(abs(g) - 1.0) < 1e-14
-                        assert comp.d == d0 - 1
+                        assert exp.chi == 1 and abs(abs(exp.weights[0]) - 1.0) < 1e-14
+                        assert exp.d == d0 - 1
                     elif c0 == 0:
-                        assert abs(g - _SQRT2) < 1e-14
+                        assert exp.chi == 1 and abs(complex(exp.weights[0]) - _SQRT2) < 1e-14
                     else:
-                        assert g == 0.0j
+                        assert exp.chi == 0
 
-                    after_vec = (
-                        np.zeros(1 << n, dtype=np.complex128)
-                        if g == 0.0j
-                        else g * comp.to_statevector()
-                    )
-                    assert np.max(np.abs(after_vec - ket_before)) < 1e-14
                     assert np.max(np.abs(exp.to_statevector() - ket_before)) < 1e-14
 
-    non_zero_col = random_valid_component(rng, 4, 2)
+    non_zero_col = ShotExpansion.from_component(random_valid_component(rng, 4, 2))
     with pytest.raises(ValueError):
         eliminate_zero_amplitude(non_zero_col, 0)
 
@@ -580,17 +552,19 @@ def test_k1_canonical_offset_and_interference() -> None:
         comp.Gamma = np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]], dtype=np.uint8)
         comp.h_words[0] = np.uint64(0b11111)
         before = comp.to_statevector()
-        g = comp.canonical_offset()
-        comp.check_invariants(require_canonical_offset=True)
-        assert np.max(np.abs(g * comp.to_statevector() - before)) < 1e-14
+        exp = merge_frames(ShotExpansion.from_components([(1.0, comp)], merge=False))
+        exp.check_invariants(require_canonical_offset=True)
+        g = complex(exp.weights[0])
+        assert any(abs(g - u) < 1e-15 for u in (1, 1j, -1, -1j))
+        assert np.max(np.abs(exp.to_statevector() - before)) < 1e-14
 
     # Constructive interference on identical cosets represented with shifted h
-    c_a = random_valid_component(rng, 4, 2)
-    c_a.canonical_offset()
+    c_a_raw = random_valid_component(rng, 4, 2)
+    c_a = merge_frames(ShotExpansion.from_components([(1.0, c_a_raw)], merge=False)).to_components()[0][1]
     c_b = c_a.copy()
-    # Shift c_b by A_words[0] and compensate phase so |c_b> == |c_a> up to canonical_offset
+    # Shift c_b by A_words[0] and compensate phase so |c_b> == |c_a> up to canonical offset
     c_b.h_words ^= c_b.A_words[0]
-    g_shift = c_b.copy().canonical_offset()  # |c_b_raw> = g_shift * |c_a>
+    g_shift = complex(merge_frames(ShotExpansion.from_components([(1.0, c_b.copy())], merge=False)).weights[0])
     exp_con = ShotExpansion.from_components(
         [(0.6, c_a), (0.4j * g_shift.conjugate(), c_b)], merge=True
     )
