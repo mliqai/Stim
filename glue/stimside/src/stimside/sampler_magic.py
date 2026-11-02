@@ -172,11 +172,3 @@ class CompiledMagicsideSampler(CompiledSamplerBase):
             record_leakage_events=self.needs_leakage_events,
             **sim_kwargs,
         )
-
-    @property
-    def compiled_decoder(self) -> CompiledLeakageDecoder:
-        return self.compiled_dem_decoder
-
-    @compiled_decoder.setter
-    def compiled_decoder(self, value: CompiledLeakageDecoder) -> None:
-        self.compiled_dem_decoder = value

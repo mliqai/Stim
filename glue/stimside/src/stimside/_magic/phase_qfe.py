@@ -36,7 +36,6 @@ from stimside.util.bitwords import (
     u8_p as _c_u8_p,
     u64_p as _c_u64_p,
     unit_bit_words,
-    unpack_bit_vector,
     validate_hermitian_pauli,
     word_dot_parity,
     word_dot_parity_batch,
@@ -47,7 +46,7 @@ from stimside.util.reference_chp import ReferenceCHPTableau
 
 __all__ = [
     "DEFAULT_ATOL", "K1_CANCEL_REL_TOL", "ImpossiblePostselectionError",
-    "n_words_for_qubits", "tail_mask", "pack_bit_vector", "unpack_bit_vector",
+    "n_words_for_qubits", "tail_mask", "pack_bit_vector",
     "coerce_pauli_words", "unit_bit_words", "get_bit_in_words", "get_bits_at_qubits",
     "word_dot_parity", "word_dot_parity_batch", "words_any_nonzero", "words_any_overlap",
     "first_set_bit_in_words", "pauli_multiply", "validate_hermitian_pauli",
@@ -544,7 +543,6 @@ class CompiledPauliBlockStep:
     kind: Literal["P1", "P2", "N1", "N2"]
     paulis: tuple[tuple[NDArray[np.uint64], NDArray[np.uint64], int], ...]
     sign: int = 1
-    weights: NDArray[np.complex128] | None = None
 
 
 @dataclass(frozen=True)
@@ -1246,15 +1244,6 @@ def _validate_compiled_block(block: CompiledPauliBlock, n_qubits: int | None) ->
         if isinstance(step, CompiledPauliBlock):
             _validate_compiled_block(step, eff_nq)
         elif isinstance(step, CompiledPauliBlockStep):
-            if step.weights is not None:
-                if (
-                    not isinstance(step.weights, np.ndarray)
-                    or np.issubdtype(step.weights.dtype, np.bool_)
-                    or not np.issubdtype(step.weights.dtype, np.number)
-                ):
-                    raise ValueError(f"Invalid step.weights: {step.weights!r}")
-                if not np.all(np.isfinite(step.weights)):
-                    raise FloatingPointError("Non-finite entries in CompiledPauliBlockStep.weights")
             if not isinstance(step.paulis, Sequence) or isinstance(step.paulis, (str, bytes)):
                 raise ValueError(f"step.paulis must be a sequence, got {step.paulis!r}")
             if step.kind in ("P1", "P2", "N1"):
@@ -1352,19 +1341,11 @@ def project_diagonal(
     b: Any,
     sigma: int = 0,
     outcome: int = 0,
-    *,
-    kappa: int | None = None,
 ) -> tuple[ShotExpansion, float]:
     """`M1`: Project onto `Pi_m = (I + (-1)^m (-1)^sigma Z(b)) / 2` without renormalizing."""
-    if kappa is not None:
-        kap = int(kappa) & 3
-        if kap not in (0, 2):
-            raise ValueError(f"Diagonal Hermitian Pauli requires kappa in {{0, 2}}, got {kap}")
-        sig = (kap >> 1) & 1
-    else:
-        sig = int(sigma)
-        if sig not in (0, 1):
-            raise ValueError(f"sigma must be 0 or 1, got {sigma}")
+    sig = int(sigma)
+    if sig not in (0, 1):
+        raise ValueError(f"sigma must be 0 or 1, got {sigma}")
     m = int(outcome)
     if m not in (0, 1):
         raise ValueError(f"outcome must be 0 or 1, got {outcome}")

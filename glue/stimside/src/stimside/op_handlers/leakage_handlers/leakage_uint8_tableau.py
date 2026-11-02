@@ -26,7 +26,6 @@ from stimside.op_handlers.leakage_handlers.transition_effects import (
     emit_tableau_transition_effects,
     sample_tableau_transitions,
 )
-from stimside.util.numpy_types import Int2DArray
 from stimside.util.stim_workarounds import split_fused_instruction
 
 if TYPE_CHECKING:
@@ -181,10 +180,10 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
 
     def _filter_targets_2q(
         self,
-        targets: list[list[int]] | list[list[stim.GateTarget]] | Int2DArray,
+        targets: list[list[stim.GateTarget]],
         allowed_st_list: tuple[tuple[int | str, ...], tuple[int | str, ...]],
         tss: TablesideSimulator,
-    ) -> list[int] | list[stim.GateTarget] | NDArray[np.int_]:
+    ) -> list[stim.GateTarget]:
         """
         Filter two-qubit op targets based on allowed states.
         If 0 or 1 is in allowed_st_list, update the state from the current Z pauli states.
@@ -192,21 +191,10 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         """
         if len(targets) == 0:
             return []
-        has_gate_targets = isinstance(targets[0][0], stim.GateTarget)
         num_pairs = len(targets)
-        q_pairs: list[tuple[int | None, int | None]] = []
-        for pair in targets:
-            q0 = (
-                pair[0].qubit_value
-                if isinstance(pair[0], stim.GateTarget)
-                else int(pair[0])
-            )
-            q1 = (
-                pair[1].qubit_value
-                if isinstance(pair[1], stim.GateTarget)
-                else int(pair[1])
-            )
-            q_pairs.append((q0, q1))
+        q_pairs: list[tuple[int | None, int | None]] = [
+            (pair[0].qubit_value, pair[1].qubit_value) for pair in targets
+        ]
 
         qs_to_peek: list[int] = []
         for i in [0, 1]:
@@ -252,15 +240,12 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                 np.logical_and(allowed_mask_pairs[:, 0], allowed_mask_pairs[:, 1]),
             )
 
-        if has_gate_targets:
-            return [
-                t
-                for pair, keep in zip(targets, allowed_mask)
-                if keep
-                for t in pair
-            ]
-        targets_np = np.asarray(targets)
-        return targets_np[allowed_mask].flatten()
+        return [
+            t
+            for pair, keep in zip(targets, allowed_mask)
+            if keep
+            for t in pair
+        ]
 
     def handle_op(self, op: stim.CircuitInstruction, sss: TablesideSimulator):
         """handle a single stim CircuitInstruction."""

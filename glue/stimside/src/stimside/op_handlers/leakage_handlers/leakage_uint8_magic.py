@@ -160,11 +160,8 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
 
     def leakage_measurement(self, op: stim.CircuitInstruction, tss: MagicsideSimulator, params: LeakageMeasurementParams) -> None:  # type: ignore[override]
         if op.name == "MPAD" and op in self.u_measurement_ops:
-            copies = split_fused_instruction(op, len(params.targets or ()))
-            if len(copies) > 1:
-                tss.do_copies_on_fused_step(op, copies, lambda s: self._eval_u_mpad(s, tss, params))
-            else:
-                self._eval_u_mpad(op, tss, params)
+            for s in split_fused_instruction(op, len(params.targets or ())):
+                self._eval_u_mpad(s, tss, params)
             return
         raw_t, is_mpad = op.targets_copy(), params.targets is not None
         p0, p1 = params.prob_for_input_state.get(0, 0.0), params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0)
@@ -189,7 +186,6 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
         raw_t, t_qubits = op.targets_copy(), list(params.targets or ())
         if len(raw_t) != len(t_qubits):
             raise ValueError(f"{op} has {len(raw_t)} pad targets, expected multiple of {len(t_qubits)}")
-        tss._next_step_meta(op)
         states, p_u = self._state[t_qubits], params.prob_for_input_state.get(0, 0.0)
         probs = np.where(states < 2, p_u, 0.0).astype(np.float64)
         for st, p_val in params.prob_for_input_state.items():

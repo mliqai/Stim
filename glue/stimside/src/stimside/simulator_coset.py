@@ -111,9 +111,7 @@ class CosetsideSimulator(
         self._shot_np_rngs: list[np.random.Generator] | None = None
         self._tab_rngs: list[stim.TableauSimulator] | None = None
         self._tab_rngs_x: list[stim.TableauSimulator] | None = None
-        self._shot_tiebreak_rng: NDArray[np.uint64] = np.zeros(
-            self.batch_size, dtype=np.uint64
-        )
+        self._shot_tiebreak_rng: NDArray[np.uint64]
         self._cpp_lib: ctypes.CDLL | None = None
         self._cpp_eng: int | None = None
         self._cpp_dirty: bool = False
@@ -192,13 +190,6 @@ class CosetsideSimulator(
                 self._sync_cpp_to_py()
             self._py_dirty = True
         return self._active_shots
-
-    @active_shots.setter
-    def active_shots(self, val: dict[int, MRQFState]) -> None:
-        self._active_shots = val
-        if self._use_cpp:
-            self._cpp_dirty = False
-            self._py_dirty = True
 
     def _sync_cpp_to_py(self) -> None:
         if not self._cpp_dirty or self._cpp_eng is None or self._cpp_lib is None:
@@ -1192,12 +1183,8 @@ class CosetsideSimulator(
         self._any_x_c.value = 0
         self._any_z_c.value = 0
 
-        if det_batch:
-            m_mat = (
-                self._exec_det_batch_cpp(step_meta)
-                if use_cpp
-                else self._exec_det_batch_py(step_meta)
-            )
+        if det_batch and use_cpp:
+            m_mat = self._exec_det_batch_cpp(step_meta)
             self._finish_det_batch(
                 step_meta,
                 op_override,
@@ -1353,55 +1340,6 @@ class CosetsideSimulator(
             *self._cpp_out_args(),
         )
         self._cpp_dirty = True
-        return m_mat
-
-    def _exec_det_batch_py(self, step_meta: MeasStepMeta) -> NDArray[np.bool_]:
-        q_arr, m_ref_arr, b_sub_words = step_meta.get_det_batch_arrays()
-        xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
-            output_xs=True, output_zs=False
-        )
-        m_mat = xs_base[q_arr, :] ^ m_ref_arr[:, None]
-        if not self._active_shots:
-            return m_mat
-        active_indices = list(self._active_shots.keys())
-        active_mrqfs = [self._active_shots[b] for b in active_indices]
-        h_mat = np.stack([m.h_words for m in active_mrqfs], axis=0)
-        au_mat = np.stack([m.a_union for m in active_mrqfs], axis=0)
-        xor_bh = b_sub_words[:, None, 0] & h_mat[None, :, 0]
-        ov_words = b_sub_words[:, None, 0] & au_mat[None, :, 0]
-        for w in range(1, self._n_words):
-            xor_bh ^= b_sub_words[:, None, w] & h_mat[None, :, w]
-            ov_words |= b_sub_words[:, None, w] & au_mat[None, :, w]
-        m_mat[:, active_indices] ^= (np.bitwise_count(xor_bh) & 1).astype(np.bool_)
-        overlap_mat = ov_words != 0
-        if np.any(overlap_mat):
-            for a_idx_np in np.flatnonzero(np.any(overlap_mat, axis=0)):
-                a_idx = int(a_idx_np)
-                b_idx = active_indices[a_idx]
-                mrqf = active_mrqfs[a_idx]
-                if mrqf.d == 0:
-                    continue
-                h_init = mrqf.h_words.copy()
-                for k_np in np.flatnonzero(overlap_mat[:, a_idx]):
-                    k_idx = int(k_np)
-                    b_k = b_sub_words[k_idx]
-                    if mrqf.d == 0 or not _words_any_overlap(b_k, mrqf.a_union):
-                        if _word_dot_parity(b_k, mrqf.h_words ^ h_init):
-                            m_mat[k_idx, b_idx] = not m_mat[k_idx, b_idx]
-                        continue
-                    sigma = (int(xs_base[int(q_arr[k_idx]), b_idx]) ^ int(m_ref_arr[k_idx])) & 1
-                    m_val, _ = mrqf.p3_measure_diagonal(
-                        b_k, sigma, draw_bit_fn=lambda b=b_idx: int(self._draw_tab_rng_bit(b))
-                    )
-                    m_mat[k_idx, b_idx] = bool(m_val)
-        ev_x, ev_z = self._evict_healed_shots(
-            step_meta,
-            xs_base=xs_base,
-            accum_x_mask=self._scratch_x_mask,
-            accum_z_mask=self._scratch_z_mask,
-        )
-        self._any_x_c.value |= int(ev_x)
-        self._any_z_c.value |= int(ev_z)
         return m_mat
 
     def _eval_substep_cpp(

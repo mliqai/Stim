@@ -34,8 +34,8 @@ from stimside._magic.phase_qfe import (
     project_diagonal,
     restrict_amplitude,
     unit_bit_words,
-    unpack_bit_vector,
 )
+from stimside.util.bitwords import unpack_bit_vector
 from stimside.util.reference_chp import ReferenceCHPTableau
 
 

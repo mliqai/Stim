@@ -167,7 +167,7 @@ def _pad_block(blk: CompiledPauliBlock, n_q: int) -> CompiledPauliBlock:
         pw = nw - blk.a_words.shape[1]
         aw, bw = (np.ascontiguousarray(np.pad(blk.a_words, ((0, 0), (0, pw)))), np.ascontiguousarray(np.pad(blk.b_words, ((0, 0), (0, pw))))) if pw else (blk.a_words, blk.b_words)
         return CompiledPauliBlock(n_q, "pauli_sum", coeffs=blk.coeffs, a_words=aw, b_words=bw, kappas=blk.kappas, global_scalar=blk.global_scalar, is_unitary=blk.is_unitary, is_identity=blk.is_identity)
-    steps = tuple(_pad_block(st, n_q) if isinstance(st, CompiledPauliBlock) else CompiledPauliBlockStep(st.kind, tuple((_pad1(a, nw), _pad1(b, nw), kp) for a, b, kp in st.paulis), st.sign, st.weights) for st in blk.steps)
+    steps = tuple(_pad_block(st, n_q) if isinstance(st, CompiledPauliBlock) else CompiledPauliBlockStep(st.kind, tuple((_pad1(a, nw), _pad1(b, nw), kp) for a, b, kp in st.paulis), st.sign) for st in blk.steps)
     return CompiledPauliBlock(n_q, "sequential", steps=steps, global_scalar=blk.global_scalar, is_unitary=blk.is_unitary, is_identity=blk.is_identity)
 
 def _scatter_pairs(src: NDArray[np.uint64], pairs: Sequence[tuple[int, int]], n_dst: int) -> NDArray[np.uint64]:

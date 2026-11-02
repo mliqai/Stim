@@ -840,7 +840,7 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
         is_reset = op.name in ("MR", "MRZ", "MRX", "MRY")
 
         p0 = params.prob_for_input_state.get(0, 0.0)
-        p1 = params.prob_for_input_state.get(1, 1.0)
+        p1 = params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0)
 
         if is_mpad:
             assert params.targets is not None
@@ -850,16 +850,8 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                     "The number of targets in the MPAD operation with a LEAKAGE_MEASUREMENT tag "
                     "does not equal the number of targets specified in the tag."
                 )
-            if op.name != "MPAD":
-                raise ValueError(
-                    f"LEAKAGE_MEASUREMENT is only implemented for 'MPAD' operations, got {op}"
-                )
         else:
             targets = self._get_target_indices(op)
-            if op.name not in ("M", "MZ", "MR", "MRZ", "MX", "MY", "MRX", "MRY"):
-                raise ValueError(
-                    f"LEAKAGE_PROJECTION_Z is only implemented for M/MZ/MR/MRZ/MX/MY/MRX/MRY operations, got {op}"
-                )
             if not np.isclose(p0, 1.0 - p1) and not fss._all_targets_in_known_state(
                 targets=targets, pauli=pauli
             ):
@@ -950,7 +942,6 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                     True if p0 >= 1.0 else (fss.np_rng.random(n0) < p0)
                 )
 
-        p1 = params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0)
         if p1 > 0.0:
             target_states_1_mask = np.logical_and(
                 target_computational_states == 1, target_is_not_leaked

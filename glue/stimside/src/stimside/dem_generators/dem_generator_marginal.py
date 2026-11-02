@@ -113,7 +113,6 @@ from stimside._native.marginal_dem_kernels import (
     MOP_CONDITIONED,
     MOP_MEAS_FLAG,
     MOP_MEAS_PROJ_Z,
-    MOP_NONE,
     MOP_TRANS_1,
     MOP_TRANS_2,
     MOP_UNTAGGED_1Q_UNITARY,
@@ -250,9 +249,6 @@ class GeneratedDemList(list):
         super().__init__(items)
         self.analysis = analysis
         self.base_dem = analysis.baseline if analysis is not None else None
-        self.matching_base_dem = (
-            analysis.matching_base_dem if analysis is not None else None
-        )
         self._generator = generator
         self._circuit = circuit
         self._records = records
@@ -1287,18 +1283,13 @@ class Builder:
         for j, (op, params) in enumerate(zip(self.ops, self.params)):
             gd = self.gate_data[op.name]
             desc = ops_arr[j]
-            desc.kind = MOP_NONE
             desc.target_offset = len(target_qubits_list)
-            desc.target_count = 0
-            desc.aux_offset = 0
-            desc.aux_count = 0
             desc.gate_id = gate_id_map.get(op.name, 0)
             desc.reset_basis = _BASIS_TO_ID.get(_RESET_BASIS.get(op.name, ""), 0)
             ctrl = _CONTROL_BASIS.get(op.name)
-            desc.ctrl_leg0_basis = _BASIS_TO_ID[ctrl[0]] if ctrl is not None else 0
-            desc.ctrl_leg1_basis = _BASIS_TO_ID[ctrl[1]] if ctrl is not None else 0
-            desc.cond_base_fires = 0
-            desc.cond_subkind = 0
+            if ctrl is not None:
+                desc.ctrl_leg0_basis = _BASIS_TO_ID[ctrl[0]]
+                desc.ctrl_leg1_basis = _BASIS_TO_ID[ctrl[1]]
             desc.cond_channel_id = -1
 
             if op.name in _ANNOTATIONS:

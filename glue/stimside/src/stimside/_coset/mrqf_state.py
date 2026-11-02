@@ -73,31 +73,6 @@ class MRQFState:
     def Gamma(self) -> NDArray[np.uint8]:
         return self._Gamma_view
 
-    @classmethod
-    def from_arrays(
-        cls,
-        num_qubits: int,
-        *,
-        A_words: NDArray[np.uint64],
-        ell: NDArray[np.uint8],
-        Gamma: NDArray[np.uint8],
-        P: Sequence[int],
-        h_words: NDArray[np.uint64] | None = None,
-    ) -> "MRQFState":
-        d = len(P)
-        st = cls(num_qubits, _init_cap=max(4, d))
-        st._d = d
-        st.P = list(P)
-        if h_words is not None:
-            np.copyto(st.h_words, np.asarray(h_words, dtype=np.uint64))
-        if d > 0:
-            st._A_buf[:d] = np.asarray(A_words, dtype=np.uint64)
-            st._ell_buf[:d] = np.asarray(ell, dtype=np.uint8)
-            st._Gamma_buf[:d, :d] = np.asarray(Gamma, dtype=np.uint8)
-        st._refresh_views()
-        st._recompute_a_union()
-        return st
-
     def _ensure_capacity(self, need_d: int) -> None:
         if need_d <= self._cap:
             return
@@ -130,25 +105,6 @@ class MRQFState:
     @property
     def d(self) -> int:
         return self._d
-
-    @property
-    def num_frames(self) -> int:
-        return 1 << self._d
-
-    def copy(self) -> "MRQFState":
-        clone = MRQFState(self.num_qubits, self.n_words, _init_cap=self._cap)
-        clone._d = self._d
-        np.copyto(clone.h_words, self.h_words)
-        np.copyto(clone.a_union, self.a_union)
-        if self._d > 0:
-            clone._A_buf[: self._d] = self._A_buf[: self._d]
-            clone._ell_buf[: self._d] = self._ell_buf[: self._d]
-            clone._Gamma_buf[: self._d, : self._d] = self._Gamma_buf[
-                : self._d, : self._d
-            ]
-        clone.P = list(self.P)
-        clone._refresh_views()
-        return clone
 
     def check_invariants(self) -> None:
         """Verify Check C.1: shapes, principal-row identity A_{P, :} = I_d, symmetric zero-diagonal Gamma, ell in Z_4."""

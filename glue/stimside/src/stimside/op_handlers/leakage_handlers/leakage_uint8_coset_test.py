@@ -556,7 +556,7 @@ class TestCompiledLeakageUint8Coset:
         assert len(sim.active_shots) == 16
         for coset in sim.active_shots.values():
             assert coset.d == 2
-            assert coset.num_frames == 4
+            assert (1 << coset.d) == 4
             coset.check_invariants()
         sim.interactive_do(circuit[4])  # TICK
         sim.interactive_do(circuit[5])  # skipped CZ 0 2
@@ -769,7 +769,7 @@ class TestCompiledLeakageUint8Coset:
         sim.interactive_do(circuit[3])  # 3 disjoint skipped CZs on |++> -> d_b = 6 (r_b = 64)
         for coset in sim.active_shots.values():
             assert coset.d == 6
-            assert coset.num_frames == 64
+            assert (1 << coset.d) == 64
             coset.check_invariants()
         sim.interactive_do(circuit[4])
         sim.interactive_do(circuit[5])  # M collapses all 64 frames back to d_b = 0 (r_b = 1)
@@ -781,6 +781,17 @@ class TestCompiledLeakageUint8Coset:
     def test_mrqf_primitives_s1_to_s5_p1_to_p3_q1_and_collisions(self) -> None:
         """Verify MRQF routines S1-S5, P1-P3, PCP, Q1, collision branches, multi-word (>64q) invariants, and conditional gates."""
         from stimside._coset.mrqf_state import MRQFState
+
+        def _mrqf_1col(ell0: int) -> MRQFState:
+            st_c = MRQFState(2, _init_cap=4)
+            st_c._d = 1
+            st_c.P = [-1]
+            st_c._A_buf[0] = 0
+            st_c._ell_buf[0] = ell0
+            st_c._Gamma_buf[0, 0] = 0
+            st_c._refresh_views()
+            st_c._recompute_a_union()
+            return st_c
 
         # 1. Example 14.1: S|+> measured in Y (d: 1 -> 0, deterministic m=0, rho=1.0)
         st = MRQFState(num_qubits=1)
@@ -815,23 +826,11 @@ class TestCompiledLeakageUint8Coset:
         st2.check_invariants()
 
         # 3. Direct S5.4 branches (c=0, lam=0 -> eta=2; c=2, lam=0 -> FAIL, eta=0) and C.5 postselection failure
-        st_s5 = MRQFState.from_arrays(
-            2,
-            A_words=np.array([[0]], dtype=np.uint64),
-            ell=np.array([0], dtype=np.uint8),
-            Gamma=np.zeros((1, 1), dtype=np.uint8),
-            P=[-1],
-        )
+        st_s5 = _mrqf_1col(0)
         ok0, eta0 = st_s5.s5_eliminate_zero(0)
         assert ok0 and eta0 == 2
 
-        st_s5_fail = MRQFState.from_arrays(
-            2,
-            A_words=np.array([[0]], dtype=np.uint64),
-            ell=np.array([2], dtype=np.uint8),
-            Gamma=np.zeros((1, 1), dtype=np.uint8),
-            P=[-1],
-        )
+        st_s5_fail = _mrqf_1col(2)
         ok2, eta2 = st_s5_fail.s5_eliminate_zero(0)
         assert not ok2 and eta2 == 0
 

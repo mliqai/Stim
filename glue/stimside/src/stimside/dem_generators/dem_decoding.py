@@ -404,12 +404,7 @@ def decode_with_generated_dems(
             )  # type: ignore[assignment]
         dec_flag, rew_flag = eff_dec, eff_rew
         regenerated_from_gen = True
-    elif (
-        single_imeta is not None
-        and single_imeta[3] is not None
-        and single_imeta[4] is not None
-        and single_imeta[5] is not None
-    ):
+    elif single_imeta is not None:
         _, orig_dec, orig_rew, gen_inst, circ_inst, rec_inst = single_imeta
         eff_dec = dec_flag or orig_dec
         eff_rew = rew_flag or orig_rew
@@ -429,24 +424,15 @@ def decode_with_generated_dems(
         if dems_seq_check:
             metas = [get_item_analysis_meta(x) for x in dems_seq_check]
             first_m = metas[0]
-            if (
-                first_m is not None
-                and first_m[3] is not None
-                and first_m[4] is not None
-                and all(
-                    m is not None
-                    and m[3] is first_m[3]
-                    and m[4] is first_m[4]
-                    and m[5] is not None
-                    for m in metas
-                )
+            if first_m is not None and all(
+                m is not None and m[3] is first_m[3] and m[4] is first_m[4]
+                for m in metas
             ):
                 _, orig_dec, orig_rew, gen_inst, circ_inst, _ = first_m
-                assert gen_inst is not None and circ_inst is not None
                 eff_dec = dec_flag or orig_dec
                 eff_rew = rew_flag or orig_rew
                 if (eff_dec, eff_rew) != (orig_dec, orig_rew):
-                    rec_2d = np.stack([m[5] for m in metas if m is not None and m[5] is not None], axis=0)
+                    rec_2d = np.stack([m[5] for m in metas if m is not None], axis=0)
                     events_2d = [
                         ev
                         for ev in (get_item_leakage_events(x) for x in dems_seq_check)
@@ -484,12 +470,7 @@ def decode_with_generated_dems(
             not is_pymatching_decoder(decoder)
             and not hasattr(decoder, "decode_batch")
         ):
-            if (
-                single_imeta is not None
-                and single_imeta[3] is not None
-                and single_imeta[4] is not None
-                and single_imeta[5] is not None
-            ):
+            if single_imeta is not None:
                 dem_full = single_imeta[3](
                     single_imeta[4],
                     single_imeta[5],

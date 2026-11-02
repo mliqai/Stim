@@ -15,7 +15,6 @@ from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 from stimside.op_handlers.leakage_handlers.common_parsing import split_arguments
-from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageParams
 from stimside.op_handlers.leakage_handlers.tag_registry import (
     check_tag_qubits,
     parse_leakage_tag_magic,
@@ -54,7 +53,7 @@ __all__ = [
     "DirectFaultSlotRecord", "PauliNoiseRecord", "HeraldedNoiseRecord", "CorrelatedNoiseRecord",
     "MeasurementRecord", "ResetRecord", "MPadRecord", "FeedbackPauliRecord", "LeakageBarrierRecord",
     "CompiledRecord", "LeftUnitaryEvent", "LeftSppEvent", "LeftResetXEvent", "RightRotEvent",
-    "FrameEvent", "CoordinateCompilation", "DirectPlan", "SelectorPlan", "TrajectoryRunResult",
+    "FrameEvent", "DirectPlan", "SelectorPlan", "TrajectoryRunResult",
     "decompose_clifford_exact", "eval_decomposition_unitary_le", "apply_clifford_factors",
     "parse_clifford_fault_tag", "parse_clifford_fault_instruction",
     "extract_circuit_faults", "compile_pauli_product",
@@ -213,10 +212,6 @@ class ExactCliffordDecomposition:
         if not self.targets:
             object.__setattr__(self, "targets", tuple(range(self.num_qubits)))
 
-    @property
-    def global_scalar(self) -> complex:
-        return OMEGA_POWERS[self.v]
-
 
 # ---------------------------------------------------------------------------
 # Exact Clifford Decomposition & Symplectic Defect Helpers
@@ -265,9 +260,6 @@ def _validate_decomp_targets(targets: Sequence[int] | None, k: int, label: objec
 
 def eval_decomposition_unitary_le(
     decomp: ExactCliffordDecomposition,
-    *,
-    num_qubits: int | None = None,
-    targets: Sequence[int] | None = None,
 ) -> NDArray[np.complex128]:
     """Evaluate `decomp` as an exact `complex128` little-endian unitary matrix."""
     k = decomp.num_qubits
@@ -275,21 +267,7 @@ def eval_decomposition_unitary_le(
     U_local = _dense_pauli_from_spec_le(decomp.p0_spec)
     for r_spec in decomp.r_specs:
         U_local = (_INV_SQRT2 * (eye_k + 1.0j * _dense_pauli_from_spec_le(r_spec))) @ U_local
-    U_local = OMEGA_POWERS[decomp.v] * U_local
-
-    t_seq = decomp.targets if targets is None else tuple(int(q) for q in targets)
-    n_tot = k if num_qubits is None else int(num_qubits)
-    if n_tot == k and tuple(t_seq) == tuple(range(k)):
-        return U_local
-    if len(t_seq) != k or len(set(t_seq)) != k or any(q < 0 or q >= n_tot for q in t_seq):
-        raise ValueError(f"Invalid embedding targets={t_seq} for k={k}, num_qubits={n_tot}")
-    dim_tot = 1 << n_tot
-    out = np.zeros((dim_tot, dim_tot), dtype=np.complex128)
-    for col in range(dim_tot):
-        psi = np.zeros(dim_tot, dtype=np.complex128)
-        psi[col] = 1.0 + 0.0j
-        out[:, col] = _apply_local_unitary_c128(psi, U_local, t_seq, n_tot, "little")
-    return out
+    return OMEGA_POWERS[decomp.v] * U_local
 
 
 def decompose_clifford_exact(
@@ -625,11 +603,8 @@ class FeedbackPauliRecord:
 @dataclass(frozen=True)
 class LeakageBarrierRecord:
     instruction: stim.CircuitInstruction
-    step_index: int
     tag_prefix: str
-    meas_index_start: int = 0
     num_measurements: int = 0
-    params: LeakageParams | None = None
 
 
 CompiledRecord: TypeAlias = (
@@ -919,7 +894,6 @@ def _instruction_num_measurements(op: stim.CircuitInstruction, canon_name: str) 
 
 def _validate_and_emit_non_magic_tagged_op(
     op: stim.CircuitInstruction,
-    step_index: int,
     num_qubits: int,
     next_meas_idx: int,
     out_records: list[CompiledRecord],
@@ -943,9 +917,7 @@ def _validate_and_emit_non_magic_tagged_op(
 
     canon_name = _canonical_gate_data(op.name).name
     n_meas = _instruction_num_measurements(op, canon_name)
-    out_records.append(
-        LeakageBarrierRecord(op, step_index, tag_prefix, next_meas_idx, n_meas, params)
-    )
+    out_records.append(LeakageBarrierRecord(op, tag_prefix, n_meas))
     return next_meas_idx + n_meas
 
 
@@ -1164,7 +1136,7 @@ def _compile_circuit_pass(
                 _validate_and_emit_magic_op(op, ref_chp, raw_records)
             else:
                 next_meas_idx = _validate_and_emit_non_magic_tagged_op(
-                    op, step_idx, n_data, next_meas_idx, raw_records
+                    op, n_data, next_meas_idx, raw_records
                 )
         else:
             name = op.name
@@ -1456,7 +1428,7 @@ def _walsh_expand_subblock(
         a_words=np.ascontiguousarray(prod_a[nz_masks], dtype=np.uint64),
         b_words=np.ascontiguousarray(prod_b[nz_masks], dtype=np.uint64),
         kappas=np.ascontiguousarray(prod_k[nz_masks], dtype=np.uint8),
-        global_scalar=1.0 + 0.0j, is_unitary=True, is_identity=False,
+        is_unitary=True, is_identity=False,
     )
 
 
@@ -1635,9 +1607,6 @@ class DirectPlan:
     raw_records: tuple[CompiledRecord, ...] = ()
     noise_channel_max_choices: tuple[int, ...] = ()
     num_resets: int = 0
-
-
-CoordinateCompilation = DirectPlan
 
 
 @dataclass
