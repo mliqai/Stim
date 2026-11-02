@@ -103,3 +103,18 @@ def test_import_layering() -> None:
     stale = sorted(ALLOWLIST - violations)
     assert not unexpected, f"Disallowed layering imports: {unexpected}"
     assert not stale, f"Stale ALLOWLIST entries (remove them!): {stale}"
+
+
+def test_util_purity() -> None:
+    util_dir = STIMSIDE_DIR / "util"
+    for path in sorted(util_dir.glob("*.py")):
+        if path.name.endswith("_test.py"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert all(a.name != "ctypes" for a in node.names), f"{path.name} imports ctypes"
+            elif isinstance(node, ast.ImportFrom):
+                assert node.module != "ctypes", f"{path.name} imports from ctypes"
+            elif isinstance(node, ast.Name):
+                assert not node.id.startswith("OMEGA"), f"{path.name} defines Magic constant {node.id}"

@@ -3,31 +3,9 @@
 from __future__ import annotations
 
 import operator
-import os
-
-import numpy as np
 
 _M64 = (1 << 64) - 1
 _M63 = (1 << 63) - 1
-
-
-class CompiledSeedMixin:
-    """`seed` for the first compile in the creating process; a derived per-compile/per-process seed after."""
-
-    seed: int | None
-
-    def _next_compiled_seed(self) -> int | None:
-        if self.seed is None:
-            return None
-        idx = getattr(self, "_compile_count", 0)
-        init_pid = getattr(self, "_init_pid", os.getpid())
-        cur_pid = os.getpid()
-        self._compile_count = idx + 1
-        if idx == 0 and cur_pid == init_pid:
-            return int(self.seed)
-        pid_delta = (cur_pid - init_pid) & 0xFFFFFFFF
-        ss = np.random.SeedSequence([int(self.seed), int(idx), int(pid_delta)])
-        return int(ss.generate_state(1, dtype=np.uint32)[0] & 0x3FFFFFFF)
 
 
 def _mix64(z: int) -> int:

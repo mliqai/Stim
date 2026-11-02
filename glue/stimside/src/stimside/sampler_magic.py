@@ -13,7 +13,7 @@ import stim  # type: ignore[import-untyped]
 from stimside._magic.compile import CliffordFaultChannel
 from stimside._magic.phase_qfe import DEFAULT_ATOL, validate_atol
 from stimside._magic.query import QueryBudget
-from stimside._sampling import CompiledSamplerBase
+from stimside._sampling import CompiledSamplerBase, next_compiled_seed
 from stimside.dem_generators.leakage_decoder import (
     BaseDecoder,
     CompiledLeakageDecoder,
@@ -30,7 +30,7 @@ from stimside.simulator_magic import (
     _parse_enum,
     _resolve_budget,
 )
-from stimside.util.seeding import CompiledSeedMixin, derived_seed
+from stimside.util.seeding import derived_seed
 
 
 def _coerce_magic_decoder(
@@ -45,7 +45,7 @@ def _coerce_magic_decoder(
     )
 
 
-class MagicsideSampler(CompiledSeedMixin, sinter.Sampler):
+class MagicsideSampler(sinter.Sampler):
     """Sinter sampler running MagicsideSimulator with an arbitrary OpHandler and LeakageDecoder."""
 
     def __init__(
@@ -105,16 +105,10 @@ class MagicsideSampler(CompiledSeedMixin, sinter.Sampler):
         return state
 
     def _next_compiled_seed(self) -> int | None:
-        if self._worker_index is None:
-            return super()._next_compiled_seed()
-        if self.seed is None:
-            return None
         idx = self._compile_count
         self._compile_count = idx + 1
-        if idx == 0 and self._worker_index == 0:
-            return int(self.seed)
-        ss = np.random.SeedSequence([int(self.seed), int(idx), int(self._worker_index)])
-        return int(ss.generate_state(1, dtype=np.uint32)[0] & 0x3FFFFFFF)
+        salt = int(self._worker_index) if self._worker_index is not None else ((os.getpid() - self._init_pid) & 0xFFFFFFFF)
+        return next_compiled_seed(self.seed, idx, salt)
 
     def compiled_sampler_for_task(self, task: sinter.Task) -> CompiledMagicsideSampler:
         if task.circuit is None:

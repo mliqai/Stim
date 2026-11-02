@@ -15,15 +15,11 @@ from stimside._coset.reference_compile import (
     StepMeta,
     UnitaryStepMeta,
 )
+from stimside._native._kernel_loader import i8_p, i32_p, i64_p, u8_p, u64_p
 from stimside._native.coset_kernels import get_coset_kernels_lib
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
 from stimside.util.bitwords import (
     first_set_bit_in_words as _first_set_bit_in_words,
-    i8_p,
-    i32_p,
-    i64_p,
-    u8_p,
-    u64_p,
     word_dot_parity as _word_dot_parity,
     words_any_nonzero as _words_any_nonzero,
     words_any_overlap as _words_any_overlap,

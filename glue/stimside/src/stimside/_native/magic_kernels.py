@@ -8,18 +8,18 @@ import sys
 
 from stimside._native._kernel_loader import (
     AbiSpec,
+    f64_p as _c_double_p,
     find_prebuilt_so as _find_prebuilt_so_candidate,
     get_lib,
+    i32_p as _c_i32_p,
     resolve_so,
+    size_p as _c_size_p,
+    u8_p as _c_u8_p,
+    u64_p as _c_u64_p,
 )
 
 _LIB_INSTANCE: ctypes.CDLL | None = None
 
-_c_double_p = ctypes.POINTER(ctypes.c_double)
-_c_u64_p = ctypes.POINTER(ctypes.c_uint64)
-_c_u8_p = ctypes.POINTER(ctypes.c_uint8)
-_c_i32_p = ctypes.POINTER(ctypes.c_int32)
-_c_size_p = ctypes.POINTER(ctypes.c_size_t)
 _sz, _c_u8, _c_int = ctypes.c_size_t, ctypes.c_uint8, ctypes.c_int
 _c_i32, _c_dbl = ctypes.c_int32, ctypes.c_double
 

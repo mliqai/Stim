@@ -3,7 +3,7 @@ from __future__ import annotations
 import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
-from stimside._sampling import CompiledSamplerBase, SamplerBase, reject_loss_oracle
+from stimside._sampling import CompiledSamplerBase, SamplerBase
 from stimside.dem_generators.leakage_decoder import (
     CompiledLeakageDecoder,
     LeakageDecoderLike,
@@ -12,9 +12,16 @@ from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandle
 from stimside.simulator_flip import FlipsideSimulator
 
 
-class FlipsideSampler(SamplerBase):
-    _allow_loss_oracle = False
+def _reject_loss_oracle(needs_leakage_events: bool) -> None:
+    if needs_leakage_events:
+        raise ValueError(
+            "FlipsideSampler cannot run a dem_decoder that needs the shots' leakage events "
+            "(e.g. MarginalLeakageDemGenerator(loss_oracle=True)): FlipsideSimulator does "
+            "not record them. Use TablesideSampler or CosetsideSampler."
+        )
 
+
+class FlipsideSampler(SamplerBase):
     def __init__(
         self,
         op_handler: OpHandler[FlipsideSimulator],
@@ -23,6 +30,7 @@ class FlipsideSampler(SamplerBase):
         seed: int | None = None,
     ) -> None:
         super().__init__(op_handler, dem_decoder, batch_size, seed)
+        _reject_loss_oracle(self.dem_decoder.needs_leakage_events)
 
     def compiled_sampler_for_task(self, task: sinter.Task) -> sinter.CompiledSampler:
         circuit = self._require_circuit(task)
@@ -51,7 +59,7 @@ class CompiledFlipsideSampler(CompiledSamplerBase):
         needs_leakage_events: bool = False,
         seed: int | None = None,
     ) -> None:
-        reject_loss_oracle(needs_leakage_events)
+        _reject_loss_oracle(needs_leakage_events)
         self._init_common(
             circuit,
             compiled_op_handler,

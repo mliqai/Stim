@@ -678,7 +678,7 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
             for sym, p in syms.items():
                 q = sym_probs.get(sym)
                 sym_probs[sym] = p if q is None else q + p - 2 * q * p
-        sym_targets = hyper._get_sym_targets()
+        sym_targets = hyper.get_sym_targets()
         dem = hyper.baseline.copy()
         for sym in sorted(sym_probs):
             if sym_probs[sym] > 0:

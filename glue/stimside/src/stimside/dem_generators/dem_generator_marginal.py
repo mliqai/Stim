@@ -249,9 +249,9 @@ class GeneratedDemList(list):
         super().__init__(items)
         self.analysis = analysis
         self.base_dem = analysis.baseline if analysis is not None else None
-        self._generator = generator
-        self._circuit = circuit
-        self._records = records
+        self.generator = generator
+        self.circuit = circuit
+        self.records = records
         self.decompose_errors = decompose_errors
         self.reweight_only = reweight_only
         self.leakage_events = leakage_events
@@ -262,9 +262,9 @@ class GeneratedDemList(list):
             return GeneratedDemList(
                 res,
                 analysis=self.analysis,
-                generator=self._generator,
-                circuit=self._circuit,
-                records=self._records[index] if self._records is not None else None,
+                generator=self.generator,
+                circuit=self.circuit,
+                records=self.records[index] if self.records is not None else None,
                 decompose_errors=self.decompose_errors,
                 reweight_only=self.reweight_only,
                 leakage_events=(
@@ -515,10 +515,19 @@ class Analysis:
         state["_cached_matcher"] = None
         return state
 
-    def _get_sym_targets(self) -> list[list[stim.DemTarget]]:
+    def get_sym_targets(self) -> list[list[stim.DemTarget]]:
         if self._sym_targets is None:
             self._sym_targets = [sym_to_targets(sym) for sym in self.symptoms]
         return self._sym_targets
+
+    def get_cached_matcher(self) -> Any:
+        if self._cached_matcher is None:
+            import pymatching  # type: ignore[import-untyped]
+
+            self._cached_matcher = pymatching.Matching.from_detector_error_model(
+                self.matching_base_dem
+            )
+        return self._cached_matcher
 
     def generate_batch(
         self,
@@ -576,7 +585,7 @@ class Analysis:
         assert group_sym_ids is not None and group_probs is not None
         # An envelope mixed from certain (p = 1) entries can round above 1, which stim rejects.
         group_probs = np.minimum(group_probs, 1.0)
-        sym_targets = self._get_sym_targets()
+        sym_targets = self.get_sym_targets()
         group_dems: list[stim.DetectorErrorModel] = []
         empty_base = (
             stim.DetectorErrorModel() if mode == 1 else self.baseline.copy()

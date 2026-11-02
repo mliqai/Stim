@@ -11,15 +11,15 @@ from numpy.typing import NDArray
 
 from stimside._native._kernel_loader import (
     AbiSpec,
+    c_ptr,
+    f64_p,
     find_prebuilt_so as _find_prebuilt_so_candidate,
     get_lib,
+    i32_p,
     resolve_so,
+    u8_p,
+    void_p,
 )
-
-u8_p = ctypes.POINTER(ctypes.c_uint8)
-i32_p = ctypes.POINTER(ctypes.c_int32)
-f64_p = ctypes.POINTER(ctypes.c_double)
-void_p = ctypes.c_void_p
 
 MOP_NONE = 0
 MOP_MEAS_FLAG = 1
@@ -185,18 +185,6 @@ def get_marginal_dem_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
     )
 
 
-def _ptr_i32(arr: NDArray[np.int32]) -> i32_p:
-    return arr.ctypes.data_as(i32_p) if arr.size > 0 else ctypes.cast(None, i32_p)
-
-
-def _ptr_f64(arr: NDArray[np.float64]) -> f64_p:
-    return arr.ctypes.data_as(f64_p) if arr.size > 0 else ctypes.cast(None, f64_p)
-
-
-def _ptr_u8(arr: NDArray[np.uint8]) -> u8_p:
-    return arr.ctypes.data_as(u8_p) if arr.size > 0 else ctypes.cast(None, u8_p)
-
-
 def trace_flows_cpp(
     num_ops: int,
     num_qubits: int,
@@ -235,10 +223,10 @@ def trace_flows_cpp(
         ctypes.c_int32(num_qubits),
         ctypes.c_int32(num_flags),
         ops_arr if len(ops_arr) > 0 else ctypes.cast(None, ctypes.POINTER(OpDescC)),
-        _ptr_i32(target_qubits),
-        _ptr_i32(touch_offsets),
-        _ptr_i32(touch_indices),
-        _ptr_i32(conj_table),
+        c_ptr(target_qubits, i32_p),
+        c_ptr(touch_offsets, i32_p),
+        c_ptr(touch_indices, i32_p),
+        c_ptr(conj_table, i32_p),
         meas_probs_arr
         if len(meas_probs_arr) > 0
         else ctypes.cast(None, ctypes.POINTER(MeasStateProbC)),
@@ -290,14 +278,14 @@ def trace_flows_cpp(
 
         lib.marginal_trace_result_copy_data(
             res_ptr,
-            _ptr_i32(sites),
-            _ptr_i32(flow_site_offsets),
-            _ptr_i32(flow_site_ids),
-            _ptr_i32(flag_cand_offsets),
-            _ptr_i32(flag_cand_flows),
-            _ptr_f64(flag_cand_weights),
-            _ptr_i32(pred_offsets),
-            _ptr_i32(pred_flags),
+            c_ptr(sites, i32_p),
+            c_ptr(flow_site_offsets, i32_p),
+            c_ptr(flow_site_ids, i32_p),
+            c_ptr(flag_cand_offsets, i32_p),
+            c_ptr(flag_cand_flows, i32_p),
+            c_ptr(flag_cand_weights, f64_p),
+            c_ptr(pred_offsets, i32_p),
+            c_ptr(pred_flags, i32_p),
         )
         return (
             sites,
@@ -332,16 +320,16 @@ def build_envelopes_cpp(
         ctypes.c_int32(num_sites),
         ctypes.c_int32(num_symptoms),
         ctypes.c_int32(entry_site_ids.size),
-        _ptr_i32(entry_site_ids),
-        _ptr_i32(entry_sym_ids),
-        _ptr_f64(entry_probs),
+        c_ptr(entry_site_ids, i32_p),
+        c_ptr(entry_sym_ids, i32_p),
+        c_ptr(entry_probs, f64_p),
         ctypes.c_int32(num_used_flows),
-        _ptr_i32(flow_site_offsets),
-        _ptr_i32(flow_site_ids),
+        c_ptr(flow_site_offsets, i32_p),
+        c_ptr(flow_site_ids, i32_p),
         ctypes.c_int32(num_flags),
-        _ptr_i32(flag_cand_offsets),
-        _ptr_i32(flag_cand_flows),
-        _ptr_f64(flag_cand_weights),
+        c_ptr(flag_cand_offsets, i32_p),
+        c_ptr(flag_cand_flows, i32_p),
+        c_ptr(flag_cand_weights, f64_p),
     )
     try:
         total_entries = int(lib.marginal_envelope_result_get_total_entries(res_ptr))
@@ -350,9 +338,9 @@ def build_envelopes_cpp(
         flag_env_probs = np.empty(total_entries, dtype=np.float64)
         lib.marginal_envelope_result_copy_data(
             res_ptr,
-            _ptr_i32(flag_env_offsets),
-            _ptr_i32(flag_env_sym_ids),
-            _ptr_f64(flag_env_probs),
+            c_ptr(flag_env_offsets, i32_p),
+            c_ptr(flag_env_sym_ids, i32_p),
+            c_ptr(flag_env_probs, f64_p),
         )
         return flag_env_offsets, flag_env_sym_ids, flag_env_probs
     finally:
@@ -392,20 +380,20 @@ def process_shots_cpp(
     res_ptr = lib.marginal_process_shots(
         ctypes.c_int32(num_shots),
         ctypes.c_int32(num_flags),
-        _ptr_u8(raised_c),
-        _ptr_i32(pred_offsets),
-        _ptr_i32(pred_flags),
-        _ptr_i32(flag_env_offsets),
-        _ptr_i32(flag_env_sym_ids),
-        _ptr_f64(flag_env_probs),
+        c_ptr(raised_c, u8_p),
+        c_ptr(pred_offsets, i32_p),
+        c_ptr(pred_flags, i32_p),
+        c_ptr(flag_env_offsets, i32_p),
+        c_ptr(flag_env_sym_ids, i32_p),
+        c_ptr(flag_env_probs, f64_p),
         ctypes.c_int32(num_symptoms),
         ctypes.c_int32(mode),
-        _ptr_f64(base_sym_probs) if base_sym_probs is not None else ctypes.cast(None, f64_p),
+        c_ptr(base_sym_probs, f64_p),
         ctypes.c_int32(num_edges),
-        _ptr_i32(sym_edge_offsets) if sym_edge_offsets is not None else ctypes.cast(None, i32_p),
-        _ptr_i32(sym_edge_ids) if sym_edge_ids is not None else ctypes.cast(None, i32_p),
-        _ptr_i32(edge_nodes) if edge_nodes is not None else ctypes.cast(None, i32_p),
-        _ptr_f64(base_edge_probs) if base_edge_probs is not None else ctypes.cast(None, f64_p),
+        c_ptr(sym_edge_offsets, i32_p),
+        c_ptr(sym_edge_ids, i32_p),
+        c_ptr(edge_nodes, i32_p),
+        c_ptr(base_edge_probs, f64_p),
     )
     try:
         c_num_groups = ctypes.c_int32(0)
@@ -423,11 +411,11 @@ def process_shots_cpp(
             group_reweights = np.empty((total_items, 3), dtype=np.float64)
             lib.marginal_batch_result_copy_data(
                 res_ptr,
-                _ptr_i32(shot_group_ids),
-                _ptr_i32(group_item_offsets),
-                ctypes.cast(None, i32_p),
-                ctypes.cast(None, f64_p),
-                _ptr_f64(group_reweights),
+                c_ptr(shot_group_ids, i32_p),
+                c_ptr(group_item_offsets, i32_p),
+                ctypes.cast(0, i32_p),
+                ctypes.cast(0, f64_p),
+                c_ptr(group_reweights, f64_p),
             )
             return shot_group_ids, group_item_offsets, None, None, group_reweights
         else:
@@ -435,11 +423,11 @@ def process_shots_cpp(
             group_probs = np.empty(total_items, dtype=np.float64)
             lib.marginal_batch_result_copy_data(
                 res_ptr,
-                _ptr_i32(shot_group_ids),
-                _ptr_i32(group_item_offsets),
-                _ptr_i32(group_sym_ids),
-                _ptr_f64(group_probs),
-                ctypes.cast(None, f64_p),
+                c_ptr(shot_group_ids, i32_p),
+                c_ptr(group_item_offsets, i32_p),
+                c_ptr(group_sym_ids, i32_p),
+                c_ptr(group_probs, f64_p),
+                ctypes.cast(0, f64_p),
             )
             return shot_group_ids, group_item_offsets, group_sym_ids, group_probs, None
     finally:

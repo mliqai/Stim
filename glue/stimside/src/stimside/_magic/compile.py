@@ -21,11 +21,6 @@ from stimside.op_handlers.leakage_handlers.tag_registry import (
     validate_magic_op,
 )
 from stimside.util.bitwords import (
-    I_POWERS_ARR as _PHASE4_ARR,
-    INV_SQRT2 as _INV_SQRT2,
-    OMEGA,
-    OMEGA_ARR as _OMEGA_ARR,
-    OMEGA_POWERS,
     first_set_bit_in_words,
     get_bit_in_words,
     n_words_for_qubits,
@@ -38,7 +33,8 @@ from stimside.util.bitwords import (
     words_any_nonzero,
 )
 from stimside._magic.phase_qfe import (
-    DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep,
+    DEFAULT_ATOL, I_POWERS_ARR as _PHASE4_ARR, INV_SQRT2 as _INV_SQRT2, K1_CANCEL_REL_TOL,
+    OMEGA, OMEGA_ARR as _OMEGA_ARR, OMEGA_POWERS, CompiledPauliBlock, CompiledPauliBlockStep,
     ImpossiblePostselectionError, ShotExpansion,
     _apply_local_unitary_c128, apply_compiled_block, apply_pauli, apply_quarter_turn,
     apply_reference_tableau_to_statevector, born_split_expansion, measure_expansion,

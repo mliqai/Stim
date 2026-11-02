@@ -1,47 +1,12 @@
-"""Shared multi-word uint64 bitpacking, Pauli parity helpers, ctypes pointers, and phase tables."""
+"""Shared multi-word uint64 bitpacking and Pauli parity helpers."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-import ctypes
-import math
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
-
-u8_p = ctypes.POINTER(ctypes.c_uint8)
-u64_p = ctypes.POINTER(ctypes.c_uint64)
-i8_p = ctypes.POINTER(ctypes.c_int8)
-i32_p = ctypes.POINTER(ctypes.c_int32)
-i64_p = ctypes.POINTER(ctypes.c_int64)
-f64_p = ctypes.POINTER(ctypes.c_double)
-
-SQRT2: float = math.sqrt(2.0)
-INV_SQRT2: float = math.ldexp(1.0, -1) * SQRT2
-OMEGA: complex = complex(INV_SQRT2, INV_SQRT2)
-OMEGA_CONJ: complex = complex(INV_SQRT2, -INV_SQRT2)
-OMEGA_POWERS: tuple[complex, ...] = (
-    1.0 + 0.0j,
-    OMEGA,
-    0.0 + 1.0j,
-    complex(-INV_SQRT2, INV_SQRT2),
-    -1.0 + 0.0j,
-    complex(-INV_SQRT2, -INV_SQRT2),
-    0.0 - 1.0j,
-    OMEGA_CONJ,
-)
-OMEGA_ARR: NDArray[np.complex128] = np.array(OMEGA_POWERS, dtype=np.complex128)
-I_POWERS: tuple[complex, ...] = (1.0 + 0.0j, 0.0 + 1.0j, -1.0 + 0.0j, 0.0 - 1.0j)
-I_POWERS_ARR: NDArray[np.complex128] = np.array(I_POWERS, dtype=np.complex128)
-
-
-def c_ptr(arr: NDArray[Any], ptr_t: Any) -> Any:
-    return ctypes.cast(arr.ctypes.data, ptr_t) if arr.size > 0 else ctypes.cast(0, ptr_t)
-
-
-def c_w_ptr(w: NDArray[np.complex128]) -> Any:
-    return c_ptr(w.view(np.float64), f64_p)
 
 
 def n_words_for_qubits(n_qubits: int) -> int:

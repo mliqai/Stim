@@ -2328,7 +2328,7 @@ def test_caller_records_mutation_and_batch_pinning_isolation() -> None:
     np.testing.assert_array_equal(want_item_rw, got_item_rw)
 
     # Retaining a single item must not pin the batch records buffer via a slice view.
-    batch_buf_ref = weakref.ref(dems._records)
+    batch_buf_ref = weakref.ref(dems.records)
     single_dem = dems[1]
     del dems
     gc.collect()

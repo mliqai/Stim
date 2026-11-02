@@ -13,9 +13,8 @@ import stim  # type: ignore[import-untyped]
 
 from stimside._magic import compile as _mc
 from stimside._magic.compile import CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _normalize_pauli_slot_map, _sample_categorical_branch, _sample_heralded_pauli_branch, _split_realization_sections, apply_clifford_factors, compile_direct, compile_open_block, compile_selector, extract_data_expansion, fault_selector_bits
-from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, born_split_expansion, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, validate_atol
+from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, SQRT2 as _SQRT2, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, born_split_expansion, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, validate_atol
 from stimside.util.bitwords import (
-    SQRT2 as _SQRT2,
     first_set_bit_in_words,
     n_words_for_qubits,
     tail_mask,

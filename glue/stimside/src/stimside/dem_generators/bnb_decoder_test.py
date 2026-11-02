@@ -425,7 +425,7 @@ def test_other_decoders_decode_the_accepted_nodes_undecomposed_dem():
     assert len(rec.dems) == len(nodes)
     marginal = MarginalLeakageDemGenerator(decompose_errors=False)(circuit, records)
     base = _sym_probs(comp.hyper_analysis.baseline)
-    sym_targets = comp.hyper_analysis._get_sym_targets()
+    sym_targets = comp.hyper_analysis.get_sym_targets()
 
     def marginal_of(s: int, flags) -> dict[tuple[str, ...], float]:
         """The marginal DEM of shot s with exactly ``flags`` raised."""

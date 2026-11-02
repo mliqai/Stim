@@ -306,15 +306,7 @@ def decode_with_edge_reweights(
         matcher = decoder
     else:
         if analysis is not None and base_dem is None:
-            if analysis._cached_matcher is None:
-                import pymatching  # type: ignore[import-untyped]
-
-                analysis._cached_matcher = (
-                    pymatching.Matching.from_detector_error_model(
-                        analysis.matching_base_dem
-                    )
-                )
-            matcher = analysis._cached_matcher
+            matcher = analysis.get_cached_matcher()
         elif base_dem is not None:
             import pymatching  # type: ignore[import-untyped]
 
@@ -341,13 +333,13 @@ def decode_with_edge_reweights(
 def _extract_regen_spec(
     dems: Any, single_imeta: Any
 ) -> tuple[bool, bool, Any, Any, Any, Any] | None:
-    if isinstance(dems, GeneratedDemList) and dems._generator is not None:
+    if isinstance(dems, GeneratedDemList) and dems.generator is not None:
         return (
             dems.decompose_errors,
             dems.reweight_only,
-            dems._generator,
-            dems._circuit,
-            dems._records,
+            dems.generator,
+            dems.circuit,
+            dems.records,
             dems.leakage_events,
         )
     if single_imeta is not None:

@@ -17,16 +17,16 @@ from stimside.dem_generators.leakage_decoder import (
     as_leakage_decoder,
 )
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler
-from stimside.util.seeding import CompiledSeedMixin
 
 
-def reject_loss_oracle(needs_leakage_events: bool) -> None:
-    if needs_leakage_events:
-        raise ValueError(
-            "FlipsideSampler cannot run a dem_decoder that needs the shots' leakage events "
-            "(e.g. MarginalLeakageDemGenerator(loss_oracle=True)): FlipsideSimulator does "
-            "not record them. Use TablesideSampler or CosetsideSampler."
-        )
+def next_compiled_seed(seed: int | None, idx: int, salt: int) -> int | None:
+    """Return `seed` on `(idx=0, salt=0)` or a deterministic per-compile/per-worker 30-bit seed."""
+    if seed is None:
+        return None
+    if idx == 0 and salt == 0:
+        return int(seed)
+    ss = np.random.SeedSequence([int(seed), int(idx), int(salt)])
+    return int(ss.generate_state(1, dtype=np.uint32)[0] & 0x3FFFFFFF)
 
 
 def sample_batches(
@@ -87,10 +87,8 @@ def sample_batches(
     )
 
 
-class SamplerBase(CompiledSeedMixin, sinter.Sampler):
+class SamplerBase(sinter.Sampler):
     """Common Sinter sampler configuration for Flipside, Tableside, and Cosetside."""
-
-    _allow_loss_oracle: bool = True
 
     def __init__(
         self,
@@ -99,15 +97,17 @@ class SamplerBase(CompiledSeedMixin, sinter.Sampler):
         batch_size: int,
         seed: int | None = None,
     ) -> None:
-        resolved = as_leakage_decoder(dem_decoder, type(self).__name__)
-        if not self._allow_loss_oracle:
-            reject_loss_oracle(resolved.needs_leakage_events)
         self.op_handler = op_handler
-        self.dem_decoder = resolved
+        self.dem_decoder = as_leakage_decoder(dem_decoder, type(self).__name__)
         self.batch_size = batch_size
         self.seed = seed
         self._init_pid = os.getpid()
         self._compile_count = 0
+
+    def _next_compiled_seed(self) -> int | None:
+        idx = self._compile_count
+        self._compile_count = idx + 1
+        return next_compiled_seed(self.seed, idx, (os.getpid() - self._init_pid) & 0xFFFFFFFF)
 
     def _require_circuit(self, task: sinter.Task) -> stim.Circuit:
         if task.circuit is None:

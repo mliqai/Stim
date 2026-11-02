@@ -23,6 +23,25 @@ from typing import Any
 
 AbiSpec = tuple[str, Sequence[Any], Any]
 
+u8_p = ctypes.POINTER(ctypes.c_uint8)
+u32_p = ctypes.POINTER(ctypes.c_uint32)
+u64_p = ctypes.POINTER(ctypes.c_uint64)
+i8_p = ctypes.POINTER(ctypes.c_int8)
+i32_p = ctypes.POINTER(ctypes.c_int32)
+i64_p = ctypes.POINTER(ctypes.c_int64)
+f64_p = ctypes.POINTER(ctypes.c_double)
+size_p = ctypes.POINTER(ctypes.c_size_t)
+int_p = ctypes.POINTER(ctypes.c_int)
+void_p = ctypes.c_void_p
+
+
+def c_ptr(arr: Any, ptr_t: Any) -> Any:
+    return ctypes.cast(arr.ctypes.data, ptr_t) if arr is not None and arr.size > 0 else ctypes.cast(0, ptr_t)
+
+
+def c_w_ptr(w: Any) -> Any:
+    return c_ptr(w.view("float64"), f64_p)
+
 
 def get_cpp_compile_and_link_args(
     include_march_native: bool = True,

@@ -15,26 +15,23 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside._native.magic_kernels import get_magic_kernels_lib as _get_cpp_lib
-from stimside.util.bitwords import (
-    I_POWERS_ARR as _PHASE4,
-    INV_SQRT2 as _INV_SQRT2,
-    OMEGA as _OMEGA,
-    OMEGA_CONJ as _OMEGA_CONJ,
-    SQRT2 as _SQRT2,
+from stimside._native._kernel_loader import (
     c_ptr as _c_ptr,
     c_w_ptr as _c_w_ptr,
+    i32_p as _c_i32_p,
+    u8_p as _c_u8_p,
+    u64_p as _c_u64_p,
+)
+from stimside._native.magic_kernels import get_magic_kernels_lib as _get_cpp_lib
+from stimside.util.bitwords import (
     coerce_pauli_words,
     first_set_bit_in_words,
     get_bit_in_words,
     get_bits_at_qubits,
-    i32_p as _c_i32_p,
     n_words_for_qubits,
     pack_bit_vector,
     pauli_multiply,
     tail_mask,
-    u8_p as _c_u8_p,
-    u64_p as _c_u64_p,
     unit_bit_words,
     validate_hermitian_pauli,
     word_dot_parity,
@@ -43,6 +40,25 @@ from stimside.util.bitwords import (
     words_any_overlap,
 )
 from stimside.util.reference_chp import ReferenceCHPTableau
+
+SQRT2: float = math.sqrt(2.0)
+INV_SQRT2: float = math.ldexp(1.0, -1) * SQRT2
+OMEGA: complex = complex(INV_SQRT2, INV_SQRT2)
+OMEGA_CONJ: complex = complex(INV_SQRT2, -INV_SQRT2)
+OMEGA_POWERS: tuple[complex, ...] = (
+    1.0 + 0.0j,
+    OMEGA,
+    0.0 + 1.0j,
+    complex(-INV_SQRT2, INV_SQRT2),
+    -1.0 + 0.0j,
+    complex(-INV_SQRT2, -INV_SQRT2),
+    0.0 - 1.0j,
+    OMEGA_CONJ,
+)
+OMEGA_ARR: NDArray[np.complex128] = np.array(OMEGA_POWERS, dtype=np.complex128)
+I_POWERS: tuple[complex, ...] = (1.0 + 0.0j, 0.0 + 1.0j, -1.0 + 0.0j, 0.0 - 1.0j)
+I_POWERS_ARR: NDArray[np.complex128] = np.array(I_POWERS, dtype=np.complex128)
+_SQRT2, _INV_SQRT2, _OMEGA, _OMEGA_CONJ, _PHASE4 = SQRT2, INV_SQRT2, OMEGA, OMEGA_CONJ, I_POWERS_ARR
 
 __all__ = [
     "DEFAULT_ATOL", "K1_CANCEL_REL_TOL", "ImpossiblePostselectionError",
