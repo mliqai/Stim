@@ -17,11 +17,10 @@ from stimside._magic.gates import CliffordFaultChannel, CompiledPauliAxis, _coer
 from stimside._magic.plan import DirectPlan, SelectorPlan, TrajectoryRunResult, compile_direct, compile_open_block, compile_selector
 from stimside._magic.statevector import extract_data_expansion
 from stimside._magic.trajectory import fault_selector_bits
-from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, SQRT2 as _SQRT2, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, born_split_expansion, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, validate_atol
+from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, born_split_expansion, contract_choi_expansions, merge_frames, project_diagonal, validate_atol
 from stimside.util.bitwords import (
     first_set_bit_in_words,
     n_words_for_qubits,
-    tail_mask,
     unit_bit_words,
 )
 from stimside.util.reference_chp import ReferenceCHPTableau
@@ -220,37 +219,8 @@ def _contract_choi(left_se: _ScaledExpansion, right_se: _ScaledExpansion, n_op: 
     if ctx.enforce_budget and enforce_terms and prod_chi > max(256, 16 * ctx.budget.max_terms):
         ctx.diagnostics.peak_terms = max(ctx.diagnostics.peak_terms, prod_chi)
         raise QueryBudgetExceededError(f"Contraction product {prod_chi} exceeds max_terms={ctx.budget.max_terms}")
-    p_L = [(q, q) for q in q_act] + [(n_op + r, n_keep + r) for r in range(m)]
-    p_R = [(q_act[r], n_keep + m + r) for r in range(m)] + ([(n_op + r, n_op + r) for r in range(m)] if right_is_choi else [])
-    work = _tensor_pairs(left_se.exp, p_L, right_se.exp, p_R, n_keep + 2 * m, atol=ctx.atol)
-    for j in range(m):
-        qL, qR = n_keep + j, n_keep + m + j
-        wL, sL, wR, sR = qL >> 6, np.uint64(qL & 63), qR >> 6, np.uint64(qR & 63)
-        restrict_amplitude(work, (((work.A_words[:, wL] >> sL) ^ (work.A_words[:, wR] >> sR)) & np.uint64(1)).astype(np.uint8), (((work.h_words[:, wL] >> sL) ^ (work.h_words[:, wR] >> sR)) & np.uint64(1)).astype(np.uint8))
-        if work.chi == 0:
-            _check_unitary_norm(z_left * z_rhs_rel, 0.0, ctx.atol, "_contract_choi")
-            return _empty_se(n_keep, ctx.atol)
-        for w, s in ((wL, sL), (wR, sR)):
-            if work.d > 0:
-                work.A_words[:, w] &= ~(np.uint64(1) << s)
-            work.h_words[:, w] &= ~(np.uint64(1) << s)
-        work._refresh_a_union()
-        for r0 in range(work.d):
-            if int(work.pivots[r0]) in (qL, qR):
-                p_new = first_set_bit_in_words(work.A_words[r0])
-                make_principal(work, r0, p_new) if p_new >= 0 else eliminate_zero_amplitude(work, r0)
-                break
-    nw_keep, tm_keep = n_words_for_qubits(n_keep), tail_mask(n_keep)
-    work.n_qubits, work.A_words, work.h_words = n_keep, np.ascontiguousarray(work.A_words[:, :nw_keep]), np.ascontiguousarray(work.h_words[:, :nw_keep])
-    if work.d > 0:
-        work.A_words[:, -1] &= tm_keep
-    work.h_words[:, -1] &= tm_keep
-    work._refresh_a_union()
-    work._is_canonical_merged = False
-    merged = merge_frames(work)
-    if (m & 1) and merged.chi > 0:
-        merged.weights = np.ascontiguousarray(merged.weights * _SQRT2)
-    out_se = _normalize_frexp(merged, left_se.log2_scale + right_se.log2_scale + (m >> 1))
+    merged = contract_choi_expansions(left_se.exp, right_se.exp, n_op, q_act, right_is_choi, atol=ctx.atol)
+    out_se = _empty_se(n_keep, ctx.atol) if merged.chi == 0 else _normalize_frexp(merged, left_se.log2_scale + right_se.log2_scale + (m >> 1))
     _check_unitary_norm(z_left * z_rhs_rel, _ldexp(out_se.exp.norm_sq() if out_se.exp.chi > 0 else 0.0, 2 * (out_se.log2_scale - right_se.log2_scale)), ctx.atol, "_contract_choi")
     ctx.check_exp(out_se.exp, is_choi=right_is_choi, enforce_terms=enforce_terms)
     return out_se

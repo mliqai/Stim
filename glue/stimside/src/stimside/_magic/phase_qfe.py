@@ -72,8 +72,8 @@ __all__ = [
     "drop_variable", "add_column", "make_principal", "restrict_amplitude",
     "eliminate_zero_amplitude", "apply_pauli", "apply_quarter_turn",
     "merge_frames", "apply_pauli_t", "apply_ccz",
-    "apply_compiled_block", "project_diagonal", "born_split_expansion", "measure_expansion",
-    "validate_atol",
+    "apply_compiled_block", "project_diagonal", "contract_choi_expansions",
+    "born_split_expansion", "measure_expansion", "validate_atol",
 ]
 
 # Exact IEEE-754 float64 / complex128 constants
@@ -1385,6 +1385,59 @@ def project_diagonal(
     )
     _assign_cpp_geom_shot(exp, int(out_chi.value), int(out_d.value), bufs)
     return exp, float(out_z.value)
+
+
+def contract_choi_expansions(
+    left: ShotExpansion,
+    right: ShotExpansion,
+    n_op: int,
+    q_act: Sequence[int],
+    right_is_choi: bool,
+    *,
+    atol: float = DEFAULT_ATOL,
+) -> ShotExpansion:
+    """Contract Choi `left` with Choi/ket `right` across `q_act` (scaled by `2**-(len(q_act)//2)`)."""
+    m = len(q_act)
+    if not _is_valid_int(n_op) or n_op < 0 or m > n_op:
+        raise ValueError(f"Invalid n_op={n_op!r} or len(q_act)={m} in contract_choi_expansions")
+    seen_q: set[int] = set()
+    q_list: list[int] = []
+    for q in q_act:
+        if not _is_valid_int(q):
+            raise ValueError(f"q_act entries must be integers, got {q!r}")
+        qi = int(q)
+        if qi < 0 or qi >= n_op or qi in seen_q:
+            raise ValueError(f"Invalid or duplicate q_act entry {q!r} for n_op={n_op}")
+        seen_q.add(qi)
+        q_list.append(qi)
+    eff_keep = max(1, (n_op + m) if right_is_choi else n_op)
+    prod_chi = left.chi * right.chi
+    if prod_chi == 0:
+        return ShotExpansion.from_components((), n_qubits=eff_keep, atol=atol)
+    if not (np.all(np.isfinite(left.weights)) and np.all(np.isfinite(right.weights))):
+        raise FloatingPointError("Non-finite weights in contract_choi_expansions")
+    q_arr = np.asarray(q_list, dtype=np.int32)
+    out_chi, out_d, bufs, out_ptrs = _alloc_cpp_geom_bufs(
+        prod_chi, n_words_for_qubits(eff_keep), max(1, left.d + right.d)
+    )
+    rc = int(
+        _get_cpp_lib().magic_contract_choi(
+            left.chi, left.d, left.n_words, *_cpp_shot_in_ptrs(left),
+            right.chi, right.d, right.n_words, *_cpp_shot_in_ptrs(right),
+            n_op, _c_ptr(q_arr, _c_i32_p), m, int(bool(right_is_choi)),
+            ctypes.c_double(K1_CANCEL_REL_TOL), *out_ptrs,
+        )
+    )
+    if rc != 0:
+        if rc == 1:
+            raise ValueError("Invalid q_act or Choi pivot support in contract_choi_expansions")
+        if rc == 2:
+            raise MemoryError("Out of memory in magic_contract_choi")
+        raise RuntimeError(f"magic_contract_choi failed with status {rc}")
+    oc = int(out_chi.value)
+    if oc == 0:
+        return ShotExpansion.from_components((), n_qubits=eff_keep, atol=atol)
+    return _assign_cpp_geom_shot(ShotExpansion.zero(eff_keep, atol=atol), oc, int(out_d.value), bufs)
 
 
 def born_split_expansion(

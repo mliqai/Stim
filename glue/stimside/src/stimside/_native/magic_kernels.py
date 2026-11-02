@@ -72,6 +72,17 @@ _SPECS: tuple[AbiSpec, ...] = (
         ],
         None,
     ),
+    ("magic_abi_v2", [], _c_i32),
+    (
+        "magic_contract_choi",
+        [
+            _sz, _sz, _sz, _c_double_p, _c_u64_p, _c_u8_p, _c_u64_p, _c_u8_p, _c_i32_p, _c_u8_p,
+            _sz, _sz, _sz, _c_double_p, _c_u64_p, _c_u8_p, _c_u64_p, _c_u8_p, _c_i32_p, _c_u8_p,
+            _sz, _c_i32_p, _sz, _c_int, _c_dbl,
+            _c_size_p, _c_size_p, _c_double_p, _c_u64_p, _c_u8_p, _c_u64_p, _c_u8_p, _c_i32_p, _c_u8_p,
+        ],
+        _c_int,
+    ),
 )
 
 
@@ -84,7 +95,7 @@ def get_magic_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
     return get_lib(
         sys.modules[__name__],
         "magic_kernels",
-        "magic_abi_v1",
+        "magic_abi_v2",
         _SPECS,
         force_recompile=force_recompile,
     )

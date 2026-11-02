@@ -22,12 +22,14 @@ from stimside._native import magic_kernels as mk
 
 EXPECTED_SYMBOLS = (
     "magic_abi_v1",
+    "magic_abi_v2",
     "magic_apply_pauli_batch",
     "magic_apply_quarter_turn",
     "magic_canonicalize_and_merge",
     "magic_branch_pauli_t",
     "magic_branch_ccz",
     "magic_project_diagonal",
+    "magic_contract_choi",
 )
 
 
@@ -67,6 +69,7 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
         for sym in EXPECTED_SYMBOLS:
             assert hasattr(lib1, sym), f"Missing symbol {sym}"
         assert int(lib1.magic_abi_v1()) == 1
+        assert int(lib1.magic_abi_v2()) == 2
 
         with pytest.raises(TypeError, match="use_cpp_kernels"):
             pq.ShotExpansion.zero(2, use_cpp_kernels=False)  # type: ignore[call-arg]
@@ -77,9 +80,14 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
         tmp_native = tmp_path / "rebuild_pkg" / "src" / "stimside" / "_native"
         tmp_native.mkdir(parents=True)
         (tmp_path / "rebuild_pkg" / "setup.py").write_text("# dummy\n", encoding="utf-8")
+        abi_syms = ("magic_abi_v1", "magic_abi_v2")
         stub_cpp = (
-            'extern "C" {\nint magic_abi_v1() { return 1; }\n'
-            + "".join(f"void {s}() {{}}\n" for s in EXPECTED_SYMBOLS if s != "magic_abi_v1")
+            'extern "C" {\nint magic_abi_v1() { return 1; }\nint magic_abi_v2() { return 2; }\n'
+            + "".join(
+                f"int {s}() {{ return 0; }}\n"
+                for s in EXPECTED_SYMBOLS
+                if s not in abi_syms
+            )
             + "}\n"
         )
         (tmp_native / "magic_kernels.cpp").write_text(stub_cpp, encoding="utf-8")
@@ -91,6 +99,7 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
             assert rebuilt is not lib1 and rebuilt._handle != lib1._handle
             assert mk._LIB_INSTANCE is rebuilt
             assert int(rebuilt.magic_abi_v1()) == 1
+            assert int(rebuilt.magic_abi_v2()) == 2
     finally:
         mk._LIB_INSTANCE = lib1 if lib1 is not None else orig_lib
 
@@ -358,3 +367,155 @@ def test_magic_compile_direct_vs_selector_and_word_boundary_parity() -> None:
     psi_d = so_d.expansion.to_statevector(ref_tableau=so_d.final_tableau)
     psi_s = so_s.expansion.to_statevector(ref_tableau=so_s.final_tableau)
     assert abs(abs(np.vdot(psi_d, psi_s)) - 1.0) < 1e-12
+
+
+def test_magic_contract_choi_word_boundary_and_edge_cases() -> None:
+    from stimside._magic.query import QueryBudget, evaluate_queries, prepare_queries
+
+    e0 = pq.ShotExpansion.zero(2)
+    empty = pq.ShotExpansion.from_components((), n_qubits=2)
+    assert pq.contract_choi_expansions(empty, e0, 2, (0,), False).chi == 0
+    assert pq.contract_choi_expansions(e0, empty, 2, (0,), False).chi == 0
+    m0 = pq.contract_choi_expansions(e0, e0, 2, (), False)
+    assert m0.chi == 1 and abs(m0.norm_sq() - 1.0) < 1e-15
+
+    bad = e0.copy()
+    bad.weights = np.array([np.nan + 0.0j], dtype=np.complex128)
+    with pytest.raises(FloatingPointError):
+        pq.contract_choi_expansions(bad, e0, 2, (0,), False)
+
+    def _query_circ(q0: int, q1: int, q2: int) -> stim.Circuit:
+        return stim.Circuit(f"""
+            H {q0} {q1} {q2}
+            I[T] {q0}
+            X_ERROR(0.2) {q0}
+            CX {q0} {q1}
+            I[CCZ] {q0} {q1} {q2}
+            Z_ERROR(0.3) {q2}
+            I[T_DAG] {q1} {q2}
+            H {q0} {q1} {q2}
+            M {q0} {q1} {q2}
+        """)
+
+    c4, c70 = _query_circ(0, 1, 2), _query_circ(0, 62, 69)
+    p4 = prepare_queries(c4)
+    p70 = prepare_queries(c70)
+    p70_stream = prepare_queries(c70, budget=QueryBudget(max_terms=1, on_budget_exceeded="fallback"))
+    for meas_bits in ({0: 0, 1: 1, 2: 0}, {0: 1, 1: 1, 2: 1}):
+        real = {"paulis": {0: 1, 1: 0}, "quantum_measurements": meas_bits}
+        r4 = evaluate_queries(p4, real, queries=("mass", "prefix_probs"))
+        r70 = evaluate_queries(p70, real, queries=("mass", "prefix_probs"))
+        r70_s = evaluate_queries(p70_stream, real, queries=("mass", "prefix_probs"))
+        assert not r70.diagnostics.used_fallback
+        assert r70_s.diagnostics.used_fallback
+        assert abs(r4.mass - r70.mass) < 1e-13
+        assert abs(r70.mass - r70_s.mass) < 1e-13
+        assert np.allclose(r4.prefix_probs, r70.prefix_probs, atol=1e-13)
+
+
+def test_magic_contract_choi_preserves_idle_ket_qubits_and_validates_q_act() -> None:
+    # 1. Idle ket qubits outside q_act must be preserved (including entanglement across 64-bit word boundaries).
+    e0_2 = pq.ShotExpansion.zero(2)
+    z0_1 = np.zeros(1, dtype=np.uint64)
+    u1_1 = pq.unit_bit_words(1, 1)
+
+    ket_0_plus = pq.apply_quarter_turn(pq.ShotExpansion.zero(2), u1_1, z0_1, 0)
+    out_empty_q = pq.contract_choi_expansions(e0_2, ket_0_plus, 2, (), False)
+    out_empty_q.check_invariants(require_canonical_offset=True)
+    np.testing.assert_allclose(out_empty_q.to_statevector(), ket_0_plus.to_statevector(), atol=1e-13)
+
+    for n_op, q_idle in ((2, 1), (70, 69)):
+        nw_ket = pq.n_words_for_qubits(n_op)
+        nw_choi = pq.n_words_for_qubits(n_op + 1)
+        z_ket, z_choi = np.zeros(nw_ket, dtype=np.uint64), np.zeros(nw_choi, dtype=np.uint64)
+        # Bell pair (|00> + |11>) / sqrt(2) on (0, q_idle) via sqrt(+i X_0) then CX_{0 -> q_idle} on |0...0>:
+        # (|00> + i|11>) / sqrt(2) created directly by P2(X_0 X_{q_idle}):
+        bell_ket = pq.apply_quarter_turn(
+            pq.ShotExpansion.zero(n_op),
+            pq.unit_bit_words(0, nw_ket) ^ pq.unit_bit_words(q_idle, nw_ket),
+            z_ket,
+            0,
+        )
+        # Choi state of T_0 on q_act=(0,) has Bell pair (|00> + |11>)/sqrt(2) on (0, n_op), followed by T_0.
+        A_bell = pq.unit_bit_words(0, nw_choi)[None, :] ^ pq.unit_bit_words(n_op, nw_choi)[None, :]
+        choi_t0 = pq.ShotExpansion(
+            n_op + 1, 1, A_bell, A_bell[0].copy(), np.zeros((1, 1), dtype=np.uint8),
+            np.array([0], dtype=np.int32), np.array([1.0 + 0.0j], dtype=np.complex128),
+            np.zeros((1, nw_choi), dtype=np.uint64), np.zeros((1, 1), dtype=np.uint8),
+            np.zeros(1, dtype=np.uint8),
+        )
+        choi_t0 = pq.apply_pauli_t(choi_t0, z_choi, pq.unit_bit_words(0, nw_choi), 0, dag=False)
+
+        got = pq.contract_choi_expansions(choi_t0, bell_ket, n_op, (0,), False)
+        got.check_invariants(require_canonical_offset=True)
+        want = pq.apply_pauli_t(bell_ket.copy(), z_ket, pq.unit_bit_words(0, nw_ket), 0, dag=False)
+        np.testing.assert_allclose(
+            _extract_active_statevector(got, [0, q_idle]),
+            _extract_active_statevector(want, [0, q_idle]),
+            atol=1e-13,
+        )
+
+    # 1b. Choi-Choi composition (right_is_choi=True) across multi-word non-contiguous q_act and mismatched n_words.
+    n_cc, q_cc = 70, (3, 62, 69)
+    m_cc, nw_cc = len(q_cc), pq.n_words_for_qubits(n_cc + len(q_cc))
+    z_cc = np.zeros(nw_cc, dtype=np.uint64)
+    u3, u62, u69 = (pq.unit_bit_words(q, nw_cc) for q in q_cc)
+    A_cc = np.vstack([pq.unit_bit_words(q_cc[r], nw_cc) ^ pq.unit_bit_words(n_cc + r, nw_cc) for r in range(m_cc)])
+    bell_cc = pq.ShotExpansion(
+        n_cc + m_cc, m_cc, A_cc, np.bitwise_or.reduce(A_cc, axis=0),
+        np.zeros((m_cc, m_cc), dtype=np.uint8), np.asarray(q_cc, dtype=np.int32),
+        np.array([1.0 + 0.0j], dtype=np.complex128), np.zeros((1, nw_cc), dtype=np.uint64),
+        np.zeros((1, m_cc), dtype=np.uint8), np.zeros(m_cc, dtype=np.uint8),
+    )
+    choi_r = pq.apply_quarter_turn(
+        pq.apply_ccz(bell_cc.copy(), [(z_cc, u3, 0), (z_cc, u62, 0), (z_cc, u69, 0)]), u62, z_cc, 0
+    )
+    choi_r_pad = pq.ShotExpansion(
+        135, choi_r.d, np.pad(choi_r.A_words, ((0, 0), (0, 1))), np.pad(choi_r.a_union, (0, 1)),
+        choi_r.Gamma.copy(), choi_r.pivots.copy(), choi_r.weights.copy(),
+        np.pad(choi_r.h_words, ((0, 0), (0, 1))), choi_r.ell.copy(), choi_r.ell_odd.copy(),
+    )
+    choi_l = pq.apply_pauli_t(pq.apply_quarter_turn(bell_cc.copy(), u3, z_cc, 0), z_cc, u69, 0, dag=False)
+    got_cc = pq.contract_choi_expansions(choi_l, choi_r_pad, n_cc, q_cc, True)
+    got_cc.check_invariants(require_canonical_offset=True)
+    want_cc = pq.apply_pauli_t(pq.apply_quarter_turn(choi_r.copy(), u3, z_cc, 0), z_cc, u69, 0, dag=False)
+    want_cc.weights = want_cc.weights * (2.0 ** -(m_cc >> 1))
+    active_cc = [*q_cc, n_cc, n_cc + 1, n_cc + 2]
+    np.testing.assert_allclose(
+        _extract_active_statevector(got_cc, active_cc),
+        _extract_active_statevector(want_cc, active_cc),
+        atol=1e-13,
+    )
+
+    # 2. Invalid q_act and invalid Choi pivots must raise ValueError cleanly (even on empty expansions).
+    empty_2 = pq.ShotExpansion.from_components((), n_qubits=2)
+    for bad_q in ((-1,), (2,), (0, 0), (0, 1, 2), (True,)):
+        with pytest.raises(ValueError):
+            pq.contract_choi_expansions(e0_2, e0_2, 2, bad_q, False)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            pq.contract_choi_expansions(empty_2, e0_2, 2, bad_q, False)  # type: ignore[arg-type]
+
+    # Choi left with a generator pivot on idle qubit 1 (not in q_act=(0,)) must be rejected.
+    bad_choi = pq.apply_quarter_turn(pq.ShotExpansion.zero(3), pq.unit_bit_words(1, 1), np.zeros(1, dtype=np.uint64), 0)
+    with pytest.raises(ValueError):
+        pq.contract_choi_expansions(bad_choi, e0_2, 2, (0,), False)
+
+    # Raw C ABI boundary also rejects out-of-range q_act with status 1 instead of out-of-bounds memory access.
+    lib = mk.get_magic_kernels_lib()
+    null_d = ctypes.cast(0, ctypes.POINTER(ctypes.c_double))
+    null_u64 = ctypes.cast(0, ctypes.POINTER(ctypes.c_uint64))
+    null_u8 = ctypes.cast(0, ctypes.POINTER(ctypes.c_uint8))
+    null_i32 = ctypes.cast(0, ctypes.POINTER(ctypes.c_int32))
+    out_chi, out_d = ctypes.c_size_t(99), ctypes.c_size_t(99)
+    bad_q_c = (ctypes.c_int32 * 1)(-1)
+    rc = int(
+        lib.magic_contract_choi(
+            0, 0, 1, null_d, null_u64, null_u8, null_u64, null_u8, null_i32, null_u8,
+            0, 0, 1, null_d, null_u64, null_u8, null_u64, null_u8, null_i32, null_u8,
+            2, bad_q_c, 1, 0, 1e-13,
+            ctypes.byref(out_chi), ctypes.byref(out_d),
+            null_d, null_u64, null_u8, null_u64, null_u8, null_i32, null_u8,
+        )
+    )
+    assert rc == 1 and out_chi.value == 0 and out_d.value == 0
+

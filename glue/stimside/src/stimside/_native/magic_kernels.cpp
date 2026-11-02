@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -1055,6 +1056,270 @@ void magic_project_diagonal(
         cancel_tol, out_chi, out_d, out_weights_ri, out_h_words, out_ell,
         out_A_words, out_Gamma, out_pivots, out_ell_odd, out_z_m
     );
+}
+
+int32_t magic_abi_v2() {
+    return 2;
+}
+
+int magic_contract_choi(
+    size_t chi_L,
+    size_t d_L,
+    size_t nw_L,
+    const double* w_ri_L,
+    const uint64_t* h_L,
+    const uint8_t* ell_L,
+    const uint64_t* A_L,
+    const uint8_t* G_L,
+    const int32_t* piv_L,
+    const uint8_t* eo_L,
+    size_t chi_R,
+    size_t d_R,
+    size_t nw_R,
+    const double* w_ri_R,
+    const uint64_t* h_R,
+    const uint8_t* ell_R,
+    const uint64_t* A_R,
+    const uint8_t* G_R,
+    const int32_t* piv_R,
+    const uint8_t* eo_R,
+    size_t n_op,
+    const int32_t* q_act,
+    size_t m,
+    int right_is_choi,
+    double cancel_tol,
+    size_t* out_chi,
+    size_t* out_d,
+    double* out_weights_ri,
+    uint64_t* out_h_words,
+    uint8_t* out_ell,
+    uint64_t* out_A_words,
+    uint8_t* out_Gamma,
+    int32_t* out_pivots,
+    uint8_t* out_ell_odd
+) {
+    if (out_chi) *out_chi = 0;
+    if (out_d) *out_d = 0;
+    if (m > n_op || (m > 0 && !q_act)) {
+        return 1;
+    }
+    try {
+        std::vector<uint8_t> is_act(n_op, 0U);
+        for (size_t r = 0; r < m; ++r) {
+            const int32_t q = q_act[r];
+            if (q < 0 || static_cast<size_t>(q) >= n_op || is_act[static_cast<size_t>(q)]) {
+                return 1;
+            }
+            is_act[static_cast<size_t>(q)] = 1U;
+        }
+        if (chi_L == 0 || chi_R == 0) {
+            return 0;
+        }
+        if (!w_ri_L || !w_ri_R || (d_L > 0 && (!piv_L || !eo_L)) || (d_R > 0 && (!piv_R || !eo_R))) {
+            return 1;
+        }
+        if (chi_R > (~size_t(0)) / chi_L) {
+            return 2;
+        }
+        const size_t prod_chi = chi_L * chi_R;
+        const size_t n_keep = right_is_choi ? (n_op + m) : n_op;
+        const size_t eff_keep = std::max<size_t>(1, n_keep);
+        const size_t nw_keep = std::max<size_t>(1, (eff_keep + 63) >> 6);
+        const size_t n_tot = std::max<size_t>(1, n_keep + 2 * m);
+        const size_t nw_tot = std::max<size_t>(1, (n_tot + 63) >> 6);
+        const size_t d_tot = d_L + d_R;
+
+        const size_t n_pL = 2 * m;
+        const size_t n_pR = right_is_choi ? (2 * m) : n_op;
+        std::vector<int32_t> src_L(n_pL), dst_L(n_pL), src_R(n_pR), dst_R(n_pR);
+        for (size_t r = 0; r < m; ++r) {
+            src_L[r] = q_act[r];
+            dst_L[r] = q_act[r];
+            src_L[m + r] = static_cast<int32_t>(n_op + r);
+            dst_L[m + r] = static_cast<int32_t>(n_keep + r);
+            src_R[r] = q_act[r];
+            dst_R[r] = static_cast<int32_t>(n_keep + m + r);
+            if (right_is_choi) {
+                src_R[m + r] = static_cast<int32_t>(n_op + r);
+                dst_R[m + r] = static_cast<int32_t>(n_op + r);
+            }
+        }
+        if (!right_is_choi) {
+            size_t idle_pos = m;
+            for (size_t q = 0; q < n_op; ++q) {
+                if (!is_act[q]) {
+                    src_R[idle_pos] = static_cast<int32_t>(q);
+                    dst_R[idle_pos] = static_cast<int32_t>(q);
+                    ++idle_pos;
+                }
+            }
+        }
+
+        auto scatter_row = [](
+            const uint64_t* src, size_t nw_src, uint64_t* dst,
+            const int32_t* s_bits, const int32_t* d_bits, size_t n_pairs
+        ) noexcept {
+            for (size_t i = 0; i < n_pairs; ++i) {
+                const size_t sb = static_cast<size_t>(s_bits[i]);
+                const size_t db = static_cast<size_t>(d_bits[i]);
+                if ((sb >> 6) < nw_src && ((src[sb >> 6] >> (sb & 63U)) & 1ULL)) {
+                    dst[db >> 6] ^= (uint64_t(1) << (db & 63U));
+                }
+            }
+        };
+        auto map_piv = [](
+            int32_t p, const int32_t* s_bits, const int32_t* d_bits, size_t n_pairs
+        ) noexcept -> int32_t {
+            for (size_t i = n_pairs; i > 0; --i) {
+                if (s_bits[i - 1] == p) return d_bits[i - 1];
+            }
+            return -1;
+        };
+
+        WorkShot work(
+            prod_chi, d_tot, std::max<size_t>(1, d_tot), nw_tot,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
+        );
+        for (size_t r = 0; r < d_L; ++r) {
+            if (A_L) scatter_row(&A_L[r * nw_L], nw_L, &work.A[r * nw_tot], src_L.data(), dst_L.data(), n_pL);
+            if (G_L) std::memcpy(&work.G[r * work.cap], &G_L[r * d_L], d_L * sizeof(uint8_t));
+            const int32_t mp = map_piv(piv_L[r], src_L.data(), dst_L.data(), n_pL);
+            if (mp < 0) return 1;
+            work.piv[r] = mp;
+            work.eo[r] = eo_L[r];
+        }
+        for (size_t r = 0; r < d_R; ++r) {
+            if (A_R) scatter_row(&A_R[r * nw_R], nw_R, &work.A[(d_L + r) * nw_tot], src_R.data(), dst_R.data(), n_pR);
+            if (G_R) std::memcpy(&work.G[(d_L + r) * work.cap + d_L], &G_R[r * d_R], d_R * sizeof(uint8_t));
+            const int32_t mp = map_piv(piv_R[r], src_R.data(), dst_R.data(), n_pR);
+            if (mp < 0) return 1;
+            work.piv[d_L + r] = mp;
+            work.eo[d_L + r] = eo_R[r];
+        }
+
+        std::vector<uint64_t> hL_scat(chi_L * nw_tot, 0ULL), hR_scat(chi_R * nw_tot, 0ULL);
+        if (h_L) {
+            for (size_t a = 0; a < chi_L; ++a) {
+                scatter_row(&h_L[a * nw_L], nw_L, &hL_scat[a * nw_tot], src_L.data(), dst_L.data(), n_pL);
+            }
+        }
+        if (h_R) {
+            for (size_t a = 0; a < chi_R; ++a) {
+                scatter_row(&h_R[a * nw_R], nw_R, &hR_scat[a * nw_tot], src_R.data(), dst_R.data(), n_pR);
+            }
+        }
+        for (size_t aL = 0; aL < chi_L; ++aL) {
+            const double wL_re = w_ri_L[2 * aL];
+            const double wL_im = w_ri_L[2 * aL + 1];
+            const uint64_t* hL_row = &hL_scat[aL * nw_tot];
+            for (size_t aR = 0; aR < chi_R; ++aR) {
+                const size_t idx = aL * chi_R + aR;
+                const double wR_re = w_ri_R[2 * aR];
+                const double wR_im = w_ri_R[2 * aR + 1];
+                work.w_ri[2 * idx] = wL_re * wR_re - wL_im * wR_im;
+                work.w_ri[2 * idx + 1] = wL_re * wR_im + wL_im * wR_re;
+                uint64_t* dst_h = &work.h[idx * nw_tot];
+                const uint64_t* hR_row = &hR_scat[aR * nw_tot];
+                for (size_t w = 0; w < nw_tot; ++w) {
+                    dst_h[w] = hL_row[w] ^ hR_row[w];
+                }
+                if (d_L > 0 && ell_L) {
+                    std::memcpy(&work.ell[idx * work.cap], &ell_L[aL * d_L], d_L * sizeof(uint8_t));
+                }
+                if (d_R > 0 && ell_R) {
+                    std::memcpy(&work.ell[idx * work.cap + d_L], &ell_R[aR * d_R], d_R * sizeof(uint8_t));
+                }
+            }
+        }
+
+        std::vector<uint8_t> lam_buf(std::max<size_t>(1, d_tot), 0U);
+        std::vector<uint8_t> eps_buf(prod_chi, 0U);
+        for (size_t j = 0; j < m; ++j) {
+            const int32_t qL = static_cast<int32_t>(n_keep + j);
+            const int32_t qR = static_cast<int32_t>(n_keep + m + j);
+            for (size_t r = 0; r < work.d; ++r) {
+                lam_buf[r] = static_cast<uint8_t>(
+                    get_bit(&work.A[r * nw_tot], qL) ^ get_bit(&work.A[r * nw_tot], qR)
+                );
+            }
+            for (size_t a = 0; a < work.chi; ++a) {
+                eps_buf[a] = static_cast<uint8_t>(
+                    get_bit(&work.h[a * nw_tot], qL) ^ get_bit(&work.h[a * nw_tot], qR)
+                );
+            }
+            work.restrict_amplitude(lam_buf.data(), eps_buf.data(), kInvSqrt2);
+            if (work.chi == 0) {
+                if (out_chi) *out_chi = 0;
+                if (out_d) *out_d = work.d;
+                return 0;
+            }
+            const size_t wL = static_cast<size_t>(qL) >> 6, sL = static_cast<size_t>(qL) & 63U;
+            const size_t wR = static_cast<size_t>(qR) >> 6, sR = static_cast<size_t>(qR) & 63U;
+            const uint64_t maskL = ~(uint64_t(1) << sL);
+            const uint64_t maskR = ~(uint64_t(1) << sR);
+            for (size_t r = 0; r < work.d; ++r) {
+                work.A[r * nw_tot + wL] &= maskL;
+                work.A[r * nw_tot + wR] &= maskR;
+            }
+            for (size_t a = 0; a < work.chi; ++a) {
+                work.h[a * nw_tot + wL] &= maskL;
+                work.h[a * nw_tot + wR] &= maskR;
+            }
+            for (size_t r0 = 0; r0 < work.d; ++r0) {
+                if (work.piv[r0] == qL || work.piv[r0] == qR) {
+                    const int32_t p_new = first_set_bit_in_words(&work.A[r0 * nw_tot], nw_tot);
+                    if (p_new >= 0) {
+                        work.make_principal(r0, p_new);
+                    } else {
+                        work.eliminate_zero_amplitude(r0);
+                    }
+                    break;
+                }
+            }
+            if (work.chi == 0) {
+                if (out_chi) *out_chi = 0;
+                if (out_d) *out_d = work.d;
+                return 0;
+            }
+        }
+
+        const uint64_t tm_keep = tail_mask(eff_keep);
+        if (nw_keep < nw_tot) {
+            for (size_t r = 0; r < work.d; ++r) {
+                std::memmove(&work.A[r * nw_keep], &work.A[r * nw_tot], nw_keep * sizeof(uint64_t));
+            }
+            for (size_t a = 0; a < work.chi; ++a) {
+                std::memmove(&work.h[a * nw_keep], &work.h[a * nw_tot], nw_keep * sizeof(uint64_t));
+            }
+            work.nw = nw_keep;
+        }
+        for (size_t r = 0; r < work.d; ++r) {
+            work.A[r * nw_keep + (nw_keep - 1)] &= tm_keep;
+        }
+        for (size_t a = 0; a < work.chi; ++a) {
+            work.h[a * nw_keep + (nw_keep - 1)] &= tm_keep;
+        }
+        work.export_and_merge(
+            cancel_tol, out_chi, out_d,
+            out_weights_ri, out_h_words, out_ell,
+            out_A_words, out_Gamma, out_pivots, out_ell_odd, nullptr
+        );
+        if ((m & 1U) != 0U && out_chi && *out_chi > 0) {
+            const size_t oc = *out_chi;
+            for (size_t a = 0; a < 2 * oc; ++a) {
+                out_weights_ri[a] *= kSqrt2;
+            }
+        }
+        return 0;
+    } catch (const std::bad_alloc&) {
+        if (out_chi) *out_chi = 0;
+        if (out_d) *out_d = 0;
+        return 2;
+    } catch (...) {
+        if (out_chi) *out_chi = 0;
+        if (out_d) *out_d = 0;
+        return 3;
+    }
 }
 
 }  // extern "C"
