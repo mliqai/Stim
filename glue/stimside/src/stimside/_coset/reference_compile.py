@@ -17,6 +17,7 @@ from stimside.util.reference_chp import (
     ReferenceCHPTableau,
     get_cached_gate_tableau,
     pauli_image,
+    pauli_image_batch,
 )
 
 RawFactor = (
@@ -324,6 +325,92 @@ class UnitaryStepMeta(_StepWordsMixin):
         )
         self._cocycle_cache[g_idx] = cocycle
         return cocycle
+
+    def get_cpp_cocycle_arrays(
+        self, n_words: int
+    ) -> tuple[int, int, int, NDArray[np.int64], list[NDArray]]:
+        """Vectorized compilation of C++ cocycle arrays across all disjoint target groups."""
+        if self._cpp_cocycle_arrays is not None:
+            return self._cpp_cocycle_arrays
+        num_g = len(self.target_groups)
+        arity = 2 if stim.gate_data(self.gate_name).is_two_qubit_gate else 1
+        raw_factors = get_inverse_clifford_mrqf_factors(self.gate_name)
+        n_fac = len(raw_factors)
+        t_groups = (
+            np.array(self.target_groups, dtype=np.int64)
+            if num_g > 0
+            else np.empty((0, arity), dtype=np.int64)
+        )
+        packed_tables = self._get_packed_words(n_words)
+        slot_cache: dict[
+            tuple[int, int, int],
+            tuple[NDArray[np.uint64], NDArray[np.uint64], NDArray[np.uint8]],
+        ] = {}
+
+        def _compile_batch_tuple(
+            lx: tuple[int, ...], lz: tuple[int, ...], sgn: int
+        ) -> tuple[NDArray[np.uint64], NDArray[np.uint64], NDArray[np.uint8]]:
+            terms = []
+            for r, (bx, bz) in enumerate(zip(lx, lz)):
+                if bx == 0 and bz == 0:
+                    continue
+                key = (r, bx, bz)
+                term = slot_cache.get(key)
+                if term is None:
+                    pauli = "X" if (bx, bz) == (1, 0) else ("Z" if (bx, bz) == (0, 1) else "Y")
+                    term = pauli_image_batch(pauli, t_groups[:, r], *packed_tables)
+                    slot_cache[key] = term
+                terms.append(term)
+            if len(terms) == 1:
+                a_w, b_w, kap = terms[0]
+                return a_w, b_w, (((kap + 2) & 3).astype(np.uint8) if sgn == -1 else kap)
+            a1, b1, k1 = terms[0]
+            a2, b2, k2 = terms[1]
+            dp = (
+                (np.bitwise_count(b1[:, 0] & a2[:, 0]).astype(np.int32) & 1)
+                if n_words == 1
+                else (np.bitwise_count(b1 & a2).sum(axis=1, dtype=np.int32) & 1)
+            )
+            add_s = 2 if sgn == -1 else 0
+            kap = ((k1.astype(np.int32) + k2.astype(np.int32) + (dp << 1) + add_s) & 3).astype(np.uint8)
+            return a1 ^ a2, b1 ^ b2, kap
+
+        g_f = (num_g, n_fac)
+        shapes = [g_f, (*g_f, arity), (*g_f, n_words)]
+        f_arrs = [
+            np.zeros(shapes[s], dtype=np.uint64 if s == 2 else np.uint8)
+            for s in (0, 1, 1, 2, 2, 0, 1, 1, 2, 2, 0)
+        ]
+        f_kinds, f_lx1, f_lz1, f_a1, f_b1, f_k1 = f_arrs[:6]
+        f_lx2, f_lz2, f_a2, f_b2, f_k2 = f_arrs[6:]
+        for f_i, f in enumerate(raw_factors):
+            if f[0] == "PCP":
+                _, lx1, lz1, sgn1, lx2, lz2, sgn2 = f
+                aw1, bw1, kap1 = _compile_batch_tuple(lx1, lz1, sgn1)
+                aw2, bw2, kap2 = _compile_batch_tuple(lx2, lz2, sgn2)
+                f_kinds[:, f_i] = 2
+                f_lx1[:, f_i] = lx1
+                f_lz1[:, f_i] = lz1
+                f_a1[:, f_i] = aw1
+                f_b1[:, f_i] = bw1
+                f_k1[:, f_i] = kap1
+                f_lx2[:, f_i] = lx2
+                f_lz2[:, f_i] = lz2
+                f_a2[:, f_i] = aw2
+                f_b2[:, f_i] = bw2
+                f_k2[:, f_i] = kap2
+            else:
+                kind, lx, lz, sgn = f
+                aw, bw, kap = _compile_batch_tuple(lx, lz, sgn)
+                f_kinds[:, f_i] = 0 if kind == "P1" else 1
+                f_lx1[:, f_i] = lx
+                f_lz1[:, f_i] = lz
+                f_a1[:, f_i] = aw
+                f_b1[:, f_i] = bw
+                f_k1[:, f_i] = kap
+        self._cpp_cocycle_arrays = (num_g, arity, n_fac, t_groups, f_arrs)
+        return self._cpp_cocycle_arrays
+
 
 
 @dataclasses.dataclass

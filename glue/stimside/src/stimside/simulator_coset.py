@@ -914,48 +914,9 @@ class CosetsideSimulator(
                 self._sync_py_to_cpp()
                 self._apply_unitary_to_frames(op)
                 lib = self._cpp_lib
-                if step_meta._cpp_cocycle_arrays is None:
-                    num_g = len(step_meta.target_groups)
-                    arity = len(step_meta.target_groups[0])
-                    cocycles = [
-                        step_meta.get_inverse_cocycle(
-                            g, self.num_qubits, self._n_words
-                        )
-                        for g in range(num_g)
-                    ]
-                    n_fac = len(cocycles[0].factors)
-                    t_groups = np.array(step_meta.target_groups, dtype=np.int64)
-                    g_f = (num_g, n_fac)
-                    shapes = [g_f, (*g_f, arity), (*g_f, self._n_words)]
-                    # C-call order: kinds, then (lx, lz, a, b, kappa) for factor halves 1 and 2.
-                    f_arrs = [
-                        np.zeros(shapes[s], dtype=np.uint64 if s == 2 else np.uint8)
-                        for s in (0, 1, 1, 2, 2, 0, 1, 1, 2, 2, 0)
-                    ]
-                    f_kinds, f_lx1, f_lz1, f_a1, f_b1, f_k1 = f_arrs[:6]
-                    f_lx2, f_lz2, f_a2, f_b2, f_k2 = f_arrs[6:]
-                    for g_i, coc in enumerate(cocycles):
-                        for f_i, fac in enumerate(coc.factors):
-                            f_kinds[g_i, f_i] = (
-                                0
-                                if fac.kind == "P1"
-                                else (1 if fac.kind == "P2" else 2)
-                            )
-                            f_lx1[g_i, f_i] = fac.local_x
-                            f_lz1[g_i, f_i] = fac.local_z
-                            f_a1[g_i, f_i] = fac.a_words
-                            f_b1[g_i, f_i] = fac.b_words
-                            f_k1[g_i, f_i] = fac.kappa
-                            if fac.kind == "PCP":
-                                f_lx2[g_i, f_i] = fac.local_x2
-                                f_lz2[g_i, f_i] = fac.local_z2
-                                f_a2[g_i, f_i] = fac.a2_words
-                                f_b2[g_i, f_i] = fac.b2_words
-                                f_k2[g_i, f_i] = fac.kappa2
-                    step_meta._cpp_cocycle_arrays = (
-                        num_g, arity, n_fac, t_groups, f_arrs
-                    )
-                num_g, arity, n_fac, t_groups, f_arrs = step_meta._cpp_cocycle_arrays
+                num_g, arity, n_fac, t_groups, f_arrs = step_meta.get_cpp_cocycle_arrays(
+                    self._n_words
+                )
                 xs_base, zs_base, _, _, _ = self._flip_simulator.to_numpy(
                     output_xs=True, output_zs=True
                 )

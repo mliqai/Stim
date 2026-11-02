@@ -186,3 +186,40 @@ def test_coset_in_place_circuit_mutation_re_parses_tags():
     s2 = CosetsideSimulator(c, compiled_op_handler=h2, batch_size=4, seed=5)
     s2.run()
     assert np.all(h2.state[0] == 2) and np.all(h2.state[1] == 2)
+
+
+def test_vectorized_cpp_cocycle_arrays_match_per_group_cocycles():
+    from stimside._coset.reference_compile import CompiledReferenceCircuit, UnitaryStepMeta
+
+    gates_1q = ("H", "S", "S_DAG", "SQRT_X", "SQRT_Y_DAG", "H_XY", "H_YZ", "C_XYZ", "C_ZYX")
+    gates_2q = ("CZ", "CX", "CY", "XCZ", "YCX", "SWAP", "ISWAP", "ISWAP_DAG", "SQRT_XX", "SQRT_ZZ_DAG", "CXSWAP")
+    for n_q in (8, 140):
+        c = stim.Circuit()
+        c.append("H", list(range(0, n_q, 2)))
+        c.append("CX", [q for i in range(0, n_q - 1, 2) for q in (i, i + 1)])
+        for g in gates_1q:
+            c.append(g, list(range(n_q)))
+        for g in gates_2q:
+            c.append(g, [q for i in range(0, n_q - 1, 2) for q in (i, i + 1)])
+        comp = CompiledReferenceCircuit(c)
+        for st in comp.steps:
+            if not isinstance(st, UnitaryStepMeta) or st.gate_name in ("I", "II", "X", "Y", "Z"):
+                continue
+            num_g, _, _, _, f_arrs = st.get_cpp_cocycle_arrays(comp.n_words)
+            for g_i in range(num_g):
+                coc = st.get_inverse_cocycle(g_i, comp.num_qubits, comp.n_words)
+                for f_i, fac in enumerate(coc.factors):
+                    want_k = 0 if fac.kind == "P1" else (1 if fac.kind == "P2" else 2)
+                    assert int(f_arrs[0][g_i, f_i]) == want_k
+                    np.testing.assert_array_equal(f_arrs[1][g_i, f_i], fac.local_x)
+                    np.testing.assert_array_equal(f_arrs[2][g_i, f_i], fac.local_z)
+                    np.testing.assert_array_equal(f_arrs[3][g_i, f_i], fac.a_words)
+                    np.testing.assert_array_equal(f_arrs[4][g_i, f_i], fac.b_words)
+                    assert int(f_arrs[5][g_i, f_i]) == fac.kappa
+                    if fac.kind == "PCP":
+                        np.testing.assert_array_equal(f_arrs[6][g_i, f_i], fac.local_x2)
+                        np.testing.assert_array_equal(f_arrs[7][g_i, f_i], fac.local_z2)
+                        np.testing.assert_array_equal(f_arrs[8][g_i, f_i], fac.a2_words)
+                        np.testing.assert_array_equal(f_arrs[9][g_i, f_i], fac.b2_words)
+                        assert int(f_arrs[10][g_i, f_i]) == fac.kappa2
+
