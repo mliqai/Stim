@@ -451,4 +451,33 @@ class TestFlipsideSimulator:
             assert bool(fss.get_observable_flips(observable_index=0, instance_index=s_idx)) == bool(full_obs[0, s_idx])
             assert int(fss.get_observable_flips(observable_index=0, instance_index=s_idx, bit_packed=True)) == int(full_obs[0, s_idx])
 
+    def test_flip_sync_reference_handles_repeated_qubit_mpp_terms(self):
+        from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8
+
+        circuit = stim.Circuit(
+            "H 0 1\n"
+            "MPP X0*X0*X1 !X0*X0 Z0*Z0\n"
+            "R 0 1\n"
+            "MPP X0*Y0*X1*Y1\n"
+            "DETECTOR rec[-4]\n"
+            "DETECTOR rec[-3]\n"
+            "DETECTOR rec[-2]\n"
+            "DETECTOR rec[-1]\n"
+        )
+        fss = FlipsideSimulator(
+            circuit=circuit,
+            compiled_op_handler=LeakageUint8().compile_op_handler(circuit=circuit, batch_size=32),
+            batch_size=32,
+            seed=7,
+        )
+        fss.run()
+        recs = fss.get_final_measurement_records()
+        assert recs.shape == (32, 4)
+        np.testing.assert_array_equal(recs[:, 0], False)
+        np.testing.assert_array_equal(recs[:, 1], True)
+        np.testing.assert_array_equal(recs[:, 2], False)
+        np.testing.assert_array_equal(recs[:, 3], True)
+        assert not np.any(fss.get_detector_flips())
+
+
 

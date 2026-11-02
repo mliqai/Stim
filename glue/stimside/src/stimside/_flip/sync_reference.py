@@ -86,21 +86,30 @@ def compute_sync_reference(
                     inv_res ^= bool(gt.is_inverted_result_target)
                     p_str = gt.pauli_type if name == "MPP" else name[-1]
                     term_paulis.append((q_r, p_str))
-                    if p_str == "X":
-                        ref_ts.h(q_r)
-                    elif p_str == "Y":
-                        ref_ts.h_yz(q_r)
-                q0 = term_paulis[0][0]
-                for q_r, _ in term_paulis[1:]:
-                    ref_ts.cnot(q_r, q0)
-                m_val = ref_ts.measure(q0)
-                for q_r, _ in reversed(term_paulis[1:]):
-                    ref_ts.cnot(q_r, q0)
-                for q_r, p_str in reversed(term_paulis):
-                    if p_str == "X":
-                        ref_ts.h(q_r)
-                    elif p_str == "Y":
-                        ref_ts.h_yz(q_r)
+                if len({q_r for q_r, _ in term_paulis}) < len(term_paulis):
+                    ps = stim.PauliString(num_qubits)
+                    for q_r, p_str in term_paulis:
+                        single = stim.PauliString(num_qubits)
+                        single[q_r] = p_str
+                        ps *= single
+                    m_val = ref_ts.measure_observable(ps)
+                else:
+                    for q_r, p_str in term_paulis:
+                        if p_str == "X":
+                            ref_ts.h(q_r)
+                        elif p_str == "Y":
+                            ref_ts.h_yz(q_r)
+                    q0 = term_paulis[0][0]
+                    for q_r, _ in term_paulis[1:]:
+                        ref_ts.cnot(q_r, q0)
+                    m_val = ref_ts.measure(q0)
+                    for q_r, _ in reversed(term_paulis[1:]):
+                        ref_ts.cnot(q_r, q0)
+                    for q_r, p_str in reversed(term_paulis):
+                        if p_str == "X":
+                            ref_ts.h(q_r)
+                        elif p_str == "Y":
+                            ref_ts.h_yz(q_r)
                 crs_list.append(bool(m_val) ^ inv_res)
             ref_chunks.append(np.array(crs_list, dtype=np.bool_))
         else:

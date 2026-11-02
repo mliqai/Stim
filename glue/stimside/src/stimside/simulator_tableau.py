@@ -486,7 +486,12 @@ class TablesideSimulator(
             if self._construct_reference_circuit:
                 self._new_reference_circuit.append(op)
             if self._running_tableau:
-                self._tableau_simulator.do(op)
+                if self._sync_tableside_rng:
+                    from stimside._tableau.runner import do_sync_bare_inst
+
+                    do_sync_bare_inst(self._tableau_simulator, op)
+                else:
+                    self._tableau_simulator.do(op)
 
     def _do_bare_only_on_tableau(self, op: stim.Circuit | stim.CircuitInstruction):
         """
@@ -500,7 +505,12 @@ class TablesideSimulator(
         else:
             self._new_circuit.append(op)
             if self._running_tableau:
-                self._tableau_simulator.do(op)
+                if self._sync_tableside_rng:
+                    from stimside._tableau.runner import do_sync_bare_inst
+
+                    do_sync_bare_inst(self._tableau_simulator, op)
+                else:
+                    self._tableau_simulator.do(op)
 
     def _append_to_new_reference_circuit(
         self, op: stim.Circuit | stim.CircuitInstruction

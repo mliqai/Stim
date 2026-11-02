@@ -746,7 +746,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._measurement_columns.append(~m_shots if inv else m_shots.copy())
                 seg_len += 1
                 seen |= supp
-                if ((idx + 1 == len(specs)) or bool(seen & specs[idx + 1][0])) and p_err > 0.0:
+                if ((idx + 1 == len(specs)) or (cname in ("MPP", "MXX", "MYY", "MZZ") and bool(seen & specs[idx + 1][0]))) and p_err > 0.0:
                     self._apply_meas_flip_noise(p_err, seg_len)
                     seg_len = 0
                     seen.clear()

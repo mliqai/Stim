@@ -495,3 +495,47 @@ def test_repeated_targets_in_leakage_projection_z_and_mr():
         )
         for b in range(4):
             assert rec[b].tolist() == [True, False, True, True]
+
+
+@pytest.mark.parametrize(
+    "program",
+    [
+        "MX 3 4 2",
+        "MY 2 0 1",
+        "MRX 3 4 2",
+        "H 1 3\nCX 1 0 3 2\nRX 3 1\nM 0 1 2 3",
+        "MXX 3 1 2 0",
+        "MX 2 2 0",
+        "H 0\nM(0.05) 0 0",
+        "MRX(0.05) 0 0",
+    ],
+)
+def test_sync_3way_lockstep_xy_collapses_and_repeated_noisy_1q_meas(program: str):
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+    from stimside.simulator_magic import MagicsideSimulator
+
+    circuit = stim.Circuit(program)
+    _, t_rec, _, _, _ = _run_sim(
+        TablesideSimulator, LeakageUint8Tableau, circuit, seed=1001, batch_size=64, sync=True
+    )
+    _, c_rec, _, _, _ = _run_sim(
+        CosetsideSimulator, LeakageUint8Coset, circuit, seed=1001, batch_size=64, sync=True
+    )
+    _, m_rec, _, _, _ = _run_sim(
+        MagicsideSimulator, LeakageUint8Magic, circuit, seed=1001, batch_size=64, sync=True
+    )
+    np.testing.assert_array_equal(t_rec, c_rec)
+    np.testing.assert_array_equal(c_rec, m_rec)
+
+    # Also verify interactive/slow sync path on batch_size=1 matches shot 0:
+    t_int = TablesideSimulator(
+        circuit,
+        compiled_op_handler=LeakageUint8Tableau().compile_op_handler(circuit=circuit, batch_size=1),
+        seed=1001,
+        batch_size=1,
+        sync_tableside_rng=True,
+    )
+    t_int.interactive_do(circuit)
+    t_int.finish_interactive_run()
+    np.testing.assert_array_equal(t_int.get_final_measurement_records()[0], c_rec[0])
+

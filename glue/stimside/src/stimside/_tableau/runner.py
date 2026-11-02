@@ -654,6 +654,17 @@ def _leaked_meas_text(qs: np.ndarray, p2: float, bare_text: str) -> str:
     return f"R {t}\n{x}{bare_text}DEPOLARIZE1(0.75) {t}\n"
 
 
+_XY_BASIS_COLLAPSE = frozenset({"MX", "MY", "MRX", "MRY", "RX", "RY", "MXX", "MYY"})
+
+
+def do_sync_bare_inst(tab: stim.TableauSimulator, inst: stim.CircuitInstruction) -> None:
+    if inst.name in _XY_BASIS_COLLAPSE and not inst.gate_args_copy():
+        for g in inst.target_groups():  # stim collapses fused X/Y targets in sorted order
+            tab.do(stim.CircuitInstruction(inst.name, g))
+    else:
+        tab.do(inst)
+
+
 class _StepCursor:
     """Shared circuit/tableau slice-flush and handler-yield cursor for Tableside runners."""
 
@@ -679,9 +690,8 @@ class _StepCursor:
         if self.use_tab and q_end > self.q:
             tab = self.tss._tableau_simulator
             if self.sync:
-                do = tab.do
                 for inst in self.pre.quantum_bare_insts[self.q : q_end]:
-                    do(inst)
+                    do_sync_bare_inst(tab, inst)
             else:
                 tab.do_circuit(self.pre.get_quant_slice(self.q, q_end))
             self.q = q_end
