@@ -189,11 +189,19 @@ struct FastEngine {
         actions.push_back({ACT_MODIFIED_MEAS, step_idx, 0, off, leaked_cnt, st.meas_leak_prob});
     }
 
+    inline static double safe_log1mp(double p) {
+        double omp = 1.0 - p;
+        return (omp < 1.0) ? std::log(omp) : -p;
+    }
+
     // Geometric skip length for sparse Bernoulli(p) sampling; consumes exactly one RNG draw.
     inline int next_skip(double log1mp) {
         double u_skip = next_double();
         if (u_skip <= 1e-16) u_skip = 1e-16;
-        return 1 + (int)(std::log(u_skip) / log1mp);
+        if (!(log1mp < 0.0)) return INT32_MAX - 1;
+        double skip = std::floor(std::log(u_skip) / log1mp);
+        if (!(skip >= 0.0 && skip < (double)(INT32_MAX - 2))) return INT32_MAX - 1;
+        return 1 + (int)skip;
     }
 
     inline void clear_bufs() {
@@ -221,6 +229,10 @@ struct FastEngine {
         }
     }
 };
+
+int tableside_kernels_abi_v1(void) {
+    return 1;
+}
 
 int fast_format_stim_op(
     const char* op_name,
@@ -483,8 +495,8 @@ int fast_engine_run_segment(
                 const TransBranch* br = &eng->all_branches[st.trans_offset];
 
                 if (!has_leaked && st.p_total_u > 0.0 && st.p_total_u < 0.05) {
-                    double log1mp = std::log(1.0 - st.p_total_u);
-                    int idx = -1;
+                    double log1mp = FastEngine::safe_log1mp(st.p_total_u);
+                    int64_t idx = -1;
                     while (true) {
                         idx += eng->next_skip(log1mp);
                         if (idx >= st.target_count) break;
@@ -530,8 +542,8 @@ int fast_engine_run_segment(
                 const TransBranch* br = &eng->all_branches[st.trans_offset];
 
                 if (!has_leaked && st.p_total_u > 0.0 && st.p_total_u < 0.05) {
-                    double log1mp = std::log(1.0 - st.p_total_u);
-                    int pair_idx = -1;
+                    double log1mp = FastEngine::safe_log1mp(st.p_total_u);
+                    int64_t pair_idx = -1;
                     while (true) {
                         pair_idx += eng->next_skip(log1mp);
                         if (pair_idx >= num_pairs) break;
@@ -598,8 +610,8 @@ int fast_engine_run_segment(
                 const int32_t* q_ptr = &eng->all_qubit_targets[st.target_offset];
                 if (st.p_total_u > 0.0) {
                     if (st.p_total_u < 0.05) {
-                        double log1mp = std::log(1.0 - st.p_total_u);
-                        int idx = -1;
+                        double log1mp = FastEngine::safe_log1mp(st.p_total_u);
+                        int64_t idx = -1;
                         while (true) {
                             idx += eng->next_skip(log1mp);
                             if (idx >= st.target_count) break;

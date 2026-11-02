@@ -168,3 +168,21 @@ def test_conditional_pauli_noise_duplicate_targets():
     assert np.all(recs == False), (
         "X_ERROR(1.0) 0 0 should apply X^2 = I on unleaked shots"
     )
+
+
+def test_coset_in_place_circuit_mutation_re_parses_tags():
+    c = stim.Circuit("I[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nM 0 1")
+    h1 = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=4)
+    s1 = CosetsideSimulator(c, compiled_op_handler=h1, batch_size=4, seed=5)
+    s1.run()
+    assert np.all(h1.state[0] == 2) and np.all(h1.state[1] == 0)
+
+    # Stim fuses the two identical tagged I instructions, keeping len(c) == 2.
+    c.pop()
+    c.append("I", [1], tag="LEAKAGE_TRANSITION_1: (1.0, U-->2)")
+    c.append("M", [0, 1])
+    assert len(c) == 2
+    h2 = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=4)
+    s2 = CosetsideSimulator(c, compiled_op_handler=h2, batch_size=4, seed=5)
+    s2.run()
+    assert np.all(h2.state[0] == 2) and np.all(h2.state[1] == 2)

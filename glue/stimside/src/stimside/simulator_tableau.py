@@ -185,13 +185,10 @@ class TablesideSimulator(
         can_use_fast = (
             pre is not None
             and hasattr(coh, "ops_to_params")
-            and len(coh.ops_to_params) == pre.num_claimed_ops
-            and (
-                coh.ops_to_params is pre.parsed_ops
-                or all(
-                    isinstance(v, _STANDARD_LEAKAGE_PARAM_TYPES)
-                    for v in coh.ops_to_params.values()
-                )
+            and coh.ops_to_params == pre.parsed_ops
+            and all(
+                isinstance(v, _STANDARD_LEAKAGE_PARAM_TYPES)
+                for v in coh.ops_to_params.values()
             )
         )
 

@@ -106,7 +106,7 @@ def get_tableside_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
     return get_lib(
         sys.modules[__name__],
         "tableside_kernels",
-        "fast_engine_get_segment_events",
+        "tableside_kernels_abi_v1",
         _SPECS,
         force_recompile=force_recompile,
     )

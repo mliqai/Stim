@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+import sys
 from typing import TYPE_CHECKING, Any
+import weakref
 
 import numpy as np
 import stim  # type: ignore[import-untyped]
@@ -468,7 +470,6 @@ class PrecompiledTablesideCircuit:
                     # may be leaked; otherwise the bare SWAP runs in the slice (state swap is a no-op).
                     emit(bare_inst, bare_inst, 8)
 
-        self.num_claimed_ops = len(self.parsed_ops)
         self.step_to_full_idx.append(len(self.full_bare_insts))
         self.step_to_quant_idx.append(len(self.quantum_bare_insts))
         self.num_steps = len(self.steps_py)
@@ -579,10 +580,11 @@ class PrecompiledTablesideCircuit:
         return self._quantum_bare_circuit
 
     def acquire_cpp_runner(self, seed: int) -> "CppTablesideRunner":
-        if self._runner_pool:
+        while self._runner_pool:
             runner = self._runner_pool.pop()
-            runner.clear(seed)
-            return runner
+            if sys.getrefcount(runner._raw_state) == runner._idle_state_refs:
+                runner.clear(seed)
+                return runner
         return CppTablesideRunner(self, seed)
 
     def release_cpp_runner(self, runner: "CppTablesideRunner") -> None:
@@ -601,7 +603,12 @@ class PrecompiledTablesideCircuit:
 
 
 _PRECOMPILED_CACHE: dict[
-    tuple[int, int, bool], tuple[stim.Circuit, PrecompiledTablesideCircuit]
+    tuple[int, int, bool],
+    tuple[
+        stim.Circuit,
+        dict[stim.CircuitInstruction, LeakageParams] | None,
+        PrecompiledTablesideCircuit,
+    ],
 ] = {}
 
 
@@ -610,14 +617,21 @@ def get_precompiled_circuit(
     unconditional_condition_on_U: bool,
     parsed_ops: dict[stim.CircuitInstruction, LeakageParams] | None = None,
 ) -> PrecompiledTablesideCircuit:
-    key = (id(circuit), len(circuit), bool(unconditional_condition_on_U))
+    ucu = bool(unconditional_condition_on_U)
+    key = (id(circuit), len(circuit), ucu)
     entry = _PRECOMPILED_CACHE.get(key)
-    if entry is not None and entry[0] is circuit and len(circuit) == key[1]:
-        return entry[1]
-    pre = PrecompiledTablesideCircuit(circuit, unconditional_condition_on_U, parsed_ops)
-    if len(_PRECOMPILED_CACHE) >= 16:
+    if (
+        entry is not None
+        and entry[0] == circuit
+        and (parsed_ops is None and entry[1] is None or entry[1] == parsed_ops)
+    ):
+        return entry[2]
+    snap = circuit.copy()
+    ops_snap = dict(parsed_ops) if parsed_ops is not None else None
+    pre = PrecompiledTablesideCircuit(snap, ucu, ops_snap)
+    if len(_PRECOMPILED_CACHE) >= 16 and key not in _PRECOMPILED_CACHE:
         _PRECOMPILED_CACHE.pop(next(iter(_PRECOMPILED_CACHE)))
-    _PRECOMPILED_CACHE[key] = (circuit, pre)
+    _PRECOMPILED_CACHE[key] = (snap, ops_snap, pre)
     return pre
 
 
@@ -738,6 +752,12 @@ def run_tableside_sync_rng(
     cur.finish()
 
 
+class _EngineOwner:
+    """Lifetime anchor ensuring FastEngine outlives all ctypes/NumPy views of its state buffer."""
+
+    __slots__ = ("__weakref__",)
+
+
 class CppTablesideRunner:
     """Tier 2 C++ FastEngine wrapper bound to a TablesideSimulator instance."""
 
@@ -762,17 +782,20 @@ class CppTablesideRunner:
             len(pre._c_branches) if pre._c_branches is not None else 0,
             pre._c_branches,
         )
+        owner = _EngineOwner()
+        weakref.finalize(owner, self.lib.fast_engine_destroy, self._eng)
         state_ptr = self.lib.fast_engine_get_state_ptr(self._eng)
-        self.state = np.ctypeslib.as_array(
-            state_ptr, shape=(max(1, pre.num_qubits),)
-        )[: pre.num_qubits]
+        n_alloc = max(1, pre.num_qubits)
+        c_buf = (ctypes.c_uint8 * n_alloc).from_address(
+            ctypes.cast(state_ptr, ctypes.c_void_p).value
+        )
+        c_buf._engine_owner = owner  # type: ignore[attr-defined]
+        raw_state = np.ctypeslib.as_array(c_buf)
+        self._raw_state = raw_state
+        self.state = raw_state if pre.num_qubits == n_alloc else raw_state[: pre.num_qubits]
+        del owner, c_buf, raw_state
+        self._idle_state_refs = sys.getrefcount(self._raw_state)
         self._fmt_buf = ctypes.create_string_buffer(32768)
-
-    def __del__(self) -> None:
-        eng = getattr(self, "_eng", None)
-        if eng is not None and getattr(self, "lib", None) is not None:
-            self.lib.fast_engine_destroy(eng)
-            self._eng = None
 
     def clear(self, new_seed: int) -> None:
         self._shot_seed = int(new_seed) + 1000

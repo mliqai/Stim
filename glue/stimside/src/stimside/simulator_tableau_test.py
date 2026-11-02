@@ -639,3 +639,139 @@ def test_cpp_format_op_round_trips_high_precision_gate_args():
         if inst.name == "X_ERROR"
     ]
     assert x_err_args == [p_filt, p_meas]
+
+
+def test_retained_handler_state_survives_gc_cache_eviction_and_pool_reuse():
+    import gc
+    import weakref
+    from stimside._tableau.runner import _PRECOMPILED_CACHE
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    c = stim.Circuit("I[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nM 0 1")
+    coh1 = LeakageUint8().compile_op_handler(circuit=c, batch_size=1)
+    sim1 = TablesideSimulator(circuit=c, compiled_op_handler=coh1, batch_size=1, seed=11)
+    owner_ref = weakref.ref(sim1._cpp_runner._raw_state.base.obj._engine_owner)
+    sim1.run()
+    view1 = coh1.state[:2]
+    assert view1.tolist() == [2, 0]
+
+    # Pool reuse check: a second simulator while coh1/view1 are alive must not alias or clobber view1.
+    del sim1
+    gc.collect()
+    coh2 = LeakageUint8().compile_op_handler(circuit=c, batch_size=1)
+    sim2 = TablesideSimulator(circuit=c, compiled_op_handler=coh2, batch_size=1, seed=12)
+    sim2.clear()
+    assert view1.tolist() == [2, 0]
+
+    # Cache eviction + GC check: FastEngine buffer must stay valid until coh1 & view1 are dropped.
+    del sim2, coh2
+    _PRECOMPILED_CACHE.clear()
+    gc.collect()
+    assert owner_ref() is not None
+    assert view1.tolist() == [2, 0]
+    coh1.clear()
+    assert view1.tolist() == [0, 0]
+
+    del coh1, view1
+    gc.collect()
+    assert owner_ref() is None
+
+
+def test_ultra_low_prob_next_skip_does_not_overflow():
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    circuit = stim.Circuit(
+        "I[LEAKAGE_TRANSITION_1: (1e-9, U-->2)] 0 1 2 3\n"
+        "II[LEAKAGE_TRANSITION_2: (1e-9, U_U-->2_2)] 0 1 2 3\n"
+        "I[LEAKAGE_TRANSITION_1: (1e-12, 1-->2)] 0 1\n"
+        "M[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0 1"
+    )
+    tss = TablesideSimulator(
+        circuit=circuit,
+        compiled_op_handler=LeakageUint8().compile_op_handler(circuit=circuit, batch_size=1),
+        batch_size=1,
+        seed=42,
+    )
+    for _ in range(1000):
+        tss.clear()
+        tss.run()
+    assert tss.get_final_measurement_records().shape == (1, 2)
+
+
+def test_in_place_circuit_mutation_and_custom_ops_to_params_isolation():
+    from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageTransition1Params
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
+        CompiledLeakageUint8,
+        LeakageUint8,
+    )
+
+    # 1. In-place instruction fusion keeps len(c) == 2 while adding leaked target 1.
+    c = stim.Circuit("I[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nM 0 1")
+    s1 = TablesideSimulator(
+        circuit=c,
+        compiled_op_handler=LeakageUint8().compile_op_handler(circuit=c, batch_size=1),
+        batch_size=1,
+        seed=7,
+    )
+    s1.run()
+    assert s1._compiled_op_handler.state.tolist() == [2, 0]
+
+    c.pop()
+    c.append("I", [1], tag="LEAKAGE_TRANSITION_1: (1.0, U-->2)")
+    c.append("M", [0, 1])
+    assert len(c) == 2
+    s2 = TablesideSimulator(
+        circuit=c,
+        compiled_op_handler=LeakageUint8().compile_op_handler(circuit=c, batch_size=1),
+        batch_size=1,
+        seed=7,
+    )
+    s2.run()
+    assert s2._compiled_op_handler.state.tolist() == [2, 2]
+
+    # 2. Custom ops_to_params must not poison subsequent default compilations on the same circuit.
+    c_custom = stim.Circuit("I[LEAKAGE_TRANSITION_1: (0.0, U-->2)] 0\nM 0")
+    op0 = c_custom[0]
+    custom_coh = CompiledLeakageUint8(
+        num_qubits=1,
+        batch_size=1,
+        unconditional_condition_on_U=True,
+        ops_to_params={
+            op0: LeakageTransition1Params(((1.0, "U", 2),), from_tag=op0.tag),
+        },
+    )
+    s_custom = TablesideSimulator(circuit=c_custom, compiled_op_handler=custom_coh, batch_size=1, seed=3)
+    s_custom.run()
+    assert custom_coh.state.tolist() == [2]
+
+    default_coh = LeakageUint8().compile_op_handler(circuit=c_custom, batch_size=1)
+    s_default = TablesideSimulator(circuit=c_custom, compiled_op_handler=default_coh, batch_size=1, seed=3)
+    s_default.run()
+    assert default_coh.state.tolist() == [0]
+
+
+@pytest.mark.parametrize("p", [1e-17, 1e-300])
+def test_sub_epsilon_leakage_transition_skip_no_crash(p: float) -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    # Exercises OP_TRANSITION_1_U (kind 3), OP_TRANSITION_2_UU (kind 4), and OP_FUSED_TRANS1_MEAS (kind 7)
+    # when 0 < p <= DBL_EPSILON / 2 (where 1.0 - p == 1.0 in IEEE-754 float64).
+    circuits = [
+        (3, stim.Circuit(f"I[LEAKAGE_TRANSITION_1: ({p}, U-->2)] 0 1 2 3\nM 0 1 2 3")),
+        (4, stim.Circuit(f"II[LEAKAGE_TRANSITION_2: ({p}, U_U-->2_U)] 0 1 2 3\nM 0 1 2 3")),
+        (
+            7,
+            stim.Circuit(
+                f"I[LEAKAGE_TRANSITION_1: ({p}, 1-->2)] 0 1 2 3\n"
+                "M[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0 1 2 3"
+            ),
+        ),
+    ]
+    for expected_kind, circ in circuits:
+        coh = LeakageUint8().compile_op_handler(circuit=circ, batch_size=1)
+        tss = TablesideSimulator(circuit=circ, compiled_op_handler=coh, batch_size=1, seed=1)
+        assert int(tss._cpp_runner.pre.steps_py[0][0]) == expected_kind
+        tss.run()
+        assert tss.get_final_measurement_records().shape == (1, 4)
+        assert coh.state.tolist() == [0, 0, 0, 0]
+
