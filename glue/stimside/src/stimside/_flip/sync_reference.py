@@ -75,136 +75,56 @@ def compute_sync_reference(
                     mpad_ref_z[num_meas] = (ref_z, collapsed)
                 ref_chunks.append(crs)
         elif name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
-            crs = np.zeros(len(op.targets_copy()), dtype=np.bool_)
-            ref_chunks.append(crs)
-        elif name in (
-            "M",
-            "MZ",
-            "MR",
-            "MRZ",
-            "MX",
-            "MRX",
-            "MY",
-            "MRY",
-            "R",
-            "RZ",
-            "RX",
-            "RY",
-        ):
-            is_x = name in ("MX", "MRX", "RX")
-            is_y = name in ("MY", "MRY", "RY")
-            is_r = name in (
-                "MR",
-                "MRZ",
-                "MRX",
-                "MRY",
-                "R",
-                "RZ",
-                "RX",
-                "RY",
-            )
-            produces_m = name in (
-                "M",
-                "MZ",
-                "MR",
-                "MRZ",
-                "MX",
-                "MRX",
-                "MY",
-                "MRY",
-            )
-            crs_list: list[bool] = []
-            for gt in op.targets_copy():
-                q = gt.qubit_value if gt.qubit_value is not None else gt.value
-                if is_x:
-                    ref_ts.h(q)
-                elif is_y:
-                    ref_ts.h_yz(q)
-                m_val = ref_ts.measure(q)
-                if is_r:
-                    ref_ts.reset_z(q)
-                if is_x:
-                    ref_ts.h(q)
-                elif is_y:
-                    ref_ts.h_yz(q)
-                crs_list.append(bool(m_val) ^ bool(gt.is_inverted_result_target))
-            if produces_m:
-                ref_chunks.append(np.array(crs_list, dtype=np.bool_))
+            ref_chunks.append(np.zeros(len(op.targets_copy()), dtype=np.bool_))
         elif name in ("MXX", "MYY", "MZZ", "MPP"):
-            raw_targets = op.targets_copy()
-            terms: list[list[stim.GateTarget]] = []
-            if name == "MPP":
-                t_i = 0
-                while t_i < len(raw_targets):
-                    term = [raw_targets[t_i]]
-                    t_i += 1
-                    while t_i < len(raw_targets) and raw_targets[t_i].is_combiner:
-                        term.append(raw_targets[t_i + 1])
-                        t_i += 2
-                    terms.append(term)
-            else:
-                for t_i in range(0, len(raw_targets), 2):
-                    terms.append([raw_targets[t_i], raw_targets[t_i + 1]])
-
-            crs_list = []
-            for term in terms:
+            crs_list: list[bool] = []
+            for term in op.target_groups():
                 inv_res = False
-                pre_ops: list[stim.CircuitInstruction] = []
-                post_ops: list[stim.CircuitInstruction] = []
                 term_paulis: list[tuple[int, str]] = []
-                if name == "MPP":
-                    for gt in term:
-                        q_r = gt.qubit_value
-                        if gt.is_inverted_result_target:
-                            inv_res = not inv_res
-                        if gt.is_x_target:
-                            p_str = "X"
-                            h_op = stim.CircuitInstruction("H", [q_r])
-                            pre_ops.append(h_op)
-                            post_ops.insert(0, h_op)
-                        elif gt.is_y_target:
-                            p_str = "Y"
-                            hyz_op = stim.CircuitInstruction("H_YZ", [q_r])
-                            pre_ops.append(hyz_op)
-                            post_ops.insert(0, hyz_op)
-                        else:
-                            p_str = "Z"
-                        term_paulis.append((q_r, p_str))
-                else:
-                    p_str = name[-1]
-                    q0, q1 = term[0].qubit_value, term[1].qubit_value
-                    inv_res = bool(
-                        term[0].is_inverted_result_target
-                        ^ term[1].is_inverted_result_target
-                    )
-                    term_paulis = [(q0, p_str), (q1, p_str)]
+                for gt in term:
+                    q_r = gt.qubit_value
+                    inv_res ^= bool(gt.is_inverted_result_target)
+                    p_str = gt.pauli_type if name == "MPP" else name[-1]
+                    term_paulis.append((q_r, p_str))
                     if p_str == "X":
-                        h_op = stim.CircuitInstruction("H", [q0, q1])
-                        pre_ops.append(h_op)
-                        post_ops.append(h_op)
+                        ref_ts.h(q_r)
                     elif p_str == "Y":
-                        hyz_op = stim.CircuitInstruction("H_YZ", [q0, q1])
-                        pre_ops.append(hyz_op)
-                        post_ops.append(hyz_op)
-
+                        ref_ts.h_yz(q_r)
                 q0 = term_paulis[0][0]
-                cx_ops: list[stim.CircuitInstruction] = []
                 for q_r, _ in term_paulis[1:]:
-                    cx_ops.append(stim.CircuitInstruction("CX", [q_r, q0]))
-                pre_ops.extend(cx_ops)
-                post_ops = list(reversed(cx_ops)) + post_ops
-
-                for p_op in pre_ops:
-                    ref_ts.do(p_op)
+                    ref_ts.cnot(q_r, q0)
                 m_val = ref_ts.measure(q0)
-                for p_op in post_ops:
-                    ref_ts.do(p_op)
+                for q_r, _ in reversed(term_paulis[1:]):
+                    ref_ts.cnot(q_r, q0)
+                for q_r, p_str in reversed(term_paulis):
+                    if p_str == "X":
+                        ref_ts.h(q_r)
+                    elif p_str == "Y":
+                        ref_ts.h_yz(q_r)
                 crs_list.append(bool(m_val) ^ inv_res)
-
             ref_chunks.append(np.array(crs_list, dtype=np.bool_))
         else:
             gd = stim.gate_data(name)
-            if gd.is_unitary or gd.is_reset:
+            if gd.is_single_qubit_gate and (gd.produces_measurements or gd.is_reset):
+                is_x, is_y = "X" in name, "Y" in name
+                crs_list = []
+                for gt in op.targets_copy():
+                    q = gt.qubit_value if gt.qubit_value is not None else gt.value
+                    if is_x:
+                        ref_ts.h(q)
+                    elif is_y:
+                        ref_ts.h_yz(q)
+                    m_val = ref_ts.measure(q)
+                    if gd.is_reset:
+                        ref_ts.reset_z(q)
+                    if is_x:
+                        ref_ts.h(q)
+                    elif is_y:
+                        ref_ts.h_yz(q)
+                    crs_list.append(bool(m_val) ^ bool(gt.is_inverted_result_target))
+                if gd.produces_measurements:
+                    ref_chunks.append(np.array(crs_list, dtype=np.bool_))
+            elif gd.is_unitary or gd.is_reset:
                 if name not in ("I", "II", "I_ERROR", "II_ERROR"):
                     if name in ("CX", "CY", "CZ", "XCZ", "YCZ") and (
                         "rec[" in str(op) or "sweep[" in str(op)

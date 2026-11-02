@@ -12,7 +12,7 @@ from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 from stimside._magic import compile as _mc
-from stimside._magic.compile import CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _normalize_pauli_slot_map, _sample_categorical_branch, _split_realization_sections, apply_clifford_factors, compile_direct, compile_open_block, compile_selector, extract_data_expansion, fault_selector_bits
+from stimside._magic.compile import CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _normalize_pauli_slot_map, _sample_categorical_branch, _sample_heralded_pauli_branch, _split_realization_sections, apply_clifford_factors, compile_direct, compile_open_block, compile_selector, extract_data_expansion, fault_selector_bits
 from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, born_split_expansion, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, validate_atol
 from stimside.util.bitwords import (
     SQRT2 as _SQRT2,
@@ -717,10 +717,14 @@ def _run_stream_trajectory(plan: PreparedQueryPlan, faults: dict[int, int], meas
         elif isinstance(rec, CorrelatedNoiseRecord):
             p_tr[aux[0]] = 0 if any(p_tr.get(j, 0) > 0 for j in aux[1]) else (p_seed[aux[0]] if aux[0] in p_seed else (int(float(r_gen.random()) < rec.prob) if use_sampling else 0))  # type: ignore[union-attr,index]
         elif isinstance(rec, HeraldedNoiseRecord):
-            ph, req_b, hp = min(1.0, max(0.0, float(sum(rec.probs)))), bool(eff_m.get(rec.meas_index, 0)), [(i + 1, p) for i, p in enumerate(rec.probs) if p > 0.0]
-            m_log += _ln(ph if req_b else max(0.0, 1.0 - ph)) if (aux not in paulis and rec.meas_index in meas) else 0.0
-            c_req = hp[_sample_categorical_branch([p / ph for _, p in hp[:-1]], r_gen) - 1 if len(hp) > 1 else 0][0] if (req_b and ph > 0.0 and hp) else int(not req_b and 1.0 - ph <= 0.0)
-            p_tr[aux] = p_seed[aux] if aux in p_seed else (c_req if rec.meas_index in eff_m else (_sample_categorical_branch(rec.probs, r_gen) if use_sampling else 0))  # type: ignore[index]
+            ph = min(1.0, max(0.0, float(sum(rec.probs))))
+            if aux not in paulis and rec.meas_index in meas:
+                m_log += _ln(ph if bool(eff_m[rec.meas_index]) else max(0.0, 1.0 - ph))
+            p_tr[aux] = p_seed[aux] if aux in p_seed else (  # type: ignore[index]
+                _sample_heralded_pauli_branch(rec.probs, eff_m[rec.meas_index], r_gen, presampled=True, skip_single_rng=True)[0]
+                if rec.meas_index in eff_m
+                else (_sample_categorical_branch(rec.probs, r_gen) if use_sampling else 0)
+            )
     sw_m = max((k for k in plan._state["root"].deps[2] if sweep.get(k, 0)), default=-1) if (sweep and plan._state["root"]) else -1
     kw: dict[str, Any] = dict(rng=r_gen, fault_trace=f_tr, pauli_noise_trace=p_tr, reset_outcomes=rp or None, requested_outcomes=eff_m or None,
                               requested_quantum_outcomes=eff_q or None, sweep_bits=([sweep.get(i, 0) for i in range(sw_m + 1)] if sw_m >= 0 else None), atol=plan.atol)

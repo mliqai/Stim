@@ -23,7 +23,11 @@ from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
 from stimside.op_handlers.leakage_handlers.transition_effects import (
     TransitionEffectMasks,
     apply_output_effect,
-    sample_coset_batched_groups,
+    eval_allowed_state_mask,
+    exec_leakage_swap,
+    meas_basis,
+    sample_batched_group_transitions,
+    unpack_leakage_measurement_targets,
 )
 from stimside.util.stim_workarounds import split_fused_instruction
 
@@ -200,23 +204,9 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         target_states = np.where(is_classical, 0, target_states)
         if peeked:
             self._clear_transient_ones(valid_qs)
-
-        allowed_mask = np.zeros(
-            (len(targets_arr), css.batch_size), dtype=np.bool_
+        return eval_allowed_state_mask(
+            target_states, is_classical, allowed_group, allowed_st_list
         )
-        if "U" in allowed_group:
-            allowed_mask |= is_classical | (target_states < 2)
-        for st in allowed_group:
-            if isinstance(st, int):
-                if st < 2:
-                    allowed_mask |= is_classical | (target_states == st)
-                else:
-                    allowed_mask |= (~is_classical) & (target_states == st)
-            elif st != "U":
-                raise ValueError(
-                    f"Unrecognised allowed state {st} in allowed_st_list {allowed_st_list}"
-                )
-        return allowed_mask
 
     def _filter_targets_2q_mask(
         self,
@@ -245,28 +235,13 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         if peeked_qs:
             self._clear_transient_ones(peeked_qs)
         allowed_mask = np.zeros((len(targets_np), css.batch_size), dtype=np.bool_)
-
         for n in range(len(allowed_st_list[0])):
-            st0 = allowed_st_list[0][n]
-            st1 = allowed_st_list[1][n]
-            if st0 == "U":
-                m0 = is_c0 | (s0 < 2)
-            elif isinstance(st0, int):
-                m0 = (is_c0 & (st0 < 2)) | ((~is_c0) & (s0 == st0))
-            else:
-                raise ValueError(
-                    f"Unrecognised allowed state {st0} in allowed_st_list {allowed_st_list}"
-                )
-
-            if st1 == "U":
-                m1 = is_c1 | (s1 < 2)
-            elif isinstance(st1, int):
-                m1 = (is_c1 & (st1 < 2)) | ((~is_c1) & (s1 == st1))
-            else:
-                raise ValueError(
-                    f"Unrecognised allowed state {st1} in allowed_st_list {allowed_st_list}"
-                )
-
+            m0 = eval_allowed_state_mask(
+                s0, is_c0, (allowed_st_list[0][n],), allowed_st_list
+            )
+            m1 = eval_allowed_state_mask(
+                s1, is_c1, (allowed_st_list[1][n],), allowed_st_list
+            )
             allowed_mask |= m0 & m1
         return allowed_mask
 
@@ -413,16 +388,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                 )
 
     def leakage_swap(self, op: stim.CircuitInstruction, tss: CosetsideSimulator) -> None:
-        """SWAP[LEAKAGE_SWAP]: SWAP the qubits in every shot, leaked ones included (their frozen
-        computational states move with them), then swap their leakage states, pair by pair from
-        left to right.
-        """
-        tss._do_bare_instruction(
-            stim.CircuitInstruction(op.name, op.targets_copy(), op.gate_args_copy())
-        )
-        targets = [t.qubit_value for t in op.targets_copy()]
-        for q0, q1 in zip(targets[::2], targets[1::2]):
-            self._state[[q0, q1], :] = self._state[[q1, q0], :]
+        """SWAP[LEAKAGE_SWAP]: SWAP the qubits in every shot, then swap leakage states."""
+        exec_leakage_swap(op, tss, self._state)
 
     def leakage_conditioning(
         self,
@@ -685,8 +652,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                 input_state_mask = (
                     target_states < 2 if input_state == "U" else target_states == input_state
                 )
-                for out_s, r_sub, b_sub in sample_coset_batched_groups(
-                    transitions, input_state_mask, total_p, tss.np_rng
+                for out_s, r_sub, b_sub in sample_batched_group_transitions(
+                    transitions, total_p, tss.np_rng, input_state_mask
                 ):
                     if len(r_sub) > 0 and str(out_s) != str(input_state):
                         apply_output_effect(
@@ -807,8 +774,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     if input_state[1] == "U"
                     else odd_target_states == input_state[1]
                 )
-                for out_pair, p_sub, b_sub in sample_coset_batched_groups(
-                    transitions, even_checks & odd_checks, total_p, tss.np_rng
+                for out_pair, p_sub, b_sub in sample_batched_group_transitions(
+                    transitions, total_p, tss.np_rng, even_checks & odd_checks
                 ):
                     if len(p_sub) == 0:
                         continue
@@ -905,33 +872,15 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     op, copies, lambda sub_op: self.leakage_measurement(sub_op, tss, params)
                 )
                 return
-        raw_op_targets = op.targets_copy()
-        if params.targets:
-            targets = list(params.targets)
-            inv_flags = [
-                bool(t.value) ^ bool(t.is_inverted_result_target)
-                for t in raw_op_targets
-            ]
-            if len(raw_op_targets) != len(targets):
-                raise ValueError(
-                    "The number of targets in the MPAD operation with a LEAKAGE_MEASUREMENT tag "
-                    "does not equal to the number of targets specified in the tag."
-                )
-        else:
-            targets = [t.qubit_value for t in raw_op_targets]
-            inv_flags = [bool(t.is_inverted_result_target) for t in raw_op_targets]
+        is_mpad, raw_op_targets, targets, inv_flags = unpack_leakage_measurement_targets(
+            op, params
+        )
 
         target_leakage_state = self._state[targets, :].copy()  # (len(targets), batch_size)
         targets_arr = np.asarray(targets, dtype=np.intp)
-        is_mpad = params.targets is not None
-        p0 = params.prob_for_input_state.get(0, 0.0)
-        p1 = params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0)
+        p0, p1 = params.p0, params.p1(is_mpad)
         p_super = 0.5 * p0 + 0.5 * p1
-        basis: Literal["X", "Y", "Z"] = (
-            "X"
-            if op.name in ("MX", "MRX")
-            else ("Y" if op.name in ("MY", "MRY") else "Z")
-        )
+        basis: Literal["X", "Y", "Z"] = meas_basis(op.name)
         leaked_mask = target_leakage_state > 1
         has_leaked = bool(np.any(leaked_mask))
 

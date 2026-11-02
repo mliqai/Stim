@@ -272,18 +272,6 @@ def graphlike_inst_symptom(
     return comps, canonical_symptom_from_components(comps)
 
 
-def graphlike_components(
-    inst: stim.DemInstruction,
-    known_graphlike: (
-        dict[tuple[int, ...], Symptom]
-        | Callable[[], dict[tuple[int, ...], Symptom]]
-        | None
-    ) = None,
-) -> list[Symptom]:
-    """Extract graphlike (<=2 detector) symptom components from a DEM error instruction."""
-    return graphlike_inst_symptom(inst, known_graphlike)[0]
-
-
 def prob_xor(p: float, q: float) -> float:
     """Probability that exactly one of two independent mechanisms fires."""
     return p + q - 2 * p * q

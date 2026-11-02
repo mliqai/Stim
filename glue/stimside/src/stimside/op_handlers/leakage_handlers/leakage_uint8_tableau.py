@@ -24,7 +24,10 @@ from stimside.op_handlers.leakage_handlers.transition_effects import (
     TransitionEffectMasks,
     apply_output_effect,
     emit_tableau_transition_effects,
+    eval_allowed_state_mask,
+    exec_leakage_swap,
     sample_tableau_transitions,
+    unpack_leakage_measurement_targets,
 )
 from stimside.util.stim_workarounds import split_fused_instruction
 
@@ -162,21 +165,9 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         safe_qs = np.where(targets_arr >= 0, targets_arr, 0)
         target_states = np.where(targets_arr < 0, 0, self.state[safe_qs])
         self.state[self.state == 1] = 0
-        is_classical = targets_arr < 0
-        allowed_mask = np.zeros(len(targets_arr), dtype=np.bool_)
-        if "U" in allowed_st_list[0]:
-            allowed_mask |= is_classical | (target_states < 2)
-        for st in allowed_st_list[0]:
-            if isinstance(st, int):
-                if st < 2:
-                    allowed_mask |= is_classical | (target_states == st)
-                else:
-                    allowed_mask |= (~is_classical) & (target_states == st)
-            elif st != "U":
-                raise ValueError(
-                    f"Unrecognised allowed state {st} in allowed_st_list {allowed_st_list}"
-                )
-        return allowed_mask
+        return eval_allowed_state_mask(
+            target_states, targets_arr < 0, allowed_st_list[0], allowed_st_list
+        )
 
     def _filter_targets_2q(
         self,
@@ -218,27 +209,14 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                 target_states[p_idx, 1] = self.state[q1]
         self.state[self.state == 1] = 0
         allowed_mask = np.zeros(num_pairs, dtype=bool)
-
         for n in range(len(allowed_st_list[0])):
-            allowed_mask_pairs = np.zeros((num_pairs, 2), dtype=bool)
-            for i in [0, 1]:
-                st = allowed_st_list[i][n]
-                if st == "U":
-                    allowed_mask_pairs[:, i] = is_classical[:, i] | (
-                        target_states[:, i] < 2
-                    )
-                elif isinstance(st, int):
-                    allowed_mask_pairs[:, i] = (is_classical[:, i] & (st < 2)) | (
-                        ~is_classical[:, i] & (target_states[:, i] == st)
-                    )
-                else:
-                    raise ValueError(
-                        f"Unrecognised allowed state {st} in allowed_st_list {allowed_st_list}"
-                    )
-            allowed_mask = np.logical_or(
-                allowed_mask,
-                np.logical_and(allowed_mask_pairs[:, 0], allowed_mask_pairs[:, 1]),
+            m0 = eval_allowed_state_mask(
+                target_states[:, 0], is_classical[:, 0], (allowed_st_list[0][n],), allowed_st_list
             )
+            m1 = eval_allowed_state_mask(
+                target_states[:, 1], is_classical[:, 1], (allowed_st_list[1][n],), allowed_st_list
+            )
+            allowed_mask |= m0 & m1
 
         return [
             t
@@ -360,15 +338,8 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                     sss._record_leakage_event(sss._circuit_time, q, old_st, new_st)
 
     def leakage_swap(self, op: stim.CircuitInstruction, tss: TablesideSimulator):
-        """SWAP[LEAKAGE_SWAP]: SWAP the qubits, leaked ones included (their frozen computational
-        states move with them), then swap their leakage states, pair by pair from left to right.
-        """
-        tss._do_bare_instruction(
-            stim.CircuitInstruction(op.name, op.targets_copy(), op.gate_args_copy())
-        )
-        targets = [t.qubit_value for t in op.targets_copy()]
-        for q0, q1 in zip(targets[::2], targets[1::2]):
-            self.state[[q0, q1]] = self.state[[q1, q0]]
+        """SWAP[LEAKAGE_SWAP]: SWAP the qubits, leaked ones included, then swap leakage states."""
+        exec_leakage_swap(op, tss, self.state)
 
     def leakage_conditioning(
         self,
@@ -619,24 +590,9 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                     self.leakage_measurement(sub_op, tss, params)
                 return
 
-        targets: list[int]
-        is_mpad = params.targets is not None
-        raw_op_targets = op.targets_copy()
-        ## The case of MPAD with LEAKAGE_MEASUREMENT tag
-        if is_mpad:
-            assert params.targets is not None
-            targets = list(params.targets)
-            if len(raw_op_targets) != len(targets):
-                raise ValueError(
-                    "The number of targets in the MPAD operation with a LEAKAGE_MEASUREMENT tag"
-                    "does not equal to the number of targets specified in the tag."
-                )
-        ## The case of M with LEAKAGE_PROJECTION_Z tag
-        else:
-            targets = [
-                t.qubit_value if t.qubit_value is not None else t.value
-                for t in raw_op_targets
-            ]
+        is_mpad, raw_op_targets, targets, inv_flags = unpack_leakage_measurement_targets(
+            op, params
+        )
 
         if not is_mpad and len(set(targets)) < len(targets):
             for t in raw_op_targets:
@@ -664,8 +620,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         # get actual qubit states
         target_leakage_state = self.state[targets]
 
-        p0 = params.prob_for_input_state.get(0, 0.0)
-        p1 = params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0)
+        p0, p1 = params.p0, params.p1(is_mpad)
 
         targets_arr = np.asarray(targets, dtype=np.intp)
         idx_of_targets_in_qubit_space = np.where(target_leakage_state < 2)[0]
@@ -868,17 +823,10 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                         )
 
         # Finally perform qubit space measurement, preserving any target inversion (!)
-        m_targets: list[int | stim.GateTarget] = []
-        for i, q_new in enumerate(targets_new):
-            is_inv = (
-                (bool(raw_op_targets[i].value) ^ bool(raw_op_targets[i].is_inverted_result_target))
-                if is_mpad
-                else bool(raw_op_targets[i].is_inverted_result_target)
-            )
-            if is_inv:
-                m_targets.append(stim.target_inv(int(q_new)))
-            else:
-                m_targets.append(int(q_new))
+        m_targets: list[int | stim.GateTarget] = [
+            stim.target_inv(int(q_new)) if inv_flags[i] else int(q_new)
+            for i, q_new in enumerate(targets_new)
+        ]
 
         tss._do_bare_only_on_tableau(stim.CircuitInstruction("M", m_targets))
         if is_reset_meas and len(targets_in_qubit_space) > 0:
@@ -893,7 +841,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
             tss._append_to_new_reference_circuit(op)
         else:
             ref_m_targets = [
-                stim.target_inv(int(q)) if raw_op_targets[i].is_inverted_result_target else int(q)
+                stim.target_inv(int(q)) if inv_flags[i] else int(q)
                 for i, q in enumerate(targets)
             ]
             tss._append_to_new_reference_circuit(

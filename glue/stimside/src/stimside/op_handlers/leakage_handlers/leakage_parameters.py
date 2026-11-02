@@ -303,6 +303,15 @@ class LeakageMeasurementParams:
                     raise ValueError(f"{name} has repeated qubit target {qubit}")
                 seen_qubits.add(qubit)
 
+    @property
+    def p0(self) -> float:
+        return self.prob_for_input_state.get(0, 0.0)
+
+    def p1(self, is_mpad: bool | None = None) -> float:
+        if is_mpad is None:
+            is_mpad = self.targets is not None
+        return self.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0)
+
 
 @dataclasses.dataclass(frozen=True)
 class LeakageSwapParams:

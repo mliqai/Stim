@@ -44,7 +44,7 @@ from stimside.dem_generators.dem_generator_marginal import (
     Builder,
     MarginalLeakageDemGenerator,
 )
-from stimside.dem_generators.graphlike import nodes_edge_key
+from stimside.dem_generators.graphlike import nodes_edge_key, prob_xor
 from stimside.dem_generators.leakage_decoder import (
     CompiledLeakageDecoder,
     LeakageDecoder,
@@ -228,15 +228,13 @@ def _flag_symptoms(
     ):
         if p > 0:
             d = site_syms.setdefault(site, {})
-            q = d.get(sym, 0.0)
-            d[sym] = q + p - 2 * q * p
+            d[sym] = prob_xor(d.get(sym, 0.0), p)
     flow_syms: list[dict[int, float]] = []
     for k in range(len(a.flow_site_offsets) - 1):
         acc: dict[int, float] = {}
         for site in a.flow_site_ids[a.flow_site_offsets[k] : a.flow_site_offsets[k + 1]]:
             for sym, p in site_syms.get(int(site), {}).items():
-                q = acc.get(sym, 0.0)
-                acc[sym] = q + p - 2 * q * p
+                acc[sym] = prob_xor(acc.get(sym, 0.0), p)
         flow_syms.append({s: p for s, p in acc.items() if p > 0})
 
     num_flags = len(a.flag_records)

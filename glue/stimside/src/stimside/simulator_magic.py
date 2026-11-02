@@ -18,9 +18,9 @@ from stimside._magic.compile import (
     _coerce_strict_int, _compile_clifford_factors, _compile_pauli_measurement_c15, _compile_reset_c15,
     _emit_magic_terms, _infer_total_data_qubits, _merge_and_validate_fault_channels, _normalize_choice_map,
     _normalize_pauli_slot_map, _prepare_run_maps, _reduce_pauli_product_targets, _sample_categorical_branch,
-    _split_pauli_product_targets, _split_realization_sections, apply_clifford_factors, compile_direct,
-    compile_open_block, compile_pauli_product, compile_selector, extract_circuit_faults, extract_data_expansion,
-    parse_clifford_fault_instruction, reconstruct_statevector, run_direct, run_selector,
+    _sample_heralded_pauli_branch, _split_pauli_product_targets, _split_realization_sections, apply_clifford_factors,
+    compile_direct, compile_open_block, compile_pauli_product, compile_selector, extract_circuit_faults,
+    extract_data_expansion, parse_clifford_fault_instruction, reconstruct_statevector, run_direct, run_selector,
 )
 from stimside._magic.phase_qfe import (
     DEFAULT_ATOL, ImpossiblePostselectionError, K1_CANCEL_REL_TOL, ShotExpansion, apply_compiled_block, apply_pauli,
@@ -371,17 +371,10 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                     n_arg[idx] = _sample_categorical_branch(rec.probs, rng)
             elif isinstance(rec, HeraldedNoiseRecord):
                 if idx not in n_arg:
-                    req_h, p_h = c_map.get(rec.meas_index), min(1.0, max(0.0, float(sum(rec.probs))))
-                    if req_h is None:
-                        n_arg[idx] = _sample_categorical_branch(rec.probs, rng)
-                    elif not req_h:
-                        n_arg[idx] = 1 if 1.0 - p_h <= 1e-15 else 0
-                        mass_scale *= 0.0 if 1.0 - p_h <= 1e-15 else (1.0 - p_h)
-                    elif p_h <= 1e-15:
-                        n_arg[idx], mass_scale = 0, 0.0
-                    else:
-                        n_arg[idx] = _sample_categorical_branch([pr / p_h for pr in rec.probs], rng) or next(i + 1 for i, pr in enumerate(rec.probs) if pr > 0.0)
-                        mass_scale *= p_h
+                    n_arg[idx], p_step = _sample_heralded_pauli_branch(
+                        rec.probs, c_map.get(rec.meas_index), rng, presampled=True
+                    )
+                    mass_scale *= p_step
             else:
                 if not rec.is_else:
                     corr_occ = False

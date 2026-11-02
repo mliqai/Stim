@@ -1760,6 +1760,37 @@ def _sample_categorical_branch(probs: Sequence[float] | NDArray[np.float64], rng
     return 0
 
 
+def _sample_heralded_pauli_branch(
+    probs: Sequence[float] | NDArray[np.float64],
+    req_h: int | bool | None,
+    rng: np.random.Generator,
+    *,
+    presampled: bool = False,
+    skip_single_rng: bool = False,
+) -> tuple[int, float]:
+    """Sample `(choice_idx, branch_prob)` for a heralded Pauli channel (`req_h` in `{None, 0, 1}`)."""
+    if req_h is None:
+        return _sample_categorical_branch(probs, rng), 1.0
+    p_h = min(1.0, max(0.0, float(sum(probs))))
+    if not req_h:
+        p_no = max(0.0, 1.0 - p_h)
+        if p_no <= 1e-15:
+            return (1 if presampled else 0), 0.0
+        return 0, p_no
+    if p_h <= 1e-15:
+        return 0, 0.0
+    pos = [(i + 1, float(p)) for i, p in enumerate(probs) if p > 0.0]
+    if skip_single_rng and len(pos) == 1:
+        return pos[0][0], p_h
+    u = float(rng.random()) * p_h
+    acc = 0.0
+    for idx_1, pr in pos[:-1]:
+        acc += pr
+        if u < acc:
+            return idx_1, p_h
+    return pos[-1][0], p_h
+
+
 def _normalize_choice_map(
     trace: object,
     max_choices: Sequence[int],
@@ -1976,7 +2007,6 @@ def _execute_compiled_records(
         elif isinstance(rec, HeraldedNoiseRecord):
             ch_idx = rec.noise_index
             m_idx = rec.meas_index
-            p_herald = min(1.0, max(0.0, float(sum(rec.probs))))
             req_h = req_c_map.get(m_idx)
 
             if noise_map is not None:
@@ -1984,35 +2014,15 @@ def _execute_compiled_records(
                 true_h = rep_h = c_h > 0
                 if req_h is not None and rep_h != bool(req_h):
                     zero_mass, rep_h, exp.log_mass = True, bool(req_h), -math.inf
-            elif req_h is not None:
-                req_rep = bool(req_h)
-                if not req_rep:
-                    c_h, true_h = 0, False
-                    p_req = max(0.0, 1.0 - p_herald)
-                    if p_req <= 1e-15:
+            else:
+                c_h, p_step = _sample_heralded_pauli_branch(rec.probs, req_h, rng)
+                true_h = c_h > 0
+                rep_h = bool(req_h) if req_h is not None else true_h
+                if req_h is not None:
+                    if p_step <= 1e-15:
                         zero_mass, exp.log_mass = True, -math.inf
                     else:
-                        exp.log_mass += math.log(p_req)
-                elif p_herald <= 1e-15:
-                    c_h, true_h, zero_mass, exp.log_mass = 0, False, True, -math.inf
-                else:
-                    true_h = True
-                    exp.log_mass += math.log(p_herald)
-                    u_cond = float(rng.random()) * p_herald
-                    acc_h, c_h, last_pos = 0.0, 0, 1
-                    for idx_p, pr_h in enumerate(rec.probs):
-                        if pr_h > 0.0:
-                            last_pos = idx_p + 1
-                        acc_h += float(pr_h)
-                        if u_cond < acc_h:
-                            c_h = idx_p + 1
-                            break
-                    if c_h == 0:
-                        c_h = last_pos
-                rep_h = req_rep
-            else:
-                c_h = _sample_categorical_branch(rec.probs, rng)
-                true_h = rep_h = c_h > 0
+                        exp.log_mass += math.log(p_step)
 
             chosen_noise.append(c_h)
             recorded_noise_map[ch_idx] = c_h

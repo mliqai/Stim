@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
@@ -21,6 +21,11 @@ from stimside.op_handlers.leakage_handlers.leakage_tag_parsing_flip import (
     parse_leakage_in_circuit,
 )
 from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
+from stimside.op_handlers.leakage_handlers.transition_effects import (
+    meas_basis,
+    sample_batched_group_transitions,
+    unpack_leakage_measurement_targets,
+)
 from stimside.util.numpy_types import Bool2DArray
 from stimside.util.stim_workarounds import split_fused_instruction
 
@@ -87,58 +92,6 @@ def _reset_value(s_in: object, s_out: object) -> int | None:
     if s_out in ("X", "Y", "Z") and isinstance(s_in, int) and s_in >= 2:
         return 0
     return None
-
-
-def _sample_flip_hits(
-    in_mask: NDArray[np.bool_] | None,
-    num_rows: int,
-    batch_size: int,
-    transitions: tuple[tuple[object, float], ...],
-    total_p: float,
-    np_rng: np.random.Generator,
-) -> list[tuple[object, NDArray[np.intp], NDArray[np.intp]]]:
-    """Sample `(branch_out, row_idx, b_idx)` groups preserving Flip's sparse RNG order."""
-    if total_p <= 0.0:
-        return []
-    if in_mask is None:
-        m_total = num_rows * batch_size
-        n_hits = (
-            m_total if total_p >= 1.0 - 1e-12 else int(np_rng.binomial(m_total, total_p))
-        )
-        if n_hits == 0:
-            return []
-        if n_hits == m_total:
-            row_idx = np.repeat(np.arange(num_rows, dtype=np.intp), batch_size)
-            b_idx = np.tile(np.arange(batch_size, dtype=np.intp), num_rows)
-        else:
-            flat_idx = np_rng.choice(m_total, size=n_hits, replace=False)
-            row_idx, b_idx = flat_idx // batch_size, flat_idx % batch_size
-    else:
-        m_total = int(np.count_nonzero(in_mask))
-        if m_total == 0:
-            return []
-        n_hits = (
-            m_total if total_p >= 1.0 - 1e-12 else int(np_rng.binomial(m_total, total_p))
-        )
-        if n_hits == 0:
-            return []
-        elig_rows, elig_bs = np.where(in_mask)
-        if n_hits == m_total:
-            row_idx, b_idx = elig_rows, elig_bs
-        else:
-            chosen = np_rng.choice(m_total, size=n_hits, replace=False)
-            row_idx, b_idx = elig_rows[chosen], elig_bs[chosen]
-
-    if len(transitions) == 1:
-        return [(transitions[0][0], row_idx, b_idx)]
-    cond_probs = [p / total_p for _, p in transitions]
-    br_idx = np_rng.choice(len(transitions), size=n_hits, p=cond_probs)
-    out = []
-    for b_i, (out_val, _) in enumerate(transitions):
-        sel = br_idx == b_i
-        if np.any(sel):
-            out.append((out_val, row_idx[sel], b_idx[sel]))
-    return out
 
 
 @dataclasses.dataclass
@@ -469,8 +422,8 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                 fss.broadcast_pauli_errors(error_mask=mask, p=p, pauli=pauli)
             else:
                 total_p = sum(p for _, p in branches)
-                for pauli_obj, row_hit, b_hit in _sample_flip_hits(
-                    active_pairs, len(t1_arr), self.batch_size, branches, total_p, fss.np_rng
+                for pauli_obj, row_hit, b_hit in sample_batched_group_transitions(
+                    branches, total_p, fss.np_rng, active_pairs, num_rows=len(t1_arr), batch_size=self.batch_size
                 ):
                     mask = np.zeros_like(self.state, dtype=bool)
                     np.logical_xor.at(mask, (t1_arr[row_hit], b_hit), True)
@@ -532,8 +485,8 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                 else ((sub_state < 2) if input_state == "U" else (sub_state == input_state))
             )
             total_p = sum(p for _, p in transitions)
-            for out_st, row_hit, b_hit in _sample_flip_hits(
-                in_mask, num_targets, self.batch_size, transitions, total_p, fss.np_rng
+            for out_st, row_hit, b_hit in sample_batched_group_transitions(
+                transitions, total_p, fss.np_rng, in_mask, num_rows=num_targets, batch_size=self.batch_size
             ):
                 if out_st == input_state:
                     continue
@@ -755,8 +708,8 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                 )
                 in_mask = check_0 & check_1
             total_p = sum(p for _, p in transitions)
-            for out_pair_obj, pair_hit, b_hit in _sample_flip_hits(
-                in_mask, num_pairs, self.batch_size, transitions, total_p, fss.np_rng
+            for out_pair_obj, pair_hit, b_hit in sample_batched_group_transitions(
+                transitions, total_p, fss.np_rng, in_mask, num_rows=num_pairs, batch_size=self.batch_size
             ):
                 out_pair: tuple[object, object] = out_pair_obj  # type: ignore[assignment]
                 for leg_in, leg_out, q_hit in (
@@ -829,35 +782,22 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                 for sub_op in copies:
                     self.leakage_projection_Z(sub_op, fss, params)
                 return
-        is_mpad = params.targets is not None
-        raw_op_targets = op.targets_copy()
-
-        pauli: Literal["X", "Y", "Z"] = (
-            "X"
-            if op.name in ("MX", "MRX")
-            else ("Y" if op.name in ("MY", "MRY") else "Z")
+        is_mpad, _, targets_list, inv_flags = unpack_leakage_measurement_targets(
+            op, params
         )
+        targets = np.asarray(targets_list, dtype=np.intp)
+        inv_arr = np.asarray(inv_flags, dtype=bool)[:, None]
+
+        pauli = meas_basis(op.name)
         is_reset = op.name in ("MR", "MRZ", "MRX", "MRY")
+        p0, p1 = params.p0, params.p1(is_mpad)
 
-        p0 = params.prob_for_input_state.get(0, 0.0)
-        p1 = params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0)
-
-        if is_mpad:
-            assert params.targets is not None
-            targets = np.asarray(params.targets, dtype=np.intp)
-            if len(raw_op_targets) != len(targets):
-                raise ValueError(
-                    "The number of targets in the MPAD operation with a LEAKAGE_MEASUREMENT tag "
-                    "does not equal the number of targets specified in the tag."
-                )
-        else:
-            targets = self._get_target_indices(op)
-            if not np.isclose(p0, 1.0 - p1) and not fss._all_targets_in_known_state(
-                targets=targets, pauli=pauli
-            ):
-                raise ValueError(
-                    f"{op} has a LEAKAGE_PROJECTION_Z tag that demands known {pauli} states, but targets aren't in known {pauli} states."
-                )
+        if not is_mpad and not np.isclose(p0, 1.0 - p1) and not fss._all_targets_in_known_state(
+            targets=targets, pauli=pauli
+        ):
+            raise ValueError(
+                f"{op} has a LEAKAGE_PROJECTION_Z tag that demands known {pauli} states, but targets aren't in known {pauli} states."
+            )
 
         m_idx = fss._flip_simulator.num_measurements
         ref_slice = fss.ref_measurements[m_idx : m_idx + len(targets)]
@@ -881,18 +821,7 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                     output_xs=True, output_zs=False
                 )
                 target_computational_states = xs[targets, :]
-            inv_arr = np.array(
-                [
-                    bool(t.value) ^ bool(t.is_inverted_result_target)
-                    for t in raw_op_targets
-                ],
-                dtype=bool,
-            )[:, None]
         else:
-            inv_arr = np.array(
-                [bool(t.is_inverted_result_target) for t in raw_op_targets],
-                dtype=bool,
-            )[:, None]
             clean_plus, clean_minus = fss._get_clean_known_states(pauli=pauli)
             is_known = (clean_plus | clean_minus)[targets]
             _, known_state_mask = fss._get_current_known_state_masks(pauli=pauli)

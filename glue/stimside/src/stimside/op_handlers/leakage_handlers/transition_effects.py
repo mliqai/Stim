@@ -157,35 +157,106 @@ def sample_tableau_transitions(
     ).astype(str)
 
 
-def sample_coset_batched_groups(
+def sample_batched_group_transitions(
     transitions: Sequence[tuple[Any, float]],
-    mask: NDArray[np.bool_],
     total_p: float,
     np_rng: np.random.Generator,
+    mask: NDArray[np.bool_] | None = None,
+    *,
+    num_rows: int = 0,
+    batch_size: int = 0,
 ) -> list[tuple[Any, NDArray[np.intp], NDArray[np.intp]]]:
-    """Sample `(out_state, row_indices, shot_indices)` groups for Coset's non-sync batched path."""
-    samples_to_take = int(np.count_nonzero(mask))
-    if samples_to_take == 0:
+    """Sample non-empty `(out_state, row_idx, shot_idx)` groups preserving sparse RNG order."""
+    if total_p <= 0.0:
         return []
-    k_trans = (
-        int(np_rng.binomial(samples_to_take, total_p))
-        if total_p < 1.0 - 1e-12
-        else samples_to_take
-    )
-    if k_trans == 0:
-        return []
-    r_all, b_all = np.where(mask)
-    if k_trans < samples_to_take:
-        chosen = np_rng.choice(samples_to_take, size=k_trans, replace=False)
-        r_trans, b_trans = r_all[chosen], b_all[chosen]
+    if mask is None:
+        m_total = num_rows * batch_size
+        n_hits = m_total if total_p >= 1.0 - 1e-12 else int(np_rng.binomial(m_total, total_p))
+        if n_hits == 0:
+            return []
+        if n_hits == m_total:
+            row_idx = np.repeat(np.arange(num_rows, dtype=np.intp), batch_size)
+            b_idx = np.tile(np.arange(batch_size, dtype=np.intp), num_rows)
+        else:
+            flat_idx = np_rng.choice(m_total, size=n_hits, replace=False)
+            row_idx, b_idx = flat_idx // batch_size, flat_idx % batch_size
     else:
-        r_trans, b_trans = r_all, b_all
+        m_total = int(np.count_nonzero(mask))
+        if m_total == 0:
+            return []
+        n_hits = m_total if total_p >= 1.0 - 1e-12 else int(np_rng.binomial(m_total, total_p))
+        if n_hits == 0:
+            return []
+        elig_rows, elig_bs = np.where(mask)
+        if n_hits == m_total:
+            row_idx, b_idx = elig_rows, elig_bs
+        else:
+            chosen = np_rng.choice(m_total, size=n_hits, replace=False)
+            row_idx, b_idx = elig_rows[chosen], elig_bs[chosen]
     if len(transitions) == 1:
-        return [(transitions[0][0], r_trans, b_trans)]
+        return [(transitions[0][0], row_idx, b_idx)]
     cond_probs = np.array([p / total_p for _, p in transitions], dtype=np.float64)
     cond_probs /= cond_probs.sum()
-    t_idx = np_rng.choice(len(transitions), size=k_trans, p=cond_probs)
+    br_idx = np_rng.choice(len(transitions), size=n_hits, p=cond_probs)
     return [
-        (transitions[t_i][0], r_trans[t_idx == t_i], b_trans[t_idx == t_i])
-        for t_i in range(len(transitions))
+        (out_val, row_idx[sel], b_idx[sel])
+        for b_i, (out_val, _) in enumerate(transitions)
+        if np.any(sel := (br_idx == b_i))
     ]
+
+
+def eval_allowed_state_mask(
+    target_states: NDArray[Any],
+    is_classical: NDArray[np.bool_],
+    allowed_group: Sequence[int | str],
+    full_list: Any,
+) -> NDArray[np.bool_]:
+    """Evaluate allowed-state membership mask for 1Q or 2Q Tableau/Coset targets."""
+    mask = np.zeros(target_states.shape, dtype=np.bool_)
+    for st in allowed_group:
+        if st == "U":
+            mask |= is_classical | (target_states < 2)
+        elif isinstance(st, int):
+            mask |= (is_classical & (st < 2)) | ((~is_classical) & (target_states == st))
+        else:
+            raise ValueError(
+                f"Unrecognised allowed state {st} in allowed_st_list {full_list}"
+            )
+    return mask
+
+
+def exec_leakage_swap(
+    op: stim.CircuitInstruction, tss: Any, state: NDArray[np.uint8]
+) -> None:
+    """Execute bare SWAP followed by pairwise leakage-state swaps on `state`."""
+    tss._do_bare_instruction(
+        stim.CircuitInstruction(op.name, op.targets_copy(), op.gate_args_copy())
+    )
+    targets = [t.qubit_value for t in op.targets_copy()]
+    for q0, q1 in zip(targets[::2], targets[1::2]):
+        state[[q0, q1]] = state[[q1, q0]]
+
+
+def meas_basis(op_name: str) -> Any:
+    """Return `'X'`, `'Y'`, or `'Z'` basis for a single-qubit measurement/reset gate."""
+    return "X" if op_name in ("MX", "MRX") else ("Y" if op_name in ("MY", "MRY") else "Z")
+
+
+def unpack_leakage_measurement_targets(
+    op: stim.CircuitInstruction, params: Any
+) -> tuple[bool, list[stim.GateTarget], list[int], list[bool]]:
+    """Unpack `(is_mpad, raw_op_targets, targets, inv_flags)` and validate MPAD arity."""
+    raw = op.targets_copy()
+    is_mpad = params.targets is not None
+    if is_mpad:
+        targets = list(params.targets)
+        if len(raw) != len(targets):
+            raise ValueError(
+                "The number of targets in the MPAD operation with a LEAKAGE_MEASUREMENT tag "
+                "does not equal to the number of targets specified in the tag."
+            )
+        inv_flags = [bool(t.value) ^ bool(t.is_inverted_result_target) for t in raw]
+    else:
+        targets = [t.qubit_value if t.qubit_value is not None else t.value for t in raw]
+        inv_flags = [bool(t.is_inverted_result_target) for t in raw]
+    return is_mpad, raw, targets, inv_flags

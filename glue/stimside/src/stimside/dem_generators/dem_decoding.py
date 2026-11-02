@@ -26,7 +26,7 @@ from stimside.dem_generators.graphlike import (
     dem_has_hyperedge,
     dets_edge_key,
     edge_to_targets,
-    graphlike_components,
+    graphlike_inst_symptom,
     inst_canonical_symptom,
     nodes_edge_key,
     prob_xor,
@@ -132,7 +132,7 @@ def _extract_graphlike_edges(
         p = float(inst.args_copy()[0])
         if p <= 0.0:
             continue
-        for dets, obs in graphlike_components(inst):
+        for dets, obs in graphlike_inst_symptom(inst)[0]:
             if not (1 <= len(dets) <= 2):
                 continue
             edge = dets_edge_key(dets)
@@ -338,6 +338,43 @@ def decode_with_edge_reweights(
     )
 
 
+def _extract_regen_spec(
+    dems: Any, single_imeta: Any
+) -> tuple[bool, bool, Any, Any, Any, Any] | None:
+    if isinstance(dems, GeneratedDemList) and dems._generator is not None:
+        return (
+            dems.decompose_errors,
+            dems.reweight_only,
+            dems._generator,
+            dems._circuit,
+            dems._records,
+            dems.leakage_events,
+        )
+    if single_imeta is not None:
+        _, orig_dec, orig_rew, gen_inst, circ_inst, rec_inst = single_imeta
+        return orig_dec, orig_rew, gen_inst, circ_inst, rec_inst, get_item_leakage_events(dems)
+    if not isinstance(dems, (stim.DetectorErrorModel, np.ndarray)):
+        seq = dems if isinstance(dems, list) else list(dems)
+        if seq:
+            metas = [get_item_analysis_meta(x) for x in seq]
+            m0 = metas[0]
+            if m0 is not None and all(m is not None and m[3] is m0[3] and m[4] is m0[4] for m in metas):
+                rec_2d = np.stack([m[5] for m in metas if m is not None], axis=0)
+                evs = [ev for ev in (get_item_leakage_events(x) for x in seq) if ev is not None]
+                return m0[1], m0[2], m0[3], m0[4], rec_2d, evs or None
+    return None
+
+
+def _decode_non_pymatching_reweights(
+    decoder: Any, regen_spec: tuple[bool, bool, Any, Any, Any, Any] | None, dets_2d: NDArray[np.uint8]
+) -> Any:
+    if regen_spec is None or is_pymatching_decoder(decoder) or hasattr(decoder, "decode_batch"):
+        return None
+    _, _, gen_inst, circ_inst, rec_inst, evs = regen_spec
+    dem_full = gen_inst(circ_inst, rec_inst, decompose_errors=True, reweight_only=False, leakage_events=evs)
+    return decode_with_generated_dems(decoder, dem_full, dets_2d, decompose_errors=True)
+
+
 def decode_with_generated_dems(
     decoder: sinter.Decoder | Any,
     dems: (
@@ -352,104 +389,33 @@ def decode_with_generated_dems(
     *,
     base_dem: stim.DetectorErrorModel | None = None,
 ) -> Any:
-    """Decode a batch with the DEM(s) or edge_reweights returned by a dem_gen callable.
-
-    Args:
-        decoder: A ``sinter.Decoder`` (such as ``sinter.BUILT_IN_DECODERS["pymatching"]``)
-            or a ``pymatching.Matching`` instance. A ``Matching`` only decodes
-            ``edge_reweights``, with ``Matching.decode_batch(..., edge_reweights=...)``,
-            which needs the PyMatching version with per-shot ``edge_reweights``: with the
-            released ``pymatching`` package it raises ``TypeError``. A ``sinter.Decoder``
-            (or ``"pymatching"``) works with either: without per-shot ``edge_reweights``
-            it decodes each distinct reweighted DEM instead, which is slower.
-        dems: One DEM for the whole batch, one DEM per shot, or PyMatching
-            ``edge_reweights`` array(s) of shape ``(num_reweights, 3)``.
-        bit_packed_dets: Bit-packed detection event array of shape
-            ``(num_shots, ceil(num_detectors / 8))``. If ``None``, returns the
-            transformed ``dems`` / ``edge_reweights`` instead of decoding.
-        decompose_errors: If True, decompose hyperedge errors into matchable
-            graphlike components using Stim's native APIs.
-        reweight_only: If True, use DEM reweight updates instead of full DEMs.
-            When both ``decompose_errors=True`` and ``reweight_only=True``, uses
-            PyMatching's ``edge_reweights`` format ``[node1, node2, weight]``.
-        base_dem: Optional baseline ``stim.DetectorErrorModel`` when ``dems`` is
-            passed as raw reweight updates or ``edge_reweights`` arrays without
-            generator metadata.
-    """
+    """Decode a batch with the DEM(s) or edge_reweights returned by a dem_gen callable."""
     dec_flag, rew_flag = bool(decompose_errors), bool(reweight_only)
     if isinstance(decoder, str):
         decoder = sinter.BUILT_IN_DECODERS[decoder]
 
-    # If dems came from MarginalLeakageDemGenerator and caller requested
-    # decompose_errors or reweight_only on decode_with_generated_dems, regenerate
-    # directly from the generator's fast C++ pipeline so we don't combine with
-    # baseline and diff again.
     single_imeta = (
         get_item_analysis_meta(dems)
         if isinstance(dems, (stim.DetectorErrorModel, np.ndarray))
         else None
     )
-    regenerated_from_gen = False
-    if isinstance(dems, GeneratedDemList) and dems._generator is not None:
-        eff_dec = dec_flag or dems.decompose_errors
-        eff_rew = rew_flag or dems.reweight_only
-        if (eff_dec, eff_rew) != (dems.decompose_errors, dems.reweight_only):
-            assert dems._circuit is not None and dems._records is not None
-            dems = dems._generator(
-                dems._circuit,
-                dems._records,
-                decompose_errors=eff_dec,
-                reweight_only=eff_rew,
-                leakage_events=dems.leakage_events,
-            )  # type: ignore[assignment]
-        dec_flag, rew_flag = eff_dec, eff_rew
-        regenerated_from_gen = True
-    elif single_imeta is not None:
-        _, orig_dec, orig_rew, gen_inst, circ_inst, rec_inst = single_imeta
-        eff_dec = dec_flag or orig_dec
-        eff_rew = rew_flag or orig_rew
+    regen_spec = _extract_regen_spec(dems, single_imeta)
+    if regen_spec is not None:
+        orig_dec, orig_rew, gen_inst, circ_inst, rec_inst, evs = regen_spec
+        eff_dec, eff_rew = dec_flag or orig_dec, rew_flag or orig_rew
         if (eff_dec, eff_rew) != (orig_dec, orig_rew):
             dems = gen_inst(
-                circ_inst,
-                rec_inst,
-                decompose_errors=eff_dec,
-                reweight_only=eff_rew,
-                leakage_events=get_item_leakage_events(dems),
+                circ_inst, rec_inst, decompose_errors=eff_dec, reweight_only=eff_rew, leakage_events=evs
             )
-            single_imeta = get_item_analysis_meta(dems)
+            single_imeta = (
+                get_item_analysis_meta(dems)
+                if isinstance(dems, (stim.DetectorErrorModel, np.ndarray))
+                else None
+            )
+            regen_spec = (eff_dec, eff_rew, gen_inst, circ_inst, rec_inst, evs)
         dec_flag, rew_flag = eff_dec, eff_rew
-        regenerated_from_gen = True
-    elif not isinstance(dems, (stim.DetectorErrorModel, np.ndarray)):
-        dems_seq_check = dems if isinstance(dems, list) else list(dems)
-        if dems_seq_check:
-            metas = [get_item_analysis_meta(x) for x in dems_seq_check]
-            first_m = metas[0]
-            if first_m is not None and all(
-                m is not None and m[3] is first_m[3] and m[4] is first_m[4]
-                for m in metas
-            ):
-                _, orig_dec, orig_rew, gen_inst, circ_inst, _ = first_m
-                eff_dec = dec_flag or orig_dec
-                eff_rew = rew_flag or orig_rew
-                if (eff_dec, eff_rew) != (orig_dec, orig_rew):
-                    rec_2d = np.stack([m[5] for m in metas if m is not None], axis=0)
-                    events_2d = [
-                        ev
-                        for ev in (get_item_leakage_events(x) for x in dems_seq_check)
-                        if ev is not None
-                    ]
-                    dems = gen_inst(
-                        circ_inst,
-                        rec_2d,
-                        decompose_errors=eff_dec,
-                        reweight_only=eff_rew,
-                        leakage_events=events_2d or None,
-                    )
-                dec_flag, rew_flag = eff_dec, eff_rew
-                regenerated_from_gen = True
-
-    if bit_packed_dets is None and regenerated_from_gen:
-        return dems
+        if bit_packed_dets is None:
+            return dems
 
     dets_2d = (
         None
@@ -465,28 +431,15 @@ def decode_with_generated_dems(
     if isinstance(dems, np.ndarray):
         if dets_2d is None:
             return dems
-        single_analysis = single_imeta[0] if single_imeta is not None else None
-        if (
-            not is_pymatching_decoder(decoder)
-            and not hasattr(decoder, "decode_batch")
-        ):
-            if single_imeta is not None:
-                dem_full = single_imeta[3](
-                    single_imeta[4],
-                    single_imeta[5],
-                    decompose_errors=True,
-                    reweight_only=False,
-                    leakage_events=get_item_leakage_events(dems),
-                )
-                return decode_with_generated_dems(
-                    decoder, dem_full, dets_2d, decompose_errors=True
-                )
+        fb = _decode_non_pymatching_reweights(decoder, regen_spec, dets_2d)
+        if fb is not None:
+            return fb
         return decode_with_edge_reweights(
             decoder,
             dems,
             dets_2d,
             base_dem=base_dem,
-            analysis=single_analysis,
+            analysis=single_imeta[0] if single_imeta is not None else None,
         )
     if not isinstance(dems, stim.DetectorErrorModel):
         dems_seq = dems if isinstance(dems, list) else list(dems)
@@ -496,29 +449,14 @@ def decode_with_generated_dems(
         ):
             if dets_2d is None:
                 return dems
+            fb = _decode_non_pymatching_reweights(decoder, regen_spec, dets_2d)
+            if fb is not None:
+                return fb
             analysis = getattr(dems, "analysis", None)
             if analysis is None and first_non_none is not None:
                 imeta = get_item_analysis_meta(first_non_none)
                 if imeta is not None:
                     analysis = imeta[0]
-            if (
-                not is_pymatching_decoder(decoder)
-                and not hasattr(decoder, "decode_batch")
-                and isinstance(dems, GeneratedDemList)
-                and dems._generator is not None
-            ):
-                # Fallback to decomposed full DEMs for non-pymatching decoders
-                assert dems._circuit is not None and dems._records is not None
-                dems_full = dems._generator(
-                    dems._circuit,
-                    dems._records,
-                    decompose_errors=True,
-                    reweight_only=False,
-                    leakage_events=dems.leakage_events,
-                )
-                return decode_with_generated_dems(
-                    decoder, dems_full, dets_2d, decompose_errors=True
-                )
             return decode_with_edge_reweights(
                 decoder,
                 dems_seq,  # type: ignore[arg-type]

@@ -21,6 +21,7 @@ from stimside.op_handlers.leakage_handlers.tag_registry import (
     parse_leakage_tag_magic as _parse_leakage_tag_magic,
     validate_magic_op,
 )
+from stimside.op_handlers.leakage_handlers.transition_effects import meas_basis
 from stimside.util.stim_workarounds import split_fused_instruction
 
 if TYPE_CHECKING:
@@ -51,8 +52,8 @@ def _strip_circuit_for_noiseless_ref(circuit: stim.Circuit) -> tuple[stim.Circui
                 params, _ = _parse_leakage_tag_magic(op)
                 assert isinstance(params, LeakageMeasurementParams)
                 is_mpad = tag.startswith("LEAKAGE_MEASUREMENT")
-                b0 = params.prob_for_input_state.get(0, 0.0) > 0.5
-                b1 = params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0) > 0.5
+                b0 = params.p0 > 0.5
+                b1 = params.p1(is_mpad) > 0.5
                 if is_mpad and b0 == b1:
                     out.append(stim.CircuitInstruction("MPAD", [int((bool(t.value) ^ t.is_inverted_result_target) ^ b0) for t in tgs]))
                 elif not is_mpad and (b0, b1) == (False, True):
@@ -164,14 +165,14 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
                 self._eval_u_mpad(s, tss, params)
             return
         raw_t, is_mpad = op.targets_copy(), params.targets is not None
-        p0, p1 = params.prob_for_input_state.get(0, 0.0), params.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0)
+        p0, p1 = params.p0, params.p1(is_mpad)
         need_slow = (0 in params.prob_for_input_state or 1 in params.prob_for_input_state) if is_mpad else (p0 != 0.0 or p1 != 1.0)
         if tss._tab_rngs is not None and need_slow:
             qs = list(dict.fromkeys(params.targets if is_mpad else (int(t.qubit_value) for t in raw_t if t.is_qubit_target)))  # type: ignore[arg-type]
             valid_op = (op.name == "MPAD" and len(raw_t) == len(params.targets or ())) if is_mpad else (op.name in ("M", "MZ", "MR", "MRZ", "MX", "MY", "MRX", "MRY") and len(qs) == len(raw_t))
             if valid_op:
                 self._ensure_batch_size(tss.batch_size)
-                basis = "X" if op.name in ("MX", "MRX") else ("Y" if op.name in ("MY", "MRY") else "Z")
+                basis = meas_basis(op.name)
                 for q_i in qs:
                     pb_row = tss.peek_pauli_born_batch([q_i], pauli=basis)[0]  # type: ignore[arg-type]
                     sup = (self._state[q_i] < 2) & (pb_row > 1e-12) & (pb_row < 1.0 - 1e-12)
@@ -186,7 +187,7 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
         raw_t, t_qubits = op.targets_copy(), list(params.targets or ())
         if len(raw_t) != len(t_qubits):
             raise ValueError(f"{op} has {len(raw_t)} pad targets, expected multiple of {len(t_qubits)}")
-        states, p_u = self._state[t_qubits], params.prob_for_input_state.get(0, 0.0)
+        states, p_u = self._state[t_qubits], params.p0
         probs = np.where(states < 2, p_u, 0.0).astype(np.float64)
         for st, p_val in params.prob_for_input_state.items():
             if st >= 2 and p_val > 0.0:

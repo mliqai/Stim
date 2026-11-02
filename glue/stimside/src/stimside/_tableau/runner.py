@@ -429,10 +429,7 @@ class PrecompiledTablesideCircuit:
 
                 elif isinstance(params, LeakageMeasurementParams):
                     is_mpad = params.targets is not None
-                    p0 = params.prob_for_input_state.get(0, 0.0)
-                    p1 = params.prob_for_input_state.get(
-                        1, 0.0 if is_mpad else 1.0
-                    )
+                    p0, p1 = params.p0, params.p1(is_mpad)
                     p2 = params.prob_for_input_state.get(2, 0.0)
                     meas_inst = stim.CircuitInstruction(
                         "M" if is_mpad else op_name, raw_t, []
