@@ -9,7 +9,6 @@ import sys
 from stimside._native._kernel_loader import (
     AbiSpec,
     f64_p as _c_double_p,
-    find_prebuilt_so as _find_prebuilt_so_candidate,
     get_lib,
     i32_p as _c_i32_p,
     resolve_so,
@@ -19,6 +18,7 @@ from stimside._native._kernel_loader import (
 )
 
 _LIB_INSTANCE: ctypes.CDLL | None = None
+_find_prebuilt_so_candidate = None
 
 _sz, _c_u8, _c_int = ctypes.c_size_t, ctypes.c_uint8, ctypes.c_int
 _c_i32, _c_dbl = ctypes.c_int32, ctypes.c_double
@@ -87,7 +87,7 @@ _SPECS: tuple[AbiSpec, ...] = (
 
 
 def _resolve_magic_kernels_so(force_recompile: bool = False) -> Path:
-    return resolve_so(__file__, "magic_kernels", force_recompile, _find_prebuilt_so_candidate)
+    return resolve_so(__file__, "magic_kernels", force_recompile)
 
 
 def get_magic_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:

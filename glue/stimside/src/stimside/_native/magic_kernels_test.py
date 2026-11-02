@@ -92,8 +92,10 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
         )
         (tmp_native / "magic_kernels.cpp").write_text(stub_cpp, encoding="utf-8")
         with monkeypatch.context() as mp:
+            import tempfile
+
+            mp.setattr(tempfile, "tempdir", str(tmp_path))
             mp.setattr(mk, "__file__", str(tmp_native / "magic_kernels.py"))
-            mp.setattr(mk, "_find_prebuilt_so_candidate", lambda *a, **kw: None)
             rebuilt = mk.get_magic_kernels_lib(force_recompile=True)
             assert (tmp_native / "libmagic_kernels.so").is_file()
             assert rebuilt is not lib1 and rebuilt._handle != lib1._handle
@@ -108,7 +110,6 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
     with monkeypatch.context() as mp:
         empty_dir = tmp_path / "missing_src"
         empty_dir.mkdir(parents=True)
-        mp.setattr(mk, "_find_prebuilt_so_candidate", lambda *a, **kw: None)
         mp.setattr(mk, "__file__", str(empty_dir / "magic_kernels.py"))
         with pytest.raises(FileNotFoundError):
             mk._resolve_magic_kernels_so(force_recompile=False)

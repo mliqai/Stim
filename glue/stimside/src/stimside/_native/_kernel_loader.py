@@ -13,11 +13,9 @@ import hashlib
 import os
 from pathlib import Path
 import platform
-import shutil
+import shlex
 import subprocess
-import sys
 import tempfile
-import time
 from types import ModuleType
 from typing import Any
 
@@ -63,61 +61,15 @@ def get_cpp_compile_and_link_args(
     return compile_args, ["-O3", "-shared"]
 
 
-def find_prebuilt_so(here: Path, lib_stem: str, cpp_path: Path) -> Path | None:
-    patterns = (f"{lib_stem}.so", f"{lib_stem}*.so", f"{lib_stem}*.dylib", f"{lib_stem}*.pyd", f"{lib_stem}*.dll")
-    search_dirs: list[Path] = [here]
-
-    rel_pkg = Path(here.parent.name, here.name)
-    repo_root = here.parent.parent.parent
-    if (repo_root / "setup.py").exists():
-        for build_dir_name in ("python_build_stimside", "build"):
-            build_root = repo_root / build_dir_name
-            if build_root.is_dir():
-                for sub in sorted(build_root.glob(f"lib*/{rel_pkg.as_posix()}")):
-                    search_dirs.append(sub)
-
-    for sys_entry in sys.path:
-        if not sys_entry:
-            continue
-        candidate_dir = Path(sys_entry) / rel_pkg
-        if candidate_dir != here and candidate_dir.is_dir():
-            search_dirs.append(candidate_dir)
-
-    cpp_mtime = cpp_path.stat().st_mtime if cpp_path.exists() else None
-    for d in search_dirs:
-        for pat in patterns:
-            for match in sorted(d.glob(pat)):
-                if not match.is_file():
-                    continue
-                if d != here and cpp_mtime is not None and match.stat().st_mtime < cpp_mtime:
-                    continue
-                return match
-    return None
-
-
 def resolve_so(
     module_file: str,
     name: str,
     force_recompile: bool = False,
-    finder: Callable[[Path, str, Path], Path | None] = find_prebuilt_so,
 ) -> Path:
-    """Locate lib<name>.so for <name>.cpp next to `module_file` (or a prebuilt copy); compile if missing/stale."""
+    """Locate lib<name>.so next to `module_file`; compile from `<name>.cpp` if missing or stale."""
     here = Path(module_file).resolve().parent
     cpp_path = here / f"{name}.cpp"
     so_path = here / f"lib{name}.so"
-
-    if not force_recompile:
-        found = finder(here, f"lib{name}", cpp_path)
-        if found is not None:
-            if found.parent != here and os.access(here, os.W_OK):
-                tmp_copy = here / f".lib{name}.{os.getpid()}.tmp.so"
-                try:
-                    shutil.copy2(found, tmp_copy)
-                    os.replace(tmp_copy, so_path)
-                    found = so_path
-                except OSError:
-                    tmp_copy.unlink(missing_ok=True)
-            so_path = found
 
     in_source_tree = (
         "site-packages" not in here.parts
@@ -131,7 +83,7 @@ def resolve_so(
             in_source_tree
             and cpp_path.exists()
             and os.access(here, os.W_OK)
-            and cpp_path.stat().st_mtime > so_path.stat().st_mtime
+            and cpp_path.stat().st_mtime_ns > so_path.stat().st_mtime_ns
         )
     )
     if need_compile:
@@ -146,21 +98,13 @@ def resolve_so(
                 f"Cannot compile '{so_path.name}' into read-only directory {here}. "
                 f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
             )
-        so_path = here / f"lib{name}.so"
         tmp_so = here / f".lib{name}.{os.getpid()}.tmp.so"
-        cxx = (
-            shutil.which(os.environ.get("CXX", ""))
-            or os.environ.get("CXX")
-            or shutil.which("g++")
-            or shutil.which("c++")
-            or shutil.which("clang++")
-            or "g++"
-        )
+        cxx = shlex.split(os.environ.get("CXX") or "c++") or ["c++"]
         c_native, link_args = get_cpp_compile_and_link_args(include_march_native=True)
         c_generic, _ = get_cpp_compile_and_link_args(include_march_native=False)
-        cmd_variants = [[cxx, *c_native, *link_args, str(cpp_path), "-o", str(tmp_so)]]
+        cmd_variants = [[*cxx, *c_native, *link_args, str(cpp_path), "-o", str(tmp_so)]]
         if c_generic != c_native:
-            cmd_variants.append([cxx, *c_generic, *link_args, str(cpp_path), "-o", str(tmp_so)])
+            cmd_variants.append([*cxx, *c_generic, *link_args, str(cpp_path), "-o", str(tmp_so)])
         last_exc: Exception | None = None
         lock_digest = hashlib.sha1(os.fsencode(so_path)).hexdigest()[:16]
         lock_path = Path(tempfile.gettempdir()) / f".stimside_build_{lock_digest}.lock"
@@ -177,14 +121,14 @@ def resolve_so(
             if (
                 not force_recompile
                 and so_path.exists()
-                and (not in_source_tree or cpp_path.stat().st_mtime <= so_path.stat().st_mtime)
+                and (not in_source_tree or cpp_path.stat().st_mtime_ns <= so_path.stat().st_mtime_ns)
             ):
                 return so_path
             for cmd in cmd_variants:
                 try:
+                    src_mtime_ns = cpp_path.stat().st_mtime_ns
                     subprocess.run(cmd, check=True)
-                    target_mtime = max(time.time(), cpp_path.stat().st_mtime + 1.0)
-                    os.utime(tmp_so, (target_mtime, target_mtime))
+                    os.utime(tmp_so, ns=(src_mtime_ns, src_mtime_ns))
                     os.replace(tmp_so, so_path)
                     last_exc = None
                     break
@@ -213,6 +157,7 @@ def load_cdll(resolve: Callable[..., Path], sentinel: str | None = None) -> ctyp
 
     Raises RuntimeError rather than return a rebuilt library that still lacks `sentinel`.
     """
+    first_err: OSError | None = None
     try:
         lib = ctypes.CDLL(str(resolve()))
         if sentinel is not None:
@@ -221,9 +166,15 @@ def load_cdll(resolve: Callable[..., Path], sentinel: str | None = None) -> ctyp
     except AttributeError:
         # Else dlopen hands this stale library back for the rebuilt one (same path).
         _ctypes.dlclose(lib._handle)
-    except OSError:
-        pass
-    lib = ctypes.CDLL(str(resolve(force_recompile=True)))
+    except OSError as exc:
+        first_err = exc
+    try:
+        rebuilt_path = resolve(force_recompile=True)
+    except Exception as exc:
+        if first_err is not None:
+            raise exc from first_err
+        raise
+    lib = ctypes.CDLL(str(rebuilt_path))
     if sentinel is not None and not hasattr(lib, sentinel):
         # dlopen handed back the stale library: another handle keeps it loaded (or the source lacks it).
         raise RuntimeError(

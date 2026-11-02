@@ -1,9 +1,8 @@
 # pyproject.toml
 
 [build-system]
-requires = []
-build-backend = "setup"
-backend-path = ["."]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
 
 # -------------------
 # Project Metadata
@@ -13,6 +12,7 @@ name = "stimside"
 dynamic = ["version"]
 description = "Stimside simulator to simulate loss and leakage using Stim."
 readme = "README.md"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 authors = [
     { name = "Matt McEwen", email = "mmcewen@google.com" },
@@ -21,9 +21,9 @@ authors = [
 
 # Project dependencies are listed here.
 dependencies = [
-    "numpy",
-    "stim",
-    "sinter",
+    "numpy>=2",
+    "stim>=1.16",
+    "sinter>=1.16",
     "pymatching",
 ]
 

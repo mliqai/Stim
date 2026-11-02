@@ -18,27 +18,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
-import site
 import sys
-import sysconfig
-import time
-
-# When pip runs with build isolation in an offline/restricted environment,
-# ensure the base interpreter's site-packages (containing setuptools and wheel)
-# are available on sys.path.
-if importlib.util.find_spec("setuptools") is None:
-    py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    candidate_dirs = [
-        sysconfig.get_paths().get("purelib"),
-        sysconfig.get_paths().get("platlib"),
-        os.path.join(sys.base_prefix, "lib", py_ver, "site-packages"),
-        os.path.join(sys.base_prefix, "lib", py_ver, "dist-packages"),
-        os.path.join(sys.base_prefix, "lib", "python3", "dist-packages"),
-        site.getusersitepackages(),
-    ]
-    for candidate in candidate_dirs:
-        if candidate and os.path.isdir(candidate) and candidate not in sys.path:
-            site.addsitedir(candidate)
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
@@ -70,44 +50,52 @@ class StimsideBuildExt(build_ext):
         # Pure C++ extern "C" shared libraries loaded via ctypes do not define PyInit_<name>.
         return []
 
+    def _capture_source_mtimes(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for ext in self.extensions:
+            mtimes = [
+                (PROJECT_ROOT / src).stat().st_mtime_ns
+                for src in ext.sources
+                if (PROJECT_ROOT / src).exists()
+            ]
+            if mtimes:
+                out[ext.name] = max(mtimes)
+        return out
+
     def run(self) -> None:
+        src_mtimes = self._capture_source_mtimes()
         super().run()
-        self._sync_extensions_to_source_dir()
+        self._sync_extensions_to_source_dir(src_mtimes)
 
     def copy_extensions_to_source(self) -> None:
         self._sync_extensions_to_source_dir()
 
-    def _sync_extensions_to_source_dir(self) -> None:
+    def _sync_extensions_to_source_dir(
+        self, src_mtimes: dict[str, int] | None = None
+    ) -> None:
         package_dir_map = self.distribution.package_dir or {"": "src"}
         root_src = package_dir_map.get("", "src")
+        captured = src_mtimes if src_mtimes is not None else self._capture_source_mtimes()
         for ext in self.extensions:
             rel_ext_path = self.get_ext_filename(ext.name)
             built_path = (Path(self.build_lib) / rel_ext_path).resolve()
             if not built_path.exists():
                 continue
-            max_src_mtime = max(
-                (
-                    (PROJECT_ROOT / src).stat().st_mtime
-                    for src in ext.sources
-                    if (PROJECT_ROOT / src).exists()
-                ),
-                default=time.time(),
-            )
-            target_mtime = max(time.time(), max_src_mtime + 1.0)
-            os.utime(built_path, (target_mtime, target_mtime))
+            src_mtime_ns = captured.get(ext.name)
+            if src_mtime_ns is not None:
+                os.utime(built_path, ns=(src_mtime_ns, src_mtime_ns))
             dest_path = (PROJECT_ROOT / root_src / rel_ext_path).resolve()
-            cache_path = (PROJECT_ROOT / "python_build_stimside" / "lib" / rel_ext_path).resolve()
-            for target_path in (dest_path, cache_path):
-                try:
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    if built_path != target_path:
-                        tmp_dest = target_path.with_name(f".{target_path.name}.{os.getpid()}.tmp")
-                        shutil.copy2(built_path, tmp_dest)
-                        os.utime(tmp_dest, (target_mtime, target_mtime))
-                        os.replace(tmp_dest, target_path)
-                except OSError:
-                    if self.inplace and target_path == dest_path:
-                        raise
+            try:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                if built_path != dest_path:
+                    tmp_dest = dest_path.with_name(f".{dest_path.name}.{os.getpid()}.tmp")
+                    shutil.copy2(built_path, tmp_dest)
+                    if src_mtime_ns is not None:
+                        os.utime(tmp_dest, ns=(src_mtime_ns, src_mtime_ns))
+                    os.replace(tmp_dest, dest_path)
+            except OSError:
+                if self.inplace:
+                    raise
 
 
 _EXTENSIONS = (
@@ -132,28 +120,8 @@ def _get_extensions() -> list[Extension]:
     ]
 
 
-if __name__ != "__main__":
-    # Expose PEP 517 / PEP 660 build-backend hooks when imported by pip/build.
-    from setuptools.build_meta import (  # noqa: F401
-        build_editable,
-        build_sdist,
-        build_wheel,
-        prepare_metadata_for_build_editable,
-        prepare_metadata_for_build_wheel,
-    )
-
-    def get_requires_for_build_wheel(config_settings=None):
-        return []
-
-    def get_requires_for_build_editable(config_settings=None):
-        return []
-
-    def get_requires_for_build_sdist(config_settings=None):
-        return []
-
-else:
-    setup(
-        ext_modules=_get_extensions(),
-        cmdclass={"build_ext": StimsideBuildExt},
-        options={"build": {"build_base": "python_build_stimside"}},
-    )
+setup(
+    ext_modules=_get_extensions(),
+    cmdclass={"build_ext": StimsideBuildExt},
+    options={"build": {"build_base": "python_build_stimside"}},
+)

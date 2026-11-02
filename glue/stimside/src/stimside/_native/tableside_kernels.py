@@ -8,7 +8,6 @@ import sys
 
 from stimside._native._kernel_loader import (
     AbiSpec,
-    find_prebuilt_so as _find_prebuilt_so_candidate,
     get_lib,
     i32_p,
     resolve_so,
@@ -103,7 +102,7 @@ _SPECS: tuple[AbiSpec, ...] = (
 
 
 def _resolve_tableside_kernels_so(force_recompile: bool = False) -> Path:
-    return resolve_so(__file__, "tableside_kernels", force_recompile, _find_prebuilt_so_candidate)
+    return resolve_so(__file__, "tableside_kernels", force_recompile)
 
 
 def get_tableside_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:

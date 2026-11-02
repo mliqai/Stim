@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 from unittest import mock
 
 import pytest
@@ -18,6 +19,14 @@ from stimside._native import (
     marginal_dem_kernels,
     tableside_kernels,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tempdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    lock_tmp = tmp_path / "_lock_tmp"
+    lock_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(lock_tmp))
+
 
 KERNELS = pytest.mark.parametrize(
     "mod,name",
@@ -41,7 +50,7 @@ def _forbid_subprocess(msg: str):
 
 @KERNELS
 def test_prebuilt_kernels_load_without_runtime_subprocess(mod, name) -> None:
-    # Ensure kernels are present (either from pip install / python_build_stimside or fallback build),
+    # Ensure kernels are present (either from pip install or fallback build),
     # then verify that loading from disk never invokes subprocess.run.
     _resolve(mod, name)
     mod._LIB_INSTANCE = None
@@ -61,20 +70,36 @@ def test_wheel_install_resolution_ignores_cpp_mtime_and_missing_cpp(
         assert _resolve(mod, name) == fake_pkg / f"lib{name}.so"
 
 
-@KERNELS
-def test_source_tree_discovers_prebuilt_so_from_sys_path_without_subprocess(
-    mod, name, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_source_tree_ignores_foreign_so_on_sys_path_and_compiles_own_cpp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake_site_native = tmp_path / "installed_site" / "stimside" / "_native"
-    fake_site_native.mkdir(parents=True)
-    shutil.copy2(_resolve(mod, name), fake_site_native / f"lib{name}.so")
+    foreign_site_native = tmp_path / "installed_site" / "stimside" / "_native"
+    foreign_site_native.mkdir(parents=True)
+    foreign_cpp = tmp_path / "foreign.cpp"
+    foreign_cpp.write_text(
+        'extern "C" int tiny_foreign_abi_v1() { return 1; }\n'
+        'extern "C" int foreign_build_marker() { return 42; }\n',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["c++", "-std=c++17", "-O2", "-fPIC", "-shared", str(foreign_cpp), "-o", str(foreign_site_native / "libtiny_foreign.so")],
+        check=True,
+    )
+
     fake_src_native = tmp_path / "repo" / "src" / "stimside" / "_native"
     fake_src_native.mkdir(parents=True)
     (tmp_path / "repo" / "setup.py").write_text("# dummy\n", encoding="utf-8")
+    local_cpp = fake_src_native / "tiny_foreign.cpp"
+    local_cpp.write_text('extern "C" int tiny_foreign_abi_v1() { return 1; }\n', encoding="utf-8")
+    older_ns = (foreign_site_native / "libtiny_foreign.so").stat().st_mtime_ns - 5_000_000_000
+    os.utime(local_cpp, ns=(older_ns, older_ns))
+
     monkeypatch.syspath_prepend(str(tmp_path / "installed_site"))
-    monkeypatch.setattr(mod, "__file__", str(fake_src_native / f"{name}.py"))
-    with _forbid_subprocess("subprocess.run should not be called when prebuilt .so is on sys.path"):
-        assert _resolve(mod, name).exists()
+    so = _kernel_loader.resolve_so(str(fake_src_native / "tiny_foreign.py"), "tiny_foreign")
+    assert so == fake_src_native / "libtiny_foreign.so"
+    lib = ctypes.CDLL(str(so))
+    assert lib.tiny_foreign_abi_v1() == 1
+    assert not hasattr(lib, "foreign_build_marker")
 
 
 @KERNELS
@@ -83,7 +108,6 @@ def test_missing_so_and_cpp_raises_clear_file_not_found(
 ) -> None:
     empty_native = tmp_path / "empty_native"
     empty_native.mkdir(parents=True)
-    monkeypatch.setattr(mod, "_find_prebuilt_so_candidate", lambda *a, **kw: None)
     monkeypatch.setattr(mod, "__file__", str(empty_native / f"{name}.py"))
     with pytest.raises(FileNotFoundError, match="pip install"):
         _resolve(mod, name)
@@ -100,8 +124,8 @@ def _stale_tiny_library(tmp_path: Path) -> tuple[functools.partial[Path], Path]:
     cpp.write_text('extern "C" int tiny_abi_v1() { return 1; }\n', encoding="utf-8")
     so = resolve(force_recompile=True)
     cpp.write_text('extern "C" int tiny_abi_v2() { return 2; }\n', encoding="utf-8")
-    t = cpp.stat().st_mtime + 10
-    os.utime(so, (t, t))
+    t_ns = cpp.stat().st_mtime_ns + 10_000_000_000
+    os.utime(so, ns=(t_ns, t_ns))
     return resolve, so
 
 
@@ -128,18 +152,15 @@ def test_loader_uses_hidden_tmp_so_and_never_uses_system_tempdir(
     cpp = native / "tiny2.cpp"
     cpp.write_text('extern "C" int tiny2_abi_v1() { return 1; }\n', encoding="utf-8")
 
-    # 1. find_prebuilt_so must ignore both hidden .lib*.tmp.so and anything in tempfile.gettempdir().
+    # 1. resolve_so must ignore both hidden .lib*.tmp.so and anything in tempfile.gettempdir().
     fake_tmp = tmp_path / "fake_sys_tmp"
     fake_tmp.mkdir()
     (fake_tmp / "libtiny2.so").write_bytes(b"bad")
     (native / ".libtiny2.999.tmp.so").write_bytes(b"partial")
     monkeypatch.setenv("TMPDIR", str(fake_tmp))
-    import tempfile
-
     monkeypatch.setattr(tempfile, "tempdir", str(fake_tmp))
-    assert _kernel_loader.find_prebuilt_so(native, "libtiny2", cpp) is None
 
-    # 2. Compilation writes to a dot-prefixed temp file invisible to find_prebuilt_so.
+    # 2. Compilation writes to a dot-prefixed temp file and never leaves lock files in package dir.
     seen_out: list[str] = []
     real_run = subprocess.run
 
@@ -149,7 +170,7 @@ def test_loader_uses_hidden_tmp_so_and_never_uses_system_tempdir(
         return real_run(cmd, *a, **kw)
 
     with mock.patch.object(subprocess, "run", side_effect=spy_run):
-        so = _kernel_loader.resolve_so(str(native / "tiny2.py"), "tiny2", force_recompile=True)
+        so = _kernel_loader.resolve_so(str(native / "tiny2.py"), "tiny2")
     assert so == native / "libtiny2.so"
     assert seen_out and all(n.startswith(".libtiny2.") for n in seen_out)
     assert list(native.glob("*lock*")) == []
@@ -160,6 +181,54 @@ def test_loader_uses_hidden_tmp_so_and_never_uses_system_tempdir(
     with _forbid_subprocess("must not compile into /tmp when package dir is read-only"):
         with pytest.raises(PermissionError, match="pip install"):
             _kernel_loader.resolve_so(str(native / "tiny2.py"), "tiny2")
+
+
+def test_cxx_wrapper_edit_race_and_corrupt_so_error_chaining(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native = tmp_path / "src" / "stimside" / "_native"
+    native.mkdir(parents=True)
+    (tmp_path / "setup.py").write_text("# dummy\n", encoding="utf-8")
+    cpp = native / "tiny_race.cpp"
+    cpp.write_text('extern "C" int tiny_race_abi_v1() { return 1; }\n', encoding="utf-8")
+
+    # 1. CXX containing compiler + flags parses cleanly via shlex.split, and an edit saved while
+    # the compiler is running leaves .cpp strictly newer than the stamped .so so the next call rebuilds.
+    monkeypatch.setenv("CXX", "c++ -w")
+    real_run = subprocess.run
+
+    def edit_during_compile(cmd, *a, **kw):
+        res = real_run(cmd, *a, **kw)
+        old_ns = cpp.stat().st_mtime_ns
+        cpp.write_text(
+            'extern "C" int tiny_race_abi_v1() { return 1; }\n'
+            'extern "C" int tiny_race_edited() { return 9; }\n',
+            encoding="utf-8",
+        )
+        new_ns = max(cpp.stat().st_mtime_ns, old_ns + 1_000_000)
+        os.utime(cpp, ns=(new_ns, new_ns))
+        return res
+
+    with mock.patch.object(subprocess, "run", side_effect=edit_during_compile):
+        so1 = _kernel_loader.resolve_so(str(native / "tiny_race.py"), "tiny_race")
+    assert so1.stat().st_mtime_ns < cpp.stat().st_mtime_ns
+
+    so2 = _kernel_loader.resolve_so(str(native / "tiny_race.py"), "tiny_race")
+    assert so2.stat().st_mtime_ns == cpp.stat().st_mtime_ns
+    assert ctypes.CDLL(str(so2)).tiny_race_edited() == 9
+    with _forbid_subprocess("second call after clean stamp must not recompile"):
+        assert _kernel_loader.resolve_so(str(native / "tiny_race.py"), "tiny_race") == so2
+
+    # 2. Corrupt .so in read-only site-packages chains the initial dlopen OSError onto PermissionError.
+    ro_pkg = tmp_path / "site-packages" / "stimside" / "_native"
+    ro_pkg.mkdir(parents=True)
+    (ro_pkg / "corrupt.cpp").write_text('extern "C" int corrupt_abi_v1() { return 1; }\n', encoding="utf-8")
+    (ro_pkg / "libcorrupt.so").write_bytes(b"not an ELF file")
+    ro_resolve = functools.partial(_kernel_loader.resolve_so, str(ro_pkg / "corrupt.py"), "corrupt")
+    monkeypatch.setattr(os, "access", lambda p, mode: False)
+    with pytest.raises(PermissionError) as exc_info:
+        _kernel_loader.load_cdll(ro_resolve, "corrupt_abi_v1")
+    assert isinstance(exc_info.value.__cause__, OSError)
 
 
 def test_coset_kernels_exports_and_checks_abi_sentinel() -> None:
@@ -173,6 +242,14 @@ def test_packaging_single_version_source_and_no_sdist_so_globs() -> None:
     manifest = (root / "MANIFEST.in").read_text(encoding="utf-8")
     pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
     setup_src = (root / "setup.py").read_text(encoding="utf-8")
+    assert (root / "LICENSE").is_file()
+    assert "include LICENSE" in manifest
+    assert 'license = {text = "Apache-2.0"}' in pyproject
+    assert 'build-backend = "setuptools.build_meta"' in pyproject
+    assert '"setuptools>=64"' in pyproject
+    assert '"numpy>=2"' in pyproject
+    assert '"stim>=1.16"' in pyproject
+    assert '"sinter>=1.16"' in pyproject
     assert "*.so" not in pyproject
     assert "*.so" not in setup_src
     assert "global-exclude *.so" in manifest
