@@ -2332,3 +2332,23 @@ def test_caller_records_mutation_and_batch_pinning_isolation() -> None:
     meta = get_item_analysis_meta(single_dem)
     assert meta is not None and meta[5].base is None
 
+
+def test_decode_with_generated_dems_zero_shots_multi_byte_observables() -> None:
+    circ = _make_surface_code_leakage_circuit(distance=3, rounds=2).copy()
+    obs0_targets = next(
+        op.targets_copy() for op in reversed(circ) if op.name == "OBSERVABLE_INCLUDE"
+    )
+    circ.append("OBSERVABLE_INCLUDE", obs0_targets, 9)
+    gen = MarginalLeakageDemGenerator()
+    empty_recs = np.zeros((0, circ.num_measurements), dtype=bool)
+    empty_dets = np.zeros((0, (circ.num_detectors + 7) // 8), dtype=np.uint8)
+    for dec, rew in ((False, False), (False, True), (True, False), (True, True)):
+        dems = gen(circ, empty_recs, decompose_errors=dec, reweight_only=rew)
+        pred = decode_with_generated_dems("pymatching", dems, empty_dets)
+        assert pred.shape == (0, 2) and pred.dtype == np.uint8
+
+    base = gen._get_analysis(circ, True).baseline
+    pred_list = decode_with_generated_dems("pymatching", [], empty_dets, base_dem=base)
+    assert pred_list.shape == (0, 2) and pred_list.dtype == np.uint8
+
+

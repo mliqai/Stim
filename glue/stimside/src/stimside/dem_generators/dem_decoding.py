@@ -68,56 +68,37 @@ def warn_if_pymatching_hyperedge(
         )
 
 
+def _extract_canonical_probs(
+    dem: stim.DetectorErrorModel, out: stim.DetectorErrorModel | None = None
+) -> dict[Any, float]:
+    probs: dict[Any, float] = {}
+    for inst in dem.flattened():
+        if inst.type != "error":
+            if out is not None:
+                out.append(inst)
+            continue
+        sym = inst_canonical_symptom(inst)
+        if sym != ((), ()):
+            probs[sym] = prob_xor(probs.get(sym, 0.0), float(inst.args_copy()[0]))
+    return probs
+
+
 def _apply_reweight_update_dem(
     base_dem: stim.DetectorErrorModel, update_dem: stim.DetectorErrorModel
 ) -> stim.DetectorErrorModel:
     """Apply a reweight-update DEM (containing updated total probabilities) onto ``base_dem``."""
-    updates: dict[Any, float] = {}
-    for inst in update_dem.flattened():
-        if inst.type != "error":
-            continue
-        sym = inst_canonical_symptom(inst)
-        if sym == ((), ()):
-            continue
-        p = float(inst.args_copy()[0])
-        updates[sym] = prob_xor(updates.get(sym, 0.0), p)
-
+    updates = _extract_canonical_probs(update_dem)
     if not updates:
         return base_dem
-
-    base_syms: dict[Any, float] = {}
     out = stim.DetectorErrorModel()
-    for inst in base_dem.flattened():
-        if inst.type != "error":
-            out.append(inst)
-            continue
-        sym = inst_canonical_symptom(inst)
-        if sym == ((), ()):
-            continue
-        p = float(inst.args_copy()[0])
-        base_syms[sym] = prob_xor(base_syms.get(sym, 0.0), p)
-
+    base_syms = _extract_canonical_probs(base_dem, out)
     for sym, p_base in base_syms.items():
-        p_final = updates.pop(sym, p_base)
-        if p_final > 0:
+        if (p_final := updates.pop(sym, p_base)) > 0:
             out.append("error", p_final, sym_to_targets(sym))
     for sym, p_new in updates.items():
         if p_new > 0:
             out.append("error", p_new, sym_to_targets(sym))
     return out
-
-
-def _prob_to_weight(p: float) -> float:
-    if p <= 0.0:
-        return _MAX_PYMATCHING_WEIGHT
-    if p >= 1.0:
-        return 0.0
-    w = math.log((1.0 - p) / p)
-    if w < 0.0:
-        return 0.0
-    if w > _MAX_PYMATCHING_WEIGHT:
-        return _MAX_PYMATCHING_WEIGHT
-    return w
 
 
 def _extract_graphlike_edges(
@@ -127,18 +108,13 @@ def _extract_graphlike_edges(
     probs: dict[tuple[int, int], float] = {}
     first_obs: dict[tuple[int, int], tuple[int, ...]] = {}
     for inst in dem.flattened():
-        if inst.type != "error":
-            continue
-        p = float(inst.args_copy()[0])
-        if p <= 0.0:
+        if inst.type != "error" or (p := float(inst.args_copy()[0])) <= 0.0:
             continue
         for dets, obs in graphlike_inst_symptom(inst)[0]:
-            if not (1 <= len(dets) <= 2):
-                continue
-            edge = dets_edge_key(dets)
-            if edge not in first_obs:
-                first_obs[edge] = obs
-            probs[edge] = prob_xor(probs.get(edge, 0.0), p)
+            if 1 <= len(dets) <= 2:
+                edge = dets_edge_key(dets)
+                first_obs.setdefault(edge, obs)
+                probs[edge] = prob_xor(probs.get(edge, 0.0), p)
     return probs, first_obs
 
 
@@ -150,8 +126,7 @@ def _weight_to_prob(w: float) -> float:
     if w >= 0.0:
         ew = math.exp(-w)
         return ew / (1.0 + ew)
-    ew = math.exp(w)
-    return 1.0 / (1.0 + ew)
+    return 1.0 / (1.0 + math.exp(w))
 
 
 def _ensure_base_dem_has_reweight_edges(
@@ -159,15 +134,13 @@ def _ensure_base_dem_has_reweight_edges(
     rw_list: Sequence[NDArray[np.float64] | None],
 ) -> stim.DetectorErrorModel:
     eff_base = decompose_dem_graphlike(base_dem)
-    existing_probs, existing_obs = _extract_graphlike_edges(eff_base)
-    missing_edges: set[tuple[int, int]] = set()
-    for rw in rw_list:
-        if rw is None:
-            continue
-        for row in rw:
-            edge = nodes_edge_key(int(row[0]), int(row[1]))
-            if edge not in existing_probs and edge not in existing_obs:
-                missing_edges.add(edge)
+    existing_probs, _ = _extract_graphlike_edges(eff_base)
+    missing_edges = {
+        nodes_edge_key(int(row[0]), int(row[1]))
+        for rw in rw_list
+        if rw is not None
+        for row in rw
+    } - existing_probs.keys()
     if not missing_edges:
         return eff_base
     out = eff_base.copy()
@@ -187,8 +160,7 @@ def _apply_edge_reweights_to_dem(
     base_probs, base_obs = base_edges
     updated_probs = dict(base_probs)
     for row in rw:
-        edge = nodes_edge_key(int(row[0]), int(row[1]))
-        updated_probs[edge] = _weight_to_prob(float(row[2]))
+        updated_probs[nodes_edge_key(int(row[0]), int(row[1]))] = _weight_to_prob(float(row[2]))
     out = stim.DetectorErrorModel()
     for inst in eff_base.flattened():
         if inst.type != "error":
@@ -215,6 +187,32 @@ def _resolve_shot_dem(
     return dem
 
 
+def _decode_grouped_shots(
+    decoder: Any,
+    dets_2d: NDArray[np.uint8],
+    groups: Sequence[tuple[list[int], stim.DetectorErrorModel]],
+) -> NDArray[np.uint8]:
+    out: NDArray[np.uint8] | None = None
+    for shots, dem in groups:
+        preds = decoder.compile_decoder_for_dem(dem=dem).decode_shots_bit_packed(
+            bit_packed_detection_event_data=dets_2d[shots]
+        )
+        if out is None:
+            out = np.zeros((dets_2d.shape[0], preds.shape[1]), dtype=np.uint8)
+        out[shots] = preds
+    assert out is not None
+    return out
+
+
+def _normalize_reweight_array(arr: NDArray[Any]) -> NDArray[np.float64] | None:
+    arr_f64 = np.asarray(arr, dtype=np.float64)
+    if arr_f64.ndim != 2 or arr_f64.shape[1] != 3:
+        raise ValueError(
+            f"Expected edge_reweights array of shape (num_reweights, 3), got {arr_f64.shape}."
+        )
+    return None if arr_f64.shape[0] == 0 else np.ascontiguousarray(arr_f64, dtype=np.float64)
+
+
 def decode_with_edge_reweights(
     decoder: Any,
     reweights: NDArray[np.float64] | Sequence[NDArray[np.float64] | None],
@@ -223,23 +221,10 @@ def decode_with_edge_reweights(
     base_dem: stim.DetectorErrorModel | None = None,
     analysis: Any = None,
 ) -> NDArray[np.uint8]:
-    dets_2d = (
-        bit_packed_dets[np.newaxis, :]
-        if bit_packed_dets.ndim == 1
-        else bit_packed_dets
-    )
+    dets_2d = bit_packed_dets[np.newaxis, :] if bit_packed_dets.ndim == 1 else bit_packed_dets
     num_shots = dets_2d.shape[0]
     if isinstance(reweights, np.ndarray):
-        if reweights.ndim != 2 or reweights.shape[1] != 3:
-            raise ValueError(
-                f"Expected edge_reweights array of shape (num_reweights, 3), got {reweights.shape}."
-            )
-        rw_arr = (
-            None
-            if reweights.shape[0] == 0
-            else np.ascontiguousarray(reweights, dtype=np.float64)
-        )
-        rw_list: list[NDArray[np.float64] | None] = [rw_arr] * num_shots
+        rw_list: list[NDArray[np.float64] | None] = [_normalize_reweight_array(reweights)] * num_shots
     else:
         if len(reweights) != num_shots:
             raise ValueError(
@@ -250,27 +235,16 @@ def decode_with_edge_reweights(
         for rw in reweights:
             if rw is None:
                 rw_list.append(None)
-                continue
-            rid = id(rw)
-            if rid not in seen_arrays:
-                arr = np.asarray(rw, dtype=np.float64)
-                if arr.ndim != 2 or arr.shape[1] != 3:
-                    raise ValueError(
-                        f"Expected edge_reweights array of shape (num_reweights, 3), got {arr.shape}."
-                    )
-                seen_arrays[rid] = (
-                    None
-                    if arr.shape[0] == 0
-                    else np.ascontiguousarray(arr, dtype=np.float64)
-                )
-            rw_list.append(seen_arrays[rid])
+            else:
+                rid = id(rw)
+                if rid not in seen_arrays:
+                    seen_arrays[rid] = _normalize_reweight_array(rw)
+                rw_list.append(seen_arrays[rid])
 
     if not hasattr(decoder, "decode_batch") and (
         not is_pymatching_decoder(decoder) or not _matching_supports_edge_reweights()
     ):
-        eff_base_dem = base_dem or (
-            analysis.matching_base_dem if analysis is not None else None
-        )
+        eff_base_dem = base_dem or (analysis.matching_base_dem if analysis is not None else None)
         if eff_base_dem is None:
             raise ValueError(
                 "base_dem (or dems generated by MarginalLeakageDemGenerator) is required "
@@ -278,50 +252,41 @@ def decode_with_edge_reweights(
             )
         if num_shots == 0:
             return np.zeros((0, (eff_base_dem.num_observables + 7) // 8), dtype=np.uint8)
-        shots_by_rw: dict[int, list[int]] = {}
-        rw_by_key: dict[int, NDArray[np.float64] | None] = {}
+        shots_by_rw: dict[int, tuple[list[int], NDArray[np.float64] | None]] = {}
         for shot_idx, rw_item in enumerate(rw_list):
             key = 0 if rw_item is None else id(rw_item)
-            shots_by_rw.setdefault(key, []).append(shot_idx)
-            rw_by_key[key] = rw_item
-        out: NDArray[np.uint8] | None = None
+            if key not in shots_by_rw:
+                shots_by_rw[key] = ([], rw_item)
+            shots_by_rw[key][0].append(shot_idx)
         graphlike_base = decompose_dem_graphlike(eff_base_dem)
         base_edges = _extract_graphlike_edges(graphlike_base)
-        for key, shots in shots_by_rw.items():
-            dem_for_group = _apply_edge_reweights_to_dem(
-                graphlike_base, base_edges, rw_by_key[key]
-            )
-            preds = decoder.compile_decoder_for_dem(
-                dem=dem_for_group
-            ).decode_shots_bit_packed(
-                bit_packed_detection_event_data=dets_2d[shots]
-            )
-            if out is None:
-                out = np.zeros((num_shots, preds.shape[1]), dtype=np.uint8)
-            out[shots] = preds
-        assert out is not None
-        return out
+        return _decode_grouped_shots(
+            decoder,
+            dets_2d,
+            [
+                (shots, _apply_edge_reweights_to_dem(graphlike_base, base_edges, rw_item))
+                for shots, rw_item in shots_by_rw.values()
+            ],
+        )
 
     if hasattr(decoder, "decode_batch"):
         matcher = decoder
-    else:
-        if analysis is not None and base_dem is None:
-            matcher = analysis.get_cached_matcher()
-        elif base_dem is not None:
-            import pymatching  # type: ignore[import-untyped]
+    elif analysis is not None and base_dem is None:
+        matcher = analysis.get_cached_matcher()
+    elif base_dem is not None:
+        import pymatching  # type: ignore[import-untyped]
 
-            eff_base = _ensure_base_dem_has_reweight_edges(base_dem, rw_list)
-            matcher = pymatching.Matching.from_detector_error_model(eff_base)
-        else:
-            raise ValueError(
-                "base_dem (or dems generated by MarginalLeakageDemGenerator) is required "
-                "when decoding edge_reweights."
-            )
+        matcher = pymatching.Matching.from_detector_error_model(
+            _ensure_base_dem_has_reweight_edges(base_dem, rw_list)
+        )
+    else:
+        raise ValueError(
+            "base_dem (or dems generated by MarginalLeakageDemGenerator) is required "
+            "when decoding edge_reweights."
+        )
 
     if num_shots == 0:
-        num_obs_bytes = (matcher.num_fault_ids + 7) // 8
-        return np.zeros((0, num_obs_bytes), dtype=np.uint8)
-
+        return np.zeros((0, (matcher.num_fault_ids + 7) // 8), dtype=np.uint8)
     return matcher.decode_batch(
         dets_2d,
         bit_packed_shots=True,
@@ -355,16 +320,6 @@ def _extract_regen_spec(
                 evs = [ev for ev in (get_item_leakage_events(x) for x in seq) if ev is not None]
                 return m0[1], m0[2], m0[3], m0[4], rec_2d, evs or None
     return None
-
-
-def _decode_non_pymatching_reweights(
-    decoder: Any, regen_spec: tuple[bool, bool, Any, Any, Any, Any] | None, dets_2d: NDArray[np.uint8]
-) -> Any:
-    if regen_spec is None or is_pymatching_decoder(decoder) or hasattr(decoder, "decode_batch"):
-        return None
-    _, _, gen_inst, circ_inst, rec_inst, evs = regen_spec
-    dem_full = gen_inst(circ_inst, rec_inst, decompose_errors=True, reweight_only=False, leakage_events=evs)
-    return decode_with_generated_dems(decoder, dem_full, dets_2d, decompose_errors=True)
 
 
 def decode_with_generated_dems(
@@ -404,7 +359,6 @@ def decode_with_generated_dems(
                 if isinstance(dems, (stim.DetectorErrorModel, np.ndarray))
                 else None
             )
-            regen_spec = (eff_dec, eff_rew, gen_inst, circ_inst, rec_inst, evs)
         dec_flag, rew_flag = eff_dec, eff_rew
         if bit_packed_dets is None:
             return dems
@@ -412,20 +366,12 @@ def decode_with_generated_dems(
     dets_2d = (
         None
         if bit_packed_dets is None
-        else (
-            bit_packed_dets[np.newaxis, :]
-            if bit_packed_dets.ndim == 1
-            else bit_packed_dets
-        )
+        else (bit_packed_dets[np.newaxis, :] if bit_packed_dets.ndim == 1 else bit_packed_dets)
     )
 
-    # Case 1: dems is already in PyMatching edge_reweights format (np.ndarray or Sequence[np.ndarray | None])
     if isinstance(dems, np.ndarray):
         if dets_2d is None:
             return dems
-        fb = _decode_non_pymatching_reweights(decoder, regen_spec, dets_2d)
-        if fb is not None:
-            return fb
         return decode_with_edge_reweights(
             decoder,
             dems,
@@ -436,67 +382,29 @@ def decode_with_generated_dems(
     if not isinstance(dems, stim.DetectorErrorModel):
         dems_seq = dems if isinstance(dems, list) else list(dems)
         first_non_none = next((x for x in dems_seq if x is not None), None)
-        if isinstance(first_non_none, np.ndarray) or (
-            len(dems_seq) > 0 and first_non_none is None
-        ):
+        is_reweight_seq = (
+            isinstance(first_non_none, np.ndarray)
+            or (dems_seq and first_non_none is None)
+            or (bool(getattr(dems, "decompose_errors", False)) and bool(getattr(dems, "reweight_only", False)))
+        )
+        if is_reweight_seq:
             if dets_2d is None:
                 return dems
-            fb = _decode_non_pymatching_reweights(decoder, regen_spec, dets_2d)
-            if fb is not None:
-                return fb
             analysis = getattr(dems, "analysis", None)
             if analysis is None and first_non_none is not None:
                 imeta = get_item_analysis_meta(first_non_none)
-                if imeta is not None:
-                    analysis = imeta[0]
+                analysis = imeta[0] if imeta is not None else None
             return decode_with_edge_reweights(
-                decoder,
-                dems_seq,  # type: ignore[arg-type]
-                dets_2d,
-                base_dem=base_dem,
-                analysis=analysis,
+                decoder, dems_seq, dets_2d, base_dem=base_dem, analysis=analysis  # type: ignore[arg-type]
             )
 
-    # Case 2: Single stim.DetectorErrorModel
     if isinstance(dems, stim.DetectorErrorModel):
-        imeta = single_imeta
-        single_analysis = imeta[0] if imeta is not None else None
-        is_rew_single = rew_flag or (imeta is not None and imeta[2])
-        eff_base_dem = base_dem or (
-            single_analysis.baseline if single_analysis is not None else None
-        )
-
-        if (
-            dec_flag
-            and rew_flag
-            and (dets_2d is None or is_pymatching_decoder(decoder))
-            and eff_base_dem is not None
-        ):
-            if dets_2d is None:
-                res_list = decode_with_generated_dems(
-                    decoder,
-                    [dems],
-                    None,
-                    decompose_errors=True,
-                    reweight_only=True,
-                    base_dem=eff_base_dem,
-                )
-                return res_list[0]
-            num_shots = dets_2d.shape[0]
-            return decode_with_generated_dems(
-                decoder,
-                [dems] * num_shots,
-                dets_2d,
-                decompose_errors=True,
-                reweight_only=True,
-                base_dem=eff_base_dem,
-            )
-
+        single_analysis = single_imeta[0] if single_imeta is not None else None
         dem_single = _resolve_shot_dem(
             dems,
-            apply_reweight=is_rew_single,
+            apply_reweight=rew_flag or bool(single_imeta and single_imeta[2]),
             decompose=dec_flag,
-            base_dem=eff_base_dem,
+            base_dem=base_dem or (single_analysis.baseline if single_analysis is not None else None),
         )
         if dets_2d is None:
             return dem_single
@@ -506,7 +414,6 @@ def decode_with_generated_dems(
             bit_packed_detection_event_data=dets_2d
         )
 
-    # Case 3: Sequence of stim.DetectorErrorModel
     dems_list: list[stim.DetectorErrorModel] = list(dems)  # type: ignore[arg-type]
     if dets_2d is not None:
         num_shots = dets_2d.shape[0]
@@ -515,18 +422,29 @@ def decode_with_generated_dems(
                 f"dem_gen returned {len(dems_list)} DEMs for a batch of {num_shots} shots."
             )
         if num_shots == 0:
-            return np.zeros((0, 0), dtype=np.uint8)
+            analysis0 = getattr(dems, "analysis", None)
+            eff_base = (
+                base_dem
+                or getattr(dems, "base_dem", None)
+                or (analysis0.baseline if analysis0 is not None else None)
+            )
+            circ0 = getattr(dems, "circuit", None)
+            n_obs = (
+                eff_base.num_observables
+                if eff_base is not None
+                else (circ0.num_observables if circ0 is not None else 0)
+            )
+            return np.zeros((0, (n_obs + 7) // 8), dtype=np.uint8)
     elif not dems_list:
         return []
 
     imeta0 = get_item_analysis_meta(dems_list[0])
-    analysis = getattr(dems, "analysis", None) or (
-        imeta0[0] if imeta0 is not None else None
+    analysis = getattr(dems, "analysis", None) or (imeta0[0] if imeta0 is not None else None)
+    apply_rew = (
+        rew_flag
+        or bool(getattr(dems, "reweight_only", False))
+        or bool(imeta0 and imeta0[2])
     )
-    is_reweight_dems = bool(getattr(dems, "reweight_only", False)) or (
-        imeta0[2] if imeta0 is not None else False
-    )
-    apply_rew = rew_flag or is_reweight_dems
     gen_base_dem = (
         base_dem
         or getattr(dems, "base_dem", None)
@@ -536,99 +454,23 @@ def decode_with_generated_dems(
     shots_by_dem: dict[int, list[int]] = {}
     for shot, dem in enumerate(dems_list):
         shots_by_dem.setdefault(id(dem), []).append(shot)
-
-    # If both decompose_errors and reweight_only are requested on plain DEMs with PyMatching (or bit_packed_dets is None):
-    if dec_flag and rew_flag and (dets_2d is None or is_pymatching_decoder(decoder)):
-        unique_ids = list(shots_by_dem.keys())
-        resolved_by_id = {
-            did: _resolve_shot_dem(
-                dems_list[shots_by_dem[did][0]],
-                apply_reweight=apply_rew,
-                decompose=True,
-                base_dem=gen_base_dem,
-            )
-            for did in unique_ids
-        }
-
-        ref_dem = (
-            decompose_dem_graphlike(gen_base_dem)
-            if gen_base_dem is not None
-            else resolved_by_id[unique_ids[0]]
-        )
-        base_probs, base_obs = _extract_graphlike_edges(ref_dem)
-        obs_compatible = True
-        edges_by_id: dict[int, dict[tuple[int, int], float]] = {}
-        for did, r_dem in resolved_by_id.items():
-            e_probs, e_obs = _extract_graphlike_edges(r_dem)
-            edges_by_id[did] = e_probs
-            for edge, obs in e_obs.items():
-                if edge in base_obs and base_obs[edge] != obs:
-                    obs_compatible = False
-                    break
-                if edge not in base_obs:
-                    base_obs[edge] = obs
-
-        if obs_compatible:
-            full_base_dem = ref_dem.copy()
-            for edge, obs in base_obs.items():
-                if edge not in base_probs:
-                    full_base_dem.append("error", 1e-12, edge_to_targets(edge, obs))
-            rw_by_id: dict[int, NDArray[np.float64] | None] = {}
-            empty_arr = np.empty((0, 3), dtype=np.float64)
-            for did, e_probs in edges_by_id.items():
-                rows: list[list[float]] = []
-                all_edges = set(base_probs.keys()) | set(e_probs.keys())
-                for edge in sorted(all_edges):
-                    p_b = base_probs.get(edge, 0.0)
-                    p_cur = e_probs.get(edge, 0.0)
-                    if abs(p_cur - p_b) > 1e-15:
-                        rows.append(
-                            [float(edge[0]), float(edge[1]), _prob_to_weight(p_cur)]
-                        )
-                rw_by_id[did] = (
-                    np.asarray(rows, dtype=np.float64)
-                    if rows
-                    else (empty_arr if dets_2d is None else None)
-                )
-            rw_per_shot = [rw_by_id[id(d)] for d in dems_list]
-            if dets_2d is None:
-                return rw_per_shot
-            return decode_with_edge_reweights(
-                decoder,
-                rw_per_shot,
-                dets_2d,
-                base_dem=full_base_dem,
-            )
-
-    if dets_2d is None:
-        transformed_by_id = {
-            did: _resolve_shot_dem(
-                dems_list[shots[0]],
-                apply_reweight=apply_rew,
-                decompose=dec_flag,
-                base_dem=gen_base_dem,
-            )
-            for did, shots in shots_by_dem.items()
-        }
-        return [transformed_by_id[id(d)] for d in dems_list]
-
-    out = None
-    for shots in shots_by_dem.values():
-        dem_item = _resolve_shot_dem(
+    resolved_by_id = {
+        did: _resolve_shot_dem(
             dems_list[shots[0]],
             apply_reweight=apply_rew,
             decompose=dec_flag,
             base_dem=gen_base_dem,
         )
-        if not dec_flag:
+        for did, shots in shots_by_dem.items()
+    }
+    if dets_2d is None:
+        return [resolved_by_id[id(d)] for d in dems_list]
+    if not dec_flag:
+        for dem_item in resolved_by_id.values():
             warn_if_pymatching_hyperedge(decoder, dem_item)
-        predictions = decoder.compile_decoder_for_dem(
-            dem=dem_item
-        ).decode_shots_bit_packed(
-            bit_packed_detection_event_data=dets_2d[shots]
-        )
-        if out is None:
-            out = np.zeros((num_shots, predictions.shape[1]), dtype=np.uint8)
-        out[shots] = predictions
-    assert out is not None
-    return out
+    return _decode_grouped_shots(
+        decoder,
+        dets_2d,
+        [(shots, resolved_by_id[did]) for did, shots in shots_by_dem.items()],
+    )
+
