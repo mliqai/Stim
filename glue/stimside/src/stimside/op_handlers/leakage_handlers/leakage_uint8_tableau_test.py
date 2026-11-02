@@ -940,3 +940,8 @@ class TestCompiledLeakageUint8:
             tss.run()
             assert np.all(tss.get_final_measurement_records() == expected), batch_size
         assert (len(handled) == 2) if to_python else (handled == [])
+
+    def test_leakage_uint8_dataclass_eq_and_repr(self):
+        assert LeakageUint8() == LeakageUint8(True)
+        assert LeakageUint8(True) != LeakageUint8(False)
+        assert "unconditional_condition_on_U=False" in repr(LeakageUint8(False))

@@ -9,12 +9,14 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
+import hashlib
 import os
 from pathlib import Path
 import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from types import ModuleType
 from typing import Any
@@ -30,9 +32,13 @@ def get_cpp_compile_and_link_args(
     if system.startswith("Win"):
         return ["/std:c++17", "/O2"], []
     compile_args = ["-std=c++17", "-O3", "-fPIC", "-fno-strict-aliasing", "-g0"]
-    if include_march_native and any(
-        arch in machine
-        for arch in ("x86_64", "amd64", "i686", "i386", "arm64", "aarch64")
+    if (
+        include_march_native
+        and os.environ.get("STIMSIDE_PORTABLE_BUILD") != "1"
+        and any(
+            arch in machine
+            for arch in ("x86_64", "amd64", "i686", "i386", "arm64", "aarch64")
+        )
     ):
         compile_args.append("-march=native")
     return compile_args, ["-O3", "-shared"]
@@ -137,31 +143,44 @@ def resolve_so(
         if c_generic != c_native:
             cmd_variants.append([cxx, *c_generic, *link_args, str(cpp_path), "-o", str(tmp_so)])
         last_exc: Exception | None = None
-        with cpp_path.open("rb") as lf:
+        lock_digest = hashlib.sha1(os.fsencode(so_path)).hexdigest()[:16]
+        lock_path = Path(tempfile.gettempdir()) / f".stimside_build_{lock_digest}.lock"
+        lf = None
+        locked = False
+        try:
+            lf = lock_path.open("a+b")
             if fcntl is not None:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-            try:
-                if (
-                    not force_recompile
-                    and so_path.exists()
-                    and (not in_source_tree or cpp_path.stat().st_mtime <= so_path.stat().st_mtime)
-                ):
-                    return so_path
-                for cmd in cmd_variants:
+                locked = True
+        except OSError:
+            pass
+        try:
+            if (
+                not force_recompile
+                and so_path.exists()
+                and (not in_source_tree or cpp_path.stat().st_mtime <= so_path.stat().st_mtime)
+            ):
+                return so_path
+            for cmd in cmd_variants:
+                try:
+                    subprocess.run(cmd, check=True)
+                    target_mtime = max(time.time(), cpp_path.stat().st_mtime + 1.0)
+                    os.utime(tmp_so, (target_mtime, target_mtime))
+                    os.replace(tmp_so, so_path)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if tmp_so.exists():
+                        tmp_so.unlink(missing_ok=True)
+        finally:
+            if lf is not None:
+                if locked and fcntl is not None:
                     try:
-                        subprocess.run(cmd, check=True)
-                        target_mtime = max(time.time(), cpp_path.stat().st_mtime + 1.0)
-                        os.utime(tmp_so, (target_mtime, target_mtime))
-                        os.replace(tmp_so, so_path)
-                        last_exc = None
-                        break
-                    except Exception as exc:
-                        last_exc = exc
-                        if tmp_so.exists():
-                            tmp_so.unlink(missing_ok=True)
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                lf.close()
         if last_exc is not None and (force_recompile or not so_path.exists()):
             raise RuntimeError(
                 f"Failed to compile {cpp_path} with {cmd_variants[0]}. "

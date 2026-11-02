@@ -179,3 +179,32 @@ def test_packaging_single_version_source_and_no_sdist_so_globs() -> None:
     assert 'version = {attr = "stimside.__version__"}' in pyproject
     assert "__version__" not in setup_src
     assert 'version = "' not in pyproject
+    assert "golden_digests.json" in manifest
+    assert "golden_digests.json" in pyproject
+    assert "*.h" not in manifest and "*.h" not in pyproject
+
+
+def test_resolve_so_tolerates_flock_ebadf_and_portable_build_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import errno
+
+    monkeypatch.setenv("STIMSIDE_PORTABLE_BUILD", "1")
+    c_args, _ = _kernel_loader.get_cpp_compile_and_link_args(include_march_native=True)
+    assert "-march=native" not in c_args
+
+    native = tmp_path / "src" / "stimside" / "_native"
+    native.mkdir(parents=True)
+    (tmp_path / "setup.py").write_text("# dummy\n", encoding="utf-8")
+    (native / "tiny_nfsv4.cpp").write_text('extern "C" int tiny_nfsv4_abi_v1() { return 7; }\n', encoding="utf-8")
+
+    if _kernel_loader.fcntl is not None:
+        monkeypatch.setattr(
+            _kernel_loader.fcntl,
+            "flock",
+            mock.Mock(side_effect=OSError(errno.EBADF, "Bad file descriptor on NFSv4")),
+        )
+    so = _kernel_loader.resolve_so(str(native / "tiny_nfsv4.py"), "tiny_nfsv4", force_recompile=True)
+    assert ctypes.CDLL(str(so)).tiny_nfsv4_abi_v1() == 7
+    assert list(native.glob("*lock*")) == []
+

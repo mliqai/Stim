@@ -2298,3 +2298,41 @@ def test_item_analysis_registry_evicts_on_gc_including_empty_reweight() -> None:
     live.clear()
     gc.collect()
     assert not (live_ids & _ITEM_ANALYSIS_META.keys())
+
+
+def test_caller_records_mutation_and_batch_pinning_isolation() -> None:
+    import gc
+    import weakref
+    from stimside.dem_generators.dem_generator_marginal import get_item_analysis_meta
+
+    sc = _make_surface_code_leakage_circuit(distance=3, rounds=3)
+    gen = MarginalLeakageDemGenerator()
+    flag_col = int(gen._get_analysis(sc, False).flag_records[0])
+    records = np.zeros((16, sc.num_measurements), dtype=bool)
+    records[1, flag_col] = True
+
+    dems = gen(sc, records)
+    want_batch_rw = decode_with_generated_dems("pymatching", dems, None, decompose_errors=True, reweight_only=True)
+    want_item_rw = decode_with_generated_dems("pymatching", dems[1], None, decompose_errors=True, reweight_only=True)
+
+    # Mutate caller's records buffer in-place after generation: cached metadata must not change.
+    records[:, :] = not bool(records[1, flag_col])
+    records[1, flag_col] = False
+    got_batch_rw = decode_with_generated_dems("pymatching", dems, None, decompose_errors=True, reweight_only=True)
+    got_item_rw = decode_with_generated_dems("pymatching", dems[1], None, decompose_errors=True, reweight_only=True)
+    for w, g in zip(want_batch_rw, got_batch_rw):
+        if w is None:
+            assert g is None
+        else:
+            np.testing.assert_array_equal(w, g)
+    np.testing.assert_array_equal(want_item_rw, got_item_rw)
+
+    # Retaining a single item must not pin the batch records buffer via a slice view.
+    batch_buf_ref = weakref.ref(dems._records)
+    single_dem = dems[1]
+    del dems
+    gc.collect()
+    assert batch_buf_ref() is None
+    meta = get_item_analysis_meta(single_dem)
+    assert meta is not None and meta[5].base is None
+

@@ -432,3 +432,55 @@ class TestFlipsideSimulator:
         assert q_sim.qubit_coords == want_coords
         assert q_sim.coords_shifts == [10.0, 0.0, 5.0]
 
+    def test_flip_getters_support_index_and_instance_slicing(self):
+        from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8
+
+        # Non-deterministic H 0 1; M 0 1 produces mixed False/True _stim_reference_offsets()
+        # because ref_ts (seed=0) collapses [False, True] while Stim's m2d reference is [False, False].
+        circuit = stim.Circuit(
+            "H 0 1\n"
+            "M 0 1\n"
+            "DETECTOR rec[-2]\n"
+            "DETECTOR rec[-1]\n"
+            "DETECTOR rec[-2] rec[-1]\n"
+            "OBSERVABLE_INCLUDE(0) rec[-2]\n"
+            "OBSERVABLE_INCLUDE(1) rec[-1]\n"
+        )
+        fss = FlipsideSimulator(
+            circuit=circuit,
+            compiled_op_handler=LeakageUint8().compile_op_handler(circuit=circuit, batch_size=12),
+            batch_size=12,
+            seed=19,
+        )
+        fss.run()
+        det_off, obs_off = fss._stim_reference_offsets()
+        assert det_off is not None and obs_off is not None
+
+        full_dets = fss.get_detector_flips(bit_packed=False)
+        full_dets_bp = fss.get_detector_flips(bit_packed=True)
+        full_obs = fss.get_observable_flips(bit_packed=False)
+        full_obs_bp = fss.get_observable_flips(bit_packed=True)
+
+        for d_idx in (0, 1, 2, -1):
+            np.testing.assert_array_equal(fss.get_detector_flips(detector_index=d_idx), full_dets[d_idx])
+            np.testing.assert_array_equal(
+                fss.get_detector_flips(detector_index=d_idx, bit_packed=True),
+                np.packbits(full_dets[d_idx], bitorder="little"),
+            )
+        for o_idx in (0, 1, -1):
+            np.testing.assert_array_equal(fss.get_observable_flips(observable_index=o_idx), full_obs[o_idx])
+            np.testing.assert_array_equal(
+                fss.get_observable_flips(observable_index=o_idx, bit_packed=True),
+                np.packbits(full_obs[o_idx], bitorder="little"),
+            )
+        for s_idx in (0, 5, -1):
+            np.testing.assert_array_equal(fss.get_detector_flips(instance_index=s_idx), full_dets[:, s_idx])
+            np.testing.assert_array_equal(fss.get_detector_flips(instance_index=s_idx, bit_packed=True), full_dets_bp[s_idx])
+            np.testing.assert_array_equal(fss.get_observable_flips(instance_index=s_idx), full_obs[:, s_idx])
+            np.testing.assert_array_equal(fss.get_observable_flips(instance_index=s_idx, bit_packed=True), full_obs_bp[s_idx])
+            assert bool(fss.get_detector_flips(detector_index=-1, instance_index=s_idx)) == bool(full_dets[-1, s_idx])
+            assert int(fss.get_detector_flips(detector_index=-1, instance_index=s_idx, bit_packed=True)) == int(full_dets[-1, s_idx])
+            assert bool(fss.get_observable_flips(observable_index=0, instance_index=s_idx)) == bool(full_obs[0, s_idx])
+            assert int(fss.get_observable_flips(observable_index=0, instance_index=s_idx, bit_packed=True)) == int(full_obs[0, s_idx])
+
+

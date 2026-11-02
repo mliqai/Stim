@@ -712,7 +712,7 @@ class MarginalLeakageDemGenerator(DemGenerator):
         rew = self.reweight_only if reweight_only is None else bool(reweight_only)
         analysis = self._get_analysis(circuit, dec)
 
-        records_arr = np.asarray(records, dtype=bool)
+        records_arr = np.array(records, dtype=bool, copy=True)
         if (
             records_arr.ndim not in (1, 2)
             or records_arr.shape[-1] != analysis.num_measurements
@@ -777,7 +777,7 @@ class MarginalLeakageDemGenerator(DemGenerator):
                     rew,
                     generator=self,
                     circuit=self._circuit,
-                    record_1d=rows[shot_idx],
+                    record_1d=rows[shot_idx].copy(),
                     leakage_events_1d=(
                         shot_events[shot_idx] if shot_events is not None else None
                     ),

@@ -1059,7 +1059,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         return res
 
     def get_detector_flips(
-        self, *, append_observables: bool = False, sweep_bits: Any = None, bit_packed: bool = False
+        self, append_observables: bool = False, *, sweep_bits: Any = None, bit_packed: bool = False
     ) -> NDArray[np.bool_] | NDArray[np.uint8]:
         dets, obs = self._convert_m2d(sweep_bits)
         return format_detector_flips(

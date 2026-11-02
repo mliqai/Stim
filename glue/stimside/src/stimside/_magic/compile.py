@@ -2362,7 +2362,12 @@ def extract_data_expansion(
     n_data_or_bits: int | Sequence[int | bool] | NDArray[Any],
     selector_bits: Sequence[int | bool] | NDArray[Any] | None = None,
 ) -> tuple[ReferenceCHPTableau, ShotExpansion]:
-    """`B2`: Matrix-free `O(n_words * chi)` extraction of `(data_tableau, data_expansion)`."""
+    """Matrix-free `O(n_words * chi)` extraction of `(data_tableau, data_expansion)`.
+
+    Passing `SelectorPlan` applies selector gauge phases (`< 1e-15` global-phase exact when
+    paired with `reconstruct_statevector(..., plan=...)` or `frame_events=`); passing a bare
+    `ReferenceCHPTableau` restricts to data qubits up to global phase (`|<psi|phi>| = 1`).
+    """
     plan_meta: SelectorPlan | None = None
     if isinstance(plan_or_tableau, SelectorPlan):
         plan_meta = plan_or_tableau
@@ -2445,7 +2450,12 @@ def reconstruct_statevector(
     ref_tableau: ReferenceCHPTableau | None = None,
     plan: DirectPlan | SelectorPlan | None = None,
 ) -> NDArray[np.complex128]:
-    """Reconstruct exact `complex128` little-endian physical statevector (`< 1e-15` global phase)."""
+    """Reconstruct `complex128` little-endian physical statevector.
+
+    Preserves exact global phase (`< 1e-15`) when given a `TrajectoryRunResult` or explicit
+    `plan=` / `frame_events=`; bare `(ReferenceCHPTableau, ShotExpansion)` without `plan=`
+    or `frame_events=` reconstructs up to global phase (`|<psi|phi>| = 1`).
+    """
     if isinstance(first, TrajectoryRunResult):
         expansion = first.expansion
         if ref_tableau is None:

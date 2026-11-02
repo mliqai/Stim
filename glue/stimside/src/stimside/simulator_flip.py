@@ -226,16 +226,18 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
     def batch_size(self):
         return self._flip_simulator.batch_size
 
-    def get_detector_flips(self, *, bit_packed: bool = False):
+    def get_detector_flips(self, *args, bit_packed: bool = False, **kwargs):
         """Detector-major ``(num_detectors, batch_size)``; with ``bit_packed=True``,
         shot-major ``(batch_size, ceil(num_detectors / 8))``."""
-        offset = self._stim_reference_offsets()[0]
-        if bit_packed:
-            raw_packed = self._flip_simulator.get_detector_flips(bit_packed=True)
-            out = _bit_transpose_swar(raw_packed, self.batch_size)
-            return self._xor_offset(out, offset, len(raw_packed))
-        out = self._flip_simulator.get_detector_flips(bit_packed=False)
-        return self._xor_offset(out, offset)
+        return self._get_flips(
+            self._flip_simulator.get_detector_flips,
+            self._stim_reference_offsets()[0],
+            self._flip_simulator.num_detectors,
+            "detector_index",
+            *args,
+            bit_packed=bit_packed,
+            **kwargs,
+        )
 
     def _stim_reference_offsets(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Per-circuit (detector, observable) values of this simulator's reference sample
@@ -254,15 +256,26 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
             self._ref_offsets = (det if det.any() else None, obs if obs.any() else None)
         return self._ref_offsets
 
-    @staticmethod
-    def _xor_offset(out, offset, num_packed=None):
-        """XOR `offset` into a detector/observable getter output."""
-        if offset is None:
+    def _get_flips(self, getter, offset, num_items: int, item_key: str, *args, bit_packed: bool = False, **kwargs):
+        item_idx = kwargs.get(item_key)
+        inst_idx = kwargs.get("instance_index")
+        if bit_packed and not args and item_idx is None and inst_idx is None:
+            raw_packed = getter(bit_packed=True)
+            out = _bit_transpose_swar(raw_packed, self.batch_size)
+            if offset is not None:
+                out ^= np.packbits(offset[: len(raw_packed)], bitorder="little")
             return out
-        if num_packed is not None:  # bit-packed (batch_size, ceil(num_packed / 8))
-            out ^= np.packbits(offset[:num_packed], bitorder="little")
-        else:
-            out ^= offset[: len(out), None]
+        out = getter(*args, bit_packed=False, **kwargs)
+        if offset is not None:
+            active_offset = offset[:num_items]
+            if item_idx is not None:
+                out ^= active_offset[item_idx]
+            elif inst_idx is not None:
+                out ^= active_offset[: len(out)]
+            else:
+                out ^= active_offset[: len(out), None]
+        if bit_packed:
+            return np.array(int(bool(out)), dtype=np.uint8) if out.ndim == 0 else np.packbits(out, axis=-1, bitorder="little")
         return out
 
     def get_measurement_flips(self, *args, **kwargs):
@@ -275,16 +288,18 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
         flips = self.get_measurement_flips()
         return np.logical_xor(self._reference_sample[: len(flips), None], flips).T
 
-    def get_observable_flips(self, *, bit_packed: bool = False):
+    def get_observable_flips(self, *args, bit_packed: bool = False, **kwargs):
         """Observable-major ``(num_observables, batch_size)``; with ``bit_packed=True``,
         shot-major ``(batch_size, ceil(num_observables / 8))``."""
-        offset = self._stim_reference_offsets()[1]
-        if bit_packed:
-            raw_packed = self._flip_simulator.get_observable_flips(bit_packed=True)
-            out = _bit_transpose_swar(raw_packed, self.batch_size)
-            return self._xor_offset(out, offset, len(raw_packed))
-        out = self._flip_simulator.get_observable_flips(bit_packed=False)
-        return self._xor_offset(out, offset)
+        return self._get_flips(
+            self._flip_simulator.get_observable_flips,
+            self._stim_reference_offsets()[1],
+            self._flip_simulator.num_observables,
+            "observable_index",
+            *args,
+            bit_packed=bit_packed,
+            **kwargs,
+        )
 
     def broadcast_pauli_errors(
         self, error_mask: Bool2DArray, p: float, pauli: Literal["X", "Y", "Z"] = "X"

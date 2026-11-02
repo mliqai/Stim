@@ -564,3 +564,16 @@ def test_get_qfe_expansion_returns_forward_stim_tableau_and_roundtrips_into_quer
     assert qfe[0] == stim.Tableau.from_circuit(stim.Circuit("H 0\nCX 0 1\nS 0"))
     res = EvaluateQueries(PrepareQueries(circ, target_spec=qfe), queries=("fidelity",))
     assert res.fidelity_mass == pytest.approx(1.0, abs=1e-12)
+
+
+def test_get_detector_flips_positional_append_observables() -> None:
+    circ = stim.Circuit("X 0\nM 0 1\nDETECTOR rec[-2]\nOBSERVABLE_INCLUDE(0) rec[-2]\nOBSERVABLE_INCLUDE(1) rec[-1]")
+    sim = MagicsideSimulator(circ, batch_size=3, seed=5)
+    sim.run()
+    np.testing.assert_array_equal(sim.get_detector_flips(True), sim.get_detector_flips(append_observables=True))
+    np.testing.assert_array_equal(
+        sim.get_detector_flips(True, bit_packed=True),
+        sim.get_detector_flips(append_observables=True, bit_packed=True),
+    )
+    assert sim.get_detector_flips(True).shape == (3, 3)
+

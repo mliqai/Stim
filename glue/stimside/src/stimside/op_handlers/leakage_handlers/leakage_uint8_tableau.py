@@ -57,8 +57,7 @@ class LeakageUint8(OpHandler["TablesideSimulator"]):
             README.
     """
 
-    def __init__(self, unconditional_condition_on_U: bool = True) -> None:
-        self.unconditional_condition_on_U = unconditional_condition_on_U
+    unconditional_condition_on_U: bool = True
 
     def compile_op_handler(
         self, *, circuit: stim.Circuit, batch_size: int

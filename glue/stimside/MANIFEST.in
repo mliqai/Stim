@@ -1,5 +1,5 @@
 include README.md
 include pyproject.toml
 include setup.py
-recursive-include src *.py *.cpp *.h
+recursive-include src *.py *.cpp golden_digests.json
 global-exclude *.so *.dylib *.pyd *.dll

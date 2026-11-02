@@ -37,7 +37,8 @@ version = {attr = "stimside.__version__"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-"stimside._native" = ["*.cpp", "*.h"]
+"stimside" = ["golden_digests.json"]
+"stimside._native" = ["*.cpp"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
