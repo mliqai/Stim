@@ -10,18 +10,23 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside._magic.compile import (
-    CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis,
-    CorrelatedNoiseRecord, DirectPlan, FrameEvent, HeraldedNoiseRecord, LeftSppEvent, LeftUnitaryEvent,
-    MagicTermRecord, MeasurementRecord, PauliNoiseRecord, ResetRecord, SelectorPlan,
-    _FEEDBACK_2Q_GATES, _PAULI_2Q_ORDER, _canonical_clifford_gate_name_and_arity, _canonical_gate_data,
-    _coerce_strict_int, _compile_clifford_factors, _compile_pauli_measurement_c15, _compile_reset_c15,
-    _emit_magic_terms, _infer_total_data_qubits, _merge_and_validate_fault_channels, _normalize_choice_map,
-    _normalize_pauli_slot_map, _prepare_run_maps, _reduce_pauli_product_targets, _sample_categorical_branch,
-    _sample_heralded_pauli_branch, _split_pauli_product_targets, _split_realization_sections, apply_clifford_factors,
-    compile_direct, compile_open_block, compile_pauli_product, compile_selector, extract_circuit_faults,
-    extract_data_expansion, parse_clifford_fault_instruction, reconstruct_statevector, run_direct, run_selector,
+from stimside._magic.channels import (
+    CompiledCliffordFactorList, CompiledOpenBlockRecord, CorrelatedNoiseRecord, FrameEvent,
+    HeraldedNoiseRecord, LeftSppEvent, LeftUnitaryEvent, MagicTermRecord, MeasurementRecord,
+    PauliNoiseRecord, ResetRecord, _FEEDBACK_2Q_GATES, _PAULI_2Q_ORDER, _compile_clifford_factors,
+    _compile_pauli_measurement_c15, _compile_reset_c15, _emit_magic_terms, _infer_total_data_qubits,
+    _normalize_choice_map, _normalize_pauli_slot_map, _reduce_pauli_product_targets,
+    _sample_categorical_branch, _sample_heralded_pauli_branch, _split_pauli_product_targets,
+    _split_realization_sections, apply_clifford_factors, compile_pauli_product,
 )
+from stimside._magic.gates import (
+    CliffordFaultChannel, CompiledPauliAxis, _canonical_clifford_gate_name_and_arity,
+    _canonical_gate_data, _coerce_strict_int, _merge_and_validate_fault_channels,
+    extract_circuit_faults, parse_clifford_fault_instruction,
+)
+from stimside._magic.plan import DirectPlan, SelectorPlan, compile_direct, compile_open_block, compile_selector
+from stimside._magic.statevector import extract_data_expansion, reconstruct_statevector
+from stimside._magic.trajectory import _prepare_run_maps, run_direct, run_selector
 from stimside._magic.phase_qfe import (
     DEFAULT_ATOL, ImpossiblePostselectionError, K1_CANCEL_REL_TOL, ShotExpansion, apply_compiled_block, apply_pauli,
     apply_quarter_turn, measure_expansion, project_diagonal, validate_atol,

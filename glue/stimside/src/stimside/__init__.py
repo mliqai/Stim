@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from stimside._magic.compile import CliffordFaultChannel, FaultBranch
+from stimside._magic.gates import CliffordFaultChannel, FaultBranch
 from stimside._magic.query import (
     EvaluateQueries,
     PrepareQueries,

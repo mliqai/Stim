@@ -219,6 +219,7 @@ def test_runtime_atol_enforcement_and_no_hidden_stream_calls(monkeypatch: pytest
     """Verify runtime atol drift raises FloatingPointError and non-fallback paths never call run_direct/run_selector."""
     import stimside._magic.compile as mc
     import stimside._magic.query as mq
+    import stimside._magic.trajectory as mt
 
     orig_pd, orig_acb = mq.project_diagonal, mq.apply_compiled_block
     for bad_z in (0.1, float("nan")):
@@ -231,8 +232,9 @@ def test_runtime_atol_enforcement_and_no_hidden_stream_calls(monkeypatch: pytest
         EvaluateQueries(PrepareQueries(stim.Circuit("H 0\nI[T] 0\nI[CLIFFORD_FAULT: (0.2, H)] 0\nI[T] 0\nM 0"), atol=1e-10), {"faults": {0: 1}, "measurements": {0: 0}})
     monkeypatch.setattr(mq, "apply_compiled_block", orig_acb)
     assert not hasattr(mq, "run_direct") and not hasattr(mq, "run_selector")
-    for fn in ("run_direct", "run_selector"):
-        monkeypatch.setattr(mc, fn, lambda *a, **kw: (_ for _ in ()).throw(AssertionError("FORBIDDEN")))
+    for mod in (mc, mt):
+        for fn in ("run_direct", "run_selector"):
+            monkeypatch.setattr(mod, fn, lambda *a, **kw: (_ for _ in ()).throw(AssertionError("FORBIDDEN")))
     c100 = stim.Circuit("H 0 50 99\nI[T] 0 50 99\nCX 0 50 50 99")
     r100 = EvaluateQueries(PrepareQueries(c100, target_spec=c100), queries=("fidelity",), conditional=False)
     assert r100.fidelity_mass is not None and abs(r100.fidelity_mass - 1.0) < 1e-12 and not r100.diagnostics.used_fallback

@@ -10,7 +10,7 @@ from numpy.typing import NDArray
 import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
-from stimside._magic.compile import CliffordFaultChannel
+from stimside._magic.gates import CliffordFaultChannel
 from stimside._magic.phase_qfe import DEFAULT_ATOL, validate_atol
 from stimside._magic.query import QueryBudget
 from stimside._sampling import CompiledSamplerBase, next_compiled_seed

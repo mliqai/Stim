@@ -11,8 +11,12 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside._magic import compile as _mc
-from stimside._magic.compile import CliffordFaultChannel, CompiledCliffordFactorList, CompiledOpenBlockRecord, CompiledPauliAxis, CorrelatedNoiseRecord, DirectFaultSlotRecord, DirectPlan, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, SelectorPlan, TrajectoryRunResult, _coerce_strict_int, _compile_pauli_measurement_c15, _normalize_choice_map, _normalize_pauli_slot_map, _sample_categorical_branch, _sample_heralded_pauli_branch, _split_realization_sections, apply_clifford_factors, compile_direct, compile_open_block, compile_selector, extract_data_expansion, fault_selector_bits
+from stimside._magic import trajectory as _traj
+from stimside._magic.channels import CompiledCliffordFactorList, CompiledOpenBlockRecord, CorrelatedNoiseRecord, DirectFaultSlotRecord, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, _compile_pauli_measurement_c15, _normalize_choice_map, _normalize_pauli_slot_map, _sample_categorical_branch, _sample_heralded_pauli_branch, _split_realization_sections, apply_clifford_factors
+from stimside._magic.gates import CliffordFaultChannel, CompiledPauliAxis, _coerce_strict_int
+from stimside._magic.plan import DirectPlan, SelectorPlan, TrajectoryRunResult, compile_direct, compile_open_block, compile_selector
+from stimside._magic.statevector import extract_data_expansion
+from stimside._magic.trajectory import fault_selector_bits
 from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, SQRT2 as _SQRT2, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, born_split_expansion, eliminate_zero_amplitude, make_principal, merge_frames, project_diagonal, restrict_amplitude, validate_atol
 from stimside.util.bitwords import (
     first_set_bit_in_words,
@@ -728,7 +732,7 @@ def _run_stream_trajectory(plan: PreparedQueryPlan, faults: dict[int, int], meas
     kw: dict[str, Any] = dict(rng=r_gen, fault_trace=f_tr, pauli_noise_trace=p_tr, reset_outcomes=rp or None, requested_outcomes=eff_m or None,
                               requested_quantum_outcomes=eff_q or None, sweep_bits=([sweep.get(i, 0) for i in range(sw_m + 1)] if sw_m >= 0 else None), atol=plan.atol)
     try:
-        tr = _mc.run_selector(plan.compiled_plan, extract_data=extract_data, **kw) if isinstance(plan.compiled_plan, SelectorPlan) else _mc.run_direct(plan.compiled_plan, **kw)
+        tr = _traj.run_selector(plan.compiled_plan, extract_data=extract_data, **kw) if isinstance(plan.compiled_plan, SelectorPlan) else _traj.run_direct(plan.compiled_plan, **kw)
     except ImpossiblePostselectionError:
         return None, _FP_ZERO, np.empty(0, dtype=np.bool_), dict(enumerate(f_tr)), (mp, qp, rp, dict(p_tr) if p_tr is not None else pp), True, fb_dg
     pd = pctx.diagnostics if pctx is not None else None

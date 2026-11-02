@@ -88,6 +88,7 @@ def test_import_layering() -> None:
         prod_files.append((mod, pkg_parts, path))
 
     violations: set[tuple[str, str]] = set()
+    adj: dict[str, set[str]] = {src: set() for src, _, _ in prod_files}
     for src, pkg_parts, path in prod_files:
         src_layer = _layer_of(src)
         allowed = ALLOWED_LAYER_DEPS[src_layer]
@@ -96,13 +97,36 @@ def test_import_layering() -> None:
             dst = cand if cand in known_mods else cand.rsplit(".", 1)[0]
             if dst not in known_mods or dst == src:
                 continue
+            adj[src].add(dst)
             if _layer_of(dst) not in allowed:
                 violations.add((src, dst))
 
+    barrel_callers = sorted(src for src, deps in adj.items() if "stimside._magic.compile" in deps)
+    assert not barrel_callers, f"Compat barrel stimside._magic.compile has production callers: {barrel_callers}"
     unexpected = sorted(violations - ALLOWLIST)
     stale = sorted(ALLOWLIST - violations)
     assert not unexpected, f"Disallowed layering imports: {unexpected}"
     assert not stale, f"Stale ALLOWLIST entries (remove them!): {stale}"
+
+    state: dict[str, int] = {}
+    stack: list[str] = []
+
+    def _dfs(u: str) -> None:
+        state[u] = 1
+        stack.append(u)
+        for v in sorted(adj.get(u, ())):
+            st = state.get(v, 0)
+            if st == 1:
+                cyc = stack[stack.index(v) :] + [v]
+                raise AssertionError(f"Import cycle detected: {' -> '.join(cyc)}")
+            if st == 0:
+                _dfs(v)
+        stack.pop()
+        state[u] = 2
+
+    for mod_name in sorted(adj):
+        if state.get(mod_name, 0) == 0:
+            _dfs(mod_name)
 
 
 def test_util_purity() -> None:
