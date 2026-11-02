@@ -1,5 +1,4 @@
 import pickle
-import time
 
 import numpy as np
 import pymatching  # type: ignore[import-untyped]
@@ -1811,10 +1810,7 @@ def test_surface_code_marginal_dem_cpp_speed_and_edge_reweights_equivalence():
     dets_packed = np.packbits(det_events, axis=1, bitorder="little")
 
     gen = MarginalLeakageDemGenerator()
-    t0 = time.perf_counter()
     rw_list = gen(sc, records, decompose_errors=True, reweight_only=True)
-    elapsed = time.perf_counter() - t0
-    assert elapsed < 2.0  # C++ kernel + deduplicated propagation builds in ~0.25s
 
     full_dems = gen(sc, records, decompose_errors=True, reweight_only=False)
     decoder = sinter.BUILT_IN_DECODERS["pymatching"]

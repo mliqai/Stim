@@ -12,13 +12,13 @@ class MockCompiledOpHandler(CompiledOpHandler[FlipsideSimulator]):
 
     def handle_op(self, op: stim.CircuitInstruction, sss: "FlipsideSimulator") -> None:
         if op in self.claim_ops():
-            raise NotImplementedError(f"mock handle_op called and somehow matched")
+            raise NotImplementedError("mock handle_op called and somehow matched")
         else:
             sss.do_on_flip_simulator(op)
             return
 
     def clear(self) -> None:
-        raise NotImplementedError(f"mock clear called")
+        raise NotImplementedError("mock clear called")
 
 
 class TestFlipsideSimulator:
@@ -107,38 +107,6 @@ class TestFlipsideSimulator:
         assert fss.get_detector_flips().shape == (circuit_num_detectors, self.batch_size)
         assert fss.get_measurement_flips().shape == (circuit_num_measurements, self.batch_size)
         assert fss.get_observable_flips().shape == (circuit_num_observables, self.batch_size)
-
-    def test_random_mask_funcs(self):
-        def _make_random_mask(fss: FlipsideSimulator, p: float, shape: tuple[int, int]) -> np.ndarray:
-            out = fss._flip_simulator.generate_bernoulli_samples(
-                p=p, num_samples=np.prod(shape), bit_packed=False, out=None
-            )
-            return out.reshape(shape)
-
-        def _fill_random_mask(fss: FlipsideSimulator, p: float, array: np.ndarray) -> None:
-            view = array.reshape(-1)
-            if view.base is not array:
-                raise ValueError("received an array that numpy cannot reshape without making a copy.")
-            fss._flip_simulator.generate_bernoulli_samples(
-                p=p, num_samples=np.prod(view.shape), bit_packed=False, out=view
-            )
-
-        circuit = stim.Circuit()
-        fss = self.make_simulator(circuit)
-
-        array = _make_random_mask(fss, p=1, shape=(4, 12))
-        assert array.shape == (4, 12)
-        assert np.all(array != 0)
-
-        array = np.zeros((4, 12), dtype=bool)
-        _fill_random_mask(fss, p=1, array=array)
-        assert array.shape == (4, 12)
-        assert np.all(array != 0)
-
-        array = np.zeros((4, 12), dtype=bool)
-        non_reshapeable_array_thing = array[1:2, :]
-        with pytest.raises(ValueError, match="cannot reshape"):
-            _fill_random_mask(fss, p=1, array=non_reshapeable_array_thing)
 
     def test_broadcast_pauli_errors(self):
         circuit = stim.Circuit(

@@ -601,7 +601,6 @@ def test_k1_common_geometry_norm_sq() -> None:
 
 
 def test_n1_n2_n3_nonclifford_gates_and_c2_budgets() -> None:
-    rng = np.random.default_rng(110)
     n = 4
     # Build incoming d=2, chi=4 state
     exp = ShotExpansion.zero(n)

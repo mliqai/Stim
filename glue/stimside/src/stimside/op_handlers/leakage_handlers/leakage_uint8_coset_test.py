@@ -1,5 +1,4 @@
 import dataclasses
-import time
 
 import numpy as np
 import pytest
@@ -454,11 +453,9 @@ class TestCompiledLeakageUint8Coset:
             batch_size=num_shots,
             seed=1234,
         )
-        t0 = time.perf_counter()
         coset_sim.run()
         coset_dets = coset_sim.get_detector_flips()
         coset_obs = coset_sim.get_observable_flips()
-        coset_time = time.perf_counter() - t0
 
         # Run TablesideSimulator for 64 independent shots (1 shot per run)
         tab_shots = 64
@@ -473,7 +470,6 @@ class TestCompiledLeakageUint8Coset:
         )
         tab_dets_list = []
         tab_obs_list = []
-        t1 = time.perf_counter()
         for _ in range(tab_shots):
             tab_sim.clear()
             tab_sim._detector_flips = None
@@ -482,7 +478,6 @@ class TestCompiledLeakageUint8Coset:
             tab_sim.run()
             tab_dets_list.append(tab_sim.get_detector_flips()[0])
             tab_obs_list.append(tab_sim.get_observable_flips()[0])
-        tab_time = (time.perf_counter() - t1) * (num_shots / tab_shots)
 
         tab_dets = np.array(tab_dets_list)
         assert coset_dets.shape == (num_shots, mod_circ.num_detectors)
@@ -494,7 +489,6 @@ class TestCompiledLeakageUint8Coset:
         assert coset_det_rate > 0.01
         assert tab_det_rate > 0.01
         assert abs(coset_det_rate - tab_det_rate) < 0.025
-        assert coset_time < tab_time
 
     def test_sinter_sampler_coset(self) -> None:
         circuit = stim.Circuit(

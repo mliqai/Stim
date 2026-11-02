@@ -214,7 +214,7 @@ _CO_CASES = {
         # At batch_size > 1, Tableside appends the per-copy noise ops to one batch circuit where stim
         # fuses them again, so only the stim RNG draws differ (same distribution): not compared.
         if bs == 1
-        or path not in ("tab_cpp", "tab_py")
+        or path != "tab_cpp"
         or stim.gate_data(stim.Circuit(lines[0])[0].name).is_unitary
     ],
 )

@@ -127,7 +127,7 @@ def _parse_conditioned_other(op: stim.CircuitInstruction, match: Any, sim: str) 
 def _parse_conditioned_pair(op: stim.CircuitInstruction, match: Any, sim: str) -> LeakageConditioningParams:
     states: list[list[int | str]] = [[], []]
     for pair in split_arguments(match.group("args")):
-        if len(pair) != 2: raise ValueError(f"CONDITIONED_ON_PAIR must have pairs of states.")
+        if len(pair) != 2: raise ValueError("CONDITIONED_ON_PAIR must have pairs of states.")
         converted = [try_as_integer(s) for s in pair]
         for s in converted:
             if isinstance(s, str) and s != "U": raise ValueError(f"Invalid state {s}.")

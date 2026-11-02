@@ -157,3 +157,15 @@ def test_sampler_positional_init_max_components_and_mode_rejection() -> None:
     for bad_kw in ({"max_components": 0}, {"max_components": True}, {"on_budget_exceeded": "ignore"}):
         with pytest.raises(ValueError):
             MagicsideSampler(**bad_kw)  # type: ignore[arg-type]
+
+
+def test_pickled_worker_index_compiled_seeds() -> None:
+    import pickle
+
+    sampler = MagicsideSampler(seed=777)
+    w0 = pickle.loads(pickle.dumps(sampler))
+    w1 = pickle.loads(pickle.dumps(sampler))
+    assert w0._worker_index == 0 and w1._worker_index == 1
+    assert w0._next_compiled_seed() != w1._next_compiled_seed()
+    assert pickle.loads(pickle.dumps(MagicsideSampler(seed=777)))._next_compiled_seed() is not None
+

@@ -354,7 +354,7 @@ def test_leakage_swap_keeps_tableside_and_cosetside_sync_in_lockstep(uc):
     assert swap_events > 0
 
 
-@pytest.mark.parametrize("mode", ["cpp", "py", "sync"])
+@pytest.mark.parametrize("mode", ["cpp", "sync"])
 @pytest.mark.parametrize("uc", [True, False])
 def test_tableside_runs_leakage_swap_on_its_fast_paths(monkeypatch, mode, uc):
     def generic_path(self, this):

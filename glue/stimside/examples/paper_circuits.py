@@ -687,8 +687,6 @@ class WalkingSurfaceCodeLayout(SurfaceCodeLayout):
         return [initial_detectors_z, initial_detectors_x]
 
     def define_bulk_detectors(self):
-        detector_qubit_pairs_rounds = []
-        d = self.d
         swap_time = self.swap_time
 
         step = Coord(1,1)
@@ -832,7 +830,6 @@ class WalkingSurfaceCodeLayout(SurfaceCodeLayout):
     def get_logicals(self):
         # there are some qubits where we need full meas histories and some we need only last meas
         # this is because of virtual classical-control swap in the late walking surface code. Not necessary in early walking surface code!
-        d = self.d
         swap_time = self.swap_time
 
         z_logical_last = []

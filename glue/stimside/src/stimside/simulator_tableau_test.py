@@ -12,13 +12,13 @@ class MockCompiledOpHandler(CompiledOpHandler[TablesideSimulator]):
 
     def handle_op(self, op: stim.CircuitInstruction, sss: "TablesideSimulator") -> None:
         if op in self.claim_ops():
-            raise NotImplementedError(f"mock handle_op called and somehow matched")
+            raise NotImplementedError("mock handle_op called and somehow matched")
         else:
             sss._do_bare_instruction(op)
             return
 
     def clear(self) -> None:
-        raise NotImplementedError(f"mock clear called")
+        raise NotImplementedError("mock clear called")
 
 
 class TestFlipsideSimulator:
@@ -750,6 +750,22 @@ def test_in_place_circuit_mutation_and_custom_ops_to_params_isolation():
     assert default_coh.state.tolist() == [0]
 
 
+def test_sample_tableau_transitions_sparse_multibranch() -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_parameters import LeakageTransition1Params
+    from stimside.op_handlers.leakage_handlers.transition_effects import sample_tableau_transitions
+
+    params = LeakageTransition1Params(((0.01, "U", 2), (0.02, "U", 3)), from_tag="LEAKAGE_TRANSITION_1")
+    rng = np.random.default_rng(42)
+    res = sample_tableau_transitions(params, "U", 1000, rng, sync_rng=False)
+    assert res is not None
+    chosen, outs = res
+    assert isinstance(chosen, np.ndarray) and len(chosen) == len(outs) > 0
+    assert set(outs) == {"2", "3"} or set(outs) == {2, 3}
+    single = LeakageTransition1Params(((0.03, "U", 2),), from_tag="LEAKAGE_TRANSITION_1")
+    res_single = sample_tableau_transitions(single, "U", 1000, rng, sync_rng=False)
+    assert res_single is not None and len(res_single[0]) == len(res_single[1]) > 0
+
+
 @pytest.mark.parametrize("p", [1e-17, 1e-300])
 def test_sub_epsilon_leakage_transition_skip_no_crash(p: float) -> None:
     from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
@@ -774,4 +790,5 @@ def test_sub_epsilon_leakage_transition_skip_no_crash(p: float) -> None:
         tss.run()
         assert tss.get_final_measurement_records().shape == (1, 4)
         assert coh.state.tolist() == [0, 0, 0, 0]
+
 

@@ -11,8 +11,10 @@ import warnings
 
 import numpy as np
 import pytest
+import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
+from stimside.dem_generators import MarginalDecoder, MarginalLeakageDemGenerator
 from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8Flip
@@ -304,6 +306,85 @@ CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
         OBSERVABLE_INCLUDE(0) rec[-1] rec[-3]
         """,
     ),
+    (
+        "c11_high_prec_gate_arg",
+        _LEAK_SHARED_TAGS,
+        True,
+        """
+        R 0 1 2
+        I[LEAKAGE_TRANSITION_1: (0.25, U-->2)] 0 1
+        X_ERROR(0.1234567890123456) 0 1 2
+        DEPOLARIZE1(0.0345678901234567) 1 2
+        M[LEAKAGE_PROJECTION_Z: (0.9, 2)] 0 1 2
+        DETECTOR rec[-1] rec[-2]
+        OBSERVABLE_INCLUDE(0) rec[-1] rec[-3]
+        """,
+    ),
+    (
+        "c12_overlapping_lt2_pauli_xor",
+        _LEAK_SHARED_TAGS,
+        True,
+        """
+        R 0 1 2
+        H 0 1 2
+        II[LEAKAGE_TRANSITION_2: (0.45, U_U-->X_Z) (0.45, U_U-->Z_X)] 0 1 1 2
+        H 0 1 2
+        M 0 1 2
+        DETECTOR rec[-1] rec[-2]
+        OBSERVABLE_INCLUDE(0) rec[-2] rec[-3]
+        """,
+    ),
+    (
+        "c13_leaked_untagged_spp",
+        ("tab_nosync", "tab_sync", "magic_ds", "magic_sync"),
+        True,
+        """
+        R 0 1 2
+        I[LEAKAGE_TRANSITION_1: (0.5, U-->2)] 0
+        SPP Z0*X1
+        SPP_DAG !Z0*X2
+        M[LEAKAGE_PROJECTION_Z: (0.9, 2)] 0 1 2
+        DETECTOR rec[-1] rec[-2]
+        OBSERVABLE_INCLUDE(0) rec[-2] rec[-3]
+        """,
+    ),
+    (
+        "c14_marginal_dem_skip_gate",
+        ("dem_marginal", "marginal_decoder"),
+        True,
+        """
+        R 0 1 2
+        I_ERROR[LEAKAGE_TRANSITION_1: (0.35, U-->2)] 0
+        X_ERROR(0.08) 0 1
+        CX 0 2 1 2
+        MR 2
+        DETECTOR rec[-1]
+        MPAD[LEAKAGE_MEASUREMENT: (1.0, 2): 0 1] 0 0
+        I_ERROR[LEAKAGE_TRANSITION_1: (1.0, 2-->U)] 0 1
+        CX 0 2 1 2
+        M 0 1 2
+        DETECTOR rec[-1] rec[-4]
+        DETECTOR rec[-1] rec[-2] rec[-3]
+        OBSERVABLE_INCLUDE(0) rec[-2]
+        """,
+    ),
+    (
+        "c15_marginal_dem_pauli_leak",
+        ("dem_marginal", "marginal_decoder"),
+        True,
+        """
+        R 0 1 2
+        X_ERROR(0.35) 0
+        II_ERROR[LEAKAGE_TRANSITION_2: (0.3, U_U-->2_X) (0.2, U_U-->X_2)] 0 1
+        CX 0 2 1 2
+        M 2
+        DETECTOR rec[-1]
+        MPAD[LEAKAGE_MEASUREMENT: (0.95, 2): 0 1] 0 0
+        M 0 1
+        DETECTOR rec[-1] rec[-2] rec[-5]
+        OBSERVABLE_INCLUDE(0) rec[-2]
+        """,
+    ),
 )
 
 
@@ -335,6 +416,32 @@ def _hash_payload(
 
 
 def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
+    if mode in ("dem_marginal", "marginal_decoder"):
+        sim_d = CosetsideSimulator(
+            circuit,
+            compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=BATCH),
+            batch_size=BATCH,
+            seed=SEED,
+        )
+        sim_d.run()
+        recs = sim_d.get_final_measurement_records()
+        dets = sim_d.get_detector_flips()
+        h = hashlib.sha256()
+        if mode == "dem_marginal":
+            gen = MarginalLeakageDemGenerator()
+            dems = gen(circuit, recs, decompose_errors=False)
+            rws = gen(circuit, recs, decompose_errors=True, reweight_only=True)
+            for d, rw in zip(dems, rws):
+                h.update(str(d).encode() + b"|")
+                h.update(np.ascontiguousarray(np.round(rw, 12), dtype=np.float64).tobytes() + b";")
+        else:
+            packed = np.packbits(dets, axis=1, bitorder="little")
+            preds = MarginalDecoder().compile_for_task(sinter.Task(circuit=circuit)).decode_shots_bit_packed(
+                bit_packed_detection_event_data=packed, records=recs
+            )
+            h.update(np.ascontiguousarray(preds, dtype=np.uint8).tobytes())
+        return h.hexdigest()[:32]
+
     rec_flag = bool(has_leakage)
     if mode == "flip":
         op_h = LeakageUint8Flip() if has_leakage else TrivialOpHandler()
@@ -458,7 +565,10 @@ def _compute_all_digests() -> dict[str, dict[str, str]]:
     out: dict[str, dict[str, str]] = {}
     for name, modes, has_leak, text in CORPUS:
         circ = stim.Circuit(text)
-        out[name] = {m: _run_case(circ, m, has_leak) for m in modes}
+        case_out = {m: _run_case(circ, m, has_leak) for m in modes}
+        sync_vals = [case_out[m] for m in ("tab_sync", "coset_sync", "magic_sync") if m in case_out]
+        assert len(set(sync_vals)) <= 1, f"Sync RNG lockstep diverged on {name}: {case_out}"
+        out[name] = case_out
     return out
 
 

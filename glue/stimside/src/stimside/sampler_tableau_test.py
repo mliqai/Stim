@@ -62,6 +62,7 @@ def test_sampler():
     task = sinter.Task(circuit=circuit, decoder=sinter.BUILT_IN_DECODERS["pymatching"])
 
     compiled_sampler = sampler.compiled_sampler_for_task(task=task)
+    assert compiled_sampler is not None
 
 
 def test_sampler_sample_and_dem_gen():

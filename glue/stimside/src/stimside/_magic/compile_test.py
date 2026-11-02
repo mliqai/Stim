@@ -935,9 +935,6 @@ def test_v1_4_selector_all_40_controlled_quarter_turns() -> None:
     """`V1.4`: Verify ALL 40 1Q (8) and 2Q (32) Hermitian Paulis via `C_s(R(P)) = G_{-1}(P) G_{+1}(Z_s P)`."""
     # 1. All 8 1-qubit Hermitian Paulis (+/- I, +/- X, +/- Y, +/- Z) on magic input T H |0>
     psi_in_1q = T_MAT @ (exact_stim_gate_local_c128("H") @ np.array([1.0, 0.0], dtype=np.complex128))
-    exp_in_2q_aug = ShotExpansion.zero(2)  # qubit 0 = data, qubit 1 = selector s
-    # Prepare T_0 H_0 |0>_0 |0>_1 directly in QFE
-    c_prep_1q = stim.Circuit("H 0\nI[T] 0")
     # Also test end-to-end via MagicPhaseTerm synthesis on (n_data=1, s=1) for all 8 axes!
     for sign in (+1, -1):
         for pch in ("I", "X", "Y", "Z"):
@@ -1377,8 +1374,7 @@ def _reconstruct_5q_active_subspace_via_o1(
     data_exp: ShotExpansion,
     data_frame_events: Sequence[object],
 ) -> np.ndarray:
-    """Reconstruct the 32 active-support amplitudes on `q_map` via `N`-qubit `O1` `overlap` (no `2^N` alloc!)."""
-    n_w = n_words_for_qubits(N)
+    """Reconstruct the 32 active-support amplitudes on `q_map` via `O1` `overlap` (no `2^N` alloc!)."""
     tm = int(tail_mask(N))
     assert (int(data_exp.a_union[-1]) & ~tm) == 0
     if data_exp.d > 0:

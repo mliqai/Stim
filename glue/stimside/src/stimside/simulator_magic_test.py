@@ -577,3 +577,26 @@ def test_get_detector_flips_positional_append_observables() -> None:
     )
     assert sim.get_detector_flips(True).shape == (3, 3)
 
+
+def test_presample_stream_maps_heralded_and_correlated_branches() -> None:
+    circ = stim.Circuit(
+        "X_ERROR(0.2) 0\n"
+        "HERALDED_PAULI_CHANNEL_1(0.0, 0.25, 0.0, 0.0) 0 1\n"
+        "CORRELATED_ERROR(1.0) X2\n"
+        "ELSE_CORRELATED_ERROR(1.0) X3\n"
+        "M 0 1 2 3"
+    )
+    reals = [
+        {"paulis": {0: 1}, "measurements": {0: 1, 1: 0}},
+        {"paulis": {0: 0, 3: 0}},
+    ]
+    sim = MagicsideSimulator(circ, batch_size=2, seed=19, fault_realizations=reals)
+    sim.run()
+    recs = sim.get_final_measurement_records()
+    # Shot 0: X_ERROR forced to X, Heralded target 0 forced herald=1 (applies X -> cancels X on q0),
+    # Heralded target 1 forced herald=0 (no Pauli), CORRELATED_ERROR(1.0) fires on q2 so ELSE skips q3.
+    assert recs[0].tolist() == [True, False, False, False, True, False]
+    # Shot 1: CORRELATED_ERROR forced to 0 via paulis[3]=0, so ELSE_CORRELATED_ERROR(1.0) fires on q3.
+    assert recs[1, 4:6].tolist() == [False, True]
+
+

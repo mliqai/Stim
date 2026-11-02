@@ -589,3 +589,102 @@ def test_node_dem_mixed_from_certain_entries_is_clamped_to_1():
         bit_packed_detection_event_data=np.ones((1, 1), dtype=np.uint8), records=records
     )
     assert out.shape == (1, 0)
+
+
+def test_bnb_search_with_stock_reweight_matcher(monkeypatch):
+    from stimside.dem_generators import bnb_decoder as bnb_mod
+    from stimside.dem_generators.dem_decoding import (
+        _apply_edge_reweights_to_dem,
+        _extract_graphlike_edges,
+        decompose_dem_graphlike,
+    )
+
+    orig_from_dem = pymatching.Matching.from_detector_error_model
+
+    class _StockReweightMatcher:
+        def __init__(self, dem: stim.DetectorErrorModel) -> None:
+            self._gl = decompose_dem_graphlike(dem)
+            self._edges = _extract_graphlike_edges(self._gl)
+            self.num_fault_ids = dem.num_observables
+
+        def _for_rw(self, rw):
+            arr = None if rw is None or len(rw) == 0 else np.asarray(rw, dtype=np.float64)
+            return orig_from_dem(_apply_edge_reweights_to_dem(self._gl, self._edges, arr))
+
+        def decode_to_edges_array(self, dets, edge_reweights=None):
+            return self._for_rw(edge_reweights).decode_to_edges_array(dets)
+
+        def decode_batch(
+            self,
+            dets,
+            *,
+            return_weights=False,
+            return_no_matching=False,
+            bit_packed_shots=False,
+            bit_packed_predictions=False,
+            edge_reweights=None,
+        ):
+            preds, weights = [], []
+            for i in range(len(dets)):
+                m = self._for_rw(None if edge_reweights is None else edge_reweights[i])
+                res = m.decode_batch(
+                    dets[i : i + 1],
+                    return_weights=return_weights,
+                    bit_packed_shots=bit_packed_shots,
+                    bit_packed_predictions=bit_packed_predictions,
+                )
+                if return_weights:
+                    preds.append(res[0])
+                    weights.append(res[1])
+                else:
+                    preds.append(res)
+            p_arr = np.vstack(preds)
+            if not return_weights:
+                return p_arr
+            w_arr = np.concatenate(weights)
+            if return_no_matching:
+                return p_arr, w_arr, np.zeros(len(dets), dtype=bool)
+            return p_arr, w_arr
+
+    monkeypatch.setattr(bnb_mod, "_has_fork_matching", lambda: True)
+    monkeypatch.setattr(pymatching.Matching, "from_detector_error_model", _StockReweightMatcher)
+
+    full = ec4_circuit(3, 3, 0.01)
+    forced = stim.Circuit()
+    for j, op in enumerate(full):
+        if op.name == "II_ERROR":
+            if j == 76:
+                forced.append(
+                    "II_ERROR", op.targets_copy()[2:6], [], tag="LEAKAGE_TRANSITION_2: (1.0, U_U-->2_U)"
+                )
+            continue
+        forced.append(op)
+    records, dets, obs = _sample(forced, 8, seed=3)
+    packed = np.packbits(dets, axis=1, bitorder="little")
+
+    comp = _compile(full, priors="trace", branching="conflict", max_queue=2)
+    out = comp.decode_shots_bit_packed(bit_packed_detection_event_data=packed, records=records)
+    assert comp.stats["shots"] == 8 and comp.stats["child"] > 0
+    assert int(np.any(_unpack(out, full.num_observables) != obs, axis=1).sum()) == 0
+    clone = pickle.loads(pickle.dumps(comp))
+    np.testing.assert_array_equal(
+        clone.decode_shots_bit_packed(bit_packed_detection_event_data=packed, records=records),
+        out,
+    )
+
+    comp_few = _compile(full, priors="uniform", branching="fewest", max_queue=2)
+    assert comp_few.decode_shots_bit_packed(
+        bit_packed_detection_event_data=packed, records=records
+    ).shape == (8, 1)
+
+    comp_fb = _compile(full, max_mwpm_calls=1)
+    comp_fb.decode_shots_bit_packed(bit_packed_detection_event_data=packed, records=records)
+    assert comp_fb.stats["budget_exhausted"] > 0 and comp_fb.stats["fallbacks"] > 0
+
+    rec = _RecordingDecoder()
+    comp_rec = _compile(full, decoder=rec)
+    assert comp_rec.decode_shots_bit_packed(
+        bit_packed_detection_event_data=packed, records=records
+    ).shape == (8, 1) and len(rec.dems) >= 1
+
+
