@@ -108,9 +108,6 @@ def _parse_leakage_in_circuit_magic(
                 ops_to_params[item] = parsed
                 if is_u:
                     u_meas_ops.add(item)
-                tag_t, raw_t = getattr(parsed, "targets", None), item.targets_copy()
-                if tag_t and item.tag.startswith(("LEAKAGE_MEASUREMENT", "CONDITIONED_ON_OTHER")) and (not raw_t or len(raw_t) % len(tag_t) != 0):
-                    raise ValueError(f"{item} target count not a multiple of {len(tag_t)}")
 
     _walk(circuit)
     check_tag_qubits(ops_to_params, num_qubits)

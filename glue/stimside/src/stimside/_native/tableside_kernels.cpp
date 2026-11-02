@@ -491,7 +491,7 @@ int fast_engine_run_segment(
                     break;
                 }
                 eng->clear_bufs();
-                const int32_t* q_ptr = &eng->all_qubit_targets[st.target_offset];
+                const int32_t* q_ptr = eng->all_qubit_targets.data() + st.target_offset;
                 const TransBranch* br = &eng->all_branches[st.trans_offset];
 
                 if (!has_leaked && st.p_total_u > 0.0 && st.p_total_u < 0.05) {
@@ -538,7 +538,7 @@ int fast_engine_run_segment(
                     break;
                 }
                 eng->clear_bufs();
-                const int32_t* q_ptr = &eng->all_qubit_targets[st.target_offset];
+                const int32_t* q_ptr = eng->all_qubit_targets.data() + st.target_offset;
                 const TransBranch* br = &eng->all_branches[st.trans_offset];
 
                 if (!has_leaked && st.p_total_u > 0.0 && st.p_total_u < 0.05) {
@@ -607,7 +607,7 @@ int fast_engine_run_segment(
                 }
 
                 eng->buf_one.clear();
-                const int32_t* q_ptr = &eng->all_qubit_targets[st.target_offset];
+                const int32_t* q_ptr = eng->all_qubit_targets.data() + st.target_offset;
                 if (st.p_total_u > 0.0) {
                     if (st.p_total_u < 0.05) {
                         double log1mp = FastEngine::safe_log1mp(st.p_total_u);

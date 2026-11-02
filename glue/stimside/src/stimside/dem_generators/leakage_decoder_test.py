@@ -420,3 +420,36 @@ def test_marginal_decoder_decodes_zero_shots(decompose_errors, reweight_only):
         records=np.zeros((0, REP_CIRCUIT.num_measurements), dtype=bool),
     )
     assert out.shape == (0, 1) and out.dtype == np.uint8  # like BaseDecoder
+
+
+def test_marginal_decoder_compile_for_task_isolates_dem_gen_cache():
+    import warnings
+
+    dec = MarginalDecoder()
+    c1_circ = REP_CIRCUIT
+    c2_circ = stim.Circuit.generated("repetition_code:memory", distance=5, rounds=2, after_clifford_depolarization=0.01)
+    comp1 = dec.compile_for_task(sinter.Task(circuit=c1_circ))
+    comp2 = dec.compile_for_task(sinter.Task(circuit=c2_circ))
+    assert comp1.dem_gen is not dec.dem_gen
+    assert comp2.dem_gen is not dec.dem_gen
+    assert comp1.dem_gen is not comp2.dem_gen
+
+    r1, d1 = _records_and_dets(c1_circ, shots=4)
+    r2, d2 = _records_and_dets(c2_circ, shots=4)
+    comp1.decode_shots_bit_packed(bit_packed_detection_event_data=d1, records=r1)
+    a1 = comp1.dem_gen._analyses[False]
+    comp2.decode_shots_bit_packed(bit_packed_detection_event_data=d2, records=r2)
+    comp1.decode_shots_bit_packed(bit_packed_detection_event_data=d1, records=r1)
+    assert comp1.dem_gen._analyses[False] is a1
+
+    sc = stim.Circuit.generated(
+        "surface_code:rotated_memory_x", distance=3, rounds=2, after_clifford_depolarization=0.01
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        comp_base = BaseDecoder().compile_for_task(sinter.Task(circuit=sc, decoder="pymatching"))
+        _, d_sc = _records_and_dets(sc, shots=8)
+        pred = comp_base.decode_shots_bit_packed(bit_packed_detection_event_data=d_sc)
+    assert pred.shape == (8, 1)
+    assert not any("hyperedge" in str(w.message).lower() for w in caught)
+

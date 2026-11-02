@@ -88,29 +88,29 @@ def _parse_transition_2(op: stim.CircuitInstruction, match: Any, sim: str) -> Le
         if m.group("direction") == "<->": transitions.append((p, (s2, s3), (s0, s1)))
     return LeakageTransition2Params(args=cast(Any, tuple(transitions)), from_tag=op.tag)
 
-def _parse_projection_z(op: stim.CircuitInstruction, match: Any, sim: str) -> LeakageMeasurementParams:
-    args_tuples = split_arguments(match.group("args"))
+def _parse_prob_states(op: stim.CircuitInstruction, args: str) -> tuple[tuple[float, Any], ...]:
     projections = []
-    for a in args_tuples:
-        if len(a) != 2: raise ValueError(f"Malformed argument '{a}' in tag '{op.tag}'.")
-        projections.append((float(a[0]), int(a[1])))
-    return LeakageMeasurementParams(args=tuple(projections), targets=None, from_tag=op.tag)
+    for a in split_arguments(args):
+        if len(a) != 2:
+            raise ValueError(f"Malformed argument '{a}' in tag '{op.tag}'.")
+        projections.append((float(a[0]), try_as_integer(a[1])))
+    return tuple(projections)
+
+def _parse_projection_z(op: stim.CircuitInstruction, match: Any, sim: str) -> LeakageMeasurementParams:
+    return LeakageMeasurementParams(
+        args=_parse_prob_states(op, match.group("args")), targets=None, from_tag=op.tag
+    )
 
 def _parse_measurement(op: stim.CircuitInstruction, match: Any, sim: str) -> LeakageMeasurementParams:
-    args, target_args = match.group("args"), match.group("targets")
-    projections = []
-    if args:
-        for a in split_arguments(args):
-            p, state = float(a[0]), try_as_integer(a[1])
-            if isinstance(state, str): raise ValueError(f"State {state} is not an integer.")
-            projections.append((p, state))
     return LeakageMeasurementParams(
-        args=tuple(projections), 
-        targets=tuple(parse_list_of_targets(target_args)), 
-        from_tag=op.tag
+        args=_parse_prob_states(op, match.group("args")),
+        targets=tuple(parse_list_of_targets(match.group("targets"))),
+        from_tag=op.tag,
     )
 
 def _parse_conditioned_self(op: stim.CircuitInstruction, match: Any, sim: str) -> LeakageConditioningParams:
+    if match.group("targets") or ":" in op.tag.split(":", 1)[1]:
+        raise ValueError(f"{match.group('name')} takes no ': targets', got '{op.tag}'.")
     states = _parse_list_of_states(match.group("args"), match.group("name"))
     return LeakageConditioningParams(args=(states,), from_tag=op.tag, targets=None)
 
@@ -125,6 +125,8 @@ def _parse_conditioned_other(op: stim.CircuitInstruction, match: Any, sim: str) 
     )
 
 def _parse_conditioned_pair(op: stim.CircuitInstruction, match: Any, sim: str) -> LeakageConditioningParams:
+    if match.group("targets") or ":" in op.tag.split(":", 1)[1]:
+        raise ValueError(f"{match.group('name')} takes no ': targets', got '{op.tag}'.")
     states: list[list[int | str]] = [[], []]
     for pair in split_arguments(match.group("args")):
         if len(pair) != 2: raise ValueError("CONDITIONED_ON_PAIR must have pairs of states.")

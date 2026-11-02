@@ -372,6 +372,7 @@ static TraceResult* trace_flows_impl(
                 f.j = *it;
                 f.next_group = 0;
             }
+            if (f.j < 0 || f.j >= num_ops) break;
             const OpDescC& op = ops[f.j];
             const int32_t* t_ptr = target_qubits + op.target_offset;
             int32_t t_cnt = op.target_count;
@@ -644,6 +645,7 @@ static TraceResult* trace_flows_impl(
     std::vector<double> flow_mix;      // source_mode only
     for (int32_t s_idx = 0; s_idx < num_sources; ++s_idx) {
         const SourceDescC& src = sources[s_idx];
+        if (src.op_index < 0 || src.op_index >= num_ops) continue;
         ActiveFlow root;
         root.h = src.qubit;
         root.s = src.state;

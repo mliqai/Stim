@@ -1048,13 +1048,13 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     ) -> NDArray[np.bool_] | NDArray[np.uint8]:
         dets, obs = self._convert_m2d(sweep_bits)
         return format_detector_flips(
-            dets, obs, append_observables=append_observables, bit_packed=bit_packed, copy_unpacked=True
+            dets, obs, append_observables=append_observables, bit_packed=bit_packed
         )
 
     def get_observable_flips(
         self, *, sweep_bits: Any = None, bit_packed: bool = False
     ) -> NDArray[np.bool_] | NDArray[np.uint8]:
-        return pack_shot_flips(self._convert_m2d(sweep_bits)[1], bit_packed=bit_packed, copy_unpacked=True)
+        return pack_shot_flips(self._convert_m2d(sweep_bits)[1], bit_packed=bit_packed)
 
     def _validate_shot_idx(self, shot: int) -> int:
         s = int(shot) + (self.batch_size if int(shot) < 0 else 0)

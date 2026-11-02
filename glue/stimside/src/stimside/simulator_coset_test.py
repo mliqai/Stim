@@ -223,3 +223,15 @@ def test_vectorized_cpp_cocycle_arrays_match_per_group_cocycles():
                         np.testing.assert_array_equal(f_arrs[9][g_i, f_i], fac.b2_words)
                         assert int(f_arrs[10][g_i, f_i]) == fac.kappa2
 
+
+@pytest.mark.parametrize("sync", [False, True])
+@pytest.mark.parametrize("bad_q", [-1, 3, 10_000_000])
+def test_peek_out_of_bounds_raises_value_error(sync: bool, bad_q: int):
+    c = stim.Circuit("R 0 1 2\nH 0\nM 0 1 2")
+    coh = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=4)
+    sim = CosetsideSimulator(c, compiled_op_handler=coh, batch_size=4, seed=1, sync_tableside_rng=sync)
+    with pytest.raises(ValueError, match="peek target out of range"):
+        sim.peek_pauli_batch([bad_q], "Z")
+    with pytest.raises(ValueError, match="peek target out of range"):
+        sim.peek_z([bad_q])
+

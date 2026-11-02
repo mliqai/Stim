@@ -82,11 +82,11 @@ def stack_measurement_columns(columns: list[NDArray[np.bool_]], batch_size: int)
 
 
 def pack_shot_flips(
-    flips: NDArray[np.bool_], *, bit_packed: bool = False, copy_unpacked: bool = False
+    flips: NDArray[np.bool_], *, bit_packed: bool = False
 ) -> NDArray[np.bool_] | NDArray[np.uint8]:
     if bit_packed:
         return np.packbits(flips, axis=-1, bitorder="little")
-    return flips.copy() if copy_unpacked else flips
+    return flips.copy()
 
 
 def format_detector_flips(
@@ -95,12 +95,11 @@ def format_detector_flips(
     *,
     append_observables: bool = False,
     bit_packed: bool = False,
-    copy_unpacked: bool = False,
 ) -> NDArray[np.bool_] | NDArray[np.uint8]:
     if append_observables and obs is not None:
         out = np.hstack([dets, obs])
         return np.packbits(out, axis=-1, bitorder="little") if bit_packed else out
-    return pack_shot_flips(dets, bit_packed=bit_packed, copy_unpacked=copy_unpacked)
+    return pack_shot_flips(dets, bit_packed=bit_packed)
 
 
 class ShotMajorM2DMixin:

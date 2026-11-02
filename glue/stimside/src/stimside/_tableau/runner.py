@@ -85,8 +85,7 @@ def _slice_circuit(
     if sub is None:
         if b - a >= 64:
             if not blocks:
-                for i in range(0, len(insts), 32):
-                    blocks.append(_circuit_of(insts[i : i + 32]))
+                blocks[:] = [_circuit_of(insts[i : i + 32]) for i in range(0, len(insts), 32)]
             b0, b1 = (a + 31) >> 5, b >> 5
             sub = _circuit_of(insts[a : b0 << 5])
             for k in range(b0, b1):
@@ -631,7 +630,7 @@ def get_precompiled_circuit(
     snap = circuit.copy()
     ops_snap = dict(parsed_ops) if parsed_ops is not None else None
     pre = PrecompiledTablesideCircuit(snap, ucu, ops_snap)
-    if len(_PRECOMPILED_CACHE) >= 16 and key not in _PRECOMPILED_CACHE:
+    if len(_PRECOMPILED_CACHE) >= 4 and key not in _PRECOMPILED_CACHE:
         _PRECOMPILED_CACHE.pop(next(iter(_PRECOMPILED_CACHE)))
     _PRECOMPILED_CACHE[key] = (snap, ops_snap, pre)
     return pre
@@ -725,9 +724,9 @@ class _StepCursor:
 
     def finish(self) -> None:
         self.flush(self.pre.step_to_full_idx[-1], self.pre.step_to_quant_idx[-1])
-        self.tss.qubit_coords = self.pre.final_qubit_coords
-        self.tss.qubit_tags = self.pre.final_qubit_tags
-        self.tss.coords_shifts = self.pre.final_coords_shifts
+        self.tss.qubit_coords = {q: list(v) for q, v in self.pre.final_qubit_coords.items()}
+        self.tss.qubit_tags = dict(self.pre.final_qubit_tags)
+        self.tss.coords_shifts = list(self.pre.final_coords_shifts)
         if self.tss._construct_reference_circuit:
             self.tss._new_reference_circuit = self.pre.reference_circuit.copy()
         self.tss._circuit_time = self.pre.unrolled_num_ops

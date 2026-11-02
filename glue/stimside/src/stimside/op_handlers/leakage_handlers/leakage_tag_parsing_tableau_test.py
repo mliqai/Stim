@@ -540,3 +540,60 @@ def test_1a_tag_registry_widened_leakage_projection_z():
         for sim_kind in ("flip", "tableau"):
             with pytest.raises(ValueError):
                 parse_leakage_tag(c[0], simulator=sim_kind)
+
+
+@pytest.mark.parametrize(
+    "bad_inst",
+    [
+        "X_ERROR[CONDITIONED_ON_SELF: 2 : 1](1.0) 0",
+        "X_ERROR[CONDITIONED_ON_SELF: 2 :](1.0) 0",
+        "X_ERROR[CONDITIONED_ON_SELF: ](1.0) 0",
+        "CZ[CONDITIONED_ON_PAIR: (U, 2) : 0] 0 1",
+        "CZ[CONDITIONED_ON_PAIR: (U, 2) :] 0 1",
+        "CZ[CONDITIONED_ON_PAIR: ] 0 1",
+        "MPAD[LEAKAGE_MEASUREMENT: (1.0, 2, 7) : 0] 0",
+        "MPAD[LEAKAGE_MEASUREMENT: (1.0) : 0] 0",
+        "M[LEAKAGE_PROJECTION_Z: (0.9, U)] 0",
+    ],
+)
+def test_malformed_conditioned_and_measurement_tags_raise_value_error(bad_inst: str) -> None:
+    inst = stim.Circuit(bad_inst)[0]
+    with pytest.raises(ValueError):
+        ltp.parse_leakage_tag(inst)
+    with pytest.raises(ValueError):
+        LeakageConditioningParams(args=((),), targets=None, from_tag="CONDITIONED_ON_SELF: ")
+
+
+def test_nan_probabilities_and_target_multiplicity_raise_value_error() -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_parameters import (
+        LeakageControlledErrorParams,
+        LeakageTransitionZParams,
+    )
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+
+    nan = float("nan")
+    with pytest.raises(ValueError):
+        LeakageTransition1Params(args=((nan, "U", 2),), from_tag="t")
+    with pytest.raises(ValueError):
+        LeakageTransition2Params(args=((nan, "U", "U", 2, "U"),), from_tag="t")
+    with pytest.raises(ValueError):
+        LeakageTransitionZParams(args=((nan, 0, 2),), from_tag="t")
+    with pytest.raises(ValueError):
+        LeakageControlledErrorParams(args=((nan, 2, "X"),), from_tag="t")
+    with pytest.raises(ValueError):
+        LeakageMeasurementParams(args=((nan, 2),), targets=(0,), from_tag="t")
+    with pytest.raises(ValueError):
+        LeakageMeasurementParams(args=((nan, 2),), targets=None, from_tag="LEAKAGE_PROJECTION_Z: ")
+
+    c_mpad = stim.Circuit("R 0 1 2\nMPAD[LEAKAGE_MEASUREMENT: (1.0, 2) : 0 1] 0\nM 0")
+    for fn in (*_COMPILERS.values(), lambda c: LeakageUint8Magic().compile_op_handler(circuit=c, batch_size=1)):
+        with pytest.raises(ValueError, match="multiple"):
+            fn(c_mpad)
+
+    c_other = stim.Circuit("R 0 1 2\nX_ERROR[CONDITIONED_ON_OTHER: 2 : 1 2](1.0) 0 0 0\nM 0")
+    for name in _TABLEAU_FAMILY:
+        with pytest.raises(ValueError, match="multiple"):
+            _COMPILERS[name](c_other)
+    with pytest.raises(ValueError, match="multiple"):
+        LeakageUint8Magic().compile_op_handler(circuit=c_other, batch_size=1)
+

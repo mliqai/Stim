@@ -891,8 +891,9 @@ def test_01_states_with_disable_stabilizer_randomization():
 
 def test_01_states_without_known_states():
     kw = {"compute_known_states": False}
-    # A plain (1.0, 2) MPAD readout itself needs known states (pre-existing); the 0/1-keyed one doesn't.
     leak_01 = "MPAD[LEAKAGE_MEASUREMENT: (0, 0), (0, 1), (1.0, 2) : 0] 0"
+    _, r_plain = _flip_run(f"X 0\n{_LT1.format('(1.0, 1-->2)', 0)}\n{_LEAK2}", **kw)
+    assert np.all(r_plain[:, 0])
     _, r = _flip_run(f"X 0\n{_LT1.format('(1.0, 1-->2)', 0)}\n{leak_01}", **kw)
     assert np.all(r[:, 0])
     _, r = _flip_run(f"{_LT1.format('(1.0, U-->2)', 0)}\n{_LT1.format('(1.0, 2-->1)', 0)}\nM 0", **kw)

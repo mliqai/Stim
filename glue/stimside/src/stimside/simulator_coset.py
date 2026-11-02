@@ -85,6 +85,9 @@ class CosetsideSimulator(
     ) -> None:
         """record_leakage_events: record every leakage-state change of each shot
         (``get_leakage_events()``, see ``stimside.util.leakage_events``)."""
+        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+        batch_size = int(batch_size)
         self.circuit = circuit
         self.num_qubits = circuit.num_qubits
         self.seed = seed
@@ -1723,6 +1726,8 @@ class CosetsideSimulator(
         targets_arr = np.ascontiguousarray(targets, dtype=np.int64)
         if len(targets_arr) == 0:
             return np.zeros((0, self.batch_size), dtype=np.int8)
+        if targets_arr.min() < 0 or targets_arr.max() >= self.num_qubits:
+            raise ValueError(f"peek target out of range [0, {self.num_qubits})")
 
         x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa = (
             self._current_packed_words()
@@ -1831,4 +1836,4 @@ class CosetsideSimulator(
             self._final_measurement_records = stack_measurement_columns(
                 self._measurement_columns, self.batch_size
             )
-        return self._final_measurement_records
+        return self._final_measurement_records.copy()

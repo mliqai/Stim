@@ -912,12 +912,11 @@ class Builder:
                 )
             key = (op.name, op.tag)
             if key not in parsed:
-                tag_params = parse_leakage_tag(op, simulator="tableau")
-                if tag_params is not None:
-                    check_tag_qubits({op: tag_params}, circuit.num_qubits)
-                parsed[key] = tag_params
-                _check_supported(parsed[key])
+                parsed[key] = parse_leakage_tag(op, simulator="tableau")
             params = parsed[key]
+            if params is not None:
+                check_tag_qubits({op: params}, circuit.num_qubits)
+                _check_supported(params)
             # stim fuses identical consecutive ops; a tag listing its own qubits
             # applies per copy, as in the simulators.
             copy_len = 0

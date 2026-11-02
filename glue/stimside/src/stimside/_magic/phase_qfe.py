@@ -1410,7 +1410,13 @@ def contract_choi_expansions(
             raise ValueError(f"Invalid or duplicate q_act entry {q!r} for n_op={n_op}")
         seen_q.add(qi)
         q_list.append(qi)
+    want_left = max(1, n_op + m)
     eff_keep = max(1, (n_op + m) if right_is_choi else n_op)
+    if left.n_qubits != want_left or right.n_qubits != eff_keep:
+        raise ValueError(
+            f"Operand n_qubits mismatch in contract_choi_expansions: got ({left.n_qubits}, {right.n_qubits}), "
+            f"expected ({want_left}, {eff_keep}) for n_op={n_op}, len(q_act)={m}, right_is_choi={right_is_choi}"
+        )
     prod_chi = left.chi * right.chi
     if prod_chi == 0:
         return ShotExpansion.from_components((), n_qubits=eff_keep, atol=atol)

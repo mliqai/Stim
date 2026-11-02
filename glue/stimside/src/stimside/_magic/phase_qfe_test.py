@@ -1626,3 +1626,17 @@ def test_m1_r3_component_terms_invariants_and_in_place_quarter_turn() -> None:
     exp_ip.check_invariants(require_canonical_offset=True)
     assert np.max(np.abs(exp_ip.to_statevector() - exp_ref.to_statevector())) < 1e-15
 
+
+def test_contract_choi_expansions_validates_operand_qubit_counts() -> None:
+    good_left = ShotExpansion.zero(2)
+    good_right = ShotExpansion.zero(2)
+    out = pq.contract_choi_expansions(good_left, good_right, n_op=1, q_act=[0], right_is_choi=True)
+    assert out.n_qubits == 2
+
+    with pytest.raises(ValueError, match="Operand n_qubits mismatch"):
+        pq.contract_choi_expansions(ShotExpansion.zero(3), good_right, n_op=1, q_act=[0], right_is_choi=True)
+    with pytest.raises(ValueError, match="Operand n_qubits mismatch"):
+        pq.contract_choi_expansions(good_left, ShotExpansion.zero(3), n_op=1, q_act=[0], right_is_choi=True)
+    with pytest.raises(ValueError, match="Operand n_qubits mismatch"):
+        pq.contract_choi_expansions(good_left, ShotExpansion.zero(2), n_op=1, q_act=[0], right_is_choi=False)
+

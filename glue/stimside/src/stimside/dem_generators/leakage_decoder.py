@@ -10,6 +10,7 @@ batch from its detection events (and, if ``needs_records`` /
 from __future__ import annotations
 
 import abc
+import copy
 from typing import Protocol, Sequence, Union
 
 import numpy as np
@@ -19,6 +20,7 @@ import stim  # type: ignore[import-untyped]
 
 from stimside.dem_generators.dem_decoding import (
     decode_with_generated_dems,
+    is_pymatching_decoder,
     warn_if_pymatching_hyperedge,
 )
 from stimside.dem_generators.dem_generator_marginal import (
@@ -180,9 +182,14 @@ class BaseDecoder(LeakageDecoder):
             decoder = sinter.BUILT_IN_DECODERS[decoder]
         dem = self.dem
         if dem is None:
-            dem = task.detector_error_model or task.circuit.detector_error_model(
-                decompose_errors=self.decompose_errors
-            )
+            dem = task.detector_error_model
+        if dem is None:
+            try:
+                dem = task.circuit.detector_error_model(
+                    decompose_errors=self.decompose_errors or is_pymatching_decoder(decoder)
+                )
+            except ValueError:
+                dem = task.circuit.detector_error_model()
         if dem.num_detectors != task.circuit.num_detectors:
             raise ValueError(
                 f"BaseDecoder's dem has num_detectors={dem.num_detectors} but the "
@@ -354,7 +361,7 @@ class MarginalDecoder(LeakageDecoder):
         return _CompiledMarginalDecoder(
             circuit=task.circuit,
             decoder=decoder,
-            dem_gen=self.dem_gen,
+            dem_gen=copy.deepcopy(self.dem_gen),
             decompose_errors=self.decompose_errors,
             reweight_only=self.reweight_only,
         )

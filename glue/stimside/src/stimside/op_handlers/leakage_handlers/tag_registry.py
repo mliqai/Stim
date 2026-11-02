@@ -1,3 +1,4 @@
+import functools
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Any, Sequence
 import stim  # type: ignore[import-untyped]
@@ -167,6 +168,7 @@ TAG_REGISTRY: dict[str, TagDef] = {
 
 # --- UNIFIED ENTRY POINT ---
 
+@functools.lru_cache(maxsize=4096)
 def parse_leakage_tag(op: stim.CircuitInstruction, simulator: Literal["flip", "tableau"]) -> LeakageParams | None:
     """Parse a leakage tag using the unified registry."""
     tag = op.tag
@@ -262,11 +264,16 @@ def _parse_leakage_in_circuit_recurse(
 def check_tag_qubits(
     ops_to_params: dict[stim.CircuitInstruction, LeakageParams], num_qubits: int
 ) -> None:
-    """Raise ValueError if a tag lists a qubit index >= the circuit's ``num_qubits``."""
+    """Raise ValueError if a tag lists a qubit index >= ``num_qubits`` or mismatched target count."""
     for op, params in ops_to_params.items():
         qubits = getattr(params, "targets", None) or ()
         if any(q >= num_qubits for q in qubits):
             raise ValueError(
                 f"{op} lists qubit {max(qubits)} in its tag, but the circuit has "
                 f"num_qubits={num_qubits}."
+            )
+        raw_t = op.targets_copy()
+        if qubits and (not raw_t or len(raw_t) % len(qubits) != 0):
+            raise ValueError(
+                f"{op} target count {len(raw_t)} is not a positive multiple of tag target count {len(qubits)}."
             )

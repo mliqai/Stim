@@ -812,15 +812,10 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                     output_xs=True, output_zs=False
                 )
                 target_computational_states = mpad_ref[0][:, None] ^ xs[targets, :]
-            # For MPAD, if targets are in known Z states, use their Z state; otherwise use xs flip state
-            elif fss._all_targets_in_known_state(targets=targets, pauli="Z"):
-                _, known_state_mask = fss._get_current_known_state_masks(pauli="Z")
-                target_computational_states = known_state_mask[targets, :]
             else:
-                xs, _, _, _, _ = fss._flip_simulator.to_numpy(
-                    output_xs=True, output_zs=False
+                target_computational_states = np.zeros(
+                    (len(targets), self.batch_size), dtype=bool
                 )
-                target_computational_states = xs[targets, :]
         else:
             clean_plus, clean_minus = fss._get_clean_known_states(pauli=pauli)
             is_known = (clean_plus | clean_minus)[targets]

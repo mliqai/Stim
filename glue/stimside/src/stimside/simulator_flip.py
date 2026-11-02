@@ -112,6 +112,10 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
                 (`op_idx` into `unroll_circuit(circuit)`, with REPEAT blocks unrolled).
         """
 
+        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+        batch_size = int(batch_size)
+
         self.circuit = circuit
         self._unrolled_ops: list[stim.CircuitInstruction] = unroll_circuit(circuit)
         self.num_qubits = circuit.num_qubits
@@ -259,7 +263,7 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
     def _get_flips(self, getter, offset, num_items: int, item_key: str, *args, bit_packed: bool = False, **kwargs):
         item_idx = kwargs.get(item_key)
         inst_idx = kwargs.get("instance_index")
-        if bit_packed and not args and item_idx is None and inst_idx is None:
+        if bit_packed and not args and not kwargs:
             raw_packed = getter(bit_packed=True)
             out = _bit_transpose_swar(raw_packed, self.batch_size)
             if offset is not None:

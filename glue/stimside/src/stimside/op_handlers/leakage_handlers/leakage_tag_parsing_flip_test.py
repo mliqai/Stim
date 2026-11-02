@@ -226,3 +226,18 @@ def test_try_as_integer():
     """Tests the try_as_integer helper function."""
     assert try_as_integer("2") == 2
     assert try_as_integer("U") == "U"
+
+
+@pytest.mark.parametrize(
+    "bad_inst",
+    [
+        "MPAD[LEAKAGE_MEASUREMENT: (1.0, 2, 7) : 0] 0",
+        "MPAD[LEAKAGE_MEASUREMENT: (1.0) : 0] 0",
+        "M[LEAKAGE_PROJECTION_Z: (0.9, U)] 0",
+        "M[LEAKAGE_PROJECTION_Z: (0.9, 2, 3)] 0",
+    ],
+)
+def test_flip_malformed_measurement_tags_raise_value_error(bad_inst: str) -> None:
+    with pytest.raises(ValueError):
+        ltp.parse_leakage_tag(stim.Circuit(bad_inst)[0])
+

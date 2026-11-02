@@ -374,13 +374,15 @@ def test_magic_contract_choi_word_boundary_and_edge_cases() -> None:
     from stimside._magic.query import QueryBudget, evaluate_queries, prepare_queries
 
     e0 = pq.ShotExpansion.zero(2)
+    e0_choi = pq.ShotExpansion.zero(3)
     empty = pq.ShotExpansion.from_components((), n_qubits=2)
-    assert pq.contract_choi_expansions(empty, e0, 2, (0,), False).chi == 0
-    assert pq.contract_choi_expansions(e0, empty, 2, (0,), False).chi == 0
+    empty_choi = pq.ShotExpansion.from_components((), n_qubits=3)
+    assert pq.contract_choi_expansions(empty_choi, e0, 2, (0,), False).chi == 0
+    assert pq.contract_choi_expansions(e0_choi, empty, 2, (0,), False).chi == 0
     m0 = pq.contract_choi_expansions(e0, e0, 2, (), False)
     assert m0.chi == 1 and abs(m0.norm_sq() - 1.0) < 1e-15
 
-    bad = e0.copy()
+    bad = e0_choi.copy()
     bad.weights = np.array([np.nan + 0.0j], dtype=np.complex128)
     with pytest.raises(FloatingPointError):
         pq.contract_choi_expansions(bad, e0, 2, (0,), False)
@@ -425,7 +427,7 @@ def test_magic_contract_choi_preserves_idle_ket_qubits_and_validates_q_act() -> 
     out_empty_q.check_invariants(require_canonical_offset=True)
     np.testing.assert_allclose(out_empty_q.to_statevector(), ket_0_plus.to_statevector(), atol=1e-13)
 
-    for n_op, q_idle in ((2, 1), (70, 69)):
+    for n_op, q_idle in ((2, 1), (64, 63), (70, 69)):
         nw_ket = pq.n_words_for_qubits(n_op)
         nw_choi = pq.n_words_for_qubits(n_op + 1)
         z_ket, z_choi = np.zeros(nw_ket, dtype=np.uint64), np.zeros(nw_choi, dtype=np.uint64)
@@ -456,7 +458,7 @@ def test_magic_contract_choi_preserves_idle_ket_qubits_and_validates_q_act() -> 
             atol=1e-13,
         )
 
-    # 1b. Choi-Choi composition (right_is_choi=True) across multi-word non-contiguous q_act and mismatched n_words.
+    # 1b. Choi-Choi composition (right_is_choi=True) across multi-word non-contiguous q_act, plus n_qubits mismatch rejection.
     n_cc, q_cc = 70, (3, 62, 69)
     m_cc, nw_cc = len(q_cc), pq.n_words_for_qubits(n_cc + len(q_cc))
     z_cc = np.zeros(nw_cc, dtype=np.uint64)
@@ -477,7 +479,9 @@ def test_magic_contract_choi_preserves_idle_ket_qubits_and_validates_q_act() -> 
         np.pad(choi_r.h_words, ((0, 0), (0, 1))), choi_r.ell.copy(), choi_r.ell_odd.copy(),
     )
     choi_l = pq.apply_pauli_t(pq.apply_quarter_turn(bell_cc.copy(), u3, z_cc, 0), z_cc, u69, 0, dag=False)
-    got_cc = pq.contract_choi_expansions(choi_l, choi_r_pad, n_cc, q_cc, True)
+    with pytest.raises(ValueError, match="n_qubits mismatch"):
+        pq.contract_choi_expansions(choi_l, choi_r_pad, n_cc, q_cc, True)
+    got_cc = pq.contract_choi_expansions(choi_l, choi_r, n_cc, q_cc, True)
     got_cc.check_invariants(require_canonical_offset=True)
     want_cc = pq.apply_pauli_t(pq.apply_quarter_turn(choi_r.copy(), u3, z_cc, 0), z_cc, u69, 0, dag=False)
     want_cc.weights = want_cc.weights * (2.0 ** -(m_cc >> 1))

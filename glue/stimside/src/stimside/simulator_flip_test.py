@@ -479,5 +479,113 @@ class TestFlipsideSimulator:
         np.testing.assert_array_equal(recs[:, 3], True)
         assert not np.any(fss.get_detector_flips())
 
+    def test_get_flips_bit_packed_rejects_extra_args_and_kwargs(self):
+        from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8
+
+        circuit = stim.Circuit("R 0\nX_ERROR(0.2) 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+        fss = FlipsideSimulator(
+            circuit=circuit,
+            compiled_op_handler=LeakageUint8().compile_op_handler(circuit=circuit, batch_size=8),
+            batch_size=8,
+            seed=3,
+        )
+        fss.run()
+        with pytest.raises(TypeError):
+            fss.get_detector_flips(bit_packed=True, append_observables=True)
+        with pytest.raises(TypeError):
+            fss.get_detector_flips(bit_packed=True, detector_idx=0)
+        with pytest.raises(TypeError):
+            fss.get_observable_flips(bit_packed=True, observable_idx=0)
 
 
+@pytest.mark.parametrize("bad_bs", [0, -1, True])
+def test_batch_size_validation_across_simulators_and_samplers(bad_bs):
+    from stimside import (
+        CosetsideSampler,
+        CosetsideSimulator,
+        FlipsideSampler,
+        MagicsideSampler,
+        MagicsideSimulator,
+        TablesideSampler,
+        TablesideSimulator,
+    )
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8 as LeakageUint8Flip
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8 as LeakageUint8Tab
+
+    circuit = stim.Circuit("R 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    for sampler_cls, handler in (
+        (FlipsideSampler, LeakageUint8Flip()),
+        (TablesideSampler, LeakageUint8Tab()),
+        (CosetsideSampler, LeakageUint8Coset()),
+        (MagicsideSampler, LeakageUint8Magic()),
+    ):
+        with pytest.raises(ValueError, match="batch_size"):
+            sampler_cls(op_handler=handler, dem_decoder="pymatching", batch_size=bad_bs)
+
+    coh_f = LeakageUint8Flip().compile_op_handler(circuit=circuit, batch_size=1)
+    coh_t = LeakageUint8Tab().compile_op_handler(circuit=circuit, batch_size=1)
+    coh_c = LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=1)
+    coh_m = LeakageUint8Magic().compile_op_handler(circuit=circuit, batch_size=1)
+    for sim_cls, coh in (
+        (FlipsideSimulator, coh_f),
+        (TablesideSimulator, coh_t),
+        (CosetsideSimulator, coh_c),
+        (MagicsideSimulator, coh_m),
+    ):
+        with pytest.raises(ValueError, match="batch_size"):
+            sim_cls(circuit=circuit, compiled_op_handler=coh, batch_size=bad_bs, seed=1)
+
+
+def test_getter_outputs_are_isolated_from_in_place_mutation():
+    from stimside import CosetsideSimulator, MagicsideSimulator, TablesideSimulator
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8 as LeakageUint8Flip
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8 as LeakageUint8Tab
+
+    circuit = stim.Circuit("R 0\nX 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    sims = [
+        FlipsideSimulator(
+            circuit=circuit,
+            compiled_op_handler=LeakageUint8Flip().compile_op_handler(circuit=circuit, batch_size=4),
+            batch_size=4,
+            seed=5,
+        ),
+        TablesideSimulator(
+            circuit=circuit,
+            compiled_op_handler=LeakageUint8Tab().compile_op_handler(circuit=circuit, batch_size=4),
+            batch_size=4,
+            seed=5,
+        ),
+        CosetsideSimulator(
+            circuit=circuit,
+            compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=4),
+            batch_size=4,
+            seed=5,
+        ),
+        MagicsideSimulator(
+            circuit=circuit,
+            compiled_op_handler=LeakageUint8Magic().compile_op_handler(circuit=circuit, batch_size=4),
+            batch_size=4,
+            seed=5,
+        ),
+    ]
+    for sim in sims:
+        sim.run()
+        orig_recs = sim.get_final_measurement_records().copy()
+        recs = sim.get_final_measurement_records()
+        recs ^= True
+        np.testing.assert_array_equal(sim.get_final_measurement_records(), orig_recs)
+
+        for bp in (False, True):
+            orig_dets = sim.get_detector_flips(bit_packed=bp).copy()
+            dets = sim.get_detector_flips(bit_packed=bp)
+            dets ^= 1 if bp else True
+            np.testing.assert_array_equal(sim.get_detector_flips(bit_packed=bp), orig_dets)
+
+            orig_obs = sim.get_observable_flips(bit_packed=bp).copy()
+            obs = sim.get_observable_flips(bit_packed=bp)
+            obs ^= 1 if bp else True
+            np.testing.assert_array_equal(sim.get_observable_flips(bit_packed=bp), orig_obs)

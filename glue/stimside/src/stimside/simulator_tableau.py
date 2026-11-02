@@ -91,6 +91,10 @@ class TablesideSimulator(
         ``batch_size > 1`` (and no ``sync_tableside_rng``) all shots of a batch share
         one leakage trajectory, so they get the same events."""
 
+        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+        batch_size = int(batch_size)
+
         self.circuit = circuit
         self.num_qubits = circuit.num_qubits
 
@@ -608,18 +612,17 @@ class TablesideSimulator(
     def get_final_measurement_records(self) -> NDArray[np.bool_]:
         if self._finished_running_circuit is False:
             raise RuntimeError("The circuit has not been fully run yet.")
-        if self._final_measurement_records is not None:
-            return self._final_measurement_records
-        if self._running_tableau and self.batch_size == 1:
-            self._final_measurement_records = np.array([self.current_tableau_measurement_record()])
-        else:
-            self._final_measurement_records = self._new_circuit.compile_sampler(
-                    seed=int(self.np_rng.integers(0, 2**63))
-                ).sample(shots=self.batch_size, bit_packed=False)
-            for meas_idx, p0, p1, is_inverted in self._asymmetric_readout_postproc:
-                col = self._final_measurement_records[:, meas_idx]
-                raw_bit = ~col if is_inverted else col
-                prob_flip = np.where(raw_bit, 1.0 - p1, p0)
-                flips = self.np_rng.random(self.batch_size) < prob_flip
-                self._final_measurement_records[:, meas_idx] ^= flips
-        return self._final_measurement_records
+        if self._final_measurement_records is None:
+            if self._running_tableau and self.batch_size == 1:
+                self._final_measurement_records = np.array([self.current_tableau_measurement_record()])
+            else:
+                self._final_measurement_records = self._new_circuit.compile_sampler(
+                        seed=int(self.np_rng.integers(0, 2**63))
+                    ).sample(shots=self.batch_size, bit_packed=False)
+                for meas_idx, p0, p1, is_inverted in self._asymmetric_readout_postproc:
+                    col = self._final_measurement_records[:, meas_idx]
+                    raw_bit = ~col if is_inverted else col
+                    prob_flip = np.where(raw_bit, 1.0 - p1, p0)
+                    flips = self.np_rng.random(self.batch_size) < prob_flip
+                    self._final_measurement_records[:, meas_idx] ^= flips
+        return self._final_measurement_records.copy()

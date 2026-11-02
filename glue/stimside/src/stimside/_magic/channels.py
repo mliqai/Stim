@@ -450,14 +450,6 @@ def _validate_and_emit_non_magic_tagged_op(
     tag_prefix = tag.split(":", 1)[0].strip()
     if params is not None:
         check_tag_qubits({op: params}, num_qubits)
-        tag_targets = getattr(params, "targets", None)
-        if tag_targets and tag_prefix in ("LEAKAGE_MEASUREMENT", "CONDITIONED_ON_OTHER"):
-            raw_targs = op.targets_copy()
-            if len(raw_targs) == 0 or (len(raw_targs) % len(tag_targets)) != 0:
-                raise ValueError(
-                    f"{op.name}[{tag_prefix}] target count {len(raw_targs)} not a positive multiple "
-                    f"of tag target count {len(tag_targets)} in {op!r}"
-                )
 
     canon_name = _canonical_gate_data(op.name).name
     n_meas = _instruction_num_measurements(op, canon_name)

@@ -48,7 +48,7 @@ class LeakageControlledErrorParams:
         seen_state_paulis: set[tuple[int, str]] = set()
         probs_by_state: dict[int, float] = {}
         for p, state, pauli in self.args:
-            if p < 0 or p > 1:
+            if not 0 <= p <= 1:
                 raise ValueError(
                     f"{self.name} has probability argument {p} outside [0,1]"
                 )
@@ -116,7 +116,7 @@ class _TransitionParamsBase:
         )
 
     def _check_prob_and_non_identity(self, p: float, s0: Any, s1: Any) -> None:
-        if p < 0 or p > 1:
+        if not 0 <= p <= 1:
             raise ValueError(
                 f"{self.name} has probability argument {p} outside [0,1]"
             )
@@ -232,6 +232,8 @@ class LeakageConditioningParams:
                 f"{name} args must be a tuple of one or two tuples, got {self.args}"
             )
         for group in self.args:
+            if not group:
+                raise ValueError(f"{name} needs at least one state")
             for arg in group:
                 if isinstance(arg, str):
                     if arg != "U":

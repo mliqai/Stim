@@ -918,4 +918,62 @@ def test_subclassed_compiled_leakage_uint8_is_not_bypassed_by_fast_path(sync: bo
     assert coh.coords_seen[0] == {0: [0.0, 0.0], 1: [1.0, 0.0]}
 
 
+def test_slice_circuit_blocks_concurrent_first_run_is_thread_safe() -> None:
+    import threading
+    from stimside._tableau.runner import get_precompiled_circuit
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
 
+    circ = stim.Circuit("\n".join(["H 0\nTICK"] * 300 + ["I[LEAKAGE_TRANSITION_1: (0.0, U-->2)] 0", "M 0"]))
+    coh0 = LeakageUint8().compile_op_handler(circuit=circ, batch_size=1)
+    pre = get_precompiled_circuit(circ, True, coh0.ops_to_params)
+    assert not pre._full_blocks
+    barrier = threading.Barrier(4)
+    errors: list[BaseException] = []
+
+    def worker(seed: int) -> None:
+        try:
+            coh = LeakageUint8().compile_op_handler(circuit=circ, batch_size=1)
+            tss = TablesideSimulator(
+                circuit=circ, compiled_op_handler=coh, batch_size=1, seed=seed, sync_tableside_rng=True
+            )
+            barrier.wait()
+            tss.run()
+            assert tss.get_final_measurement_records().tolist() == [[False]]
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i + 1,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+
+
+def test_precompiled_cache_cap_and_metadata_mutation_isolation() -> None:
+    from stimside._tableau.runner import _PRECOMPILED_CACHE
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    for k in range(6):
+        c = stim.Circuit(f"QUBIT_COORDS({k}, 0) 0\nSHIFT_COORDS(1, 0)\nI[LEAKAGE_TRANSITION_1: (0.0, U-->2)] 0\nM 0")
+        coh = LeakageUint8().compile_op_handler(circuit=c, batch_size=1)
+        TablesideSimulator(circuit=c, compiled_op_handler=coh, batch_size=1, seed=1).run()
+    assert len(_PRECOMPILED_CACHE) <= 4
+
+    c_meta = stim.Circuit(
+        "QUBIT_COORDS[my_tag](2, 3) 0\nSHIFT_COORDS(4, 5)\nI[LEAKAGE_TRANSITION_1: (0.0, U-->2)] 0\nM 0"
+    )
+    coh1 = LeakageUint8().compile_op_handler(circuit=c_meta, batch_size=1)
+    tss1 = TablesideSimulator(circuit=c_meta, compiled_op_handler=coh1, batch_size=1, seed=1)
+    tss1.run()
+    tss1.qubit_coords[0].append(99.0)
+    tss1.qubit_coords[99] = [1.0]
+    tss1.qubit_tags[99] = "poisoned"
+    tss1.coords_shifts.append(99.0)
+
+    coh2 = LeakageUint8().compile_op_handler(circuit=c_meta, batch_size=1)
+    tss2 = TablesideSimulator(circuit=c_meta, compiled_op_handler=coh2, batch_size=1, seed=1)
+    tss2.run()
+    assert tss2.qubit_coords == {0: [2.0, 3.0]}
+    assert 99 not in tss2.qubit_tags
+    assert tss2.coords_shifts == [4.0, 5.0]

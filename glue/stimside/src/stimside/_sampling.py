@@ -139,9 +139,11 @@ class SamplerBase(sinter.Sampler):
         batch_size: int,
         seed: int | None = None,
     ) -> None:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
         self.op_handler = op_handler
         self.dem_decoder = as_leakage_decoder(dem_decoder, type(self).__name__)
-        self.batch_size = batch_size
+        self.batch_size = int(batch_size)
         self.seed = seed
         self._init_pid = os.getpid()
         self._compile_count = 0
