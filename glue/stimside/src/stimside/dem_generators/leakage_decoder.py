@@ -21,9 +21,9 @@ from stimside.dem_generators.dem_decoding import (
     decode_with_generated_dems,
     warn_if_pymatching_hyperedge,
 )
-from stimside.dem_generators.dem_generator_base import DemGenerator
 from stimside.dem_generators.dem_generator_marginal import (
     LEAKAGE_SWAP_UNSUPPORTED,
+    DemGenerator,
     MarginalLeakageDemGenerator,
     has_leakage_swap,
 )

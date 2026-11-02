@@ -68,6 +68,7 @@ PyMatching ``edge_reweights`` arrays of shape ``(num_reweights, 3)``).
 
 from __future__ import annotations
 
+import abc
 from collections import defaultdict
 import dataclasses
 import functools
@@ -79,7 +80,6 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside.dem_generators.dem_generator_base import DemGenerator
 from stimside.dem_generators.graphlike import (
     Symptom,
     collect_known_graphlike,
@@ -604,6 +604,42 @@ class Analysis:
                     extra.append("error", p, sym_targets[sym_id])
             group_dems.append(extra if mode == 1 else (self.baseline + extra))
         return [group_dems[int(gid)] for gid in shot_group_ids]
+
+
+class DemGenerator(abc.ABC):
+    """Abstract base class for per-shot DEM generators accepted by stimside samplers."""
+
+    def __init__(
+        self,
+        unconditional_condition_on_U: bool = True,
+        decompose_errors: bool = False,
+        reweight_only: bool = False,
+        loss_oracle: bool = False,
+    ) -> None:
+        self.unconditional_condition_on_U = unconditional_condition_on_U
+        self.decompose_errors = bool(decompose_errors)
+        self.reweight_only = bool(reweight_only)
+        self.loss_oracle = bool(loss_oracle)
+
+    @property
+    def needs_leakage_events(self) -> bool:
+        return self.loss_oracle
+
+    @abc.abstractmethod
+    def base_dem(
+        self, circuit: stim.Circuit, *, decompose_errors: bool | None = None
+    ) -> stim.DetectorErrorModel: ...
+
+    @abc.abstractmethod
+    def __call__(
+        self,
+        circuit: stim.Circuit,
+        records: NDArray[np.bool_],
+        decompose_errors: bool | None = None,
+        reweight_only: bool | None = None,
+        *,
+        leakage_events: Sequence[ShotLeakageEvents] | ShotLeakageEvents | None = None,
+    ) -> Any: ...
 
 
 class MarginalLeakageDemGenerator(DemGenerator):
