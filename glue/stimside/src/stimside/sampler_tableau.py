@@ -34,6 +34,8 @@ class TablesideSampler(SamplerBase):
             needs_records=self.dem_decoder.needs_records,
             needs_leakage_events=self.dem_decoder.needs_leakage_events,
             seed=self._next_compiled_seed(),
+            postselection_mask=task.postselection_mask,
+            postselected_observables_mask=task.postselected_observables_mask,
         )
 
 
@@ -48,6 +50,8 @@ class CompiledTablesideSampler(CompiledSamplerBase):
         needs_records: bool,
         needs_leakage_events: bool,
         seed: int | None = None,
+        postselection_mask: object = None,
+        postselected_observables_mask: object = None,
     ) -> None:
         self._init_common(
             circuit,
@@ -56,6 +60,8 @@ class CompiledTablesideSampler(CompiledSamplerBase):
             compiled_dem_decoder,
             needs_records,
             needs_leakage_events,
+            postselection_mask,  # type: ignore[arg-type]
+            postselected_observables_mask,  # type: ignore[arg-type]
         )
         self.tab_simulator = TablesideSimulator(
             circuit=circuit,

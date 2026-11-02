@@ -179,3 +179,122 @@ def test_decode_with_generated_dems_skips_redecomposing_generator_dems(monkeypat
 def test_dem_without_hyperedges_is_returned_unchanged():
     dem = stim.DetectorErrorModel("error(0.1) D0 D1\nerror(0.1) D2 L0")
     assert decompose_dem_graphlike(dem) is dem
+
+
+def test_reweighted_dem_preserves_observables_and_detectors_when_edges_zeroed():
+    import pymatching  # type: ignore[import-untyped]
+    from stimside.dem_generators.leakage_decoder import MarginalDecoder
+
+    circuit = stim.Circuit(
+        """
+        QUBIT_COORDS(0, 0) 0
+        R 0 1 2
+        RX 2
+        I[LEAKAGE_TRANSITION_1: (0.05, 2-->U)] 2 1
+        I[LEAKAGE_TRANSITION_1: (0.1, U-->3) (0.3, U-->2) (0.1, 2<->3)] 1 2
+        CZ 1 2
+        I_ERROR[LEAKAGE_TRANSITION_1: (0.3, 2-->3) (0.05, U-->3) (0.2, 3-->U)] 1 2
+        TICK
+        SQRT_Y 0 2
+        I[LEAKAGE_TRANSITION_1: (0.2, U-->3) (0.2, 3-->U)] 1
+        R 0
+        I_ERROR[LEAKAGE_TRANSITION_1: (0.1, U-->2) (0.3, U-->3)] 1 0 2
+        MPAD[LEAKAGE_MEASUREMENT: (0.85, 3): 0] 0
+        X_ERROR(0.05) 2 1 0
+        TICK
+        CZ 2 0
+        MPAD[LEAKAGE_MEASUREMENT: (0.1, 0) (0.2, 1) (0.9, 2): 0 2 1] 0 0 0
+        DETECTOR rec[-3]
+        DEPOLARIZE2(0.05) 0 2
+        Y_ERROR(0.2) 0 1
+        DEPOLARIZE2(0.45) 1 2
+        PAULI_CHANNEL_1(0.033, 0.07, 0.079) 2 0 1
+        TICK
+        MPAD[LEAKAGE_MEASUREMENT: (0.9, 2): 2 1] 0 0
+        DETECTOR rec[-1] rec[-5]
+        M[LEAKAGE_PROJECTION_Z: (0.9, 2)] 0 1 2
+        DETECTOR rec[-3] rec[-6]
+        DETECTOR rec[-3] rec[-5]
+        OBSERVABLE_INCLUDE(0) rec[-1] rec[-3]
+        """
+    )
+
+    class _NonPMDecoder(sinter.Decoder):
+        def compile_decoder_for_dem(self, *, dem: stim.DetectorErrorModel):
+            return sinter.BUILT_IN_DECODERS["pymatching"].compile_decoder_for_dem(dem=dem)
+
+    seed, shots = 1053, 12
+    recs = circuit.compile_sampler(seed=seed).sample(shots)
+    recs = recs ^ (np.random.default_rng(seed).random(recs.shape) < 0.1)
+    dets = np.packbits(
+        circuit.compile_detector_sampler(seed=seed).sample(shots), axis=1, bitorder="little"
+    )
+    for dec in ("pymatching", _NonPMDecoder()):
+        compiled = MarginalDecoder(
+            decoder=dec, decompose_errors=True, reweight_only=True
+        ).compile_for_task(sinter.Task(circuit=circuit))
+        pred = compiled.decode_shots_bit_packed(
+            bit_packed_detection_event_data=dets, records=recs
+        )
+        assert pred.shape == (shots, 1)
+
+    # Coordinate-less highest detector & observable both preserved when last edge reweights to p=0.
+    base = stim.DetectorErrorModel(
+        "\n".join([f"error(0.1) D{i}" for i in range(8)] + ["error(0.1) D8 L0"])
+    )
+    edges = dem_decoding._extract_graphlike_edges(base)
+    rebuilt = dem_decoding._apply_edge_reweights_to_dem(
+        base, edges, np.array([[8, -1, 1e9]], dtype=np.float64)
+    )
+    assert rebuilt.num_detectors == 9
+    assert rebuilt.num_observables == 1
+    assert decode_with_generated_dems(
+        _NonPMDecoder(),
+        [np.array([[8, -1, 1e9]], dtype=np.float64)],
+        np.zeros((1, 2), dtype=np.uint8),
+        base_dem=base,
+    ).shape == (1, 1)
+
+    # Plain DEM with Matching raises TypeError; metadata-less reweight_only without base_dem raises ValueError.
+    matcher = pymatching.Matching.from_detector_error_model(base)
+    with pytest.raises(TypeError, match="pymatching.Matching"):
+        decode_with_generated_dems(
+            matcher,
+            base,
+            np.zeros((1, 2), dtype=np.uint8),
+            decompose_errors=True,
+            reweight_only=True,
+            base_dem=base,
+        )
+    out_dem = decode_with_generated_dems(
+        "pymatching", base, None, decompose_errors=True, reweight_only=True, base_dem=base
+    )
+    assert isinstance(out_dem, stim.DetectorErrorModel)
+
+    upd = stim.DetectorErrorModel("error(0.2) D1")
+    for bad_in in (upd, [upd]):
+        with pytest.raises(ValueError, match="base_dem"):
+            decode_with_generated_dems(
+                "pymatching", bad_in, np.zeros((1, 1), dtype=np.uint8), reweight_only=True
+            )
+
+
+def test_generator_metadata_takes_precedence_over_fallback_base_dem():
+    circuit = _make_surface_code_leakage_circuit(distance=3, rounds=2)
+    gen = MarginalLeakageDemGenerator()
+    recs = np.zeros((2, circuit.num_measurements), dtype=bool)
+    recs[1, gen._get_analysis(circuit, False).flag_records[0]] = True
+    dets = np.zeros((2, (circuit.num_detectors + 7) // 8), dtype=np.uint8)
+    other_base = circuit.detector_error_model()
+
+    for dec, rew in ((False, True), (True, True)):
+        dems = gen(circuit, recs, decompose_errors=dec, reweight_only=rew)
+        want = decode_with_generated_dems("pymatching", dems, dets)
+        got = decode_with_generated_dems("pymatching", dems, dets, base_dem=other_base)
+        np.testing.assert_array_equal(got, want)
+        want_single = decode_with_generated_dems("pymatching", dems[1], dets[1:])
+        got_single = decode_with_generated_dems(
+            "pymatching", dems[1], dets[1:], base_dem=other_base
+        )
+        np.testing.assert_array_equal(got_single, want_single)
+

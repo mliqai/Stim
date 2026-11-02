@@ -150,6 +150,7 @@ class PrecompiledTablesideCircuit:
         self.step_to_quant_idx: list[int] = []
         self.step_has_bare_op: list[bool] = []
         self.requires_tableau = False
+        self.collapses_z = False
 
         c_steps: list[StepDescC] = []
         raw_t_chunks: list[np.ndarray] = []
@@ -321,6 +322,7 @@ class PrecompiledTablesideCircuit:
                     cond_groups = params.args
                     if any(0 in g or 1 in g for g in cond_groups):
                         self.requires_tableau = True
+                        self.collapses_z = True
                         kind = 6
                     elif (
                         not params.targets
@@ -346,6 +348,8 @@ class PrecompiledTablesideCircuit:
                     has_01 = (0 in params.args_by_input_state) or (
                         1 in params.args_by_input_state
                     )
+                    if has_01:
+                        self.collapses_z = True
                     if has_01 or has_dup_targets:
                         self.requires_tableau = True
                         p1_tot = sum(
@@ -389,6 +393,7 @@ class PrecompiledTablesideCircuit:
                     )
                     if has_01:
                         self.requires_tableau = True
+                        self.collapses_z = True
                         emit(None, None, 6)
                     elif has_overlapping_pairs:
                         emit(None, None, 6)

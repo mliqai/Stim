@@ -44,6 +44,8 @@ class FlipsideSampler(SamplerBase):
             needs_records=self.dem_decoder.needs_records,
             needs_leakage_events=self.dem_decoder.needs_leakage_events,
             seed=self._next_compiled_seed(),
+            postselection_mask=task.postselection_mask,
+            postselected_observables_mask=task.postselected_observables_mask,
         )
 
 
@@ -58,6 +60,8 @@ class CompiledFlipsideSampler(CompiledSamplerBase):
         needs_records: bool,
         needs_leakage_events: bool = False,
         seed: int | None = None,
+        postselection_mask: object = None,
+        postselected_observables_mask: object = None,
     ) -> None:
         _reject_loss_oracle(needs_leakage_events)
         self._init_common(
@@ -67,6 +71,8 @@ class CompiledFlipsideSampler(CompiledSamplerBase):
             compiled_dem_decoder,
             needs_records,
             needs_leakage_events,
+            postselection_mask,  # type: ignore[arg-type]
+            postselected_observables_mask,  # type: ignore[arg-type]
         )
         self.simulator = FlipsideSimulator(
             circuit=circuit,

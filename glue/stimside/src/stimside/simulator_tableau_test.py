@@ -792,3 +792,130 @@ def test_sub_epsilon_leakage_transition_skip_no_crash(p: float) -> None:
         assert coh.state.tolist() == [0, 0, 0, 0]
 
 
+@pytest.mark.parametrize(
+    ("prog", "exact"),
+    [
+        ("H 0\nX_ERROR[CONDITIONED_ON_SELF: 1](1.0) 0\nM 0", [0.0]),
+        (
+            "H 0\nI[LEAKAGE_TRANSITION_1: (1.0, 1-->2)] 0\nM[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0",
+            [0.5],
+        ),
+        (
+            "H 0\nI[LEAKAGE_TRANSITION_1: (1.0, 1-->2)] 0\nX 1\nM[LEAKAGE_PROJECTION_Z: (0.0, 2)] 0",
+            [0.0],
+        ),
+        (
+            "X_ERROR(0.5) 0\nI[LEAKAGE_TRANSITION_1: (1.0, 1-->2)] 0\nM[LEAKAGE_PROJECTION_Z: (0.0, 2)] 0",
+            [0.0],
+        ),
+        (
+            "H 0\nII[LEAKAGE_TRANSITION_2: (1.0, 1_U-->2_U)] 0 1\nM[LEAKAGE_PROJECTION_Z: (0.0, 2)] 0",
+            [0.0],
+        ),
+    ],
+)
+def test_batch_size_gt1_zero_one_collapse_marginals(prog: str, exact: list[float]) -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    circ = stim.Circuit(prog)
+    coh = LeakageUint8().compile_op_handler(circuit=circ, batch_size=64)
+    tss = TablesideSimulator(circuit=circ, compiled_op_handler=coh, batch_size=64, seed=7)
+    acc = np.zeros(circ.num_measurements)
+    n_shots = 0
+    while n_shots < 4096:
+        tss.clear()
+        tss.run()
+        recs = tss.get_final_measurement_records()
+        acc += recs.sum(axis=0)
+        n_shots += recs.shape[0]
+    got = acc / n_shots
+    for g, e in zip(got, exact):
+        if e in (0.0, 1.0):
+            assert g == e
+        else:
+            assert abs(g - e) < 5.0 * np.sqrt(e * (1.0 - e) / n_shots)
+
+
+def test_interactive_batch_leakage_events_and_sync_guard() -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    circ = stim.Circuit(
+        "R 0\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nM[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0"
+    )
+    coh = LeakageUint8().compile_op_handler(circuit=circ, batch_size=4)
+    tss = TablesideSimulator(
+        circuit=circ,
+        compiled_op_handler=coh,
+        batch_size=4,
+        seed=1,
+        record_unleaked_to_leaked=True,
+        record_leakage_events=True,
+    )
+    tss.interactive_do(circ)
+    tss.finish_interactive_run()
+    u2l = tss.get_unleaked_to_leaked_records()
+    lev = tss.get_leakage_events()
+    assert [len(x) for x in u2l] == [1, 1, 1, 1]
+    assert [len(x) for x in lev] == [1, 1, 1, 1]
+
+    coh_sync = LeakageUint8().compile_op_handler(circuit=circ, batch_size=4)
+    tss_sync = TablesideSimulator(
+        circuit=circ,
+        compiled_op_handler=coh_sync,
+        batch_size=4,
+        seed=1,
+        sync_tableside_rng=True,
+    )
+    with pytest.raises(ValueError, match="sync_tableside_rng=True"):
+        tss_sync.interactive_do(circ)
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_subclassed_compiled_leakage_uint8_is_not_bypassed_by_fast_path(sync: bool) -> None:
+    import dataclasses
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
+        CompiledLeakageUint8,
+        LeakageUint8,
+    )
+
+    @dataclasses.dataclass
+    class _LocationNoise(CompiledLeakageUint8):
+        calls: int = 0
+        coords_seen: list[dict[int, list[float]]] = dataclasses.field(default_factory=list)
+
+        def handle_op(self, op, sss):
+            self.calls += 1
+            if op.name == "H":
+                self.coords_seen.append(dict(sss.qubit_coords))
+                far = [
+                    t.value
+                    for t in op.targets_copy()
+                    if sss.qubit_coords.get(t.value, [0])[0] >= 1
+                ]
+                super().handle_op(op, sss)
+                if far:
+                    sss._do_bare_instruction(stim.CircuitInstruction("Z", sorted(set(far))))
+                return
+            super().handle_op(op, sss)
+
+    circ = stim.Circuit(
+        "QUBIT_COORDS(0, 0) 0\nQUBIT_COORDS(1, 0) 1\n"
+        "I[LEAKAGE_TRANSITION_1: (0.0, U-->2)] 0\nH 0 1\nTICK\nH 0 1\nM 0 1"
+    )
+    base = LeakageUint8().compile_op_handler(circuit=circ, batch_size=1)
+    coh = _LocationNoise(
+        num_qubits=base.num_qubits,
+        batch_size=1,
+        unconditional_condition_on_U=True,
+        ops_to_params=base.ops_to_params,
+    )
+    tss = TablesideSimulator(
+        circuit=circ, compiled_op_handler=coh, batch_size=1, seed=1, sync_tableside_rng=sync
+    )
+    tss.run()
+    assert tss.get_final_measurement_records()[0].astype(int).tolist() == [0, 1]
+    assert coh.calls == 5
+    assert coh.coords_seen[0] == {0: [0.0, 0.0], 1: [1.0, 0.0]}
+
+
+

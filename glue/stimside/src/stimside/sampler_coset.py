@@ -38,6 +38,8 @@ class CosetsideSampler(SamplerBase):
             needs_leakage_events=self.dem_decoder.needs_leakage_events,
             compiled_ref=CompiledReferenceCircuit(circuit),
             seed=self._next_compiled_seed(),
+            postselection_mask=task.postselection_mask,
+            postselected_observables_mask=task.postselected_observables_mask,
         )
 
 
@@ -55,6 +57,8 @@ class CompiledCosetsideSampler(CompiledSamplerBase):
         needs_leakage_events: bool,
         compiled_ref: CompiledReferenceCircuit | None = None,
         seed: int | None = None,
+        postselection_mask: object = None,
+        postselected_observables_mask: object = None,
     ) -> None:
         self._init_common(
             circuit,
@@ -63,6 +67,8 @@ class CompiledCosetsideSampler(CompiledSamplerBase):
             compiled_dem_decoder,
             needs_records,
             needs_leakage_events,
+            postselection_mask,  # type: ignore[arg-type]
+            postselected_observables_mask,  # type: ignore[arg-type]
         )
         self.simulator = CosetsideSimulator(
             circuit=circuit,

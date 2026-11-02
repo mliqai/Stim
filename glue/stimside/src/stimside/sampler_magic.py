@@ -128,6 +128,8 @@ class MagicsideSampler(sinter.Sampler):
             needs_records=eff_dec.needs_records,
             needs_leakage_events=eff_dec.needs_leakage_events,
             seed=self._next_compiled_seed(),
+            postselection_mask=task.postselection_mask,
+            postselected_observables_mask=task.postselected_observables_mask,
             **self._sim_kwargs,
         )
 
@@ -147,6 +149,8 @@ class CompiledMagicsideSampler(CompiledSamplerBase):
         needs_leakage_events: bool = False,
         batch_size: int = 256,
         seed: int | None = None,
+        postselection_mask: NDArray[np.uint8] | None = None,
+        postselected_observables_mask: NDArray[np.uint8] | None = None,
         **sim_kwargs: Any,
     ) -> None:
         self._init_common(
@@ -156,6 +160,8 @@ class CompiledMagicsideSampler(CompiledSamplerBase):
             compiled_decoder,
             needs_records,
             needs_leakage_events,
+            postselection_mask,
+            postselected_observables_mask,
         )
         self.simulator = MagicsideSimulator(
             circuit=circuit,

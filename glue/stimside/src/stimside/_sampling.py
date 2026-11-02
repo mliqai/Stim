@@ -37,11 +37,14 @@ def sample_batches(
     needs_records: bool = False,
     needs_leakage_events: bool = False,
     track_leakage_count: bool = False,
+    postselection_mask: np.ndarray | None = None,
+    postselected_observables_mask: np.ndarray | None = None,
 ) -> sinter.AnonTaskStats:
     """Run ``simulator`` in batches until ``suggested_shots`` are decoded into ``sinter.AnonTaskStats``."""
     start_time = time.process_time()
     shots_taken = 0
     num_errors = 0
+    num_discards = 0
     leak_total = 0
 
     while shots_taken < suggested_shots:
@@ -50,23 +53,62 @@ def sample_batches(
 
         det_packed = simulator.get_detector_flips(bit_packed=True)
         obs_packed = simulator.get_observable_flips(bit_packed=True)
-
-        decode_kwargs: dict[str, Any] = {
-            "bit_packed_detection_event_data": det_packed,
-            "records": (
-                simulator.get_final_measurement_records() if needs_records else None
-            ),
-        }
-        if needs_leakage_events:
-            decode_kwargs["leakage_events"] = simulator.get_leakage_events()
-        pred_packed = compiled_dem_decoder.decode_shots_bit_packed(**decode_kwargs)
-
-        num_errors += int(
-            np.count_nonzero(np.any(pred_packed != obs_packed, axis=-1))
-        )
         shots_taken += simulator.batch_size
         if track_leakage_count and u2l_list is not None:
             leak_total += sum(len(arr) for arr in u2l_list)
+
+        records = simulator.get_final_measurement_records() if needs_records else None
+        leakage_events = simulator.get_leakage_events() if needs_leakage_events else None
+
+        if postselection_mask is not None:
+            if postselection_mask.dtype != np.uint8 or postselection_mask.shape != (det_packed.shape[1],):
+                raise ValueError(
+                    f"Expected uint8 postselection_mask of shape {(det_packed.shape[1],)}, "
+                    f"got dtype={postselection_mask.dtype}, shape={postselection_mask.shape}."
+                )
+            det_disc = np.any(det_packed & postselection_mask, axis=-1)
+            n_det_disc = int(np.count_nonzero(det_disc))
+            if n_det_disc:
+                num_discards += n_det_disc
+                if n_det_disc == det_packed.shape[0]:
+                    continue
+                keep = ~det_disc
+                det_packed = det_packed[keep]
+                obs_packed = obs_packed[keep]
+                if records is not None:
+                    records = records[keep]
+                if leakage_events is not None:
+                    leakage_events = [ev for ev, k in zip(leakage_events, keep) if k]
+
+        decode_kwargs: dict[str, Any] = {
+            "bit_packed_detection_event_data": det_packed,
+            "records": records,
+        }
+        if needs_leakage_events:
+            decode_kwargs["leakage_events"] = leakage_events
+        pred_packed = compiled_dem_decoder.decode_shots_bit_packed(**decode_kwargs)
+        if pred_packed.shape != obs_packed.shape:
+            raise ValueError(
+                f"Decoder returned shape {pred_packed.shape}, expected {obs_packed.shape}."
+            )
+
+        diff = pred_packed ^ obs_packed
+        if postselected_observables_mask is not None:
+            if (
+                postselected_observables_mask.dtype != np.uint8
+                or postselected_observables_mask.shape != (obs_packed.shape[1],)
+            ):
+                raise ValueError(
+                    f"Expected uint8 postselected_observables_mask of shape {(obs_packed.shape[1],)}, "
+                    f"got dtype={postselected_observables_mask.dtype}, shape={postselected_observables_mask.shape}."
+                )
+            obs_disc = np.any(diff & postselected_observables_mask, axis=-1)
+            n_obs_disc = int(np.count_nonzero(obs_disc))
+            if n_obs_disc:
+                num_discards += n_obs_disc
+                diff = diff[~obs_disc]
+
+        num_errors += int(np.count_nonzero(np.any(diff, axis=-1)))
 
     seconds = time.process_time() - start_time
     if track_leakage_count:
@@ -78,12 +120,12 @@ def sample_batches(
         return sinter.AnonTaskStats(
             shots=shots_taken,
             errors=num_errors,
-            discards=0,
+            discards=num_discards,
             seconds=seconds,
             custom_counts=counts,
         )
     return sinter.AnonTaskStats(
-        shots=shots_taken, errors=num_errors, discards=0, seconds=seconds
+        shots=shots_taken, errors=num_errors, discards=num_discards, seconds=seconds
     )
 
 
@@ -124,6 +166,8 @@ class CompiledSamplerBase(sinter.CompiledSampler):
     compiled_dem_decoder: CompiledLeakageDecoder
     needs_records: bool
     needs_leakage_events: bool
+    postselection_mask: np.ndarray | None = None
+    postselected_observables_mask: np.ndarray | None = None
     _track_leakage_count: bool = False
 
     def _init_common(
@@ -134,6 +178,8 @@ class CompiledSamplerBase(sinter.CompiledSampler):
         compiled_dem_decoder: CompiledLeakageDecoder,
         needs_records: bool,
         needs_leakage_events: bool,
+        postselection_mask: np.ndarray | None = None,
+        postselected_observables_mask: np.ndarray | None = None,
     ) -> None:
         self.circuit = circuit
         self.batch_size = int(batch_size)
@@ -141,6 +187,8 @@ class CompiledSamplerBase(sinter.CompiledSampler):
         self.compiled_op_handler = compiled_op_handler
         self.needs_records = bool(needs_records)
         self.needs_leakage_events = bool(needs_leakage_events)
+        self.postselection_mask = postselection_mask
+        self.postselected_observables_mask = postselected_observables_mask
 
     def sample(self, suggested_shots: int) -> sinter.AnonTaskStats:
         return sample_batches(
@@ -150,4 +198,6 @@ class CompiledSamplerBase(sinter.CompiledSampler):
             needs_records=self.needs_records,
             needs_leakage_events=self.needs_leakage_events,
             track_leakage_count=self._track_leakage_count,
+            postselection_mask=self.postselection_mask,
+            postselected_observables_mask=self.postselected_observables_mask,
         )

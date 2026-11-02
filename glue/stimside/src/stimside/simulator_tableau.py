@@ -126,15 +126,17 @@ class TablesideSimulator(
 
         self._compiled_op_handler = compiled_op_handler
         self._precompiled_circuit = None
-        if hasattr(compiled_op_handler, "ops_to_params") and hasattr(
-            compiled_op_handler, "unconditional_condition_on_U"
-        ):
+        from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
+            CompiledLeakageUint8,
+        )
+
+        if type(compiled_op_handler) is CompiledLeakageUint8:
             from stimside._tableau.runner import get_precompiled_circuit
 
             self._precompiled_circuit = get_precompiled_circuit(
                 circuit,
-                bool(getattr(compiled_op_handler, "unconditional_condition_on_U")),
-                getattr(compiled_op_handler, "ops_to_params"),
+                bool(compiled_op_handler.unconditional_condition_on_U),
+                compiled_op_handler.ops_to_params,
             )
 
         self._compiled_m2d_converter_inst: object | None = None
@@ -179,20 +181,37 @@ class TablesideSimulator(
     # Public methods without running interactively
     ############################################################################
 
+    @staticmethod
+    def _ops_collapse_z(ops_to_params: dict[object, object]) -> bool:
+        for p in ops_to_params.values():
+            if isinstance(p, LeakageConditioningParams) and any(
+                0 in g or 1 in g for g in p.args
+            ):
+                return True
+            if isinstance(p, LeakageTransition1Params) and (
+                0 in p.args_by_input_state or 1 in p.args_by_input_state
+            ):
+                return True
+            if isinstance(p, LeakageTransition2Params) and any(
+                0 in k or 1 in k for k in p.args_by_input_state
+            ):
+                return True
+        return False
+
     def _run_single_trajectory(self):
         pre = self._precompiled_circuit
         coh = self._compiled_op_handler
         can_use_fast = (
             pre is not None
-            and hasattr(coh, "ops_to_params")
-            and coh.ops_to_params == pre.parsed_ops
+            and coh.ops_to_params == pre.parsed_ops  # type: ignore[attr-defined]
             and all(
                 isinstance(v, _STANDARD_LEAKAGE_PARAM_TYPES)
-                for v in coh.ops_to_params.values()
+                for v in coh.ops_to_params.values()  # type: ignore[attr-defined]
             )
         )
 
         if can_use_fast:
+            assert pre is not None
             if self._sync_tableside_rng:
                 from stimside._tableau.runner import run_tableside_sync_rng
 
@@ -211,7 +230,19 @@ class TablesideSimulator(
                 "Use .clear() to prepare the simulator for a new run. "
             )
 
-        if self._sync_tableside_rng and self.batch_size > 1:
+        pre = self._precompiled_circuit
+        coh = self._compiled_op_handler
+        collapses_z = (
+            pre.collapses_z
+            if pre is not None and coh.ops_to_params == pre.parsed_ops  # type: ignore[attr-defined]
+            else (
+                self._ops_collapse_z(coh.ops_to_params)  # type: ignore[attr-defined]
+                if hasattr(coh, "ops_to_params")
+                else False
+            )
+        )
+
+        if (self._sync_tableside_rng or collapses_z) and self.batch_size > 1:
             orig_batch = self.batch_size
             meas_list = []
             saved_events = [[] for _ in range(orig_batch)] if self.record_unleaked_to_leaked else []
@@ -247,19 +278,7 @@ class TablesideSimulator(
 
         if self.batch_size > 1:
             self._final_measurement_records = None
-            if self.record_leakage_events:
-                # All shots of the batch share the one simulated leakage trajectory.
-                ev0 = self._leakage_events[0]
-                self._leakage_events = [list(ev0) for _ in range(self.batch_size)]
-            if (
-                self.record_unleaked_to_leaked
-                and len(self._unleaked_to_leaked_events) == self.batch_size
-                and len(self._unleaked_to_leaked_events[0]) > 0
-                and len(self._unleaked_to_leaked_events[1]) == 0
-            ):
-                ev0 = list(self._unleaked_to_leaked_events[0])
-                for b in range(1, self.batch_size):
-                    self._unleaked_to_leaked_events[b] = list(ev0)
+            self._share_shot0_leakage_events()
         else:
             if self._running_tableau:
                 rec = self.current_tableau_measurement_record()
@@ -367,6 +386,11 @@ class TablesideSimulator(
         if self._unrolled_ops is None:
             self._unrolled_ops = unroll_circuit(self.circuit)
         if not self._used_interactively:
+            if self._sync_tableside_rng and self.batch_size > 1:
+                raise ValueError(
+                    "interactive_do with sync_tableside_rng=True requires batch_size=1 "
+                    "(run() simulates independent per-shot trajectories)."
+                )
             self._used_interactively = True
             self._running_tableau = True
         self._do(this)
@@ -374,6 +398,23 @@ class TablesideSimulator(
     def finish_interactive_run(self):
         """Finish an interactive run of the simulator."""
         self._finished_running_circuit = True
+        if self.batch_size > 1:
+            self._share_shot0_leakage_events()
+
+    def _share_shot0_leakage_events(self) -> None:
+        # All shots of the batch share the one simulated leakage trajectory.
+        if self.record_leakage_events:
+            ev0 = self._leakage_events[0]
+            self._leakage_events = [list(ev0) for _ in range(self.batch_size)]
+        if (
+            self.record_unleaked_to_leaked
+            and len(self._unleaked_to_leaked_events) == self.batch_size
+            and len(self._unleaked_to_leaked_events[0]) > 0
+            and len(self._unleaked_to_leaked_events[1]) == 0
+        ):
+            ev0 = list(self._unleaked_to_leaked_events[0])
+            for b in range(1, self.batch_size):
+                self._unleaked_to_leaked_events[b] = list(ev0)
 
     ############################################################################
     # private methods to run the simulation
@@ -552,7 +593,7 @@ class TablesideSimulator(
                 "The tableau simulator is not directly called if batch_size > 1."
             )
         self._run_tableau()
-        return np.array(self._tableau_simulator.current_measurement_record())
+        return np.array(self._tableau_simulator.current_measurement_record(), dtype=np.bool_)
 
     def get_final_measurement_records(self) -> NDArray[np.bool_]:
         if self._finished_running_circuit is False:

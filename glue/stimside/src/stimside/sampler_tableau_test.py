@@ -196,3 +196,142 @@ def test_bit_packed_detector_and_observable_getters_across_engines() -> None:
         np.testing.assert_array_equal(obs_p, np.packbits(obs, axis=-1, bitorder="little"))
         np.testing.assert_array_equal(both_p, np.packbits(both, axis=-1, bitorder="little"))
 
+
+def test_sampler_decoder_shape_guard_and_single_shot_zero_reweight_error_count() -> None:
+    import numpy as np
+    import pytest
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    class _BadShapeCompiled(CompiledLeakageDecoder):
+        def decode_shots_bit_packed(
+            self, *, bit_packed_detection_event_data, records=None, leakage_events=None
+        ):
+            return np.zeros((bit_packed_detection_event_data.shape[0], 0), dtype=np.uint8)
+
+    class _BadShapeDecoder(LeakageDecoder):
+        @property
+        def name(self) -> str:
+            return "bad_shape"
+
+        def compile_for_task(self, task):
+            return _BadShapeCompiled()
+
+    circ = stim.Circuit("X 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    sampler = TablesideSampler(
+        op_handler=TrivialOpHandler(), dem_decoder=_BadShapeDecoder(), batch_size=1, seed=0
+    )
+    with pytest.raises(ValueError, match="Decoder returned shape"):
+        sampler.compiled_sampler_for_task(sinter.Task(circuit=circ)).sample(1)
+
+    leak_zero_obs_circ = stim.Circuit(
+        "R 0 1\n"
+        "I[LEAKAGE_TRANSITION_1: (0.8, U-->2)] 0\n"
+        "MPAD[LEAKAGE_MEASUREMENT: (1.0, 2): 0] 0\n"
+        "X_ERROR[CONDITIONED_ON_SELF: U](0.4) 0\n"
+        "X_ERROR(0.2) 1\n"
+        "M[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0\n"
+        "M 1\n"
+        "DETECTOR rec[-1] rec[-2]\n"
+        "OBSERVABLE_INCLUDE(0) rec[-2]"
+    )
+    st = TablesideSampler(
+        op_handler=LeakageUint8(),
+        dem_decoder=MarginalDecoder(decompose_errors=True, reweight_only=True),
+        batch_size=1,
+        seed=0,
+    ).compiled_sampler_for_task(sinter.Task(circuit=leak_zero_obs_circ)).sample(32)
+    assert st.shots == 32
+    assert st.errors >= 16
+
+
+def test_all_four_samplers_support_sinter_postselection_masks() -> None:
+    import numpy as np
+    from stimside.dem_generators.dem_generator_marginal import MarginalLeakageDemGenerator
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import (
+        LeakageUint8 as LeakageUint8Flip,
+    )
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
+        LeakageUint8 as LeakageUint8Tableau,
+    )
+    from stimside.sampler_coset import CosetsideSampler
+    from stimside.sampler_flip import FlipsideSampler
+    from stimside.sampler_magic import MagicsideSampler
+
+    circ = stim.Circuit(
+        """
+        R 0 1 2
+        X_ERROR(0.25) 0
+        X_ERROR(0.20) 1
+        X_ERROR(0.15) 2
+        M 0 1 2
+        DETECTOR rec[-3]
+        DETECTOR rec[-2]
+        OBSERVABLE_INCLUDE(0) rec[-2]
+        OBSERVABLE_INCLUDE(1) rec[-1]
+        """
+    )
+    det_mask = np.array([0b01], dtype=np.uint8)  # postselect on D0
+    obs_mask = np.array([0b01], dtype=np.uint8)  # postselect on L0 mispredictions
+    task = sinter.Task(
+        circuit=circ,
+        decoder="vacuous",
+        postselection_mask=det_mask,
+        postselected_observables_mask=obs_mask,
+    )
+    samplers = [
+        FlipsideSampler(LeakageUint8Flip(), BaseDecoder(decoder="vacuous"), batch_size=64, seed=5),
+        TablesideSampler(LeakageUint8Tableau(), BaseDecoder(decoder="vacuous"), batch_size=64, seed=5),
+        CosetsideSampler(LeakageUint8Coset(), BaseDecoder(decoder="vacuous"), batch_size=64, seed=5),
+        MagicsideSampler(LeakageUint8Magic(), BaseDecoder(decoder="vacuous"), batch_size=64, seed=5),
+    ]
+    for smp in samplers:
+        st = smp.compiled_sampler_for_task(task).sample(1024)
+        assert st.shots == 1024
+        # Expected: P(disc_det)=0.25, P(disc_obs | ~disc_det)=0.20 -> discards ~ 0.40 * 1024 = 409.6
+        # Expected errors: (1 - 0.40) * 0.15 * 1024 = 92.16
+        assert 330 < st.discards < 490
+        assert 55 < st.errors < 135
+
+    # All-discarded batch + MarginalDecoder(loss_oracle=True) filtering records and leakage_events:
+    always_disc_circ = stim.Circuit(
+        "X_ERROR(1.0) 0\nI[LEAKAGE_TRANSITION_1: (0.5, U-->2)] 0\nM[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0\n"
+        "DETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]"
+    )
+    all_disc_task = sinter.Task(
+        circuit=always_disc_circ,
+        decoder="pymatching",
+        postselection_mask=np.array([0b1], dtype=np.uint8),
+    )
+    oracle_dec = MarginalDecoder(dem_gen=MarginalLeakageDemGenerator(loss_oracle=True))
+    st_all = CosetsideSampler(
+        LeakageUint8Coset(), oracle_dec, batch_size=8, seed=3
+    ).compiled_sampler_for_task(all_disc_task).sample(16)
+    assert st_all.shots == 16 and st_all.discards == 16 and st_all.errors == 0
+
+    import pytest
+
+    partial_task = sinter.Task(
+        circuit=stim.Circuit(
+            "X_ERROR(0.5) 0\nX_ERROR(0.1) 1\nI[LEAKAGE_TRANSITION_1: (0.3, U-->2)] 1\n"
+            "MPAD[LEAKAGE_MEASUREMENT: (1.0, 2): 1] 0\nM[LEAKAGE_PROJECTION_Z: (0.5, 2)] 0 1\n"
+            "DETECTOR rec[-2]\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]"
+        ),
+        decoder="pymatching",
+        postselection_mask=np.array([0b01], dtype=np.uint8),
+    )
+    st_partial = CosetsideSampler(
+        LeakageUint8Coset(), oracle_dec, batch_size=16, seed=9
+    ).compiled_sampler_for_task(partial_task).sample(64)
+    assert st_partial.shots == 64 and 15 < st_partial.discards < 50
+
+    bad_task = sinter.Task(
+        circuit=circ,
+        postselection_mask=np.array([1, 1], dtype=np.uint8),
+        skip_validation=True,
+    )
+    with pytest.raises(ValueError, match="postselection_mask"):
+        samplers[0].compiled_sampler_for_task(bad_task).sample(64)
+
+
