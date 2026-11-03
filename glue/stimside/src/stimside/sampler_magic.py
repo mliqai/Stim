@@ -23,12 +23,12 @@ from stimside.dem_generators.leakage_decoder import (
 )
 from stimside.op_handlers.abstract_op_handler import OpHandler, TrivialOpHandler
 from stimside.simulator_magic import (
+    BACKENDS,
+    FAULT_MODES,
+    M2D_MODES,
     MagicsideSimulator,
-    _BACKENDS,
-    _FAULT_MODES,
-    _M2D_MODES,
-    _parse_enum,
-    _resolve_budget,
+    parse_enum,
+    resolve_budget,
 )
 from stimside.util.seeding import derived_seed
 
@@ -74,19 +74,19 @@ class MagicsideSampler(sinter.Sampler):
             _coerce_magic_decoder(dem_decoder),
             int(batch_size),
         )
-        fm: Literal["DIRECT", "SELECTOR"] = _parse_enum(fault_mode, _FAULT_MODES, "fault_mode")
-        be: Literal["STREAM", "QUERY"] = _parse_enum(backend, _BACKENDS, "backend")
+        fm: Literal["DIRECT", "SELECTOR"] = parse_enum(fault_mode, FAULT_MODES, "fault_mode")
+        be: Literal["STREAM", "QUERY"] = parse_enum(backend, BACKENDS, "backend")
         if (be == "QUERY" or fm == "SELECTOR") and op_handler is not None and not isinstance(op_handler, TrivialOpHandler):
             raise ValueError(f"backend={be!r}, fault_mode={fm!r} is incompatible with non-trivial op_handler")
         if seed is not None:
             derived_seed(seed, 0)
         self.seed = seed
-        qb, mc, obe = _resolve_budget(query_budget, max_components, on_budget_exceeded)
+        qb, mc, obe = resolve_budget(query_budget, max_components, on_budget_exceeded)
         self._sim_kwargs: dict[str, Any] = {
             "batch_size": self.batch_size,
             "fault_mode": fm,
             "backend": be,
-            "m2d_reference_mode": _parse_enum(m2d_reference_mode, _M2D_MODES, "m2d_reference_mode", lower=True),
+            "m2d_reference_mode": parse_enum(m2d_reference_mode, M2D_MODES, "m2d_reference_mode", lower=True),
             "reference_sample": None if reference_sample is None else np.asarray(reference_sample, dtype=np.bool_).copy(),
             "fault_channels": tuple(fault_channels) if fault_channels is not None else None,
             "query_budget": qb,
@@ -124,7 +124,7 @@ class MagicsideSampler(sinter.Sampler):
         return CompiledMagicsideSampler(
             circuit=task.circuit,
             compiled_op_handler=compiled_handler,
-            compiled_decoder=eff_dec.compile_for_task(task),
+            compiled_dem_decoder=eff_dec.compile_for_task(task),
             needs_records=eff_dec.needs_records,
             needs_leakage_events=eff_dec.needs_leakage_events,
             seed=self._next_compiled_seed(),
@@ -144,7 +144,8 @@ class CompiledMagicsideSampler(CompiledSamplerBase):
         *,
         circuit: stim.Circuit,
         compiled_op_handler: Any,
-        compiled_decoder: CompiledLeakageDecoder,
+        compiled_dem_decoder: CompiledLeakageDecoder | None = None,
+        compiled_decoder: CompiledLeakageDecoder | None = None,
         needs_records: bool,
         needs_leakage_events: bool = False,
         batch_size: int = 256,
@@ -153,6 +154,10 @@ class CompiledMagicsideSampler(CompiledSamplerBase):
         postselected_observables_mask: NDArray[np.uint8] | None = None,
         **sim_kwargs: Any,
     ) -> None:
+        if (compiled_dem_decoder is None) == (compiled_decoder is None):
+            raise TypeError("Pass exactly one of compiled_dem_decoder or compiled_decoder.")
+        eff_compiled_decoder = compiled_dem_decoder if compiled_dem_decoder is not None else compiled_decoder
+        assert eff_compiled_decoder is not None
         sim = MagicsideSimulator(
             circuit=circuit,
             compiled_op_handler=compiled_op_handler,
@@ -164,7 +169,7 @@ class CompiledMagicsideSampler(CompiledSamplerBase):
         )
         super().__init__(
             sim,
-            compiled_decoder,
+            eff_compiled_decoder,
             needs_records=needs_records,
             needs_leakage_events=needs_leakage_events,
             postselection_mask=postselection_mask,

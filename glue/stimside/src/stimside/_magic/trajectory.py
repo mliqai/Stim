@@ -21,10 +21,10 @@ from stimside._magic.channels import (
     MeasurementRecord,
     PauliNoiseRecord,
     ResetRecord,
-    _normalize_choice_map,
-    _sample_categorical_branch,
-    _sample_heralded_pauli_branch,
     apply_clifford_factors,
+    normalize_choice_map,
+    sample_categorical_branch,
+    sample_heralded_pauli_branch,
 )
 from stimside._magic.gates import CompiledPauliAxis
 from stimside._magic.phase_qfe import (
@@ -44,7 +44,7 @@ from stimside.util.bitwords import n_words_for_qubits, unit_bit_words
 from stimside.util.reference_chp import ReferenceCHPTableau
 
 
-def _prepare_run_maps(
+def prepare_run_maps(
     plan: DirectPlan | SelectorPlan,
     *,
     fault_trace: object = None,
@@ -64,15 +64,15 @@ def _prepare_run_maps(
         (ch.slot_id if ch.slot_id is not None else idx): idx for idx, ch in enumerate(plan.fault_channels)
     }
     meas_bounds = (1,) * plan.num_measurements
-    f_map = _normalize_choice_map(
+    f_map = normalize_choice_map(
         fault_trace, fault_max, "fault_trace", key_to_slot=fault_id_to_slot, allow_none_zero=True
     )
-    n_map = _normalize_choice_map(pauli_noise_trace, plan.noise_channel_max_choices, "pauli_noise_trace")
-    r_map = _normalize_choice_map(reset_outcomes, (1,) * plan.num_resets, "reset_outcomes", allow_bool_values=True)
-    c_map = _normalize_choice_map(
+    n_map = normalize_choice_map(pauli_noise_trace, plan.noise_channel_max_choices, "pauli_noise_trace")
+    r_map = normalize_choice_map(reset_outcomes, (1,) * plan.num_resets, "reset_outcomes", allow_bool_values=True)
+    c_map = normalize_choice_map(
         requested_outcomes, meas_bounds, "requested_outcomes", allow_bool_values=True, mapping_only=True
     )
-    q_map = _normalize_choice_map(
+    q_map = normalize_choice_map(
         requested_quantum_outcomes, meas_bounds, "requested_quantum_outcomes",
         allow_bool_values=True, mapping_only=True,
     )
@@ -198,7 +198,7 @@ def _execute_compiled_records(
                     raise RuntimeError(f"Trajectory exceeded max_components={max_components} (got chi={exp.chi})")
 
         elif isinstance(rec, DirectFaultSlotRecord):
-            c_idx = fault_map.get(rec.slot_index, 0) if fault_map is not None else _sample_categorical_branch(rec.probs, rng)
+            c_idx = fault_map.get(rec.slot_index, 0) if fault_map is not None else sample_categorical_branch(rec.probs, rng)
             chosen_faults.append(c_idx)
             if c_idx > 0 and not zero_mass:
                 exp = apply_clifford_factors(exp, rec.branch_factors[c_idx - 1], atol=atol)
@@ -206,7 +206,7 @@ def _execute_compiled_records(
 
         elif isinstance(rec, PauliNoiseRecord):
             ch_idx = rec.noise_index
-            c_n = noise_map.get(ch_idx, 0) if noise_map is not None else _sample_categorical_branch(rec.probs, rng)
+            c_n = noise_map.get(ch_idx, 0) if noise_map is not None else sample_categorical_branch(rec.probs, rng)
             chosen_noise.append(c_n)
             recorded_noise_map[ch_idx] = c_n
             if c_n > 0 and not zero_mass:
@@ -223,7 +223,7 @@ def _execute_compiled_records(
                 if req_h is not None and rep_h != bool(req_h):
                     zero_mass, rep_h, exp.log_mass = True, bool(req_h), -math.inf
             else:
-                c_h, p_step = _sample_heralded_pauli_branch(rec.probs, req_h, rng)
+                c_h, p_step = sample_heralded_pauli_branch(rec.probs, req_h, rng)
                 true_h = c_h > 0
                 rep_h = bool(req_h) if req_h is not None else true_h
                 if req_h is not None:
@@ -379,7 +379,7 @@ def run_direct(
     atol: float = DEFAULT_ATOL,
 ) -> TrajectoryRunResult:
     """`A2`: Execute a `DirectPlan` trajectory."""
-    f_map, n_map, r_map, c_map, q_map = _prepare_run_maps(
+    f_map, n_map, r_map, c_map, q_map = prepare_run_maps(
         plan, fault_trace=fault_trace, pauli_noise_trace=pauli_noise_trace,
         reset_outcomes=reset_outcomes, requested_outcomes=requested_outcomes,
         requested_quantum_outcomes=requested_quantum_outcomes,
@@ -413,7 +413,7 @@ def _sample_selector_activations_from_maps(
 ) -> tuple[NDArray[np.bool_], tuple[int, ...], dict[int, int]]:
     fault_choices = tuple(
         fault_map.get(slot_idx, 0) if fault_map is not None
-        else _sample_categorical_branch([b.prob for b in ch.branches], rng_obj)
+        else sample_categorical_branch([b.prob for b in ch.branches], rng_obj)
         for slot_idx, ch in enumerate(plan.fault_channels)
     )
     sel_bits = fault_selector_bits(plan, dict(enumerate(fault_choices)))
@@ -423,7 +423,7 @@ def _sample_selector_activations_from_maps(
         corr_active = False
         for (g_kind, probs_g, s_grp), ch_idx in zip(plan.noise_selector_groups, plan.noise_selector_channel_indices):
             if g_kind == "CAT":
-                c_n = noise_map.get(ch_idx, 0) if noise_map is not None else _sample_categorical_branch(probs_g, rng_obj)
+                c_n = noise_map.get(ch_idx, 0) if noise_map is not None else sample_categorical_branch(probs_g, rng_obj)
                 noise_choice_map[ch_idx] = c_n
                 if c_n > 0:
                     sel_bits[s_grp[c_n - 1] - plan.num_data_qubits] = True
@@ -455,7 +455,7 @@ def sample_selector_activations(
     """Sample joint one-hot `selector_bits` (`bool[num_selector_qubits]`) for `plan` at `t=0`."""
     if not isinstance(plan, SelectorPlan):
         raise TypeError(f"Expected SelectorPlan, got {type(plan)!r}")
-    f_map, n_map, _, _, _ = _prepare_run_maps(plan, fault_trace=fault_trace, pauli_noise_trace=pauli_noise_trace)
+    f_map, n_map, _, _, _ = prepare_run_maps(plan, fault_trace=fault_trace, pauli_noise_trace=pauli_noise_trace)
     rng_obj = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
     return _sample_selector_activations_from_maps(plan, rng_obj, f_map, n_map)[0]
 
@@ -475,7 +475,7 @@ def run_selector(
     extract_data: bool = False,
 ) -> TrajectoryRunResult:
     """`B2`: Execute `SelectorPlan` via joint one-hot selector `X_s` activations at `t=0`."""
-    f_map, n_map, r_map, c_map, q_map = _prepare_run_maps(
+    f_map, n_map, r_map, c_map, q_map = prepare_run_maps(
         plan, fault_trace=fault_trace, pauli_noise_trace=pauli_noise_trace,
         reset_outcomes=reset_outcomes, requested_outcomes=requested_outcomes,
         requested_quantum_outcomes=requested_quantum_outcomes,

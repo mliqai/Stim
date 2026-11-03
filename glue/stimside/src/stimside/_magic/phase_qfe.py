@@ -126,7 +126,7 @@ def _coerce_finite_complex(val: Any, name: str = "weight") -> complex:
     return c
 
 
-def _check_unitary_norm(pre_norm: float, post_norm: float, atol: float, op_name: str) -> None:
+def check_unitary_norm(pre_norm: float, post_norm: float, atol: float, op_name: str) -> None:
     """Enforce unitary squared-norm conservation, catching NaN/Inf safely."""
     tol = validate_atol(atol)
     if not (
@@ -593,7 +593,7 @@ _C128_CX: NDArray[np.complex128] = np.array(
 )
 
 
-def _apply_local_unitary_c128(
+def apply_local_unitary_c128(
     psi: NDArray[np.complex128],
     U_le: NDArray[np.complex128],
     targets: Sequence[int],
@@ -630,10 +630,10 @@ def apply_reference_tableau_to_statevector(
         if name in _ELIM_1Q_MATS:
             U1 = _ELIM_1Q_MATS[name]
             for q in targs:
-                psi = _apply_local_unitary_c128(psi, U1, (q,), n, endian)
+                psi = apply_local_unitary_c128(psi, U1, (q,), n, endian)
         elif name == "CX":
             for i in range(0, len(targs), 2):
-                psi = _apply_local_unitary_c128(psi, _C128_CX, (targs[i], targs[i + 1]), n, endian)
+                psi = apply_local_unitary_c128(psi, _C128_CX, (targs[i], targs[i + 1]), n, endian)
         else:
             raise ValueError(f"Unexpected gate {name!r} in tableau elimination circuit")
     return psi
@@ -808,7 +808,7 @@ def apply_quarter_turn(
         exp = _copy_shot_inplace(exp, merged_in) if in_place else merged_in
         if exp.chi == 0:
             if check_unitary:
-                _check_unitary_norm(pre_norm, 0.0, tol_e, "apply_quarter_turn")
+                check_unitary_norm(pre_norm, 0.0, tol_e, "apply_quarter_turn")
             return exp
     out_chi, out_d, bufs, out_ptrs = _alloc_cpp_geom_bufs(exp.chi, exp.n_words, exp.d + 1)
     rc = lib.magic_apply_quarter_turn(
@@ -819,7 +819,7 @@ def apply_quarter_turn(
         raise FloatingPointError(f"magic_apply_quarter_turn returned error code {rc}")
     _assign_cpp_geom_shot(exp, int(out_chi.value), int(out_d.value), bufs)
     if check_unitary:
-        _check_unitary_norm(pre_norm, exp.norm_sq(), tol_e, "apply_quarter_turn")
+        check_unitary_norm(pre_norm, exp.norm_sq(), tol_e, "apply_quarter_turn")
     return exp
 
 
@@ -879,7 +879,7 @@ def _branch_pauli_sum_shot(
             expansion.n_qubits, log_mass=expansion.log_mass, atol=expansion.atol,
         )
         if check_unitary:
-            _check_unitary_norm(pre_norm, 0.0, tol, op_name)
+            check_unitary_norm(pre_norm, 0.0, tol, op_name)
         return empty
     chi, d, nw = expansion.chi, expansion.d, expansion.n_words
     out_w = np.empty(r * chi, dtype=np.complex128)
@@ -901,7 +901,7 @@ def _branch_pauli_sum_shot(
         return raw
     out = merge_frames(raw)
     if check_unitary:
-        _check_unitary_norm(pre_norm, out.norm_sq(), tol, op_name)
+        check_unitary_norm(pre_norm, out.norm_sq(), tol, op_name)
     return out
 
 
@@ -938,7 +938,7 @@ def _apply_pauli_sum_op(
             expansion, out_w[:oc].copy(), out_h[:oc].copy(), out_ell[:oc].copy(), is_canonical_merged=True
         )
         if check_unitary:
-            _check_unitary_norm(pre_norm, res.norm_sq(), tol, op_name)
+            check_unitary_norm(pre_norm, res.norm_sq(), tol, op_name)
         return res
     return _branch_pauli_sum_shot(
         expansion, bw, ba, bb, bk, merge=False,
@@ -1180,7 +1180,7 @@ def apply_compiled_block(
     out.weights *= g_sc
     out = merge_frames(out) if block.is_identity else _execute_sequential_steps(out, block.steps, tol=tol)
     if do_check:
-        _check_unitary_norm(pre_norm, out.norm_sq(), tol, "apply_compiled_block")
+        check_unitary_norm(pre_norm, out.norm_sq(), tol, "apply_compiled_block")
     return out
 
 

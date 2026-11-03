@@ -227,6 +227,18 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
     def batch_size(self):
         return self._flip_simulator.batch_size
 
+    @property
+    def num_measurements(self) -> int:
+        return int(self.circuit.num_measurements)
+
+    @property
+    def num_detectors(self) -> int:
+        return int(self.circuit.num_detectors)
+
+    @property
+    def num_observables(self) -> int:
+        return int(self.circuit.num_observables)
+
     def get_detector_flips(self, *args, bit_packed: bool = False, **kwargs):
         """Detector-major ``(num_detectors, batch_size)``; with ``bit_packed=True``,
         shot-major ``(batch_size, ceil(num_detectors / 8))``."""

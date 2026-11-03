@@ -169,3 +169,29 @@ def test_pickled_worker_index_compiled_seeds() -> None:
     assert w0._next_compiled_seed() != w1._next_compiled_seed()
     assert pickle.loads(pickle.dumps(MagicsideSampler(seed=777)))._next_compiled_seed() is not None
 
+
+def test_compiled_magicside_sampler_compiled_dem_decoder_kwarg() -> None:
+    from stimside.sampler_magic import CompiledMagicsideSampler
+
+    circ = stim.Circuit("R 0\nX_ERROR(0.1) 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    task = sinter.Task(circuit=circ)
+    cdec = BaseDecoder(decoder="pymatching").compile_for_task(task)
+    cs_new = CompiledMagicsideSampler(
+        circuit=circ, compiled_op_handler=None, compiled_dem_decoder=cdec, needs_records=False, batch_size=8, seed=11
+    )
+    cs_legacy = CompiledMagicsideSampler(
+        circuit=circ, compiled_op_handler=None, compiled_decoder=cdec, needs_records=False, batch_size=8, seed=11
+    )
+    s_new, s_legacy = cs_new.sample(8), cs_legacy.sample(8)
+    assert (s_new.shots, s_new.errors, s_new.discards, s_new.custom_counts) == (
+        s_legacy.shots,
+        s_legacy.errors,
+        s_legacy.discards,
+        s_legacy.custom_counts,
+    )
+    with pytest.raises(TypeError, match="compiled_dem_decoder"):
+        CompiledMagicsideSampler(circuit=circ, compiled_op_handler=None, needs_records=False)
+    with pytest.raises(TypeError, match="compiled_dem_decoder"):
+        CompiledMagicsideSampler(
+            circuit=circ, compiled_op_handler=None, compiled_dem_decoder=cdec, compiled_decoder=cdec, needs_records=False
+        )

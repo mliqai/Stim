@@ -11,22 +11,22 @@ from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 from stimside._magic.channels import (
-    CompiledCliffordFactorList, CompiledOpenBlockRecord, CorrelatedNoiseRecord, FrameEvent,
-    HeraldedNoiseRecord, LeftSppEvent, LeftUnitaryEvent, MagicTermRecord, MeasurementRecord,
-    PauliNoiseRecord, ResetRecord, _FEEDBACK_2Q_GATES, _PAULI_2Q_ORDER, _compile_clifford_factors,
-    _compile_pauli_measurement_c15, _compile_reset_c15, _emit_magic_terms, _infer_total_data_qubits,
-    _normalize_choice_map, _normalize_pauli_slot_map, _reduce_pauli_product_targets,
-    _sample_categorical_branch, _sample_heralded_pauli_branch, _split_pauli_product_targets,
-    _split_realization_sections, apply_clifford_factors, compile_pauli_product,
+    FEEDBACK_2Q_GATES, PAULI_2Q_ORDER, CompiledCliffordFactorList, CompiledOpenBlockRecord,
+    CorrelatedNoiseRecord, FrameEvent, HeraldedNoiseRecord, LeftSppEvent, LeftUnitaryEvent,
+    MagicTermRecord, MeasurementRecord, PauliNoiseRecord, ResetRecord, apply_clifford_factors,
+    compile_clifford_factors, compile_pauli_measurement_c15, compile_pauli_product, compile_reset_c15,
+    emit_magic_terms, infer_total_data_qubits, normalize_choice_map, normalize_pauli_slot_map,
+    reduce_pauli_product_targets, sample_categorical_branch, sample_heralded_pauli_branch,
+    split_pauli_product_targets, split_realization_sections,
 )
 from stimside._magic.gates import (
-    CliffordFaultChannel, CompiledPauliAxis, _canonical_clifford_gate_name_and_arity,
-    _canonical_gate_data, _coerce_strict_int, _merge_and_validate_fault_channels,
-    extract_circuit_faults, parse_clifford_fault_instruction,
+    CliffordFaultChannel, CompiledPauliAxis, canonical_clifford_gate_name_and_arity,
+    canonical_gate_data, coerce_strict_int, extract_circuit_faults,
+    merge_and_validate_fault_channels, parse_clifford_fault_instruction,
 )
 from stimside._magic.plan import DirectPlan, SelectorPlan, compile_direct, compile_open_block, compile_selector
 from stimside._magic.statevector import extract_data_expansion, reconstruct_statevector
-from stimside._magic.trajectory import _prepare_run_maps, run_direct, run_selector
+from stimside._magic.trajectory import prepare_run_maps, run_direct, run_selector
 from stimside._magic.phase_qfe import (
     DEFAULT_ATOL, ImpossiblePostselectionError, K1_CANCEL_REL_TOL, ShotExpansion, apply_compiled_block, apply_pauli,
     apply_quarter_turn, measure_expansion, project_diagonal, validate_atol,
@@ -65,20 +65,20 @@ from stimside.util.sync_rng import (
 )
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
 
-_FAULT_MODES: dict[str, Literal["DIRECT", "SELECTOR"]] = {"DIRECT": "DIRECT", "SELECTOR": "SELECTOR"}
-_BACKENDS: dict[str, Literal["STREAM", "QUERY"]] = {"STREAM": "STREAM", "QUERY": "QUERY"}
-_M2D_MODES: dict[str, Literal["auto", "magicside", "stim", "zero"]] = {
+FAULT_MODES: dict[str, Literal["DIRECT", "SELECTOR"]] = {"DIRECT": "DIRECT", "SELECTOR": "SELECTOR"}
+BACKENDS: dict[str, Literal["STREAM", "QUERY"]] = {"STREAM": "STREAM", "QUERY": "QUERY"}
+M2D_MODES: dict[str, Literal["auto", "magicside", "stim", "zero"]] = {
     "auto": "auto", "magicside": "magicside", "magic": "magicside", "noiseless_magic": "magicside",
     "stim": "stim", "clifford": "stim", "zero": "zero", "skip": "zero",
 }
 
 
-def _resolve_budget(
+def resolve_budget(
     query_budget: QueryBudget | None, max_components: int | None, on_budget_exceeded: str | None
 ) -> tuple[QueryBudget | None, int | None, Literal["raise", "fallback"]]:
     if query_budget is not None and not isinstance(query_budget, QueryBudget):
         raise TypeError(f"Expected QueryBudget or None, got {type(query_budget).__name__}")
-    mc = None if max_components is None else _coerce_strict_int(max_components, "max_components")
+    mc = None if max_components is None else coerce_strict_int(max_components, "max_components")
     if mc is not None and mc < 1:
         raise ValueError(f"max_components must be >= 1, got {mc}")
     if query_budget is None and mc is None and on_budget_exceeded is None:
@@ -97,19 +97,19 @@ def _normalize_shot_realization(
         return {}
     if not isinstance(raw, Mapping):
         raise ValueError(f"Expected Mapping fault realization, got {type(raw)!r}")
-    sec = _split_realization_sections(raw)
+    sec = split_realization_sections(raw)
     if "faults" in sec:
-        sec["faults"] = _normalize_choice_map(
+        sec["faults"] = normalize_choice_map(
             sec["faults"], fault_max, "faults",
             key_to_slot=fault_id_to_slot, allow_none_zero=True, allow_binary_bool=True, strict_length=True,
         )
     for mk in ("measurements", "quantum_measurements"):
         if mk in sec:
-            sec[mk] = _normalize_choice_map(sec[mk], (1,) * num_measurements, mk, allow_bool_values=True)
+            sec[mk] = normalize_choice_map(sec[mk], (1,) * num_measurements, mk, allow_bool_values=True)
     if "sweep_bits" in sec:
         sw = sec["sweep_bits"]
-        w = (max(_coerce_strict_int(k, "sweep_bits key") for k in sw) + 1) if isinstance(sw, Mapping) and sw else (len(sw) if not isinstance(sw, (str, bytes, Mapping)) and hasattr(sw, "__len__") else 0)
-        sw_m = _normalize_choice_map(sw, (1,) * max(0, w), "sweep_bits", allow_bool_values=True) or {}
+        w = (max(coerce_strict_int(k, "sweep_bits key") for k in sw) + 1) if isinstance(sw, Mapping) and sw else (len(sw) if not isinstance(sw, (str, bytes, Mapping)) and hasattr(sw, "__len__") else 0)
+        sw_m = normalize_choice_map(sw, (1,) * max(0, w), "sweep_bits", allow_bool_values=True) or {}
         sec["sweep_bits"] = np.array([bool(sw_m.get(i, 0)) for i in range(max(sw_m) + 1)], dtype=np.bool_) if sw_m else np.zeros(0, dtype=np.bool_)
     return sec
 
@@ -122,10 +122,10 @@ def _normalize_stream_paulis(plan: DirectPlan | SelectorPlan, raw_p: Any) -> Any
         for rec in plan.records
         if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord, CorrelatedNoiseRecord))
     }
-    return _normalize_pauli_slot_map(raw_p, plan.noise_channel_max_choices, kinds)
+    return normalize_pauli_slot_map(raw_p, plan.noise_channel_max_choices, kinds)
 
 
-def _parse_enum(val: Any, table: Mapping[str, Any], name: str, *, lower: bool = False) -> Any:
+def parse_enum(val: Any, table: Mapping[str, Any], name: str, *, lower: bool = False) -> Any:
     key = (val.strip().lower() if lower else val.strip().upper()) if isinstance(val, str) else ""
     if key not in table:
         raise ValueError(f"Unsupported {name}: {val!r}")
@@ -168,17 +168,17 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
             raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
         self.circuit, self.batch_size = circuit, int(batch_size)
-        self.fault_mode: Literal["DIRECT", "SELECTOR"] = _parse_enum(fault_mode, _FAULT_MODES, "fault_mode")
-        self.backend: Literal["STREAM", "QUERY"] = _parse_enum(backend, _BACKENDS, "backend")
+        self.fault_mode: Literal["DIRECT", "SELECTOR"] = parse_enum(fault_mode, FAULT_MODES, "fault_mode")
+        self.backend: Literal["STREAM", "QUERY"] = parse_enum(backend, BACKENDS, "backend")
         self.atol = validate_atol(atol)
-        self.m2d_reference_mode: Literal["auto", "magicside", "stim", "zero"] = _parse_enum(m2d_reference_mode, _M2D_MODES, "m2d_reference_mode", lower=True)
+        self.m2d_reference_mode: Literal["auto", "magicside", "stim", "zero"] = parse_enum(m2d_reference_mode, M2D_MODES, "m2d_reference_mode", lower=True)
         self.record_unleaked_to_leaked = bool(record_unleaked_to_leaked)
         self.record_leakage_events = bool(record_leakage_events)
         self.sync_tableside_rng = bool(sync_tableside_rng)
         if seed is not None:
             derived_seed(seed, 0)
         self.seed = seed
-        self.query_budget, self.max_components, self.on_budget_exceeded = _resolve_budget(
+        self.query_budget, self.max_components, self.on_budget_exceeded = resolve_budget(
             query_budget, max_components, on_budget_exceeded
         )
         self._explicit_ref_sample: NDArray[np.bool_] | None = None
@@ -192,9 +192,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._eff_m2d_mode: Literal["magicside", "stim", "zero"] = ("magicside" if any(op.tag in _MAGIC_TAGS for op in self._unrolled_ops) else "stim") if self.m2d_reference_mode == "auto" else self.m2d_reference_mode
         flat_ops, inline_faults = extract_circuit_faults(circuit)
         self._user_fault_channels = tuple(fault_channels) if fault_channels is not None else None
-        self._prog_faults, self._inline_faults, self._all_fault_channels = _merge_and_validate_fault_channels(len(flat_ops), inline_faults, fault_channels)
+        self._prog_faults, self._inline_faults, self._all_fault_channels = merge_and_validate_fault_channels(len(flat_ops), inline_faults, fault_channels)
         self._logical_nq = max([self.num_qubits] + [q + 1 for ch in self._all_fault_channels for b in ch.branches for q in b.targets])
-        self._eff_nq = _infer_total_data_qubits(circuit, self._all_fault_channels)
+        self._eff_nq = infer_total_data_qubits(circuit, self._all_fault_channels)
         self._tab_scratch_q = self.num_qubits
         self._sweep_mat = _normalize_sweep_matrix(sweep_bits, self.batch_size)
         if compiled_op_handler is None and op_handler is not None:
@@ -361,7 +361,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     ) -> tuple[dict[int, int] | None, dict[int, int] | None, float]:
         rng = self.np_rng
         f_arg = None if f_map is None else {
-            int(ch.slot_id): (f_map[i] if i in f_map else _sample_categorical_branch([b.prob for b in ch.branches], rng))  # type: ignore[arg-type]
+            int(ch.slot_id): (f_map[i] if i in f_map else sample_categorical_branch([b.prob for b in ch.branches], rng))  # type: ignore[arg-type]
             for i, ch in enumerate(plan.fault_channels)
         }
         if n_map is None:
@@ -373,10 +373,10 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             idx = rec.noise_index
             if isinstance(rec, PauliNoiseRecord):
                 if idx not in n_arg:
-                    n_arg[idx] = _sample_categorical_branch(rec.probs, rng)
+                    n_arg[idx] = sample_categorical_branch(rec.probs, rng)
             elif isinstance(rec, HeraldedNoiseRecord):
                 if idx not in n_arg:
-                    n_arg[idx], p_step = _sample_heralded_pauli_branch(
+                    n_arg[idx], p_step = sample_heralded_pauli_branch(
                         rec.probs, c_map.get(rec.meas_index), rng, presampled=True
                     )
                     mass_scale *= p_step
@@ -399,7 +399,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         for s in range(self.batch_size):
             nr = self._norm_reals[s] if self._norm_reals is not None else {}
             f_raw = {int(plan.fault_channels[i].slot_id): v for i, v in nr["faults"].items()} if nr.get("faults") is not None else None  # type: ignore[arg-type]
-            f_map, n_map, r_map, c_map, q_map = _prepare_run_maps(
+            f_map, n_map, r_map, c_map, q_map = prepare_run_maps(
                 plan, fault_trace=f_raw, pauli_noise_trace=_normalize_stream_paulis(plan, nr.get("paulis")),
                 reset_outcomes=nr.get("resets"), requested_outcomes=nr.get("measurements"),
                 requested_quantum_outcomes=nr.get("quantum_measurements"),
@@ -504,11 +504,11 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def _fire_fault_channel_live(self, slot_idx: int, ch: CliffordFaultChannel) -> None:
         self._flush_magic()
         probs = [b.prob for b in ch.branches]
-        facs = [_compile_clifford_factors(self._live_ref_tab, b.gate_name, b.targets) for b in ch.branches]
+        facs = [compile_clifford_factors(self._live_ref_tab, b.gate_name, b.targets) for b in ch.branches]
         for s in range(self.batch_size):
             forced = self._forced_fault_branch(s, slot_idx)
             rng_s = self._shot_np_rngs[s] if self._shot_np_rngs is not None else self.np_rng
-            c = _sample_categorical_branch(probs, rng_s) if forced is None else forced
+            c = sample_categorical_branch(probs, rng_s) if forced is None else forced
             if c > 0:
                 self._apply_factor_list(s, facs[c - 1])
 
@@ -560,7 +560,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._fire_fault_channel_live(slot_idx, ch)
 
     def _emit_magic_op(self, op: stim.CircuitInstruction, qs: Sequence[int] | None = None) -> None:
-        _emit_magic_terms(
+        emit_magic_terms(
             op.tag, validate_magic_op(op) if qs is None else qs, self._live_ref_tab, self._pending_magic
         )
 
@@ -588,7 +588,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
             self._do_heralded_noise(op)
             return
-        cname = _canonical_gate_data(name).name
+        cname = canonical_gate_data(name).name
         gd = stim.gate_data(cname)
         if gd.is_noisy_gate and not gd.produces_measurements and not gd.is_reset:
             self.do_conditional_pauli_noise(op, condition_met_mask=None)
@@ -713,8 +713,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             raise ValueError(f"Invalid measurement flip probability {p_err!r}")
         specs: list[tuple[set[int], Any, bool]] = []
         if cname == "MPP":
-            for grp, inv in _split_pauli_product_targets(op):
-                red = _reduce_pauli_product_targets(grp)
+            for grp, inv in split_pauli_product_targets(op):
+                red = reduce_pauli_product_targets(grp)
                 specs.append(({q for q, _ in red}, red, inv))
         elif cname in ("MXX", "MYY", "MZZ"):
             pch = cname[-1]
@@ -730,9 +730,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         seg_len = 0
         for idx, (supp, payload, inv) in enumerate(specs):
             rec: MeasurementRecord | ResetRecord = (
-                _compile_reset_c15(self._live_ref_tab, payload[0], payload[1], meas_index=0 if gd.produces_measurements else None, invert_result=inv, flip_prob=0.0, frame_events=self._live_frame_events)
+                compile_reset_c15(self._live_ref_tab, payload[0], payload[1], meas_index=0 if gd.produces_measurements else None, invert_result=inv, flip_prob=0.0, frame_events=self._live_frame_events)
                 if gd.is_reset
-                else _compile_pauli_measurement_c15(self._live_ref_tab, payload, invert_result=inv, flip_prob=0.0, meas_index=0, frame_events=self._live_frame_events)
+                else compile_pauli_measurement_c15(self._live_ref_tab, payload, invert_result=inv, flip_prob=0.0, meas_index=0, frame_events=self._live_frame_events)
             )
             m_shots = self._project_substep_batch(rec)
             if gd.produces_measurements:
@@ -756,7 +756,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         raise ValueError(f"Unsupported classical target {tgt!r}")
 
     def do_conditional_clifford(self, op: stim.CircuitInstruction, condition_met_mask: NDArray[np.bool_] | None = None, *, condition_group_fn: Callable[[int], NDArray[np.bool_]] | None = None) -> None:
-        name = _canonical_gate_data(op.name).name
+        name = canonical_gate_data(op.name).name
         if name in ("I", "II"):
             if condition_group_fn is not None:
                 arity = 1 if name == "I" else 2
@@ -766,7 +766,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         mask_at = lambda i: condition_group_fn(i) if condition_group_fn is not None else (condition_met_mask[i] if condition_met_mask is not None else None)
         if name in ("SPP", "SPP_DAG"):
             dag = name == "SPP_DAG"
-            for g_idx, (grp, inv) in enumerate(_split_pauli_product_targets(op)):
+            for g_idx, (grp, inv) in enumerate(split_pauli_product_targets(op)):
                 self._apply_conditional_ref_step(
                     mask_at(g_idx),
                     lambda g=grp, iv=inv: (
@@ -778,10 +778,10 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                     ),
                 )
             return
-        canon, arity = _canonical_clifford_gate_name_and_arity(name)
+        canon, arity = canonical_clifford_gate_name_and_arity(name)
         raw = op.targets_copy()
         if arity == 2 and any(t.qubit_value is None for t in raw):
-            fb_axes = _FEEDBACK_2Q_GATES.get(canon)
+            fb_axes = FEEDBACK_2Q_GATES.get(canon)
             for p_idx, (a, b_t) in enumerate(zip(raw[::2], raw[1::2])):
                 mask_g = mask_at(p_idx)
                 if a.qubit_value is not None and b_t.qubit_value is not None:
@@ -811,7 +811,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._apply_conditional_ref_step(
             mask_g,
             lambda: (self._live_ref_tab.do_unitary(canon, grp), self._live_frame_events.append(LeftUnitaryEvent(canon, grp))),
-            lambda: _compile_clifford_factors(self._live_ref_tab, canon, grp),
+            lambda: compile_clifford_factors(self._live_ref_tab, canon, grp),
         )
 
     def _apply_conditional_ref_step(
@@ -837,7 +837,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._apply_factor_list(int(s), fac, inverse=True)
 
     def do_conditional_pauli_noise(self, op: stim.CircuitInstruction, condition_met_mask: NDArray[np.bool_] | None = None) -> None:
-        cname = _canonical_gate_data(op.name).name
+        cname = canonical_gate_data(op.name).name
         if cname in ("I_ERROR", "II_ERROR", "I", "II"):
             return
         args = [float(a) for a in op.gate_args_copy()]
@@ -897,7 +897,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             terms = list(zip(("X", "Y", "Z"), probs1))
         else:
             probs2 = (args[0] / 15.0,) * 15 if cname == "DEPOLARIZE2" else tuple(args[:15])
-            terms = list(zip(_PAULI_2Q_ORDER, probs2))
+            terms = list(zip(PAULI_2Q_ORDER, probs2))
         acc = 0.0
         for label, pr in terms:
             lo, acc = acc, acc + pr

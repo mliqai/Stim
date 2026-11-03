@@ -12,11 +12,10 @@ import stim  # type: ignore[import-untyped]
 from stimside._magic.gates import (
     CliffordFaultChannel,
     CompiledPauliAxis,
-    _PAU_ABK,
-    _canonical_gate_data,
-    _coerce_strict_int,
-    _spec_terms,
+    PAU_ABK,
+    coerce_strict_int,
     decompose_clifford_exact,
+    spec_terms,
 )
 from stimside._magic.phase_qfe import (
     DEFAULT_ATOL,
@@ -26,13 +25,8 @@ from stimside._magic.phase_qfe import (
     apply_pauli,
     apply_quarter_turn,
 )
-from stimside.op_handlers.leakage_handlers.tag_registry import (
-    check_tag_qubits,
-    parse_leakage_tag_magic,
-)
 from stimside.util.bitwords import (
     first_set_bit_in_words,
-    n_words_for_qubits,
     pauli_multiply,
     tail_mask,
     unit_bit_words,
@@ -208,17 +202,17 @@ def compile_pauli_product(
     return CompiledPauliAxis(np.ascontiguousarray(a_acc), np.ascontiguousarray(b_acc), kap_acc)
 
 
-def _compile_clifford_factors(
+def compile_clifford_factors(
     ref_chp: ReferenceCHPTableau,
     gate_name: str,
     targets: Sequence[int],
 ) -> CompiledCliffordFactorList:
     dec = decompose_clifford_exact(gate_name, targets)
-    p0_neg, p0_terms = _spec_terms(dec.p0_spec, targets)
+    p0_neg, p0_terms = spec_terms(dec.p0_spec, targets)
     p0_axis = None if (not p0_terms and not p0_neg) else compile_pauli_product(ref_chp, p0_terms, negate=p0_neg)
     r_axes = tuple(
         compile_pauli_product(ref_chp, r_terms, negate=r_neg)
-        for r_neg, r_terms in (_spec_terms(r_sp, targets) for r_sp in dec.r_specs)
+        for r_neg, r_terms in (spec_terms(r_sp, targets) for r_sp in dec.r_specs)
     )
     return CompiledCliffordFactorList(v=dec.v, p0=p0_axis, r_axes=r_axes)
 
@@ -260,7 +254,7 @@ def apply_clifford_factors(
     return exp
 
 
-def _split_pauli_product_targets(
+def split_pauli_product_targets(
     op: stim.CircuitInstruction,
 ) -> list[tuple[list[tuple[int, str]], bool]]:
     """Split combiner-separated targets of `MPP`/`SPP`/`SPP_DAG`/`CORRELATED_ERROR`."""
@@ -294,22 +288,22 @@ def _split_pauli_product_targets(
     return groups
 
 
-def _reduce_pauli_product_targets(
+def reduce_pauli_product_targets(
     raw_targets: Sequence[tuple[int, str]],
 ) -> list[tuple[int, str]]:
     """Reduce `(qubit, pauli)` targets modulo global phase into unique unsigned Hermitian Paulis."""
     phys_map: dict[int, tuple[int, int]] = {}
     for q_raw, pch_raw in raw_targets:
-        if pch_raw not in _PAU_ABK:
+        if pch_raw not in PAU_ABK:
             raise ValueError(f"Expected Pauli character in ('I','X','Y','Z'), got {pch_raw!r}")
         q_c = int(q_raw)
         xc, zc = phys_map.get(q_c, (0, 0))
-        dx, dz, _ = _PAU_ABK[pch_raw]
+        dx, dz, _ = PAU_ABK[pch_raw]
         phys_map[q_c] = (xc ^ dx, zc ^ dz)
     return [(q_c, "IZXY"[(xc << 1) | zc]) for q_c, (xc, zc) in phys_map.items() if (xc or zc)]
 
 
-def _compile_pauli_measurement_c15(
+def compile_pauli_measurement_c15(
     ref_chp: ReferenceCHPTableau,
     terms: Sequence[tuple[int, str]],
     *,
@@ -329,7 +323,7 @@ def _compile_pauli_measurement_c15(
     return MeasurementRecord(meas_index, flip_prob, invert_result, bar_M, rot_axis)
 
 
-def _compile_reset_c15(
+def compile_reset_c15(
     ref_chp: ReferenceCHPTableau,
     q: int,
     basis: Literal["Z", "X", "Y"],
@@ -374,23 +368,15 @@ def _compile_reset_c15(
     )
 
 
-_ANNOTATION_GATES: frozenset[str] = frozenset(
-    {"TICK", "QUBIT_COORDS", "SHIFT_COORDS", "DETECTOR", "OBSERVABLE_INCLUDE"}
-)
-_FEEDBACK_2Q_GATES: dict[str, tuple[str, str]] = {
+FEEDBACK_2Q_GATES: dict[str, tuple[str, str]] = {
     "CX": ("Z", "X"), "CY": ("Z", "Y"), "CZ": ("Z", "Z"), "XCZ": ("X", "Z"), "YCZ": ("Y", "Z"),
 }
-_PAULI_2Q_ORDER: tuple[str, ...] = tuple(
+PAULI_2Q_ORDER: tuple[str, ...] = tuple(
     p0 + p1 for p0 in "IXYZ" for p1 in "IXYZ" if not (p0 == "I" and p1 == "I")
 )
-_CAT_NOISE_META: dict[str, tuple[int, int]] = {
-    "X_ERROR": (1, 1), "Y_ERROR": (1, 1), "Z_ERROR": (1, 1),
-    "DEPOLARIZE1": (1, 3), "PAULI_CHANNEL_1": (1, 3),
-    "DEPOLARIZE2": (2, 15), "PAULI_CHANNEL_2": (2, 15),
-}
 
 
-def _emit_magic_terms(
+def emit_magic_terms(
     tag: str,
     qs: Sequence[int],
     ref_chp: ReferenceCHPTableau,
@@ -406,7 +392,7 @@ def _emit_magic_terms(
             out_records.append(MagicTermRecord(MagicPhaseTerm(axes=axes, kind="CCZ")))
 
 
-def _infer_total_data_qubits(
+def infer_total_data_qubits(
     circuit: stim.Circuit, all_channels: Sequence[CliffordFaultChannel]
 ) -> int:
     return max(
@@ -415,46 +401,7 @@ def _infer_total_data_qubits(
     )
 
 
-def _instruction_num_measurements(op: stim.CircuitInstruction, canon_name: str) -> int:
-    if not _canonical_gate_data(canon_name).produces_measurements:
-        return 0
-    if canon_name == "MPP":
-        return len(_split_pauli_product_targets(op))
-    n_t = len(op.targets_copy())
-    return (n_t // 2) if canon_name in ("MXX", "MYY", "MZZ") else n_t
-
-
-def _validate_and_emit_non_magic_tagged_op(
-    op: stim.CircuitInstruction,
-    num_qubits: int,
-    next_meas_idx: int,
-    out_records: list[CompiledRecord],
-) -> int:
-    """Validate a registered leakage tag (emitting `LeakageBarrierRecord`) or reject unknown tags."""
-    tag = op.tag
-    if not (tag.startswith("LEAKAGE") or tag.startswith("CONDITIONED_ON")):
-        raise ValueError(f"Unrecognized instruction tag {tag!r} on {op!r}")
-    params, _ = parse_leakage_tag_magic(op, syntax_only=True)
-    tag_prefix = tag.split(":", 1)[0].strip()
-    if params is not None:
-        check_tag_qubits({op: params}, num_qubits)
-
-    canon_name = _canonical_gate_data(op.name).name
-    n_meas = _instruction_num_measurements(op, canon_name)
-    out_records.append(LeakageBarrierRecord(op, tag_prefix, n_meas))
-    return next_meas_idx + n_meas
-
-
-def _slice_axis_to_qubits(ax: CompiledPauliAxis, n_qubits: int) -> CompiledPauliAxis:
-    n_w, tm = n_words_for_qubits(n_qubits), tail_mask(n_qubits)
-    a_d = np.ascontiguousarray(ax.a_words[:n_w].copy(), dtype=np.uint64)
-    b_d = np.ascontiguousarray(ax.b_words[:n_w].copy(), dtype=np.uint64)
-    a_d[-1] &= tm
-    b_d[-1] &= tm
-    return CompiledPauliAxis(a_words=a_d, b_words=b_d, kappa=ax.kappa)
-
-
-def _restrict_tableau_to_data(
+def restrict_tableau_to_data(
     ref_sel: ReferenceCHPTableau, n_data: int, sel_bits: NDArray[np.bool_] | None = None
 ) -> ReferenceCHPTableau:
     """Slice `ref_sel` onto `0 .. n_data - 1` conditioned on `|sel_bits>` (`|0>` if `None`)."""
@@ -490,7 +437,7 @@ _PAULI_4_STR: dict[str, int] = {"I": 0, "X": 2, "Y": 3, "Z": 4}
 _PAULI_2Q_STR: dict[str, int] = {a + b: i for i, (a, b) in enumerate((p, q) for p in "IXYZ" for q in "IXYZ")}
 
 
-def _split_realization_sections(raw: Mapping[Any, Any]) -> dict[str, Any]:
+def split_realization_sections(raw: Mapping[Any, Any]) -> dict[str, Any]:
     if not raw:
         return {}
     if not any(isinstance(k, str) for k in raw):
@@ -505,14 +452,14 @@ def _split_realization_sections(raw: Mapping[Any, Any]) -> dict[str, Any]:
     return sec
 
 
-def _normalize_pauli_slot_map(
+def normalize_pauli_slot_map(
     raw_p: Any, max_choices: Sequence[int], noise_kinds: Mapping[int, str]
 ) -> Any:
     if not isinstance(raw_p, Mapping):
         return raw_p
     out: dict[int, Any] = {}
     for k, v in raw_p.items():
-        ik = _coerce_strict_int(k, "paulis key")
+        ik = coerce_strict_int(k, "paulis key")
         if ik < 0 or ik >= len(max_choices):
             raise ValueError(f"Pauli slot {ik} out of range")
         mc, kind = max_choices[ik], noise_kinds.get(ik, "")
@@ -531,7 +478,7 @@ def _normalize_pauli_slot_map(
     return out
 
 
-def _sample_categorical_branch(probs: Sequence[float] | NDArray[np.float64], rng: np.random.Generator) -> int:
+def sample_categorical_branch(probs: Sequence[float] | NDArray[np.float64], rng: np.random.Generator) -> int:
     """Return `0` with prob `1 - sum(probs)`, or `1..K` for branch `0..K-1`."""
     u = float(rng.random())
     acc = 0.0
@@ -542,7 +489,7 @@ def _sample_categorical_branch(probs: Sequence[float] | NDArray[np.float64], rng
     return 0
 
 
-def _sample_heralded_pauli_branch(
+def sample_heralded_pauli_branch(
     probs: Sequence[float] | NDArray[np.float64],
     req_h: int | bool | None,
     rng: np.random.Generator,
@@ -552,7 +499,7 @@ def _sample_heralded_pauli_branch(
 ) -> tuple[int, float]:
     """Sample `(choice_idx, branch_prob)` for a heralded Pauli channel (`req_h` in `{None, 0, 1}`)."""
     if req_h is None:
-        return _sample_categorical_branch(probs, rng), 1.0
+        return sample_categorical_branch(probs, rng), 1.0
     p_h = min(1.0, max(0.0, float(sum(probs))))
     if not req_h:
         p_no = max(0.0, 1.0 - p_h)
@@ -573,7 +520,7 @@ def _sample_heralded_pauli_branch(
     return pos[-1][0], p_h
 
 
-def _normalize_choice_map(
+def normalize_choice_map(
     trace: object,
     max_choices: Sequence[int],
     name: str,
@@ -592,12 +539,12 @@ def _normalize_choice_map(
         slot_lookup = key_to_slot if key_to_slot is not None else {i: i for i in range(len(max_choices))}
         out: dict[int, int] = {}
         for k, v in trace.items():
-            ik = _coerce_strict_int(k, f"{name} key", allow_bool=False)
+            ik = coerce_strict_int(k, f"{name} key", allow_bool=False)
             if ik not in slot_lookup:
                 raise ValueError(f"Out-of-range or unknown key {k!r} in {name}")
             slot = slot_lookup[ik]
             allow_b = allow_bool_values or (allow_binary_bool and max_choices[slot] == 1)
-            iv = 0 if (v is None and allow_none_zero) else _coerce_strict_int(v, f"{name}[{ik}]", allow_bool=allow_b)
+            iv = 0 if (v is None and allow_none_zero) else coerce_strict_int(v, f"{name}[{ik}]", allow_bool=allow_b)
             if iv < 0 or iv > max_choices[slot]:
                 raise ValueError(f"{name}[{ik}]={iv} out of range [0, {max_choices[slot]}]")
             out[slot] = iv
@@ -611,7 +558,7 @@ def _normalize_choice_map(
     out_seq: dict[int, int] = {}
     for idx, max_c in enumerate(max_choices):
         allow_b = allow_bool_values or (allow_binary_bool and max_c == 1)
-        iv = _coerce_strict_int(trace[idx], f"{name}[{idx}]", allow_bool=allow_b)
+        iv = coerce_strict_int(trace[idx], f"{name}[{idx}]", allow_bool=allow_b)
         if iv < 0 or iv > max_c:
             raise ValueError(f"{name}[{idx}]={iv} out of range [0, {max_c}]")
         out_seq[idx] = iv

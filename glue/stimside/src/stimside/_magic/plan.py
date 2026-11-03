@@ -15,31 +15,28 @@ from stimside._magic.channels import (
     CompiledRecord,
     CorrelatedNoiseRecord,
     DirectFaultSlotRecord,
+    FEEDBACK_2Q_GATES,
     FeedbackPauliRecord,
     FrameEvent,
     HeraldedNoiseRecord,
+    LeakageBarrierRecord,
     LeftSppEvent,
     LeftUnitaryEvent,
+    MPadRecord,
     MagicPhaseTerm,
     MagicTermRecord,
-    MPadRecord,
+    PAULI_2Q_ORDER,
     PauliNoiseRecord,
     RightRotEvent,
-    _ANNOTATION_GATES,
-    _CAT_NOISE_META,
-    _FEEDBACK_2Q_GATES,
-    _PAULI_2Q_ORDER,
-    _compile_clifford_factors,
-    _compile_pauli_measurement_c15,
-    _compile_reset_c15,
-    _emit_magic_terms,
-    _infer_total_data_qubits,
-    _reduce_pauli_product_targets,
-    _restrict_tableau_to_data,
-    _slice_axis_to_qubits,
-    _split_pauli_product_targets,
-    _validate_and_emit_non_magic_tagged_op,
+    compile_clifford_factors,
+    compile_pauli_measurement_c15,
     compile_pauli_product,
+    compile_reset_c15,
+    emit_magic_terms,
+    infer_total_data_qubits,
+    reduce_pauli_product_targets,
+    restrict_tableau_to_data,
+    split_pauli_product_targets,
 )
 from stimside._magic.gates import (
     CONTROLLED_PAULI_2Q_AXES,
@@ -48,12 +45,12 @@ from stimside._magic.gates import (
     DECOMP_1Q,
     DECOMP_2Q,
     FaultBranch,
-    _canonical_gate_data,
-    _merge_and_validate_fault_channels,
-    _plain_qubits,
-    _spec_terms,
+    canonical_gate_data,
     decompose_clifford_exact,
     extract_circuit_faults,
+    merge_and_validate_fault_channels,
+    plain_qubits,
+    spec_terms,
 )
 from stimside._magic.phase_qfe import (
     OMEGA_ARR as _OMEGA_ARR,
@@ -62,13 +59,66 @@ from stimside._magic.phase_qfe import (
     CompiledPauliBlockStep,
     ShotExpansion,
 )
-from stimside.op_handlers.leakage_handlers.tag_registry import validate_magic_op
+from stimside.op_handlers.leakage_handlers.tag_registry import (
+    check_tag_qubits,
+    parse_leakage_tag_magic,
+    validate_magic_op,
+)
 from stimside.util.bitwords import (
     n_words_for_qubits,
     pauli_multiply,
+    tail_mask,
     word_dot_parity,
 )
 from stimside.util.reference_chp import ReferenceCHPTableau
+
+_ANNOTATION_GATES: frozenset[str] = frozenset(
+    {"TICK", "QUBIT_COORDS", "SHIFT_COORDS", "DETECTOR", "OBSERVABLE_INCLUDE"}
+)
+_CAT_NOISE_META: dict[str, tuple[int, int]] = {
+    "X_ERROR": (1, 1), "Y_ERROR": (1, 1), "Z_ERROR": (1, 1),
+    "DEPOLARIZE1": (1, 3), "PAULI_CHANNEL_1": (1, 3),
+    "DEPOLARIZE2": (2, 15), "PAULI_CHANNEL_2": (2, 15),
+}
+
+
+def _instruction_num_measurements(op: stim.CircuitInstruction, canon_name: str) -> int:
+    if not canonical_gate_data(canon_name).produces_measurements:
+        return 0
+    if canon_name == "MPP":
+        return len(split_pauli_product_targets(op))
+    n_t = len(op.targets_copy())
+    return (n_t // 2) if canon_name in ("MXX", "MYY", "MZZ") else n_t
+
+
+def _validate_and_emit_non_magic_tagged_op(
+    op: stim.CircuitInstruction,
+    num_qubits: int,
+    next_meas_idx: int,
+    out_records: list[CompiledRecord],
+) -> int:
+    """Validate a registered leakage tag (emitting `LeakageBarrierRecord`) or reject unknown tags."""
+    tag = op.tag
+    if not (tag.startswith("LEAKAGE") or tag.startswith("CONDITIONED_ON")):
+        raise ValueError(f"Unrecognized instruction tag {tag!r} on {op!r}")
+    params, _ = parse_leakage_tag_magic(op, syntax_only=True)
+    tag_prefix = tag.split(":", 1)[0].strip()
+    if params is not None:
+        check_tag_qubits({op: params}, num_qubits)
+
+    canon_name = canonical_gate_data(op.name).name
+    n_meas = _instruction_num_measurements(op, canon_name)
+    out_records.append(LeakageBarrierRecord(op, tag_prefix, n_meas))
+    return next_meas_idx + n_meas
+
+
+def _slice_axis_to_qubits(ax: CompiledPauliAxis, n_qubits: int) -> CompiledPauliAxis:
+    n_w, tm = n_words_for_qubits(n_qubits), tail_mask(n_qubits)
+    a_d = np.ascontiguousarray(ax.a_words[:n_w].copy(), dtype=np.uint64)
+    b_d = np.ascontiguousarray(ax.b_words[:n_w].copy(), dtype=np.uint64)
+    a_d[-1] &= tm
+    b_d[-1] &= tm
+    return CompiledPauliAxis(a_words=a_d, b_words=b_d, kappa=ax.kappa)
 
 
 def _count_gadget_pauli_selectors(flat_ops: Sequence[stim.CircuitInstruction]) -> int:
@@ -76,7 +126,7 @@ def _count_gadget_pauli_selectors(flat_ops: Sequence[stim.CircuitInstruction]) -
     for op in flat_ops:
         if op.tag != "":
             continue
-        cname = _canonical_gate_data(op.name).name
+        cname = canonical_gate_data(op.name).name
         if cname in _CAT_NOISE_META:
             arity, k_br = _CAT_NOISE_META[cname]
             total += k_br * (len(op.targets_copy()) // arity)
@@ -124,12 +174,12 @@ def _emit_selector_clifford_branch(
         return
 
     dec = decompose_clifford_exact(g, qs)
-    p0_neg, p0_terms = _spec_terms(dec.p0_spec, qs)
+    p0_neg, p0_terms = spec_terms(dec.p0_spec, qs)
     v_eff = (dec.v + (4 if p0_neg else 0)) & 7
     _emit_selector_pauli_branch(s_qubit, p0_terms, n_data, ref_sel, frame_events, gauge_steps)
 
     for r_sp in dec.r_specs:
-        neg_r, r_terms = _spec_terms(r_sp, qs)
+        neg_r, r_terms = spec_terms(r_sp, qs)
         bar_P = compile_pauli_product(ref_sel, r_terms, negate=neg_r)
         bar_ZsP = compile_pauli_product(ref_sel, [(s_qubit, "Z")] + r_terms, negate=neg_r)
         raw_records.append(MagicTermRecord(MagicPhaseTerm(axes=(bar_ZsP,), kind="T", epsilon=1)))
@@ -172,10 +222,10 @@ def _compile_circuit_pass(
 ) -> _CircuitPassResult:
     """Shared single-pass lowering for `compile_coordinates`, `compile_direct`, and `compile_selector`."""
     flat_ops, inline_faults = extract_circuit_faults(circuit)
-    prog_by_step, inline_by_step, all_channels = _merge_and_validate_fault_channels(
+    prog_by_step, inline_by_step, all_channels = merge_and_validate_fault_channels(
         len(flat_ops), inline_faults, fault_channels
     )
-    n_data = _infer_total_data_qubits(circuit, all_channels)
+    n_data = infer_total_data_qubits(circuit, all_channels)
     gad_noise = selector_mode and gadgetize_pauli_noise
     n_fault_sel = sum(len(ch.branches) for ch in all_channels) if selector_mode else 0
     n_sel = n_fault_sel + (_count_gadget_pauli_selectors(flat_ops) if gad_noise else 0)
@@ -206,7 +256,7 @@ def _compile_circuit_pass(
                         s_q, br, n_data, ref_chp, raw_records, frame_events, gauge_steps
                     )
             else:
-                b_factors = tuple(_compile_clifford_factors(ref_chp, b.gate_name, b.targets) for b in ch.branches)
+                b_factors = tuple(compile_clifford_factors(ref_chp, b.gate_name, b.targets) for b in ch.branches)
                 raw_records.append(
                     DirectFaultSlotRecord(slot_idx, b_factors, np.array([b.prob for b in ch.branches], dtype=np.float64))
                 )
@@ -232,7 +282,7 @@ def _compile_circuit_pass(
     def _emit_measurements(groups: Sequence[tuple[Sequence[tuple[int, str]], bool]], p_flip: float) -> None:
         nonlocal next_meas_idx
         for grp_terms, grp_inv in groups:
-            m_rec = _compile_pauli_measurement_c15(
+            m_rec = compile_pauli_measurement_c15(
                 ref_chp, grp_terms, invert_result=grp_inv, flip_prob=p_flip,
                 meas_index=next_meas_idx, frame_events=frame_events,
             )
@@ -247,14 +297,14 @@ def _compile_circuit_pass(
 
         if op.tag != "":
             if op.tag in ("T", "T_DAG", "CCZ"):
-                _emit_magic_terms(op.tag, validate_magic_op(op), ref_chp, raw_records)
+                emit_magic_terms(op.tag, validate_magic_op(op), ref_chp, raw_records)
             else:
                 next_meas_idx = _validate_and_emit_non_magic_tagged_op(
                     op, n_data, next_meas_idx, raw_records
                 )
         else:
             name = op.name
-            canon_name = _canonical_gate_data(name).name
+            canon_name = canonical_gate_data(name).name
             args = op.gate_args_copy()
             targs = op.targets_copy()
 
@@ -262,13 +312,13 @@ def _compile_circuit_pass(
                 pass
             elif canon_name in ("SPP", "SPP_DAG"):
                 dag = canon_name == "SPP_DAG"
-                for grp_terms, grp_inv in _split_pauli_product_targets(op):
+                for grp_terms, grp_inv in split_pauli_product_targets(op):
                     ref_chp.do_spp(grp_terms, negate=grp_inv, dag=dag)
                     frame_events.append(LeftSppEvent(tuple(grp_terms), grp_inv, dag))
-            elif canon_name in _FEEDBACK_2Q_GATES and any(
+            elif canon_name in FEEDBACK_2Q_GATES and any(
                 t.is_measurement_record_target or t.is_sweep_bit_target for t in targs
             ):
-                ax0, ax1 = _FEEDBACK_2Q_GATES[canon_name]
+                ax0, ax1 = FEEDBACK_2Q_GATES[canon_name]
                 for off in range(0, len(targs), 2):
                     t0, t1 = targs[off], targs[off + 1]
                     q0_plain = t0.is_qubit_target and not t0.is_inverted_result_target
@@ -293,7 +343,7 @@ def _compile_circuit_pass(
                     )
             elif canon_name in DECOMP_1Q or canon_name in DECOMP_2Q:
                 arity = 1 if canon_name in DECOMP_1Q else 2
-                qs_u = _plain_qubits(targs, name)
+                qs_u = plain_qubits(targs, name)
                 if canon_name not in ("I", "II"):
                     for off in range(0, len(qs_u), arity):
                         grp_u = tuple(qs_u[off : off + arity])
@@ -319,7 +369,7 @@ def _compile_circuit_pass(
                 for off in range(0, len(targs), 2):
                     q0, q1 = int(targs[off].qubit_value), int(targs[off + 1].qubit_value)
                     _emit_cat_pauli_noise(
-                        canon_name, probs_15, tuple([(q0, pair[0]), (q1, pair[1])] for pair in _PAULI_2Q_ORDER)
+                        canon_name, probs_15, tuple([(q0, pair[0]), (q1, pair[1])] for pair in PAULI_2Q_ORDER)
                     )
             elif canon_name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
                 probs_h = (
@@ -340,8 +390,8 @@ def _compile_circuit_pass(
                     next_noise_idx += 1
             elif canon_name in ("E", "CORRELATED_ERROR", "ELSE_CORRELATED_ERROR"):
                 p, is_else = float(args[0]), (canon_name == "ELSE_CORRELATED_ERROR")
-                simp_terms = _reduce_pauli_product_targets(
-                    [tm for g_terms, _ in _split_pauli_product_targets(op) for tm in g_terms]
+                simp_terms = reduce_pauli_product_targets(
+                    [tm for g_terms, _ in split_pauli_product_targets(op) for tm in g_terms]
                 )
                 if gad_noise:
                     s_q = next_sel_q
@@ -358,7 +408,7 @@ def _compile_circuit_pass(
             elif canon_name in ("M", "MZ", "MX", "MY", "MXX", "MYY", "MZZ", "MPP"):
                 p_flip = float(args[0]) if args else 0.0
                 if canon_name == "MPP":
-                    groups_m: Sequence[tuple[Sequence[tuple[int, str]], bool]] = _split_pauli_product_targets(op)
+                    groups_m: Sequence[tuple[Sequence[tuple[int, str]], bool]] = split_pauli_product_targets(op)
                 elif canon_name in ("MXX", "MYY", "MZZ"):
                     pch = canon_name[1]
                     groups_m = [
@@ -389,7 +439,7 @@ def _compile_circuit_pass(
                     m_idx = next_meas_idx if is_mr else None
                     if is_mr:
                         next_meas_idx += 1
-                    r_rec = _compile_reset_c15(
+                    r_rec = compile_reset_c15(
                         ref_chp, int(t.qubit_value), basis_ch, meas_index=m_idx,
                         invert_result=bool(t.is_inverted_result_target) if is_mr else False,
                         flip_prob=p_flip, frame_events=frame_events,
@@ -416,7 +466,7 @@ def _compile_circuit_pass(
             for ev in frame_tup
             if not (isinstance(ev, LeftUnitaryEvent) and any(q >= n_data for q in ev.targets))
         )
-        data_tab = _restrict_tableau_to_data(ref_chp, n_data)
+        data_tab = restrict_tableau_to_data(ref_chp, n_data)
     return _CircuitPassResult(
         n_data, n_sel, n_total, next_meas_idx, tuple(raw_records), ref_chp, frame_tup,
         all_channels, tuple(fault_sel_groups), tuple(noise_sel_groups), tuple(noise_sel_ch_indices),

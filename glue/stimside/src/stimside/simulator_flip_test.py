@@ -608,3 +608,26 @@ def test_flip_ltz_duplicate_targets_and_y_basis_projection() -> None:
     np.testing.assert_array_equal(recs[unleaked, 0], recs[unleaked, 1])
     assert not np.any(recs[unleaked, 3])
 
+
+def test_simulator_count_properties_parity() -> None:
+    from stimside import CosetsideSimulator, MagicsideSimulator, TablesideSimulator
+    from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
+
+    c = stim.Circuit(
+        "R 0 1 2\nM 0 1 2\n"
+        "DETECTOR rec[-3] rec[-2]\nDETECTOR rec[-2] rec[-1]\n"
+        "OBSERVABLE_INCLUDE(0) rec[-3]"
+    )
+    coh = TrivialOpHandler().compile_op_handler(circuit=c, batch_size=2)
+    for sim in (
+        FlipsideSimulator(c, compiled_op_handler=coh, batch_size=2, seed=1),
+        TablesideSimulator(c, compiled_op_handler=coh, batch_size=2, seed=1),
+        CosetsideSimulator(c, compiled_op_handler=coh, batch_size=2, seed=1),
+        MagicsideSimulator(c, compiled_op_handler=coh, batch_size=2, seed=1),
+    ):
+        assert (sim.num_measurements, sim.num_detectors, sim.num_observables) == (3, 2, 1)
+        sim.run()
+        assert (sim.num_measurements, sim.num_detectors, sim.num_observables) == (3, 2, 1)
+        sim.clear()
+        assert (sim.num_measurements, sim.num_detectors, sim.num_observables) == (3, 2, 1)
+

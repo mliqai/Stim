@@ -17,7 +17,7 @@ from stimside._magic.phase_qfe import (
 )
 from stimside.op_handlers.leakage_handlers.common_parsing import split_arguments
 
-_PAU_ABK: dict[str, tuple[int, int, int]] = {"I": (0, 0, 0), "X": (1, 0, 0), "Z": (0, 1, 0), "Y": (1, 1, 1)}
+PAU_ABK: dict[str, tuple[int, int, int]] = {"I": (0, 0, 0), "X": (1, 0, 0), "Z": (0, 1, 0), "Y": (1, 1, 1)}
 
 # Verified exact F = OMEGA_POWERS[v] * R(r_specs[-1]) ... R(r_specs[0]) * P(p0_spec) over all 46 canonical 1Q/2Q Stim gates
 DECOMP_1Q: dict[str, tuple[int, str, tuple[str, ...]]] = {
@@ -56,7 +56,7 @@ CONTROLLED_PAULI_2Q_AXES: dict[str, tuple[str, str]] = {
 }
 
 
-def _coerce_strict_int(val: object, label: str, *, allow_bool: bool = False) -> int:
+def coerce_strict_int(val: object, label: str, *, allow_bool: bool = False) -> int:
     if isinstance(val, (bool, np.bool_)):
         if allow_bool:
             return int(bool(val))
@@ -66,7 +66,7 @@ def _coerce_strict_int(val: object, label: str, *, allow_bool: bool = False) -> 
     return int(val)
 
 
-def _canonical_gate_data(gate_name: str) -> stim.GateData:
+def canonical_gate_data(gate_name: str) -> stim.GateData:
     if not isinstance(gate_name, str) or not gate_name.strip():
         raise ValueError(f"Invalid gate name: {gate_name!r}")
     try:
@@ -75,14 +75,14 @@ def _canonical_gate_data(gate_name: str) -> stim.GateData:
         raise ValueError(f"Unknown Stim gate {gate_name!r}") from exc
 
 
-def _canonical_clifford_gate_name_and_arity(gate_name: str) -> tuple[str, int]:
-    gd = _canonical_gate_data(gate_name)
+def canonical_clifford_gate_name_and_arity(gate_name: str) -> tuple[str, int]:
+    gd = canonical_gate_data(gate_name)
     if not gd.is_unitary or not (gd.is_single_qubit_gate or gd.is_two_qubit_gate):
         raise ValueError(f"Gate {gate_name!r} is not a 1Q or 2Q unitary Clifford gate")
     return gd.name, (1 if gd.is_single_qubit_gate else 2)
 
 
-def _plain_qubits(targets: Sequence[stim.GateTarget], label: str) -> list[int]:
+def plain_qubits(targets: Sequence[stim.GateTarget], label: str) -> list[int]:
     out: list[int] = []
     for t in targets:
         if not t.is_qubit_target or t.is_inverted_result_target:
@@ -118,8 +118,8 @@ class FaultBranch:
         p = float(self.prob)
         if not math.isfinite(p) or p < 0.0 or p > 1.0:
             raise ValueError(f"Invalid FaultBranch probability: {self.prob!r}")
-        canon_name, arity = _canonical_clifford_gate_name_and_arity(self.gate_name)
-        t_tup = tuple(_coerce_strict_int(q, "FaultBranch target") for q in self.targets)
+        canon_name, arity = canonical_clifford_gate_name_and_arity(self.gate_name)
+        t_tup = tuple(coerce_strict_int(q, "FaultBranch target") for q in self.targets)
         if len(t_tup) != arity or any(q < 0 for q in t_tup) or len(set(t_tup)) != arity:
             raise ValueError(f"Invalid targets {t_tup} for {arity}Q gate {canon_name!r}")
         object.__setattr__(self, "prob", p)
@@ -135,12 +135,12 @@ class CliffordFaultChannel:
     slot_id: int | None = None
 
     def __post_init__(self) -> None:
-        step = _coerce_strict_int(self.step_index, "CliffordFaultChannel step_index")
+        step = coerce_strict_int(self.step_index, "CliffordFaultChannel step_index")
         if step < 0:
             raise ValueError(f"CliffordFaultChannel step_index must be >= 0, got {step}")
         object.__setattr__(self, "step_index", step)
         if self.slot_id is not None:
-            sid = _coerce_strict_int(self.slot_id, "CliffordFaultChannel slot_id")
+            sid = coerce_strict_int(self.slot_id, "CliffordFaultChannel slot_id")
             if sid < 0:
                 raise ValueError(f"CliffordFaultChannel slot_id must be >= 0, got {sid}")
             object.__setattr__(self, "slot_id", sid)
@@ -176,9 +176,9 @@ class ExactCliffordDecomposition:
 def _spec_to_abk_small(spec: str) -> tuple[int, int, int]:
     a_m, b_m, kap = 0, 0, (2 if spec[0] == "-" else 0)
     for i, ch in enumerate(spec[1:]):
-        if ch not in _PAU_ABK:
+        if ch not in PAU_ABK:
             raise ValueError(f"Invalid Pauli char {ch!r} in {spec!r}")
-        xa, zb, dk = _PAU_ABK[ch]
+        xa, zb, dk = PAU_ABK[ch]
         a_m |= xa << i
         b_m |= zb << i
         kap = (kap + dk) & 3
@@ -193,7 +193,7 @@ def _abk_small_to_spec(a_m: int, b_m: int, kap: int, k: int) -> str:
     return ("-" if exp4 == 2 else "+") + body
 
 
-def _spec_terms(spec: str, targets: Sequence[int]) -> tuple[bool, list[tuple[int, str]]]:
+def spec_terms(spec: str, targets: Sequence[int]) -> tuple[bool, list[tuple[int, str]]]:
     return spec[0] == "-", [(int(targets[i]), ch) for i, ch in enumerate(spec[1:]) if ch != "I"]
 
 
@@ -233,7 +233,7 @@ def decompose_clifford_exact(
 ) -> ExactCliffordDecomposition:
     """Decompose a named 1Q/2Q Stim Clifford or `stim.Tableau` with exact `omega**v` phase."""
     if isinstance(gate_or_tableau, str):
-        canon_name, k = _canonical_clifford_gate_name_and_arity(gate_or_tableau)
+        canon_name, k = canonical_clifford_gate_name_and_arity(gate_or_tableau)
         v, p0_spec, r_specs = (DECOMP_1Q if k == 1 else DECOMP_2Q)[canon_name]
         t_tup = _validate_decomp_targets(targets, k, gate_or_tableau)
         if not inverse:
@@ -339,7 +339,7 @@ def parse_clifford_fault_tag(tag: str) -> tuple[tuple[float, str], ...]:
             raise ValueError(f"Invalid probability {p_str!r} in CLIFFORD_FAULT tag {tag!r}") from exc
         if not math.isfinite(prob) or prob < 0.0 or prob > 1.0:
             raise ValueError(f"CLIFFORD_FAULT probability must be finite in [0, 1], got {prob!r}")
-        canon_gate, arity = _canonical_clifford_gate_name_and_arity(g_str)
+        canon_gate, arity = canonical_clifford_gate_name_and_arity(g_str)
         if expected_arity is None:
             expected_arity = arity
         elif arity != expected_arity:
@@ -356,14 +356,14 @@ def parse_clifford_fault_instruction(
     op: stim.CircuitInstruction, step_index: int
 ) -> list[CliffordFaultChannel]:
     """Validate and expand an `I[CLIFFORD_FAULT: ...]` or `II[CLIFFORD_FAULT: ...]` instruction."""
-    canon_carrier = _canonical_gate_data(op.name).name
+    canon_carrier = canonical_gate_data(op.name).name
     if canon_carrier not in ("I", "II") or op.gate_args_copy():
         raise ValueError(f"Invalid CLIFFORD_FAULT carrier/args on {op!r}")
     parsed_branches = parse_clifford_fault_tag(op.tag)
-    _, arity = _canonical_clifford_gate_name_and_arity(parsed_branches[0][1])
+    _, arity = canonical_clifford_gate_name_and_arity(parsed_branches[0][1])
     if canon_carrier == "II" and arity != 2:
         raise ValueError(f"Carrier 'II' requires 2-qubit CLIFFORD_FAULT gates, got {parsed_branches}")
-    qs = _plain_qubits(op.targets_copy(), "CLIFFORD_FAULT")
+    qs = plain_qubits(op.targets_copy(), "CLIFFORD_FAULT")
     if len(qs) == 0 or (len(qs) % arity) != 0:
         raise ValueError(f"CLIFFORD_FAULT with {arity}Q gates requires a positive multiple of {arity} targets")
     channels: list[CliffordFaultChannel] = []
@@ -400,7 +400,7 @@ def extract_circuit_faults(
     return flat_ops, tuple(inline_faults)
 
 
-def _merge_and_validate_fault_channels(
+def merge_and_validate_fault_channels(
     num_steps: int,
     inline_faults: Sequence[CliffordFaultChannel],
     external_faults: Sequence[CliffordFaultChannel] | None,

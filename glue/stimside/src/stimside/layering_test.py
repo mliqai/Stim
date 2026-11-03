@@ -7,14 +7,17 @@ from pathlib import Path
 
 STIMSIDE_DIR = Path(__file__).parent
 
+_ENGINE_NAMES = ("flip", "tableau", "coset", "magic")
+_ALL_ENGINES = {f"engine:{n}" for n in _ENGINE_NAMES}
+
 ALLOWED_LAYER_DEPS: dict[str, set[str]] = {
     "util": {"util"},
     "_native": {"_native"},
     "op_handlers": {"op_handlers", "util"},
     "dem": {"dem", "op_handlers", "util", "_native"},
-    "engines": {"engines", "op_handlers", "util", "_native"},
-    "samplers": {"samplers", "engines", "dem", "op_handlers", "util"},
-    "root": {"root", "samplers", "engines", "dem", "op_handlers", "util", "_native"},
+    **{f"engine:{n}": {f"engine:{n}", "op_handlers", "util", "_native"} for n in _ENGINE_NAMES},
+    "samplers": {"samplers", *_ALL_ENGINES, "dem", "op_handlers", "util"},
+    "root": {"root", "samplers", *_ALL_ENGINES, "dem", "op_handlers", "util", "_native"},
 }
 
 ALLOWLIST: set[tuple[str, str]] = set()
@@ -32,8 +35,9 @@ def _layer_of(mod: str) -> str:
         return head
     if head == "dem_generators":
         return "dem"
-    if head in ("_flip", "_tableau", "_coset", "_magic") or head.startswith("simulator_"):
-        return "engines"
+    for name in _ENGINE_NAMES:
+        if head in (f"_{name}", f"simulator_{name}"):
+            return f"engine:{name}"
     if head == "_sampling" or head.startswith("sampler_"):
         return "samplers"
     raise AssertionError(f"Unclassified stimside module: {mod!r}")
@@ -69,6 +73,15 @@ def _runtime_targets(tree: ast.AST, pkg_parts: list[str]) -> set[str]:
             if mod.startswith("stimside"):
                 for alias in node.names:
                     targets.add(f"{mod}.{alias.name}")
+
+        def visit_Call(self, node: ast.Call) -> None:
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else (fn.attr if isinstance(fn, ast.Attribute) else "")
+            if name in ("import_module", "__import__") and node.args:
+                arg0 = node.args[0]
+                if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str) and arg0.value.startswith("stimside"):
+                    targets.add(arg0.value)
+            self.generic_visit(node)
 
     _Visitor().visit(tree)
     return targets

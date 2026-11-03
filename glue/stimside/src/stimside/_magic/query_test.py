@@ -485,3 +485,17 @@ def test_query_born_split_rejects_negative_mass_matching_magic_compile(monkeypat
     )
     with pytest.raises(FloatingPointError, match="Significantly negative projected Born mass"):
         EvaluateQueries(plan, queries=("mass",))
+
+
+def test_evaluate_queries_unpinned_clifford_fault_vs_pauli_noise_semantics() -> None:
+    plan_pauli = PrepareQueries(stim.Circuit("X_ERROR(0.3) 0\nM 0"))
+    plan_fault = PrepareQueries(stim.Circuit("I[CLIFFORD_FAULT: (0.3, X)] 0\nM 0"))
+    assert abs((EvaluateQueries(plan_pauli, {"measurements": {0: 1}}).mass or 0.0) - 0.3) < 1e-12
+    assert EvaluateQueries(plan_fault, {"measurements": {0: 1}}).mass == 0.0
+    assert abs((EvaluateQueries(plan_fault, {"faults": {0: 1}, "measurements": {0: 1}}).mass or 0.0) - 1.0) < 1e-12
+    mc_hits = sum(
+        int(EvaluateQueries(plan_fault, None, queries=("sample_measurements",), rng=s).sampled_measurements[0])  # type: ignore[index]
+        for s in range(64)
+    )
+    assert 5 <= mc_hits <= 35
+

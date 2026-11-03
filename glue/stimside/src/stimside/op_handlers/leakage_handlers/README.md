@@ -5,7 +5,7 @@ The leakage noise tag family is designed to support leakage errors:
 Basically, each qubit has hidden classical state, and these tags allow you to manipulate that state,
 and use the tracked state to add Pauli noise to the simulator
 
-All leakage error tag starts with `LEAKAGE`, to make them easy to notice and to not waste time
+Leakage tags start with `LEAKAGE` or `CONDITIONED_ON`, to make them easy to notice and to not waste time
 parsing a tag you don't care about. The four engine-specific handlers are exported at the `stimside`
 package root as `LeakageUint8Flip`, `LeakageUint8Tableau`, `LeakageUint8Coset`, and `LeakageUint8Magic`
 (with `LeakageUint8` kept as the legacy class name inside `leakage_uint8_flip` and `leakage_uint8_tableau`).
@@ -86,7 +86,8 @@ Computational states are handled similarly to `LEAKAGE_TRANSITION_1`
     (p, U_2-->3_U) =    if the first qubit is unleaked and the second qubit is in 2,
                         with probability p, leak the first qubit to 3 and unleak the second qubit.
 
-A qubit that transitions from a leaked state to `U` (or `V`) is always fully depolarized.
+A qubit that transitions from a leaked state (`>= 2`) to `U` (or `V`/`D`) is always fully depolarized,
+whereas an unleaked input (`U`, `0`, or `1`) transitioning to `U` keeps its computational state untouched.
 A `0` or `1` output instead resets the qubit into that Z state without depolarizing it (whatever its input),
 and a leaked qubit transitioning to `X`, `Y` or `Z` is reset to `0` before that Pauli is applied.
 
@@ -143,8 +144,8 @@ After the measurement, the leaked targets are fully depolarized.
 to right. Unlike the other leakage tags it takes no arguments (`LEAKAGE_SWAP`, not `LEAKAGE_SWAP: ...`), and it is
 only allowed on `SWAP`. An untagged `SWAP` never moves leakage states.
 
-`TablesideSimulator` and `CosetsideSimulator` apply the computational `SWAP` to every pair, leaked qubits included
-(whatever `unconditional_condition_on_U` is), so a leaked qubit's frozen computational state moves with it.
+`TablesideSimulator`, `CosetsideSimulator`, and `MagicsideSimulator` apply the computational `SWAP` to every pair,
+leaked qubits included (whatever `unconditional_condition_on_U` is), so a leaked qubit's frozen computational state moves with it.
 `FlipsideSimulator` swaps the Pauli frames. The qubit that receives a leak counts as an unleaked-to-leaked transition,
 so `get_unleaked_to_leaked_records()` over-counts moved leaks. `MarginalLeakageDemGenerator` does not model moved
 leakage: it and the decoders built on it raise `NotImplementedError` for circuits with this tag, except the loss oracle
@@ -155,16 +156,31 @@ README.
 #### Untagged gates on leaked qubits
 `FlipsideSimulator` fully depolarizes a qubit when it leaks and again right after any `M`, `MX`, `MY`, `MR`, `MRX`,
 `MRY`, `R`, `RX` or `RY` on it (not after `MPP`, `MXX`, `MYY` or `MZZ`), and applies untagged gates to it as usual
-("scrambled, then applied"). `TablesideSimulator` and `CosetsideSimulator` freeze its computational state when it
-leaks. By default (`unconditional_condition_on_U=True`) untagged unitary gates and non-heralded noise then skip it
-("skipped"); with `unconditional_condition_on_U=False` they apply to the frozen state ("frozen, then applied").
-There is no `LEAKAGE_DEPOLARIZE_1` tag. In `TablesideSimulator` and `CosetsideSimulator`,
+("scrambled, then applied"). `TablesideSimulator`, `CosetsideSimulator`, and `MagicsideSimulator` freeze its
+computational state when it leaks. By default (`unconditional_condition_on_U=True`) untagged unitary Clifford gates and
+non-heralded noise then skip it ("skipped"); with `unconditional_condition_on_U=False` they apply to the frozen state
+("frozen, then applied").
+There is no `LEAKAGE_DEPOLARIZE_1` tag. In `TablesideSimulator`, `CosetsideSimulator`, and `MagicsideSimulator`,
 `DEPOLARIZE1[CONDITIONED_ON_SELF: 2](0.75) q` fully depolarizes `q` in the shots where it is in state 2;
 `FlipsideSimulator` doesn't support `CONDITIONED_ON_SELF`.
 See "Untagged Instructions on Leaked Qubits" in the top-level README for the details.
 
+#### Per-Engine Tag Support Matrix
+
+| Tag | `Flip` | `Tableau` | `Coset` | `Magic` (`STREAM`+`DIRECT`) | `MarginalLeakageDemGenerator` |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `LEAKAGE_TRANSITION_1` | Yes (`0`/`1` out needs known Z) | Yes | Yes | Yes | Yes |
+| `LEAKAGE_TRANSITION_2` | Yes (`0`/`1`/`X`/`Y`/`Z` out needs known Z) | Yes | Yes | Yes | Yes (1 leaked leg) |
+| `LEAKAGE_PROJECTION_Z` | Yes | Yes | Yes | Yes | Yes |
+| `LEAKAGE_MEASUREMENT` (`MPAD`) | Yes (`0`,`1`,`2..9`) | Yes (`0`,`1`,`2..9`) | Yes (`0`,`1`,`2..9`) | Yes (`U`,`0`,`1`,`2..9`) | Yes (`0`,`1`,`2..9`) |
+| `LEAKAGE_SWAP` (`SWAP`) | Yes | Yes | Yes | Yes | `loss_oracle=True` only (approx.) |
+| `CONDITIONED_ON_SELF` / `OTHER` / `PAIR` | No | Yes | Yes | Yes | Yes |
+| `LEAKAGE_CONTROLLED_ERROR` | Yes | No | No | No | Yes |
+| `LEAKAGE_TRANSITION_Z` | Yes | No | No | No | Yes |
+| `LEAKAGE_DETECTOR` (`DETECTOR`) | No | Yes (no-op) | Yes (no-op) | No | Ignored |
+
 #### Important Behavioral Notes
 
-* **State Collapse When Conditioning on `0` or `1`**: Conditioning on computational basis states `0` or `1` (in `CONDITIONED_ON_SELF` / `CONDITIONED_ON_OTHER` / `CONDITIONED_ON_PAIR`, `LEAKAGE_TRANSITION_1`, `LEAKAGE_TRANSITION_2`, `LEAKAGE_PROJECTION_Z`, or `LEAKAGE_MEASUREMENT`) in `TablesideSimulator` and `CosetsideSimulator` projectively collapses any $Z$-basis superposition on the inspected unleaked qubit(s) into `|0>` or `|1>` before evaluating the condition or transition. Use `U` to condition on the unleaked subspace without collapsing superpositions.
+* **State Collapse When Conditioning on `0` or `1`**: Conditioning on computational basis states `0` or `1` (in `CONDITIONED_ON_SELF` / `CONDITIONED_ON_OTHER` / `CONDITIONED_ON_PAIR`, `LEAKAGE_TRANSITION_1`, `LEAKAGE_TRANSITION_2`, `LEAKAGE_PROJECTION_Z`, or `LEAKAGE_MEASUREMENT`) in `TablesideSimulator`, `CosetsideSimulator`, and `MagicsideSimulator` projectively collapses any $Z$-basis superposition on the inspected unleaked qubit(s) into `|0>` or `|1>` before evaluating the condition or transition. Use `U` to condition on the unleaked subspace without collapsing superpositions.
 * **`0`/`1` in `LEAKAGE_TRANSITION_1`/`LEAKAGE_TRANSITION_2` on `FlipsideSimulator`**: an input `0`/`1` is matched against the noiseless reference Z value XOR the shot's X frame. A target that is superposed in the noiseless reference is collapsed to `0` there, and each shot gets a 50% Z kick (the measurement back-action). An output `0`/`1` resets the qubit (X frame set so the value is right, plus a 50% Z kick, like `R`). This needs the target's reference Z value to be definite, or collapsed by a `0`/`1` input key of the same instruction; otherwise a `ValueError` is raised.
 * **Repeated Qubit Targets**: Any instruction referencing the same qubit multiple times (such as `CX 0 1 1 0` or `I[LEAKAGE_TRANSITION_1: (p, U-->2)] 0 0`) is processed sequentially in left-to-right target order, matching Stim. Exception: in `CosetsideSimulator`, the `0`/`1` conditions of a conditioned noise channel (e.g. `X_ERROR[CONDITIONED_ON_SELF: 0](p) 0 0`) are checked once, for all targets, before the noise is applied, so a repeated qubit does not see the noise applied to its earlier copy; `TablesideSimulator` checks them target group by target group. Separate the copies with `TICK` (stim fuses identical consecutive instructions) to get sequential semantics in both.

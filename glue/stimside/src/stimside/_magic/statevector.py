@@ -13,7 +13,7 @@ from stimside._magic.channels import (
     LeftSppEvent,
     LeftUnitaryEvent,
     RightRotEvent,
-    _restrict_tableau_to_data,
+    restrict_tableau_to_data,
 )
 from stimside._magic.gates import (
     CompiledPauliAxis,
@@ -25,7 +25,7 @@ from stimside._magic.phase_qfe import (
     INV_SQRT2 as _INV_SQRT2,
     OMEGA_POWERS,
     ShotExpansion,
-    _apply_local_unitary_c128,
+    apply_local_unitary_c128,
     apply_pauli,
     apply_reference_tableau_to_statevector,
     merge_frames,
@@ -137,7 +137,7 @@ def extract_data_expansion(
         return plan_meta.data_final_tableau.copy(), data_exp
 
     assert isinstance(plan_or_tableau, ReferenceCHPTableau)
-    return _restrict_tableau_to_data(plan_or_tableau, n_data, sel_arr), data_exp
+    return restrict_tableau_to_data(plan_or_tableau, n_data, sel_arr), data_exp
 
 
 _UNITARY_1Q_2Q_CACHE: dict[str, NDArray[np.complex128]] = {}
@@ -217,9 +217,9 @@ def reconstruct_statevector(
     zero_w = np.zeros(n_w, dtype=np.uint64)
     for l_ev in (ev for ev in events if not isinstance(ev, RightRotEvent)):
         if isinstance(l_ev, LeftUnitaryEvent):
-            psi = _apply_local_unitary_c128(psi, _cached_gate_unitary_le(l_ev.gate_name), l_ev.targets, n, "little")
+            psi = apply_local_unitary_c128(psi, _cached_gate_unitary_le(l_ev.gate_name), l_ev.targets, n, "little")
         elif isinstance(l_ev, LeftResetXEvent):
-            psi = _apply_local_unitary_c128(psi, _cached_gate_unitary_le("X"), (l_ev.qubit,), n, "little")
+            psi = apply_local_unitary_c128(psi, _cached_gate_unitary_le("X"), (l_ev.qubit,), n, "little")
         elif isinstance(l_ev, LeftSppEvent):
             a_w, b_w, kap = zero_w.copy(), zero_w.copy(), (2 if l_ev.negate else 0)
             for q_s, pch_s in l_ev.terms:

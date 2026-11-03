@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Any, Callable, Mapping, Sequence
 
@@ -12,12 +12,49 @@ from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
 from stimside._magic import trajectory as _traj
-from stimside._magic.channels import CompiledCliffordFactorList, CompiledOpenBlockRecord, CorrelatedNoiseRecord, DirectFaultSlotRecord, FeedbackPauliRecord, HeraldedNoiseRecord, LeakageBarrierRecord, MagicTermRecord, MeasurementRecord, MPadRecord, PauliNoiseRecord, ResetRecord, _compile_pauli_measurement_c15, _normalize_choice_map, _normalize_pauli_slot_map, _sample_categorical_branch, _sample_heralded_pauli_branch, _split_realization_sections, apply_clifford_factors
-from stimside._magic.gates import CliffordFaultChannel, CompiledPauliAxis, _coerce_strict_int
+from stimside._magic.channels import (
+    CompiledCliffordFactorList,
+    CompiledOpenBlockRecord,
+    CorrelatedNoiseRecord,
+    DirectFaultSlotRecord,
+    FeedbackPauliRecord,
+    HeraldedNoiseRecord,
+    LeakageBarrierRecord,
+    MagicTermRecord,
+    MeasurementRecord,
+    MPadRecord,
+    PauliNoiseRecord,
+    ResetRecord,
+    apply_clifford_factors,
+    compile_pauli_measurement_c15,
+    normalize_choice_map,
+    normalize_pauli_slot_map,
+    sample_categorical_branch,
+    sample_heralded_pauli_branch,
+    split_realization_sections,
+)
+from stimside._magic.gates import CliffordFaultChannel, CompiledPauliAxis, coerce_strict_int
 from stimside._magic.plan import DirectPlan, SelectorPlan, TrajectoryRunResult, compile_direct, compile_open_block, compile_selector
 from stimside._magic.statevector import extract_data_expansion
 from stimside._magic.trajectory import fault_selector_bits
-from stimside._magic.phase_qfe import DEFAULT_ATOL, K1_CANCEL_REL_TOL, CompiledPauliBlock, CompiledPauliBlockStep, ImpossiblePostselectionError, PhaseQFEComponent, ShotExpansion, _check_unitary_norm, apply_compiled_block, apply_pauli, apply_quarter_turn, born_split_expansion, contract_choi_expansions, merge_frames, project_diagonal, validate_atol
+from stimside._magic.phase_qfe import (
+    DEFAULT_ATOL,
+    K1_CANCEL_REL_TOL,
+    CompiledPauliBlock,
+    CompiledPauliBlockStep,
+    ImpossiblePostselectionError,
+    PhaseQFEComponent,
+    ShotExpansion,
+    apply_compiled_block,
+    apply_pauli,
+    apply_quarter_turn,
+    born_split_expansion,
+    check_unitary_norm,
+    contract_choi_expansions,
+    merge_frames,
+    project_diagonal,
+    validate_atol,
+)
 from stimside.util.bitwords import (
     first_set_bit_in_words,
     n_words_for_qubits,
@@ -45,7 +82,7 @@ class QueryBudget:
     def __post_init__(self) -> None:
         bounds = (("max_terms", 1), ("max_contraction_ops", 1), ("max_cache_bytes", 0)) + ((("max_dim", 0),) if self.max_dim is not None else ())
         for fn, lo in bounds:
-            iv = _coerce_strict_int(getattr(self, fn), fn)
+            iv = coerce_strict_int(getattr(self, fn), fn)
             if iv < lo:
                 raise ValueError(f"{fn} must be >= {lo}, got {iv}")
             object.__setattr__(self, fn, iv)
@@ -104,10 +141,19 @@ class PreparedQueryPlan:
     _state: dict[str, Any] = field(default_factory=dict, repr=False)
 
 _FP_ZERO, _ln = (0.0, 0), (lambda x: math.log(x) if x > 0.0 else -math.inf)
+
+
 def _ldexp(raw: float, exp2: int) -> float:
-    if not math.isfinite(raw) or (raw > 0.0 and math.frexp(raw)[1] + exp2 > 1024):
+    if not math.isfinite(raw):
         raise FloatingPointError(f"Non-finite or overflowing scalar norm raw={raw!r}, exp2={exp2}")
-    return 0.0 if (raw <= 0.0 or math.frexp(raw)[1] + exp2 < -1074) else float(math.ldexp(*math.frexp(raw)[:1], math.frexp(raw)[1] + exp2))
+    if raw <= 0.0:
+        return 0.0
+    try:
+        return float(math.ldexp(raw, exp2))
+    except OverflowError as exc:
+        raise FloatingPointError(f"Non-finite or overflowing scalar norm raw={raw!r}, exp2={exp2}") from exc
+
+
 def _fp(x: float, e: int = 0) -> tuple[float, int]:
     if not math.isfinite(x):
         raise FloatingPointError(f"Non-finite branch weight {x!r}")
@@ -135,7 +181,7 @@ class _SegTreeNode:
 class _EvalCtx:
     def __init__(self, budget: QueryBudget, atol: float, m_act: int, faults: dict[int, int], meas: dict[int, int], sweep: dict[int, int], *, enforce_budget: bool = True, prev_diag: QueryDiagnostics | None = None) -> None:
         self.budget, self.atol, self.m_act, self.enforce_budget = budget, atol, m_act, enforce_budget
-        self.diagnostics = QueryDiagnostics(prev_diag.cache_hits, prev_diag.cache_misses, prev_diag.node_evaluations, prev_diag.invalidated_nodes, prev_diag.peak_terms, prev_diag.peak_dim, prev_diag.contraction_ops, True) if prev_diag is not None else QueryDiagnostics()
+        self.diagnostics = replace(prev_diag, used_fallback=True) if prev_diag is not None else QueryDiagnostics()
         self.faults, self.meas, self.sweep, self.visited = faults, meas, sweep, set()
         self.p_map, self.r_map, self.m_map, self.q_map, self.extra_cl_log = {}, {}, {}, {}, 0.0
     def bump_op(self) -> None:
@@ -209,9 +255,9 @@ def _contract_choi(left_se: _ScaledExpansion, right_se: _ScaledExpansion, n_op: 
     ctx.bump_op()
     m, n_keep = len(q_act), ((n_op + len(q_act)) if right_is_choi else n_op)
     z_left = left_se.norm_sq()
-    _check_unitary_norm(1.0, z_left, ctx.atol, "_contract_choi(left)")
+    check_unitary_norm(1.0, z_left, ctx.atol, "_contract_choi(left)")
     if right_is_choi:
-        _check_unitary_norm(1.0, right_se.norm_sq(), ctx.atol, "_contract_choi(right)")
+        check_unitary_norm(1.0, right_se.norm_sq(), ctx.atol, "_contract_choi(right)")
     if right_se.exp.chi == 0:
         return _empty_se(n_keep, ctx.atol)
     z_rhs_rel, prod_chi = right_se.exp.norm_sq(), left_se.exp.chi * right_se.exp.chi
@@ -220,7 +266,7 @@ def _contract_choi(left_se: _ScaledExpansion, right_se: _ScaledExpansion, n_op: 
         raise QueryBudgetExceededError(f"Contraction product {prod_chi} exceeds max_terms={ctx.budget.max_terms}")
     merged = contract_choi_expansions(left_se.exp, right_se.exp, n_op, q_act, right_is_choi, atol=ctx.atol)
     out_se = _empty_se(n_keep, ctx.atol) if merged.chi == 0 else _normalize_frexp(merged, left_se.log2_scale + right_se.log2_scale + (m >> 1))
-    _check_unitary_norm(z_left * z_rhs_rel, _ldexp(out_se.exp.norm_sq() if out_se.exp.chi > 0 else 0.0, 2 * (out_se.log2_scale - right_se.log2_scale)), ctx.atol, "_contract_choi")
+    check_unitary_norm(z_left * z_rhs_rel, _ldexp(out_se.exp.norm_sq() if out_se.exp.chi > 0 else 0.0, 2 * (out_se.log2_scale - right_se.log2_scale)), ctx.atol, "_contract_choi")
     ctx.check_exp(out_se.exp, is_choi=right_is_choi, enforce_terms=enforce_terms)
     return out_se
 
@@ -289,8 +335,8 @@ def _normalize_acceptance_spec(acc_spec: Any, num_meas: int) -> tuple[str, Any]:
         raise TypeError(f"Invalid acceptance_spec: {type(acc_spec)!r}")
     norm_map, imp = {}, False
     for raw_k, raw_v in acc_spec.items():
-        idx = _coerce_strict_int(raw_k, "acceptance_spec key")
-        idx, bit = (idx + num_meas if idx < 0 else idx), _coerce_strict_int(raw_v, f"acceptance_spec[{raw_k}]", allow_bool=True)
+        idx = coerce_strict_int(raw_k, "acceptance_spec key")
+        idx, bit = (idx + num_meas if idx < 0 else idx), coerce_strict_int(raw_v, f"acceptance_spec[{raw_k}]", allow_bool=True)
         if idx < 0 or idx >= num_meas or bit not in (0, 1):
             raise ValueError(f"Invalid acceptance_spec entry {raw_k!r}: {raw_v!r} for M={num_meas}")
         imp, norm_map[idx] = (imp or (idx in norm_map and norm_map[idx] != bit)), bit
@@ -309,8 +355,21 @@ def _bell_steps_for(ref_data: ReferenceCHPTableau, rt: ReferenceCHPTableau, outp
             dst[:n].fill(0)
             dst[:n, :src.shape[1]], dst[n:] = src, _scatter_pairs(getattr(rt, attr)[:k], p_R, n + k)
         j_ref.x_kap[:n], j_ref.z_kap[:n], j_ref.x_kap[n:], j_ref.z_kap[n:] = ref_data.x_kap[:n], ref_data.z_kap[:n], (-rt.x_kap[:k]) & np.uint8(3), (-rt.z_kap[:k]) & np.uint8(3)
-        bcache.pop(next(iter(bcache))) if len(bcache) >= 16 else None
-        bcache[key] = tuple((mr.rot_axis, (unit_bit_words(first_set_bit_in_words(mr.obs_axis.a_words), nw_j), 0) if mr.rot_axis is not None else (mr.obs_axis.b_words, (mr.obs_axis.kappa >> 1) & 1)) for j, q in enumerate(output_qubits) for pch in ("X", "Z") for mr in (_compile_pauli_measurement_c15(j_ref, [(q, pch), (n + j, pch)], invert_result=False, flip_prob=0.0, meas_index=0),))
+        if len(bcache) >= 16:
+            bcache.pop(next(iter(bcache)))
+        steps = []
+        for j, q in enumerate(output_qubits):
+            for pch in ("X", "Z"):
+                mr = compile_pauli_measurement_c15(
+                    j_ref, [(q, pch), (n + j, pch)], invert_result=False, flip_prob=0.0, meas_index=0
+                )
+                proj = (
+                    (unit_bit_words(first_set_bit_in_words(mr.obs_axis.a_words), nw_j), 0)
+                    if mr.rot_axis is not None
+                    else (mr.obs_axis.b_words, (mr.obs_axis.kappa >> 1) & 1)
+                )
+                steps.append((mr.rot_axis, proj))
+        bcache[key] = tuple(steps)
     return bcache[key]
 
 def _compute_partial_trace_fidelity_mass(ref_data: ReferenceCHPTableau, exp_data: ShotExpansion, log2_scale: int, comp_target: tuple[ReferenceCHPTableau, ShotExpansion] | str, output_qubits: tuple[int, ...], ctx: _EvalCtx, bcache: dict[Any, Any]) -> tuple[float, int]:
@@ -320,7 +379,7 @@ def _compute_partial_trace_fidelity_mass(ref_data: ReferenceCHPTableau, exp_data
     assert isinstance(comp_target, tuple)
     ctx.bump_op()
     n, (rt, et), prod_chi = ref_data.num_qubits, comp_target, exp_data.chi * comp_target[1].chi
-    _check_unitary_norm(1.0, et.norm_sq(), atol, "_compute_partial_trace_fidelity_mass(target)")
+    check_unitary_norm(1.0, et.norm_sq(), atol, "_compute_partial_trace_fidelity_mass(target)")
     if ctx.enforce_budget and prod_chi > ctx.budget.max_terms:
         ctx.diagnostics.peak_terms = max(ctx.diagnostics.peak_terms, prod_chi)
         raise QueryBudgetExceededError(f"Fidelity tensor terms {prod_chi} > max_terms={ctx.budget.max_terms}")
@@ -345,6 +404,31 @@ def _compute_partial_trace_fidelity_mass(ref_data: ReferenceCHPTableau, exp_data
         ctx.check_exp(j_se.exp, is_choi=False)
     return _fp(j_se.exp.norm_sq(), 2 * j_se.log2_scale + k)
 
+
+def _record_axes(rec: Any) -> Sequence[CompiledPauliAxis]:
+    if isinstance(rec, CompiledOpenBlockRecord):
+        return rec.axes
+    if isinstance(rec, MagicTermRecord):
+        return rec.term.axes
+    if isinstance(rec, DirectFaultSlotRecord):
+        return [
+            ax
+            for bf in rec.branch_factors
+            for ax in (((bf.p0,) if bf.p0 is not None else ()) + bf.r_axes)
+        ]
+    if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord)):
+        return [ax for ax in rec.branch_axes if ax is not None]
+    if isinstance(rec, (CorrelatedNoiseRecord, FeedbackPauliRecord)):
+        return (rec.axis,)
+    if isinstance(rec, (MeasurementRecord, ResetRecord)):
+        return [
+            ax
+            for ax in (rec.obs_axis, getattr(rec, "reset_kick_axis", None), rec.rot_axis)
+            if ax is not None
+        ]
+    return ()
+
+
 def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_channels: Sequence[CliffordFaultChannel] | None = None, target_spec: Any = None, output_qubits: Sequence[int] | None = None, acceptance_spec: Mapping[int, int | bool] | Callable[[NDArray[np.bool_]], bool] | None = None, budget: QueryBudget | None = None, atol: float = DEFAULT_ATOL) -> PreparedQueryPlan:
     """`Q1`: Compile `circuit` into a dependency-tracked QFE Choi/Ket segment-tree plan."""
     if not isinstance(circuit, stim.Circuit):
@@ -359,18 +443,15 @@ def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_c
         raise ValueError("Unsupported leakage tag in PrepareQueries")
     n_data, n_op = (compiled.num_qubits if isinstance(compiled, DirectPlan) else compiled.num_data_qubits), max(1, compiled.num_qubits if isinstance(compiled, DirectPlan) else compiled.num_total_qubits)
     nw_op, logical_nq = n_words_for_qubits(n_op), max([int(circuit.num_qubits)] + [q + 1 for ch in compiled.fault_channels for br in ch.branches for q in br.targets])
-    out_qs = tuple(range(logical_nq)) if output_qubits is None else tuple(_coerce_strict_int(q, "output_qubit") for q in output_qubits)
+    out_qs = tuple(range(logical_nq)) if output_qubits is None else tuple(coerce_strict_int(q, "output_qubit") for q in output_qubits)
     if any(q < 0 or q >= logical_nq for q in out_qs) or len(set(out_qs)) != len(out_qs):
         raise ValueError(f"Invalid output_qubits={list(out_qs)} for num_data_qubits={logical_nq}")
     comp_target = _compile_target_spec(target_spec, out_qs, tol)
     _normalize_acceptance_spec(acceptance_spec, compiled.num_measurements)
     slot_id_to_idx = {i: i for i in range(len(compiled.fault_channels))} | {int(ch.slot_id): i for i, ch in enumerate(compiled.fault_channels) if ch.slot_id is not None}
-    axes_of = lambda r: r.axes if isinstance(r, CompiledOpenBlockRecord) else (r.term.axes if isinstance(r, MagicTermRecord) else (
-        [ax for bf in r.branch_factors for ax in ((bf.p0,) if bf.p0 is not None else ()) + bf.r_axes] if isinstance(r, DirectFaultSlotRecord) else (
-            [ax for ax in r.branch_axes if ax is not None] if isinstance(r, (PauliNoiseRecord, HeraldedNoiseRecord)) else ((r.axis,) if isinstance(r, (CorrelatedNoiseRecord, FeedbackPauliRecord)) else ([ax for ax in (r.obs_axis, getattr(r, "reset_kick_axis", None), r.rot_axis) if ax is not None] if isinstance(r, (MeasurementRecord, ResetRecord)) else ())))))
     x_union = np.zeros(nw_op, dtype=np.uint64)
     for rec in compiled.records:
-        for ax in axes_of(rec):
+        for ax in _record_axes(rec):
             x_union[: ax.a_words.shape[0]] |= ax.a_words
     for sq in (sq for s_grp in (compiled.fault_selector_groups if isinstance(compiled, SelectorPlan) else ()) for sq in s_grp):
         x_union[sq >> 6] |= np.uint64(1) << np.uint64(sq & 63)
@@ -379,7 +460,7 @@ def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_c
     if isinstance(compiled, SelectorPlan):
         z0 = np.zeros(nw_op, dtype=np.uint64)
         for s_idx, s_grp in enumerate(compiled.fault_selector_groups):
-            fpos = next((i for i, rec in enumerate(compiled.records) if any((q >> 6) < ax.a_words.shape[0] and ((int((ax.a_words | ax.b_words)[q >> 6]) >> (q & 63)) & 1) for ax in axes_of(rec) for q in s_grp)), len(compiled.records))
+            fpos = next((i for i, rec in enumerate(compiled.records) if any((q >> 6) < ax.a_words.shape[0] and ((int((ax.a_words | ax.b_words)[q >> 6]) >> (q & 63)) & 1) for ax in _record_axes(rec) for q in s_grp)), len(compiled.records))
             bfacs = tuple(CompiledCliffordFactorList(0, CompiledPauliAxis(unit_bit_words(sq, nw_op), z0, 0), ()) for sq in s_grp)
             sel_ins.setdefault(fpos, []).append(DirectFaultSlotRecord(s_idx, bfacs, np.empty(0, dtype=np.float64)))
     ops, dyn, noise_meta, rc, cs = [], [], {}, 0, ()
@@ -418,7 +499,9 @@ def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_c
 
     root = _build(0, len(otup)) if otup else None
     bcache: dict[Any, Any] = {}
-    _bell_steps_for(compiled.data_final_tableau if isinstance(compiled, SelectorPlan) else compiled.final_tableau, comp_target[0], out_qs, bcache) if (isinstance(comp_target, tuple) and out_qs) else None
+    if isinstance(comp_target, tuple) and out_qs:
+        ref_final = compiled.data_final_tableau if isinstance(compiled, SelectorPlan) else compiled.final_tableau
+        _bell_steps_for(ref_final, comp_target[0], out_qs, bcache)
     st = {"target": comp_target, "bcache": bcache, "slots": slot_id_to_idx, "noise": noise_meta, "q_act": q_act, "ops": otup, "dyn": tuple(dyn), "root": root, "nodes": tuple(nodes), "lru": OrderedDict(), "bytes": 0}
     return PreparedQueryPlan(circuit, mode_norm, n_data, n_op, compiled.num_measurements, out_qs, eff_budget, tol, compiled, target_spec, acceptance_spec, st)
 
@@ -437,7 +520,7 @@ def _apply_leaf(se: _ScaledExpansion, leaf: tuple[Any, Any, Any], ctx: _EvalCtx,
         )
     elif isinstance(rec, FeedbackPauliRecord) and (ctx.meas.get(aux, 0) if rec.source_kind == "rec" else ctx.sweep.get(aux, 0)):
         exp = apply_pauli(exp, *_ax_tup(rec.axis, nw))
-    _check_unitary_norm(z_pre, exp.norm_sq() if exp.chi > 0 else 0.0, ctx.atol, "_apply_leaf")
+    check_unitary_norm(z_pre, exp.norm_sq() if exp.chi > 0 else 0.0, ctx.atol, "_apply_leaf")
     out_se = _normalize_frexp(exp, se.log2_scale)
     ctx.check_exp(out_se.exp, is_choi=is_choi, enforce_terms=enforce_terms)
     return out_se
@@ -512,7 +595,7 @@ def _apply_node_range(plan: PreparedQueryPlan, ctx: _EvalCtx, u: _SegTreeNode | 
 def _norm_sweep(raw_s: Any) -> dict[int, int]:
     if raw_s is not None and not isinstance(raw_s, Mapping) and (isinstance(raw_s, (str, bytes, bytearray, memoryview)) or (raw_s.ndim != 1 if isinstance(raw_s, np.ndarray) else not isinstance(raw_s, Sequence))):
         raise ValueError(f"Invalid sweep_bits container: {type(raw_s)!r}")
-    out = {} if raw_s is None else ({_coerce_strict_int(k, "sweep_index"): _coerce_strict_int(v, "sweep_bit", allow_bool=True) for k, v in raw_s.items()} if isinstance(raw_s, Mapping) else {i: _coerce_strict_int(v, "sweep_bit", allow_bool=True) for i, v in enumerate(raw_s)})
+    out = {} if raw_s is None else ({coerce_strict_int(k, "sweep_index"): coerce_strict_int(v, "sweep_bit", allow_bool=True) for k, v in raw_s.items()} if isinstance(raw_s, Mapping) else {i: coerce_strict_int(v, "sweep_bit", allow_bool=True) for i, v in enumerate(raw_s)})
     if any(k < 0 or v not in (0, 1) for k, v in out.items()):
         raise ValueError("Sweep keys must be >= 0 and sweep bits must be 0 or 1")
     return out
@@ -522,15 +605,15 @@ def _unpack_realization(plan: PreparedQueryPlan, realization: Mapping[Any, Any] 
         raise TypeError(f"Expected PreparedQueryPlan and Mapping|None realization, got {type(plan)!r}, {type(realization)!r}")
     if not realization:
         return {}, {}, {}, {}, {}, {}
-    sec = _split_realization_sections(realization)
+    sec = split_realization_sections(realization)
     cp, max_c = plan.compiled_plan, plan.compiled_plan.noise_channel_max_choices
-    raw_p = _normalize_pauli_slot_map(sec.get("paulis"), max_c, plan._state["noise"])
+    raw_p = normalize_pauli_slot_map(sec.get("paulis"), max_c, plan._state["noise"])
     f_max = [len(ch.branches) for ch in cp.fault_channels]
-    faults = _normalize_choice_map(sec.get("faults"), f_max, "faults", key_to_slot=plan._state["slots"], allow_none_zero=True, allow_binary_bool=True) or {}
-    meas = _normalize_choice_map(sec.get("measurements"), (1,) * plan.num_measurements, "measurements", allow_bool_values=True) or {}
-    qmeas = _normalize_choice_map(sec.get("quantum_measurements"), (1,) * plan.num_measurements, "quantum_measurements", allow_bool_values=True) or {}
-    paulis = _normalize_choice_map(raw_p, max_c, "paulis") or {}
-    resets = _normalize_choice_map(sec.get("resets"), (1,) * cp.num_resets, "resets", allow_bool_values=True) or {}
+    faults = normalize_choice_map(sec.get("faults"), f_max, "faults", key_to_slot=plan._state["slots"], allow_none_zero=True, allow_binary_bool=True) or {}
+    meas = normalize_choice_map(sec.get("measurements"), (1,) * plan.num_measurements, "measurements", allow_bool_values=True) or {}
+    qmeas = normalize_choice_map(sec.get("quantum_measurements"), (1,) * plan.num_measurements, "quantum_measurements", allow_bool_values=True) or {}
+    paulis = normalize_choice_map(raw_p, max_c, "paulis") or {}
+    resets = normalize_choice_map(sec.get("resets"), (1,) * cp.num_resets, "resets", allow_bool_values=True) or {}
     return faults, meas, qmeas, paulis, resets, _norm_sweep(sec.get("sweep_bits"))
 
 def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: dict[int, int], qmeas_in: dict[int, int], paulis_in: dict[int, int], resets_in: dict[int, int], sweep_in: dict[int, int],
@@ -539,14 +622,26 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
                    ) -> tuple[tuple[float, int], tuple[float, int], tuple[float, int], bool, list[tuple[float, float]], NDArray[np.bool_], _ScaledExpansion, dict[int, int], QueryDiagnostics]:
     use_sampling = ("sample_measurements" in q_set) or sample_mc_faults
     r_gen = (rng_obj if rng_obj is not None else np.random.default_rng()) if use_sampling else None
-    faults = {i: (faults_in[i] if i in faults_in else _sample_categorical_branch([b.prob for b in ch.branches], r_gen)) for i, ch in enumerate(plan.compiled_plan.fault_channels)} if sample_mc_faults else dict(faults_in)  # type: ignore[arg-type]
+    faults = {i: (faults_in[i] if i in faults_in else sample_categorical_branch([b.prob for b in ch.branches], r_gen)) for i, ch in enumerate(plan.compiled_plan.fault_channels)} if sample_mc_faults else dict(faults_in)  # type: ignore[arg-type]
     m_act, otup, dyn, nodes, root, bcache = len(plan._state["q_act"]), plan._state["ops"], plan._state["dyn"], plan._state["nodes"], plan._state["root"], plan._state["bcache"]
     ctx = _EvalCtx(plan.budget, plan.atol, m_act, faults, dict(meas_in), dict(sweep_in), enforce_budget=not stream_only, prev_diag=prev_diag)
     if out_ctx is not None:
         out_ctx.append(ctx)
     init_ket, step_w = _ScaledExpansion(ShotExpansion.zero(plan.num_total_qubits, atol=plan.atol), 0), [[_FP_ZERO] * plan.num_measurements, [_FP_ZERO] * plan.num_measurements]
     totals, last_ket, last_m, m_vals = [_FP_ZERO, _FP_ZERO, _FP_ZERO], _empty_se(plan.num_total_qubits, plan.atol), dict(meas_in), {k: {v} for k, v in meas_in.items()}
-    run_seg = lambda kt, cl, cr, iv: kt if cl >= cr else ((lambda out: [out := _apply_leaf(out, otup[ki], ctx, is_choi=False) for ki in range(cl, cr) if out.exp.chi > 0] and out or out)(kt) if stream_only else _apply_node_range(plan, ctx, root, cl, cr, kt, is_vacuum=iv))
+
+    def run_seg(kt: _ScaledExpansion, cl: int, cr: int, iv: bool) -> _ScaledExpansion:
+        if cl >= cr:
+            return kt
+        if not stream_only:
+            return _apply_node_range(plan, ctx, root, cl, cr, kt, is_vacuum=iv)
+        out = kt
+        for ki in range(cl, cr):
+            if out.exp.chi == 0:
+                break
+            out = _apply_leaf(out, otup[ki], ctx, is_choi=False)
+        return out
+
     stack: list[tuple[int, int, _ScaledExpansion, tuple[float, int], dict[int, int], dict[int, int], dict[int, int]]] = [(0, 0, init_ket, (0.5, 1), dict(paulis_in), dict(resets_in), {})]
     while stack:
         di, cur_l, ket, pi_w, p_map, r_map, m_map = stack.pop()
@@ -592,14 +687,21 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
                 ps = next((s for s in surv if ((mi in pin[0] and s[1] == pin[0][mi]) if isinstance(rec, MPadRecord) else (ni in pin[3] and s[0] == pin[3][ni]))), None) if pin else None
                 if ps is None and isinstance(rec, MPadRecord) and mi not in meas_in:
                     mb = int(bool(rec.pad_bit) ^ (rec.flip_prob > 0.0 and float(r_gen.random()) < rec.flip_prob))
-                    cb, ctx.extra_cl_log = None, ctx.extra_cl_log + _ln((1.0 - rec.flip_prob) if bool(mb) == bool(rec.pad_bit) else (((1.0 - (1.0 - rec.flip_prob)) or rec.flip_prob) if rec.pad_bit else rec.flip_prob))
+                    if bool(mb) == bool(rec.pad_bit):
+                        p_step = 1.0 - rec.flip_prob
+                    elif rec.pad_bit:
+                        # Match trajectory.py's `1.0 - (1.0 - flip_prob)` rounding for fallback cancellation.
+                        p_step = (1.0 - (1.0 - rec.flip_prob)) or rec.flip_prob
+                    else:
+                        p_step = rec.flip_prob
+                    cb, ctx.extra_cl_log = None, ctx.extra_cl_log + _ln(p_step)
                 elif ps is None and isinstance(rec, CorrelatedNoiseRecord) and ni not in p_map and not prior:
                     cb, mb = int(float(r_gen.random()) < rec.prob), None
                 elif ps is None and isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord)) and ni not in p_map and (mi is None or mi not in meas_in):
-                    cb = _sample_categorical_branch(rec.probs, r_gen)
+                    cb = sample_categorical_branch(rec.probs, r_gen)
                     mb = int(cb > 0) if mi is not None else None
                 else:
-                    cb, mb, _ = ps if ps is not None else surv[_sample_categorical_branch([pr / w_sum for _, _, pr in surv[:-1]], r_gen) - 1 if len(surv) > 1 else 0]
+                    cb, mb, _ = ps if ps is not None else surv[sample_categorical_branch([pr / w_sum for _, _, pr in surv[:-1]], r_gen) - 1 if len(surv) > 1 else 0]
                 if ni is not None and cb is not None and ni not in paulis_in:
                     ctx.p_map[ni] = cb
                 if mi is not None and mb is not None and mi not in meas_in:
@@ -681,11 +783,11 @@ def _run_stream_trajectory(plan: PreparedQueryPlan, faults: dict[int, int], meas
     if skip or resets:
         return None, _FP_ZERO, np.empty(0, dtype=np.bool_), dict(f_in), (mp, qp, rp, pp), True, fb_dg
     r_gen, eff_m, eff_q, p_seed = (rng_obj if rng_obj is not None else np.random.default_rng(0)), {**meas, **mp}, {**qmeas, **qp}, {**paulis, **pp}
-    f_tr = [(f_in[i] if i in f_in else _sample_categorical_branch([b.prob for b in ch.branches], r_gen)) if sample_mc_faults else f_in.get(i, 0) for i, ch in enumerate(plan.compiled_plan.fault_channels)]
+    f_tr = [(f_in[i] if i in f_in else sample_categorical_branch([b.prob for b in ch.branches], r_gen)) if sample_mc_faults else f_in.get(i, 0) for i, ch in enumerate(plan.compiled_plan.fault_channels)]
     m_log, p_tr = ((-pctx.extra_cl_log if math.isfinite(pctx.extra_cl_log) else -math.inf) if pctx else 0.0), (None if (use_sampling and not p_seed) else {})
     for _, rec, aux in (plan._state["dyn"] if p_tr is not None else ()):
         if isinstance(rec, PauliNoiseRecord):
-            p_tr[aux] = p_seed[aux] if aux in p_seed else (_sample_categorical_branch(rec.probs, r_gen) if use_sampling else 0)  # type: ignore[index]
+            p_tr[aux] = p_seed[aux] if aux in p_seed else (sample_categorical_branch(rec.probs, r_gen) if use_sampling else 0)  # type: ignore[index]
         elif isinstance(rec, CorrelatedNoiseRecord):
             p_tr[aux[0]] = 0 if any(p_tr.get(j, 0) > 0 for j in aux[1]) else (p_seed[aux[0]] if aux[0] in p_seed else (int(float(r_gen.random()) < rec.prob) if use_sampling else 0))  # type: ignore[union-attr,index]
         elif isinstance(rec, HeraldedNoiseRecord):
@@ -693,9 +795,9 @@ def _run_stream_trajectory(plan: PreparedQueryPlan, faults: dict[int, int], meas
             if aux not in paulis and rec.meas_index in meas:
                 m_log += _ln(ph if bool(eff_m[rec.meas_index]) else max(0.0, 1.0 - ph))
             p_tr[aux] = p_seed[aux] if aux in p_seed else (  # type: ignore[index]
-                _sample_heralded_pauli_branch(rec.probs, eff_m[rec.meas_index], r_gen, presampled=True, skip_single_rng=True)[0]
+                sample_heralded_pauli_branch(rec.probs, eff_m[rec.meas_index], r_gen, presampled=True, skip_single_rng=True)[0]
                 if rec.meas_index in eff_m
-                else (_sample_categorical_branch(rec.probs, r_gen) if use_sampling else 0)
+                else (sample_categorical_branch(rec.probs, r_gen) if use_sampling else 0)
             )
     sw_m = max((k for k in plan._state["root"].deps[2] if sweep.get(k, 0)), default=-1) if (sweep and plan._state["root"]) else -1
     kw: dict[str, Any] = dict(rng=r_gen, fault_trace=f_tr, pauli_noise_trace=p_tr, reset_outcomes=rp or None, requested_outcomes=eff_m or None,
@@ -705,8 +807,16 @@ def _run_stream_trajectory(plan: PreparedQueryPlan, faults: dict[int, int], meas
     except ImpossiblePostselectionError:
         return None, _FP_ZERO, np.empty(0, dtype=np.bool_), dict(enumerate(f_tr)), (mp, qp, rp, dict(p_tr) if p_tr is not None else pp), True, fb_dg
     pd = pctx.diagnostics if pctx is not None else None
-    dg = (QueryDiagnostics(pd.cache_hits, pd.cache_misses, pd.node_evaluations, pd.invalidated_nodes, max(pd.peak_terms, tr.peak_components), max(pd.peak_dim, tr.peak_dim), pd.contraction_ops, True)
-          if pd is not None else QueryDiagnostics(peak_terms=tr.peak_components, peak_dim=tr.peak_dim, used_fallback=True))
+    dg = (
+        replace(
+            pd,
+            peak_terms=max(pd.peak_terms, tr.peak_components),
+            peak_dim=max(pd.peak_dim, tr.peak_dim),
+            used_fallback=True,
+        )
+        if pd is not None
+        else QueryDiagnostics(peak_terms=tr.peak_components, peak_dim=tr.peak_dim, used_fallback=True)
+    )
     lg2, bm_it, clip = ((tr.log_branch_mass + m_log) / math.log(2.0) if (math.isfinite(m_log) and math.isfinite(tr.log_branch_mass)) else -math.inf), iter(tr.born_masses), False
     for _, rec, aux in (() if math.isfinite(lg2) else plan._state["dyn"]):
         mi, ni = getattr(rec, "meas_index", None), (aux[0] if isinstance(rec, CorrelatedNoiseRecord) else (aux if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord)) else None))
@@ -731,8 +841,49 @@ def _run_stream_trajectory(plan: PreparedQueryPlan, faults: dict[int, int], meas
     m_out = np.array([bool((meas | mp).get(j, 0)) for j in range(plan.num_measurements)], dtype=np.bool_)
     return tr, _FP_ZERO, m_out, {i: int(c) for i, c in enumerate(tr.fault_choices)}, (mp, qp, rp, pp), clip, dg
 
+
+def _has_unpinned_branching(
+    dyn_ops: Sequence[tuple[int, Any, Any]],
+    meas: Mapping[int, int],
+    qmeas: Mapping[int, int],
+    paulis: Mapping[int, int],
+    resets: Mapping[int, int],
+) -> bool:
+    for _, r, ax in dyn_ops:
+        if isinstance(r, PauliNoiseRecord) and ax not in paulis and sum(r.probs) > 0.0:
+            return True
+        if isinstance(r, ResetRecord) and ax not in resets and (r.meas_index is None or r.meas_index not in qmeas):
+            return True
+        if isinstance(r, CorrelatedNoiseRecord) and ax[0] not in paulis and r.prob > 0.0 and not any(paulis.get(j, 0) > 0 for j in ax[1]):
+            return True
+        if isinstance(r, HeraldedNoiseRecord) and ax not in paulis and sum(r.probs) > 0.0 and meas.get(r.meas_index, 1) == 1:
+            return True
+        if isinstance(r, (MeasurementRecord, ResetRecord, MPadRecord)) and r.meas_index is not None:
+            if r.meas_index not in meas and r.flip_prob not in (0.0, 1.0):
+                return True
+            if (
+                not isinstance(r, MPadRecord)
+                and r.meas_index not in qmeas
+                and not (isinstance(r, ResetRecord) and ax in resets)
+                and (r.meas_index not in meas or r.flip_prob not in (0.0, 1.0))
+            ):
+                return True
+    return False
+
+
 def EvaluateQueries(plan: PreparedQueryPlan, realization: Mapping[Any, Any] | None = None, *, queries: Sequence[str] = ("mass",), conditional: bool = True, rng: np.random.Generator | int | None = None, acceptance_spec: Mapping[int, int | bool] | Callable[[NDArray[np.bool_]], bool] | None = None, target_spec: Any = None) -> QueryResult:
-    """`Q2`: Evaluate global scalar-network queries against `plan` for a given `realization`."""
+    """`Q2`: Evaluate global scalar-network queries against `plan` for a given `realization`.
+
+    Semantics for unspecified variables:
+    - Unspecified `CLIFFORD_FAULT` slots default to branch `0` (no-fault) unless
+      `realization is None` and `rng` is provided, in which case fault slots are
+      Monte-Carlo sampled via `rng`.
+    - Unpinned standard Pauli/correlated/heralded noise channels, resets, and
+      measurements are summed (marginalized) across all branches unless
+      `"sample_measurements"` is requested or `realization` pins them.
+    - Unpinned multi-measurement marginal queries branch over dynamic steps and
+      can grow exponentially unless bounded by `QueryBudget`.
+    """
     if not isinstance(plan, PreparedQueryPlan):
         raise TypeError(f"Expected PreparedQueryPlan, got {type(plan)!r}")
     if isinstance(queries, (str, bytes)) or not isinstance(queries, Sequence) or not queries or any(not isinstance(q, str) or q not in _VALID_QUERIES for q in queries):
@@ -742,12 +893,8 @@ def EvaluateQueries(plan: PreparedQueryPlan, realization: Mapping[Any, Any] | No
         raise ValueError("target_spec must be provided when querying 'fidelity'")
     norm_acc, (faults, meas, qmeas, paulis, resets, sweep) = _normalize_acceptance_spec(acceptance_spec if acceptance_spec is not None else plan.acceptance_spec, plan.num_measurements), _unpack_realization(plan, realization)
     sample_mc_faults, use_sampling = ((realization is None) and (rng is not None)), (("sample_measurements" in q_set) or ((realization is None) and (rng is not None)))
-    rng_obj = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(_coerce_strict_int(rng, "rng seed"))) if rng is not None else (np.random.default_rng() if use_sampling else None)
-    is_mixed = (not use_sampling) and any(
-        (isinstance(r, PauliNoiseRecord) and ax not in paulis and sum(r.probs) > 0.0) or (isinstance(r, ResetRecord) and ax not in resets and (r.meas_index is None or r.meas_index not in qmeas))
-        or (isinstance(r, CorrelatedNoiseRecord) and ax[0] not in paulis and r.prob > 0.0 and not any(paulis.get(j, 0) > 0 for j in ax[1]))
-        or (isinstance(r, HeraldedNoiseRecord) and ax not in paulis and sum(r.probs) > 0.0 and meas.get(r.meas_index, 1) == 1)
-        or (isinstance(r, (MeasurementRecord, ResetRecord, MPadRecord)) and r.meas_index is not None and ((r.meas_index not in meas and r.flip_prob not in (0.0, 1.0)) or (not isinstance(r, MPadRecord) and r.meas_index not in qmeas and not (isinstance(r, ResetRecord) and ax in resets) and (r.meas_index not in meas or r.flip_prob not in (0.0, 1.0))))) for _, r, ax in plan._state["dyn"])
+    rng_obj = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(coerce_strict_int(rng, "rng seed"))) if rng is not None else (np.random.default_rng() if use_sampling else None)
+    is_mixed = (not use_sampling) and _has_unpinned_branching(plan._state["dyn"], meas, qmeas, paulis, resets)
     pack = lambda z_fp, a_fp, b_fp, ac, pp, ma, dg: QueryResult(
         _ldexp(*z_fp) if "mass" in q_set else None, ((_fp_div(a_fp, z_fp) if cond else _ldexp(*a_fp)) if "acceptance" in q_set else None),
         ((_fp_div(b_fp, z_fp) if cond else _ldexp(*b_fp)) if "fidelity" in q_set else None), pp if "prefix_probs" in q_set else None,
@@ -783,7 +930,7 @@ def run_query_shot(plan: PreparedQueryPlan, *, realization: Mapping[Any, Any] | 
     """Execute one causal shot via `plan`'s cached segment tree (or `STREAM` fallback)."""
     faults, meas, qmeas, paulis, resets, r_sweep = _unpack_realization(plan, realization)
     sweep, cp = (_norm_sweep(sweep_bits) if sweep_bits is not None else r_sweep), plan.compiled_plan
-    rng_obj, c_box = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(None if rng is None else _coerce_strict_int(rng, "rng seed"))), []
+    rng_obj, c_box = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(None if rng is None else coerce_strict_int(rng, "rng seed"))), []
     def _pack_shot(zf: tuple[float, int], ma: NDArray[np.bool_], kf: _ScaledExpansion, ef: dict[int, int], dg: QueryDiagnostics) -> QueryShotTrajectory:
         sb = fault_selector_bits(cp, ef) if isinstance(cp, SelectorPlan) else None
         ft, oe = (extract_data_expansion(cp, kf.exp, sb) if (extract_data and isinstance(cp, SelectorPlan) and sb is not None) else (cp.final_tableau.copy(), kf.exp.copy()))
@@ -806,7 +953,7 @@ def run_query_batch(plan: PreparedQueryPlan, batch_size: int, *, rng: np.random.
     """Execute `batch_size` shots reusing `plan`'s cached segment tree across the batch."""
     if not isinstance(plan, PreparedQueryPlan):
         raise TypeError(f"Expected PreparedQueryPlan, got {type(plan)!r}")
-    b_sz, is_seq = _coerce_strict_int(batch_size, "batch_size"), (lambda x: isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray, memoryview)))
+    b_sz, is_seq = coerce_strict_int(batch_size, "batch_size"), (lambda x: isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray, memoryview)))
     f_bcast = fault_realizations is None or isinstance(fault_realizations, Mapping)
     f_seq = [fault_realizations] * b_sz if f_bcast else (fault_realizations if (is_seq(fault_realizations) and len(fault_realizations) == b_sz) else None)
     sw_1d = isinstance(sweep_bits, Mapping) or (isinstance(sweep_bits, np.ndarray) and sweep_bits.ndim == 1) or (is_seq(sweep_bits) and (len(sweep_bits) == 0 or isinstance(sweep_bits[0], (int, np.integer, bool, np.bool_))))
@@ -814,7 +961,7 @@ def run_query_batch(plan: PreparedQueryPlan, batch_size: int, *, rng: np.random.
     if b_sz < 1 or f_seq is None or s_raw is None:
         raise ValueError(f"Invalid batch_size={b_sz}, fault_realizations, or sweep_bits for run_query_batch")
     s_seq, _ = (s_raw if (sweep_bits is None or sw_1d) else [None if sr is None else _norm_sweep(sr) for sr in s_raw]), [_unpack_realization(plan, r) for r in ((fault_realizations,) if f_bcast else f_seq)]
-    rng_obj, records, trajectories = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(None if rng is None else _coerce_strict_int(rng, "rng seed"))), np.zeros((b_sz, plan.num_measurements), dtype=np.bool_), []
+    rng_obj, records, trajectories = (rng if isinstance(rng, np.random.Generator) else np.random.default_rng(None if rng is None else coerce_strict_int(rng, "rng seed"))), np.zeros((b_sz, plan.num_measurements), dtype=np.bool_), []
     for s in range(b_sz):
         traj = run_query_shot(plan, realization=f_seq[s], sweep_bits=s_seq[s], rng=rng_obj, extract_data=extract_data)
         records[s] = traj.measurements
