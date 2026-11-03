@@ -392,17 +392,10 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
         gate targets implicitly come in pairs t0 t1,
         if t0 is in the given leakage state, t1 has a Pauli error applied to it
         """
-        t0_arr, t1_arr = self._get_pair_target_indices(op)
-        if len(t0_arr) == 0:
-            fss.do_on_flip_simulator(op)
-            return
-
-        ctrl_states = self.state[t0_arr, :]
-        if not np.any(ctrl_states >= 2):
-            fss.do_on_flip_simulator(op)
-            return
-
         fss.do_on_flip_simulator(op)
+        t0_arr, t1_arr = self._get_pair_target_indices(op)
+        if len(t0_arr) == 0 or not np.any((ctrl_states := self.state[t0_arr, :]) >= 2):
+            return
 
         has_dup_t1 = len(set(t1_arr.tolist())) != len(t1_arr)
 
@@ -790,7 +783,7 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
 
         pauli = meas_basis(op.name)
         is_reset = op.name in ("MR", "MRZ", "MRX", "MRY")
-        p0, p1 = params.p0, params.p1(is_mpad)
+        p0, p1 = params.p0, params.p1
 
         if not is_mpad and not np.isclose(p0, 1.0 - p1) and not fss._all_targets_in_known_state(
             targets=targets, pauli=pauli

@@ -250,22 +250,6 @@ class LeakageConditioningParams:
                         f"{name} args must be a tuple of integers or strings, got {arg}"
                     )
 
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, LeakageConditioningParams):
-            return False
-        if (
-            len(self.args) != len(other.args)
-            or self.from_tag != other.from_tag
-            or self.targets != other.targets
-        ):
-            return False
-        if len(self.args) == 2:
-            return set(zip(self.args[0], self.args[1])) == set(
-                zip(other.args[0], other.args[1])
-            )
-        return all(set(a) == set(b) for a, b in zip(self.args, other.args))
-
-
 @dataclasses.dataclass(frozen=True)
 class LeakageMeasurementParams:
     name: ClassVar[str] = "LEAKAGE_MEASUREMENT"
@@ -309,10 +293,9 @@ class LeakageMeasurementParams:
     def p0(self) -> float:
         return self.prob_for_input_state.get(0, 0.0)
 
-    def p1(self, is_mpad: bool | None = None) -> float:
-        if is_mpad is None:
-            is_mpad = self.targets is not None
-        return self.prob_for_input_state.get(1, 0.0 if is_mpad else 1.0)
+    @property
+    def p1(self) -> float:
+        return self.prob_for_input_state.get(1, 0.0 if self.targets is not None else 1.0)
 
 
 @dataclasses.dataclass(frozen=True)

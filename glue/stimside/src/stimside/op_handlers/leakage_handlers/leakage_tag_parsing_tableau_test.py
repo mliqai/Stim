@@ -219,13 +219,14 @@ def test_leakage_conditioning_params_validation_and_pair_eq():
     p1 = LeakageConditioningParams(
         args=((2, 3), (3, 2)), targets=None, from_tag="CONDITIONED_ON_PAIR: (2,3) (3,2)"
     )
-    p2 = LeakageConditioningParams(
-        args=((3, 2), (2, 3)), targets=None, from_tag="CONDITIONED_ON_PAIR: (2,3) (3,2)"
+    p_same = LeakageConditioningParams(
+        args=((2, 3), (3, 2)), targets=None, from_tag="CONDITIONED_ON_PAIR: (2,3) (3,2)"
     )
     p_diff = LeakageConditioningParams(
         args=((2, 3), (2, 3)), targets=None, from_tag="CONDITIONED_ON_PAIR: (2,3) (3,2)"
     )
-    assert p1 == p2
+    assert p1 == p_same
+    assert hash(p1) == hash(p_same)
     assert p1 != p_diff
 
     with pytest.raises(ValueError):

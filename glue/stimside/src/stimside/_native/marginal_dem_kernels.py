@@ -174,14 +174,7 @@ def _resolve_marginal_dem_kernels_so(force_recompile: bool = False) -> Path:
 
 
 def get_marginal_dem_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
-    """Locate (or compile if needed) and return the cached ctypes CDLL for marginal_dem_kernels.cpp."""
-    return get_lib(
-        sys.modules[__name__],
-        "marginal_dem_kernels",
-        "marginal_dem_kernels_abi_v5",
-        _SPECS,
-        force_recompile=force_recompile,
-    )
+    return get_lib(sys.modules[__name__], "marginal_dem_kernels", "marginal_dem_kernels_abi_v5", _SPECS, force_recompile=force_recompile)
 
 
 def trace_flows_cpp(
@@ -221,30 +214,18 @@ def trace_flows_cpp(
         ctypes.c_int32(num_ops),
         ctypes.c_int32(num_qubits),
         ctypes.c_int32(num_flags),
-        ops_arr if len(ops_arr) > 0 else ctypes.cast(None, ctypes.POINTER(OpDescC)),
+        ops_arr,
         c_ptr(target_qubits, i32_p),
         c_ptr(touch_offsets, i32_p),
         c_ptr(touch_indices, i32_p),
         c_ptr(conj_table, i32_p),
-        meas_probs_arr
-        if len(meas_probs_arr) > 0
-        else ctypes.cast(None, ctypes.POINTER(MeasStateProbC)),
-        trans1_rules_arr
-        if len(trans1_rules_arr) > 0
-        else ctypes.cast(None, ctypes.POINTER(Trans1RuleC)),
-        trans2_rules_arr
-        if len(trans2_rules_arr) > 0
-        else ctypes.cast(None, ctypes.POINTER(Trans2RuleC)),
-        move_branches_arr
-        if len(move_branches_arr) > 0
-        else ctypes.cast(None, ctypes.POINTER(MoveBranchC)),
-        cond_rules_arr
-        if len(cond_rules_arr) > 0
-        else ctypes.cast(None, ctypes.POINTER(CondFireRuleC)),
+        meas_probs_arr,
+        trans1_rules_arr,
+        trans2_rules_arr,
+        move_branches_arr,
+        cond_rules_arr,
         ctypes.c_int32(len(sources_arr)),
-        sources_arr
-        if len(sources_arr) > 0
-        else ctypes.cast(None, ctypes.POINTER(SourceDescC)),
+        sources_arr,
     )
     try:
         c_num_sites = ctypes.c_int32(0)
@@ -406,28 +387,17 @@ def process_shots_cpp(
         total_items = int(c_total_items.value)
         shot_group_ids = np.empty(num_shots, dtype=np.int32)
         group_item_offsets = np.empty(num_groups + 1, dtype=np.int32)
-        if mode == 2:
-            group_reweights = np.empty((total_items, 3), dtype=np.float64)
-            lib.marginal_batch_result_copy_data(
-                res_ptr,
-                c_ptr(shot_group_ids, i32_p),
-                c_ptr(group_item_offsets, i32_p),
-                ctypes.cast(0, i32_p),
-                ctypes.cast(0, f64_p),
-                c_ptr(group_reweights, f64_p),
-            )
-            return shot_group_ids, group_item_offsets, None, None, group_reweights
-        else:
-            group_sym_ids = np.empty(total_items, dtype=np.int32)
-            group_probs = np.empty(total_items, dtype=np.float64)
-            lib.marginal_batch_result_copy_data(
-                res_ptr,
-                c_ptr(shot_group_ids, i32_p),
-                c_ptr(group_item_offsets, i32_p),
-                c_ptr(group_sym_ids, i32_p),
-                c_ptr(group_probs, f64_p),
-                ctypes.cast(0, f64_p),
-            )
-            return shot_group_ids, group_item_offsets, group_sym_ids, group_probs, None
+        group_sym_ids = None if mode == 2 else np.empty(total_items, dtype=np.int32)
+        group_probs = None if mode == 2 else np.empty(total_items, dtype=np.float64)
+        group_reweights = np.empty((total_items, 3), dtype=np.float64) if mode == 2 else None
+        lib.marginal_batch_result_copy_data(
+            res_ptr,
+            c_ptr(shot_group_ids, i32_p),
+            c_ptr(group_item_offsets, i32_p),
+            c_ptr(group_sym_ids, i32_p),
+            c_ptr(group_probs, f64_p),
+            c_ptr(group_reweights, f64_p),
+        )
+        return shot_group_ids, group_item_offsets, group_sym_ids, group_probs, group_reweights
     finally:
         lib.marginal_free_batch_result(res_ptr)

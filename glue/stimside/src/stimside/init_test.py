@@ -64,7 +64,6 @@ def test_top_level_stimside_exports() -> None:
     assert stimside.OpHandler is abstract_op_handler.OpHandler
     assert stimside.CompiledOpHandler is abstract_op_handler.CompiledOpHandler
     assert stimside.TrivialOpHandler is abstract_op_handler.TrivialOpHandler
-    assert abstract_op_handler._TrivialOpHandler is abstract_op_handler.TrivialOpHandler
 
     assert stimside.LeakageUint8Flip is leakage_uint8_flip.LeakageUint8
     assert stimside.LeakageUint8Flip is leakage_uint8_flip.LeakageUint8Flip

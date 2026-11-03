@@ -14,7 +14,6 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageTransition2Params,
     LeakageConditioningParams,
     LeakageMeasurementParams,
-    LeakageSwapParams,
 )
 from stimside.op_handlers.leakage_handlers.leakage_tag_parsing_tableau import (
     parse_leakage_in_circuit,
@@ -23,6 +22,7 @@ from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
 from stimside.op_handlers.leakage_handlers.transition_effects import (
     TransitionEffectMasks,
     apply_output_effect,
+    dispatch_tagged_leakage_op,
     emit_tableau_transition_effects,
     eval_allowed_state_mask,
     exec_leakage_swap,
@@ -259,8 +259,8 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                     filtered_targets = self._filter_targets_2q(
                         target_groups, (("U",), ("U",)), sss
                     )
-                elif op_name in ("SPP", "SPP_DAG"):
-                    # Keep each Pauli product term only if none of its qubits is leaked.
+                else:
+                    # SPP / SPP_DAG: keep each Pauli product term only if none of its qubits is leaked.
                     filtered_targets = []
                     for term in op.target_groups():
                         if all(self.state[t.qubit_value] < 2 for t in term):
@@ -268,9 +268,6 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                                 if k > 0:
                                     filtered_targets.append(stim.target_combiner())
                                 filtered_targets.append(t)
-                else:
-                    sss._do_bare_instruction(op)
-                    return
                 if len(filtered_targets) > 0:
                     sss._do_bare_instruction(
                         stim.CircuitInstruction(op_name, filtered_targets, op.gate_args_copy())
@@ -288,54 +285,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                 sss._do_bare_instruction(op)
                 return
 
-        params = self.ops_to_params[op]
-        is_transition = isinstance(
-            params, (LeakageTransition1Params, LeakageTransition2Params, LeakageSwapParams)
-        )
-        rec_ev = is_transition and getattr(sss, "record_leakage_events", False)
-        if (sss.record_unleaked_to_leaked or rec_ev) and is_transition:
-            target_indices = np.unique(
-                [
-                    t.qubit_value if t.qubit_value is not None else t.value
-                    for t in op.targets_copy()
-                    if (t.qubit_value if t.qubit_value is not None else t.value) >= 0
-                ]
-            )
-            was_unleaked = self.state[target_indices] < 2
-            old_states = self.state[target_indices].copy() if rec_ev else None
-        else:
-            target_indices = None
-            was_unleaked = None
-            old_states = None
-
-        match params:
-            case LeakageConditioningParams():
-                self.leakage_conditioning(op=op, tss=sss, params=params)
-            case LeakageTransition1Params():
-                self.leakage_transition_1(op=op, tss=sss, params=params)
-            case LeakageTransition2Params():
-                self.leakage_transition_2(op=op, tss=sss, params=params)
-            case LeakageMeasurementParams():
-                self.leakage_measurement(op, tss=sss, params=params)
-            case LeakageSwapParams():
-                self.leakage_swap(op=op, tss=sss)
-            case _:
-                raise ValueError(f"Unrecognised LEAKAGE params: {params}")
-
-        if (
-            sss.record_unleaked_to_leaked
-            and was_unleaked is not None
-            and target_indices is not None
-        ):
-            k = int(np.count_nonzero(was_unleaked & (self.state[target_indices] >= 2)))
-            if k > 0:
-                sss._record_unleaked_to_leaked_count(k, sss._circuit_time)
-        if old_states is not None and target_indices is not None:
-            for q, old_st, new_st in zip(
-                target_indices, old_states, self.state[target_indices]
-            ):
-                if old_st != new_st:
-                    sss._record_leakage_event(sss._circuit_time, q, old_st, new_st)
+        dispatch_tagged_leakage_op(self, op, sss, state2d=self.state[:, None])
 
     def leakage_swap(self, op: stim.CircuitInstruction, tss: TablesideSimulator):
         """SWAP[LEAKAGE_SWAP]: SWAP the qubits, leaked ones included, then swap leakage states."""
@@ -620,7 +570,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         # get actual qubit states
         target_leakage_state = self.state[targets]
 
-        p0, p1 = params.p0, params.p1(is_mpad)
+        p0, p1 = params.p0, params.p1
 
         targets_arr = np.asarray(targets, dtype=np.intp)
         idx_of_targets_in_qubit_space = np.where(target_leakage_state < 2)[0]
@@ -748,21 +698,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                                 )
                             )
                     if np.any(mflip_mask):
-                        if is_mpad:
-                            x_error_prob = 0.5 * p0 + 0.5 * p1
-                            if x_error_prob > 0:
-                                tss._do_bare_only_on_tableau(
-                                    stim.CircuitInstruction(
-                                        "X_ERROR",
-                                        anc_comp_arr[mflip_mask],
-                                        [x_error_prob],
-                                    )
-                                )
-                        elif (
-                            tss.batch_size > 1
-                            and abs(p0 - (1.0 - p1)) > 1e-12
-                            and hasattr(tss, "_asymmetric_readout_postproc")
-                        ):
+                        if tss.batch_size > 1 and abs(p0 - (1.0 - p1)) > 1e-12:
                             base_meas_idx = tss._new_circuit.num_measurements
                             for i_pos in idx_of_targets_in_qubit_space[mflip_mask]:
                                 tss._asymmetric_readout_postproc.append(

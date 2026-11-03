@@ -58,7 +58,7 @@ OMEGA_POWERS: tuple[complex, ...] = (
 OMEGA_ARR: NDArray[np.complex128] = np.array(OMEGA_POWERS, dtype=np.complex128)
 I_POWERS: tuple[complex, ...] = (1.0 + 0.0j, 0.0 + 1.0j, -1.0 + 0.0j, 0.0 - 1.0j)
 I_POWERS_ARR: NDArray[np.complex128] = np.array(I_POWERS, dtype=np.complex128)
-_SQRT2, _INV_SQRT2, _OMEGA, _OMEGA_CONJ, _PHASE4 = SQRT2, INV_SQRT2, OMEGA, OMEGA_CONJ, I_POWERS_ARR
+_INV_SQRT2, _PHASE4 = INV_SQRT2, I_POWERS_ARR
 
 __all__ = [
     "DEFAULT_ATOL", "K1_CANCEL_REL_TOL", "ImpossiblePostselectionError",
@@ -69,8 +69,7 @@ __all__ = [
     "PhaseQFEComponent", "ShotExpansion",
     "MeasurementResult", "CompiledPauliBlockStep", "CompiledPauliBlock",
     "apply_reference_tableau_to_statevector",
-    "drop_variable", "add_column", "make_principal", "restrict_amplitude",
-    "eliminate_zero_amplitude", "apply_pauli", "apply_quarter_turn",
+    "apply_pauli", "apply_quarter_turn",
     "merge_frames", "apply_pauli_t", "apply_ccz",
     "apply_compiled_block", "project_diagonal", "contract_choi_expansions",
     "born_split_expansion", "measure_expansion", "validate_atol",
@@ -638,168 +637,6 @@ def apply_reference_tableau_to_statevector(
         else:
             raise ValueError(f"Unexpected gate {name!r} in tableau elimination circuit")
     return psi
-
-
-# ---------------------------------------------------------------------------
-# Structural Helpers: H0 - H4
-# ---------------------------------------------------------------------------
-
-
-def drop_variable(target: ShotExpansion, col: int) -> None:
-    """`H0`: Delete binary generator variable `col` in-place (`d -> d - 1`)."""
-    if not isinstance(target, ShotExpansion):
-        raise TypeError(f"Unsupported target type: {type(target)!r}")
-    c = int(col)
-    if c < 0 or c >= target.d:
-        raise ValueError(f"Column index {c} out of range for d={target.d}")
-    target.A_words = np.ascontiguousarray(np.delete(target.A_words, c, axis=0))
-    target.Gamma = np.ascontiguousarray(np.delete(np.delete(target.Gamma, c, axis=0), c, axis=1))
-    target.pivots = np.ascontiguousarray(np.delete(target.pivots, c))
-    target.ell = np.ascontiguousarray(np.delete(target.ell, c, axis=1))
-    assert target.ell_odd is not None
-    target.ell_odd = np.ascontiguousarray(np.delete(target.ell_odd, c))
-    target.d -= 1
-    target._refresh_a_union()
-    if target.chi > 1:
-        target._is_canonical_merged = False
-
-
-def add_column(target: ShotExpansion, src: int, dst: int) -> None:
-    """`H1`: Column addition `A_dst ^= A_src` with exact mod-4 `Q` pullback in-place."""
-    if not isinstance(target, ShotExpansion):
-        raise TypeError(f"Unsupported target type: {type(target)!r}")
-    r, s = int(src), int(dst)
-    if r < 0 or r >= target.d or s < 0 or s >= target.d:
-        raise ValueError(f"Column indices ({r}, {s}) out of range for d={target.d}")
-    if r == s:
-        raise ValueError("add_column requires distinct columns (src != dst)")
-    old_edge = int(target.Gamma[r, s])
-    src_row = target.Gamma[r, :].copy()
-    target.A_words[s] ^= target.A_words[r]
-
-    assert target.ell_odd is not None
-    parity = int(target.ell_odd[r]) & 1
-    if target.chi > 0:
-        target.ell[:, s] = (target.ell[:, s] + target.ell[:, r] + np.uint8(2 * old_edge)) & np.uint8(3)
-    target.ell_odd[s] ^= np.uint8(parity)
-    target._refresh_a_union()
-
-    mask = np.ones(target.d, dtype=bool)
-    mask[r] = False
-    mask[s] = False
-    new_edges = target.Gamma[s, mask] ^ src_row[mask]
-    target.Gamma[s, mask] = new_edges
-    target.Gamma[mask, s] = new_edges
-    new_rs = np.uint8(old_edge ^ parity)
-    target.Gamma[r, s] = new_rs
-    target.Gamma[s, r] = new_rs
-
-
-def make_principal(
-    target: ShotExpansion, col: int, pivot_qubit: int | None = None
-) -> int:
-    """`H2`: Clear bit `pivot_qubit` from all columns `!= col` and record pivot."""
-    if not isinstance(target, ShotExpansion):
-        raise TypeError(f"Unsupported target type: {type(target)!r}")
-    c = int(col)
-    if c < 0 or c >= target.d:
-        raise ValueError(f"Column index {c} out of range for d={target.d}")
-    if pivot_qubit is None:
-        p = first_set_bit_in_words(target.A_words[c])
-        if p < 0:
-            raise ValueError(f"Column {c} is identically zero; cannot make principal")
-    else:
-        p = int(pivot_qubit)
-        if p < 0 or p >= target.n_qubits:
-            raise ValueError(f"pivot_qubit={p} out of range for n_qubits={target.n_qubits}")
-        if get_bit_in_words(target.A_words[c], p) == 0:
-            raise ValueError(f"Column {c} has 0 at requested pivot_qubit={p}")
-    if target.d > 1:
-        col_bits = get_bits_at_qubits(target.A_words, np.array([p], dtype=np.int32))[:, 0]
-        for j in range(target.d):
-            if j != c and col_bits[j] != 0:
-                add_column(target, c, j)
-    target.pivots[c] = np.int32(p)
-    return p
-
-
-def restrict_amplitude(
-    target: ShotExpansion,
-    lam: Sequence[int] | NDArray[np.integer],
-    eps: int | Sequence[int] | NDArray[np.integer],
-    *,
-    scale: float = _INV_SQRT2,
-) -> None:
-    """`H3`: Restrict to affine hyperplane `lam . u = eps (mod 2)` in-place."""
-    if not isinstance(target, ShotExpansion):
-        raise TypeError(f"Unsupported target type: {type(target)!r}")
-    lam_arr = (np.asarray(lam, dtype=np.uint8) & np.uint8(1)).ravel()
-    if lam_arr.shape != (target.d,):
-        raise ValueError(f"lam length {lam_arr.shape[0]} does not match d={target.d}")
-    nz = np.flatnonzero(lam_arr)
-    if np.ndim(eps) == 0:
-        eps_vec = np.full(target.chi, int(eps) & 1, dtype=np.uint8)  # type: ignore[arg-type]
-    else:
-        eps_vec = (np.asarray(eps, dtype=np.uint8) & np.uint8(1)).ravel()
-        if eps_vec.shape != (target.chi,):
-            raise ValueError(f"eps length {eps_vec.shape[0]} does not match chi={target.chi}")
-    if len(nz) == 0:
-        if target.chi > 0:
-            keep = eps_vec == np.uint8(0)
-            target.weights = np.ascontiguousarray(target.weights[keep])
-            target.h_words = np.ascontiguousarray(target.h_words[keep])
-            target.ell = np.ascontiguousarray(target.ell[keep])
-        return
-    f = int(nz[0])
-    for k in nz[1:]:
-        add_column(target, f, int(k))
-    if target.chi > 0:
-        target.weights *= _PHASE4[(eps_vec * target.ell[:, f]) & np.uint8(3)] * scale
-        ones = eps_vec != 0
-        if np.any(ones):
-            target.h_words[ones] ^= target.A_words[f]
-            target.ell[ones] = (target.ell[ones] + (target.Gamma[f, :] << np.uint8(1))[None, :]) & np.uint8(3)
-    drop_variable(target, f)
-
-
-def _xor_hollow_outer_inplace(Gamma: NDArray[np.uint8], lam: NDArray[np.uint8]) -> None:
-    upd = (lam[:, None] & lam[None, :]) & np.uint8(1)
-    np.fill_diagonal(upd, 0)
-    Gamma ^= upd
-
-
-def eliminate_zero_amplitude(target: ShotExpansion, col: int) -> None:
-    """`H4`: Analytically contract a zero amplitude column `A_words[col] == 0` in-place."""
-    if not isinstance(target, ShotExpansion):
-        raise TypeError(f"Unsupported target type: {type(target)!r}")
-    c = int(col)
-    if c < 0 or c >= target.d:
-        raise ValueError(f"Column index {c} out of range for d={target.d}")
-    if words_any_nonzero(target.A_words[c]):
-        raise ValueError(f"eliminate_zero_amplitude requires A_words[{c}] == 0, got non-zero column")
-    lam = np.delete(target.Gamma[c, :], c).copy()
-    assert target.ell_odd is not None
-    c_odd = int(target.ell_odd[c]) & 1
-    c_vec = target.ell[:, c].copy() if target.chi > 0 else np.zeros(0, dtype=np.uint8)
-    drop_variable(target, c)
-    if c_odd == 1:
-        if target.chi > 0:
-            target.weights *= np.where(c_vec == np.uint8(1), _OMEGA, _OMEGA_CONJ)
-            if target.d > 0:
-                neg_c = ((4 - c_vec.astype(np.int16)) & 3).astype(np.uint8)
-                target.ell = np.ascontiguousarray((target.ell + neg_c[:, None] * lam[None, :]) & np.uint8(3))
-        if target.d > 0:
-            target.ell_odd ^= lam & np.uint8(1)
-            _xor_hollow_outer_inplace(target.Gamma, lam)
-        return
-    eps_vec = (c_vec >> np.uint8(1)) & np.uint8(1)
-    if np.any(lam != 0):
-        restrict_amplitude(target, lam, eps_vec, scale=1.0)
-    elif target.chi > 0:
-        keep = eps_vec == np.uint8(0)
-        target.weights = np.ascontiguousarray(target.weights[keep] * _SQRT2)
-        target.h_words = np.ascontiguousarray(target.h_words[keep])
-        target.ell = np.ascontiguousarray(target.ell[keep])
 
 
 # ---------------------------------------------------------------------------
@@ -1454,7 +1291,6 @@ def born_split_expansion(
     *,
     atol: float,
     z_in: float | None = None,
-    project_fn: Any = None,
 ) -> tuple[
     ShotExpansion, float, ShotExpansion, float, float, ShotExpansion,
     tuple[NDArray[np.uint64], NDArray[np.uint64], int] | None,
@@ -1474,9 +1310,8 @@ def born_split_expansion(
         rot = None
         work_exp, b_diag, sig_diag = expansion, b_w, (kap >> 1) & 1
 
-    proj = project_diagonal if project_fn is None else project_fn
-    exp0, z0_raw = proj(work_exp, b_diag, sig_diag, 0)
-    exp1, z1_raw = proj(work_exp, b_diag, sig_diag, 1)
+    exp0, z0_raw = project_diagonal(work_exp, b_diag, sig_diag, 0)
+    exp1, z1_raw = project_diagonal(work_exp, b_diag, sig_diag, 1)
     scale_z = max(1.0, z)
     if not (math.isfinite(z0_raw) and math.isfinite(z1_raw)):
         raise FloatingPointError(f"Non-finite projected Born masses: z0={z0_raw!r}, z1={z1_raw!r}")

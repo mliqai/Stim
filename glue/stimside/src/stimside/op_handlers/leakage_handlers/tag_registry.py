@@ -25,7 +25,7 @@ class TagDef:
     name: str
     parser_func: Callable[[stim.CircuitInstruction, Any, str], LeakageParams]
     allowed_arity: Literal[1, 2] | None = None
-    allowed_gates: Sequence[str] | dict[Literal["flip", "tableau"], Sequence[str]] | None = None
+    allowed_gates: Sequence[str] | None = None
     supported_simulators: Sequence[Literal["flip", "tableau"]] = field(
         default_factory=lambda: ("flip", "tableau")
     )
@@ -56,17 +56,11 @@ class TagDef:
         if self.allowed_arity == 2 and not gd.is_two_qubit_gate:
             raise ValueError(f"2Q leakage tag '{op.tag}' attached to not-2Q stim gate '{op.name}'.")
 
-        if self.allowed_gates is not None:
-            if isinstance(self.allowed_gates, dict):
-                allowed = self.allowed_gates.get(simulator)
-            else:
-                allowed = self.allowed_gates
-            
-            if allowed is not None and op.name not in allowed:
-                raise ValueError(
-                    f"Leakage tag '{self.name}' must be attached to one of {allowed}, "
-                    f"but was attached to '{op.name}'."
-                )
+        if self.allowed_gates is not None and op.name not in self.allowed_gates:
+            raise ValueError(
+                f"Leakage tag '{self.name}' must be attached to one of {self.allowed_gates}, "
+                f"but was attached to '{op.name}'."
+            )
 
 
 # --- THE REGISTRY ---
@@ -95,16 +89,13 @@ TAG_REGISTRY: dict[str, TagDef] = {
         name="LEAKAGE_CONTROLLED_ERROR",
         allowed_arity=2,
         supported_simulators=("flip",),
-        allowed_gates=("I", "I_ERROR", "II", "II_ERROR"),
+        allowed_gates=("II", "II_ERROR"),
         parser_func=ltp._parse_controlled_error
     ),
     "LEAKAGE_TRANSITION_1": TagDef(
         name="LEAKAGE_TRANSITION_1",
         allowed_arity=1,
-        allowed_gates={
-            "flip": ("I", "I_ERROR", "II", "II_ERROR"),
-            "tableau": ("I", "I_ERROR", "II", "II_ERROR", "DETECTOR", "OBSERVABLE_INCLUDE")
-        },
+        allowed_gates=("I", "I_ERROR"),
         parser_func=ltp._parse_transition_1
     ),
     "LEAKAGE_TRANSITION_Z": TagDef(
@@ -117,10 +108,7 @@ TAG_REGISTRY: dict[str, TagDef] = {
     "LEAKAGE_TRANSITION_2": TagDef(
         name="LEAKAGE_TRANSITION_2",
         allowed_arity=2,
-        allowed_gates={
-            "flip": ("I", "I_ERROR", "II", "II_ERROR"),
-            "tableau": ("I", "I_ERROR", "II", "II_ERROR", "DETECTOR", "OBSERVABLE_INCLUDE")
-        },
+        allowed_gates=("II", "II_ERROR"),
         parser_func=ltp._parse_transition_2
     ),
     "LEAKAGE_PROJECTION_Z": TagDef(

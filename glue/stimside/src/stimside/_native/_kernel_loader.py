@@ -5,10 +5,7 @@ from __future__ import annotations
 import _ctypes
 from collections.abc import Callable, Sequence
 import ctypes
-try:
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
+import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -44,10 +41,7 @@ def c_w_ptr(w: Any) -> Any:
 def get_cpp_compile_and_link_args(
     include_march_native: bool = True,
 ) -> tuple[list[str], list[str]]:
-    system = platform.system()
     machine = (platform.machine() or platform.processor() or "").lower()
-    if system.startswith("Win"):
-        return ["/std:c++17", "/O2"], []
     compile_args = ["-std=c++17", "-O3", "-fPIC", "-fno-strict-aliasing", "-g0"]
     if (
         include_march_native
@@ -109,12 +103,9 @@ def resolve_so(
         lock_digest = hashlib.sha1(os.fsencode(so_path)).hexdigest()[:16]
         lock_path = Path(tempfile.gettempdir()) / f".stimside_build_{lock_digest}.lock"
         lf = None
-        locked = False
         try:
             lf = lock_path.open("a+b")
-            if fcntl is not None:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-                locked = True
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         except OSError:
             pass
         try:
@@ -138,11 +129,6 @@ def resolve_so(
                         tmp_so.unlink(missing_ok=True)
         finally:
             if lf is not None:
-                if locked and fcntl is not None:
-                    try:
-                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-                    except OSError:
-                        pass
                 lf.close()
         if last_exc is not None and (force_recompile or not so_path.exists()):
             raise RuntimeError(

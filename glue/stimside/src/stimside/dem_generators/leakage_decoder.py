@@ -25,7 +25,6 @@ from stimside.dem_generators.dem_decoding import (
 )
 from stimside.dem_generators.dem_generator_marginal import (
     LEAKAGE_SWAP_UNSUPPORTED,
-    DemGenerator,
     MarginalLeakageDemGenerator,
     has_leakage_swap,
 )
@@ -117,8 +116,8 @@ def as_leakage_decoder(dem_decoder: object, owner: str) -> LeakageDecoder:
     """
     if isinstance(dem_decoder, LeakageDecoder):
         return dem_decoder
-    # DemGenerators return DEMs, not predictions; classes are not decoders.
-    if callable(dem_decoder) and not isinstance(dem_decoder, (type, DemGenerator)):
+    # MarginalLeakageDemGenerator returns DEMs, not predictions; classes are not decoders.
+    if callable(dem_decoder) and not isinstance(dem_decoder, (type, MarginalLeakageDemGenerator)):
         return CallableDecoder(dem_decoder)
     raise TypeError(
         f"{owner} requires dem_decoder to be a LeakageDecoder (e.g. "

@@ -53,7 +53,7 @@ def _strip_circuit_for_noiseless_ref(circuit: stim.Circuit) -> tuple[stim.Circui
                 assert isinstance(params, LeakageMeasurementParams)
                 is_mpad = tag.startswith("LEAKAGE_MEASUREMENT")
                 b0 = params.p0 > 0.5
-                b1 = params.p1(is_mpad) > 0.5
+                b1 = params.p1 > 0.5
                 if is_mpad and b0 == b1:
                     out.append(stim.CircuitInstruction("MPAD", [int((bool(t.value) ^ t.is_inverted_result_target) ^ b0) for t in tgs]))
                 elif not is_mpad and (b0, b1) == (False, True):
@@ -162,7 +162,7 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
                 self._eval_u_mpad(s, tss, params)
             return
         raw_t, is_mpad = op.targets_copy(), params.targets is not None
-        p0, p1 = params.p0, params.p1(is_mpad)
+        p0, p1 = params.p0, params.p1
         need_slow = (0 in params.prob_for_input_state or 1 in params.prob_for_input_state) if is_mpad else (p0 != 0.0 or p1 != 1.0)
         if tss._tab_rngs is not None and need_slow:
             qs = list(dict.fromkeys(params.targets if is_mpad else (int(t.qubit_value) for t in raw_t if t.is_qubit_target)))  # type: ignore[arg-type]

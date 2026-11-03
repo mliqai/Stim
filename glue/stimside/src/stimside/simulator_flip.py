@@ -6,11 +6,8 @@ import stim  # type: ignore[import-untyped]
 
 from stimside._flip.sync_reference import compute_sync_reference
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
-from stimside.util.circuit import apply_coords_op, replays, unroll_circuit
-from stimside.util.known_states import (
-    compute_known_states_uint8,
-    convert_paulis_to_arrays,
-)
+from stimside.util.circuit import apply_coords_op, check_replay, unroll_circuit
+from stimside.util.known_states import compute_known_states_uint8
 from stimside.util.numpy_types import Bool1DArray, Bool2DArray
 from stimside.util.stim_workarounds import broadcast_pauli_errors
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
@@ -342,20 +339,6 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
     # known states methods:
     ############################################################################
 
-    def _get_all_clean_known_state(
-        self, circuit_time: int | None = None
-    ) -> tuple[
-        Bool1DArray, Bool1DArray, Bool1DArray, Bool1DArray, Bool1DArray, Bool1DArray
-    ]:
-        """given circuit locations, return the state of the target under noiseless execution."""
-        if self._known_states_uint8 is None:
-            raise ValueError(
-                "Can't access known_states when initialized with compute_known_states=False."
-            )
-        if circuit_time is None:
-            circuit_time = self.get_current_circuit_time()
-        return convert_paulis_to_arrays(self._known_states_uint8[circuit_time])
-
     _PAULI_TO_UINT8_CODE = {"X": 1, "Y": 3, "Z": 5}
 
     def _get_clean_known_states(
@@ -468,21 +451,13 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
             for _ in range(this.repeat_count):
                 self._do(loop_body)
         elif isinstance(this, stim.CircuitInstruction):
-            t = self._circuit_time
-            if t >= len(self._unrolled_ops) or not replays(this, self._unrolled_ops[t]):
-                expected = (
-                    f"which has `{self._unrolled_ops[t]}` there"
-                    if t < len(self._unrolled_ops)
-                    else f"which ends after {len(self._unrolled_ops)} operations"
-                )
-                raise ValueError(
-                    f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` doesn't match "
-                    f"the circuit the FlipsideSimulator was constructed with, {expected}. Its "
-                    "reference values are precomputed from that circuit, so interactive_do can only "
-                    "replay it in order. Construct the simulator with the circuit to step through. "
-                    "Pass the circuit itself or its parts, not `circuit.flattened()` or "
-                    "`circuit + more`."
-                )
+            check_replay(
+                this,
+                self._unrolled_ops,
+                self._circuit_time,
+                "FlipsideSimulator",
+                allow_extension=False,
+            )
             self._do_instruction(this)
         else:
             raise NotImplementedError

@@ -12,7 +12,6 @@ from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageConditioningParams,
     LeakageMeasurementParams,
     LeakageParams,
-    LeakageSwapParams,
     LeakageTransition1Params,
     LeakageTransition2Params,
 )
@@ -23,6 +22,7 @@ from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
 from stimside.op_handlers.leakage_handlers.transition_effects import (
     TransitionEffectMasks,
     apply_output_effect,
+    dispatch_tagged_leakage_op,
     eval_allowed_state_mask,
     exec_leakage_swap,
     meas_basis,
@@ -333,59 +333,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
             sss._do_bare_instruction(op)
             return
 
-        params = self.ops_to_params[op]
-        is_transition = isinstance(
-            params, (LeakageTransition1Params, LeakageTransition2Params, LeakageSwapParams)
-        )
-        rec_ev = is_transition and getattr(sss, "record_leakage_events", False)
-        if (sss.record_unleaked_to_leaked or rec_ev) and is_transition:
-            self._ensure_batch_size(sss.batch_size)
-            target_indices = np.unique(
-                [
-                    t.qubit_value if t.qubit_value is not None else t.value
-                    for t in op.targets_copy()
-                    if (t.qubit_value if t.qubit_value is not None else t.value) >= 0
-                ]
-            )
-            was_unleaked = self._state[target_indices, :] < 2
-            old_states = self._state[target_indices, :].copy() if rec_ev else None
-        else:
-            target_indices = None
-            was_unleaked = None
-            old_states = None
-
-        match params:
-            case LeakageConditioningParams():
-                self.leakage_conditioning(op=op, tss=sss, params=params)
-            case LeakageTransition1Params():
-                self.leakage_transition_1(op=op, tss=sss, params=params)
-            case LeakageTransition2Params():
-                self.leakage_transition_2(op=op, tss=sss, params=params)
-            case LeakageMeasurementParams():
-                self.leakage_measurement(op=op, tss=sss, params=params)
-            case LeakageSwapParams():
-                self.leakage_swap(op=op, tss=sss)
-            case _:
-                raise ValueError(f"Unrecognised LEAKAGE params: {params}")
-
-        if (
-            sss.record_unleaked_to_leaked
-            and was_unleaked is not None
-            and target_indices is not None
-        ):
-            now_leaked = self._state[target_indices, :] >= 2
-            counts = np.count_nonzero(was_unleaked & now_leaked, axis=0)
-            sss._record_unleaked_to_leaked_counts(counts, sss._circuit_time)
-        if old_states is not None and target_indices is not None:
-            new_states = self._state[target_indices, :]
-            for i_q, b in zip(*np.nonzero(old_states != new_states)):
-                sss._record_leakage_event(
-                    sss._circuit_time,
-                    target_indices[i_q],
-                    old_states[i_q, b],
-                    new_states[i_q, b],
-                    shot_idx=int(b),
-                )
+        dispatch_tagged_leakage_op(self, op, sss)
 
     def leakage_swap(self, op: stim.CircuitInstruction, tss: CosetsideSimulator) -> None:
         """SWAP[LEAKAGE_SWAP]: SWAP the qubits in every shot, then swap leakage states."""
@@ -878,7 +826,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
 
         target_leakage_state = self._state[targets, :].copy()  # (len(targets), batch_size)
         targets_arr = np.asarray(targets, dtype=np.intp)
-        p0, p1 = params.p0, params.p1(is_mpad)
+        p0, p1 = params.p0, params.p1
         p_super = 0.5 * p0 + 0.5 * p1
         basis: Literal["X", "Y", "Z"] = meas_basis(op.name)
         leaked_mask = target_leakage_state > 1

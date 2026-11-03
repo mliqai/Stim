@@ -9,14 +9,12 @@ from typing import Any
 
 import numpy as np
 import sinter  # type: ignore[import-untyped]
-import stim  # type: ignore[import-untyped]
 
 from stimside.dem_generators.leakage_decoder import (
     CompiledLeakageDecoder,
     LeakageDecoderLike,
     as_leakage_decoder,
 )
-from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler
 
 
 def next_compiled_seed(seed: int | None, idx: int, salt: int) -> int | None:
@@ -129,16 +127,26 @@ def sample_batches(
     )
 
 
+from stimside.op_handlers.abstract_op_handler import OpHandler
+
+_DEFAULT_BATCH: Any = object()
+
+
 class SamplerBase(sinter.Sampler):
     """Common Sinter sampler configuration for Flipside, Tableside, and Cosetside."""
+
+    _compiled_cls: type[Any]
+    _default_batch_size: int = 256
 
     def __init__(
         self,
         op_handler: OpHandler[Any],
         dem_decoder: LeakageDecoderLike,
-        batch_size: int,
+        batch_size: int = _DEFAULT_BATCH,
         seed: int | None = None,
     ) -> None:
+        if batch_size is _DEFAULT_BATCH:
+            batch_size = self._default_batch_size
         if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
             raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
         self.op_handler = op_handler
@@ -153,12 +161,25 @@ class SamplerBase(sinter.Sampler):
         self._compile_count = idx + 1
         return next_compiled_seed(self.seed, idx, (os.getpid() - self._init_pid) & 0xFFFFFFFF)
 
-    def _require_circuit(self, task: sinter.Task) -> stim.Circuit:
+    def compiled_sampler_for_task(self, task: sinter.Task) -> sinter.CompiledSampler:
         if task.circuit is None:
             raise ValueError(
                 f"{type(self).__name__} requires a circuit in the task to compile a sampler."
             )
-        return task.circuit
+        circuit = task.circuit
+        return self._compiled_cls(
+            circuit=circuit,
+            compiled_op_handler=self.op_handler.compile_op_handler(
+                circuit=circuit, batch_size=self.batch_size
+            ),
+            batch_size=self.batch_size,
+            compiled_dem_decoder=self.dem_decoder.compile_for_task(task),
+            needs_records=self.dem_decoder.needs_records,
+            needs_leakage_events=self.dem_decoder.needs_leakage_events,
+            seed=self._next_compiled_seed(),
+            postselection_mask=task.postselection_mask,
+            postselected_observables_mask=task.postselected_observables_mask,
+        )
 
 
 class CompiledSamplerBase(sinter.CompiledSampler):
@@ -172,21 +193,19 @@ class CompiledSamplerBase(sinter.CompiledSampler):
     postselected_observables_mask: np.ndarray | None = None
     _track_leakage_count: bool = False
 
-    def _init_common(
+    def __init__(
         self,
-        circuit: stim.Circuit | None,
-        compiled_op_handler: CompiledOpHandler[Any] | None,
-        batch_size: int,
+        simulator: Any,
         compiled_dem_decoder: CompiledLeakageDecoder,
+        *,
         needs_records: bool,
-        needs_leakage_events: bool,
+        needs_leakage_events: bool = False,
         postselection_mask: np.ndarray | None = None,
         postselected_observables_mask: np.ndarray | None = None,
     ) -> None:
-        self.circuit = circuit
-        self.batch_size = int(batch_size)
+        self.simulator = simulator
+        self.batch_size = int(simulator.batch_size)
         self.compiled_dem_decoder = compiled_dem_decoder
-        self.compiled_op_handler = compiled_op_handler
         self.needs_records = bool(needs_records)
         self.needs_leakage_events = bool(needs_leakage_events)
         self.postselection_mask = postselection_mask

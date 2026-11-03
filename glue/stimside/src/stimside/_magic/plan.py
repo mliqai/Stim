@@ -32,12 +32,12 @@ from stimside._magic.channels import (
     _compile_clifford_factors,
     _compile_pauli_measurement_c15,
     _compile_reset_c15,
+    _emit_magic_terms,
     _infer_total_data_qubits,
     _reduce_pauli_product_targets,
     _restrict_tableau_to_data,
     _slice_axis_to_qubits,
     _split_pauli_product_targets,
-    _validate_and_emit_magic_op,
     _validate_and_emit_non_magic_tagged_op,
     compile_pauli_product,
 )
@@ -62,6 +62,7 @@ from stimside._magic.phase_qfe import (
     CompiledPauliBlockStep,
     ShotExpansion,
 )
+from stimside.op_handlers.leakage_handlers.tag_registry import validate_magic_op
 from stimside.util.bitwords import (
     n_words_for_qubits,
     pauli_multiply,
@@ -207,7 +208,7 @@ def _compile_circuit_pass(
             else:
                 b_factors = tuple(_compile_clifford_factors(ref_chp, b.gate_name, b.targets) for b in ch.branches)
                 raw_records.append(
-                    DirectFaultSlotRecord(slot_idx, ch, b_factors, np.array([b.prob for b in ch.branches], dtype=np.float64))
+                    DirectFaultSlotRecord(slot_idx, b_factors, np.array([b.prob for b in ch.branches], dtype=np.float64))
                 )
 
     def _emit_cat_pauli_noise(
@@ -246,7 +247,7 @@ def _compile_circuit_pass(
 
         if op.tag != "":
             if op.tag in ("T", "T_DAG", "CCZ"):
-                _validate_and_emit_magic_op(op, ref_chp, raw_records)
+                _emit_magic_terms(op.tag, validate_magic_op(op), ref_chp, raw_records)
             else:
                 next_meas_idx = _validate_and_emit_non_magic_tagged_op(
                     op, n_data, next_meas_idx, raw_records

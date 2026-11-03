@@ -80,6 +80,3 @@ class _TrivialCompiledOpHandler(CompiledOpHandler[Any]):
         """clear any stored state, ready for a new simulation."""
         return
 
-
-_TrivialOpHandler = TrivialOpHandler
-

@@ -340,11 +340,6 @@ class ReferenceCHPTableau:
 
         self.apply_right_rot(a_words, b_rot_words, kap_iprot)
 
-        reset_flip_ref = False
-        if is_reset and m_ref == 1:
-            self.z_kap[q] = (self.z_kap[q] + 2) & 3
-            reset_flip_ref = True
-
         return RandMeasMeta(
             is_random=True,
             q=q,
@@ -356,7 +351,6 @@ class ReferenceCHPTableau:
             kappa_rot=kappa_rot,
             G_x_indices=G_x_indices,
             G_z_indices=G_z_indices,
-            reset_flip_ref=reset_flip_ref,
         )
 
     def to_stim_tableau(self) -> stim.Tableau:

@@ -29,7 +29,6 @@ from stimside._magic.phase_qfe import (
 from stimside.op_handlers.leakage_handlers.tag_registry import (
     check_tag_qubits,
     parse_leakage_tag_magic,
-    validate_magic_op,
 )
 from stimside.util.bitwords import (
     first_set_bit_in_words,
@@ -77,7 +76,6 @@ class CompiledOpenBlockRecord:
 @dataclass(frozen=True)
 class DirectFaultSlotRecord:
     slot_index: int
-    channel: CliffordFaultChannel
     branch_factors: tuple[CompiledCliffordFactorList, ...]
     probs: NDArray[np.float64]
 
@@ -112,7 +110,6 @@ class MeasurementRecord:
     meas_index: int
     flip_prob: float
     invert_result: bool
-    is_random: bool
     obs_axis: CompiledPauliAxis
     rot_axis: CompiledPauliAxis | None
 
@@ -122,7 +119,6 @@ class ResetRecord:
     meas_index: int | None
     flip_prob: float
     invert_result: bool
-    is_random: bool
     obs_axis: CompiledPauliAxis
     rot_axis: CompiledPauliAxis | None
     reset_flip_ref: bool
@@ -324,13 +320,13 @@ def _compile_pauli_measurement_c15(
 ) -> MeasurementRecord:
     bar_M = compile_pauli_product(ref_chp, terms, negate=False)
     if not words_any_nonzero(bar_M.a_words):
-        return MeasurementRecord(meas_index, flip_prob, invert_result, False, bar_M, None)
+        return MeasurementRecord(meas_index, flip_prob, invert_result, bar_M, None)
     e_p = unit_bit_words(first_set_bit_in_words(bar_M.a_words), ref_chp.n_words)
     rot_axis = CompiledPauliAxis(bar_M.a_words.copy(), np.ascontiguousarray(bar_M.b_words ^ e_p), (bar_M.kappa + 1) & 3)
     ref_chp.apply_right_rot(rot_axis.a_words, rot_axis.b_words, (rot_axis.kappa + 1) & 3)
     if frame_events is not None:
         frame_events.append(RightRotEvent(rot_axis=rot_axis))
-    return MeasurementRecord(meas_index, flip_prob, invert_result, True, bar_M, rot_axis)
+    return MeasurementRecord(meas_index, flip_prob, invert_result, bar_M, rot_axis)
 
 
 def _compile_reset_c15(
@@ -373,7 +369,7 @@ def _compile_reset_c15(
             frame_events.append(LeftUnitaryEvent(conj_gate, (q,)))
 
     return ResetRecord(
-        meas_index, flip_prob, invert_result, rot_axis is not None,
+        meas_index, flip_prob, invert_result,
         obs_axis, rot_axis, reset_flip_ref, kick_axis,
     )
 
@@ -408,14 +404,6 @@ def _emit_magic_terms(
         for off in range(0, len(qs), 3):
             axes = tuple(compile_pauli_product(ref_chp, [(q, "Z")]) for q in qs[off : off + 3])
             out_records.append(MagicTermRecord(MagicPhaseTerm(axes=axes, kind="CCZ")))
-
-
-def _validate_and_emit_magic_op(
-    op: stim.CircuitInstruction,
-    ref_chp: ReferenceCHPTableau,
-    out_records: list[CompiledRecord],
-) -> None:
-    _emit_magic_terms(op.tag, validate_magic_op(op), ref_chp, out_records)
 
 
 def _infer_total_data_qubits(

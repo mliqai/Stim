@@ -92,7 +92,6 @@ class PreparedQueryPlan:
     """Compiled `Q1`-`Q2` query plan holding the hybrid Choi/Ket segment tree and LRU cache."""
     circuit: stim.Circuit
     fault_mode: str
-    logical_num_qubits: int
     num_data_qubits: int
     num_total_qubits: int
     num_measurements: int
@@ -382,7 +381,7 @@ def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_c
         for s_idx, s_grp in enumerate(compiled.fault_selector_groups):
             fpos = next((i for i, rec in enumerate(compiled.records) if any((q >> 6) < ax.a_words.shape[0] and ((int((ax.a_words | ax.b_words)[q >> 6]) >> (q & 63)) & 1) for ax in axes_of(rec) for q in s_grp)), len(compiled.records))
             bfacs = tuple(CompiledCliffordFactorList(0, CompiledPauliAxis(unit_bit_words(sq, nw_op), z0, 0), ()) for sq in s_grp)
-            sel_ins.setdefault(fpos, []).append(DirectFaultSlotRecord(s_idx, compiled.fault_channels[s_idx], bfacs, np.empty(0, dtype=np.float64)))
+            sel_ins.setdefault(fpos, []).append(DirectFaultSlotRecord(s_idx, bfacs, np.empty(0, dtype=np.float64)))
     ops, dyn, noise_meta, rc, cs = [], [], {}, 0, ()
     for r_i, rec in enumerate(compiled.records):
         ops.extend((sr, None, ((sr.slot_index,), (), ())) for sr in sel_ins.get(r_i, ()))
@@ -421,7 +420,7 @@ def PrepareQueries(circuit: stim.Circuit, *, fault_mode: str = "DIRECT", fault_c
     bcache: dict[Any, Any] = {}
     _bell_steps_for(compiled.data_final_tableau if isinstance(compiled, SelectorPlan) else compiled.final_tableau, comp_target[0], out_qs, bcache) if (isinstance(comp_target, tuple) and out_qs) else None
     st = {"target": comp_target, "bcache": bcache, "slots": slot_id_to_idx, "noise": noise_meta, "q_act": q_act, "ops": otup, "dyn": tuple(dyn), "root": root, "nodes": tuple(nodes), "lru": OrderedDict(), "bytes": 0}
-    return PreparedQueryPlan(circuit, mode_norm, logical_nq, n_data, n_op, compiled.num_measurements, out_qs, eff_budget, tol, compiled, target_spec, acceptance_spec, st)
+    return PreparedQueryPlan(circuit, mode_norm, n_data, n_op, compiled.num_measurements, out_qs, eff_budget, tol, compiled, target_spec, acceptance_spec, st)
 
 def _apply_leaf(se: _ScaledExpansion, leaf: tuple[Any, Any, Any], ctx: _EvalCtx, *, is_choi: bool, enforce_terms: bool = True) -> _ScaledExpansion:
     ctx.bump_op()
@@ -620,7 +619,7 @@ def _eval_via_tree(plan: PreparedQueryPlan, faults_in: dict[int, int], meas_in: 
             ctx.bump_op()
             nw = ket.exp.n_words
             e0, z0_c, e1, z1_c, z_in_r, work, _ = born_split_expansion(
-                ket.exp, *_ax_tup(rec.obs_axis, nw), atol=ctx.atol, project_fn=project_diagonal
+                ket.exp, *_ax_tup(rec.obs_axis, nw), atol=ctx.atol
             )
             if rec.rot_axis is not None:
                 ctx.check_exp(work, is_choi=False)
@@ -803,7 +802,7 @@ def run_query_shot(plan: PreparedQueryPlan, *, realization: Mapping[Any, Any] | 
             return _pack_shot(z_fp, m_arr, ket_f, eff_f, diag)
         return QueryShotTrajectory(m_out, _ldexp(*z_fp), tr.expansion, tr.final_tableau, tr.selector_bits, diag) if z_fp[0] > 0.0 else _pack_shot(_FP_ZERO, m_out, _empty_se(plan.num_total_qubits, plan.atol), f_pin, diag)
 
-def run_query_batch(plan: PreparedQueryPlan, batch_size: int, *, rng: np.random.Generator | int | None = None, fault_realizations: Sequence[Mapping[Any, Any] | None] | Mapping[Any, Any] | None = None, sweep_bits: Any = None, extract_data: bool = False, retain_states: bool = True) -> tuple[NDArray[np.bool_], list[QueryShotTrajectory]]:
+def run_query_batch(plan: PreparedQueryPlan, batch_size: int, *, rng: np.random.Generator | int | None = None, fault_realizations: Sequence[Mapping[Any, Any] | None] | Mapping[Any, Any] | None = None, sweep_bits: Any = None, extract_data: bool = False) -> tuple[NDArray[np.bool_], list[QueryShotTrajectory]]:
     """Execute `batch_size` shots reusing `plan`'s cached segment tree across the batch."""
     if not isinstance(plan, PreparedQueryPlan):
         raise TypeError(f"Expected PreparedQueryPlan, got {type(plan)!r}")
@@ -819,5 +818,5 @@ def run_query_batch(plan: PreparedQueryPlan, batch_size: int, *, rng: np.random.
     for s in range(b_sz):
         traj = run_query_shot(plan, realization=f_seq[s], sweep_bits=s_seq[s], rng=rng_obj, extract_data=extract_data)
         records[s] = traj.measurements
-        trajectories.append(traj) if retain_states else None
+        trajectories.append(traj)
     return records, trajectories

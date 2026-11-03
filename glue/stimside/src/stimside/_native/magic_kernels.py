@@ -18,13 +18,11 @@ from stimside._native._kernel_loader import (
 )
 
 _LIB_INSTANCE: ctypes.CDLL | None = None
-_find_prebuilt_so_candidate = None
 
 _sz, _c_u8, _c_int = ctypes.c_size_t, ctypes.c_uint8, ctypes.c_int
 _c_i32, _c_dbl = ctypes.c_int32, ctypes.c_double
 
 _SPECS: tuple[AbiSpec, ...] = (
-    ("magic_abi_v1", [], _c_i32),
     (
         "magic_apply_pauli_batch",
         [_sz, _sz, _sz, _c_double_p, _c_u64_p, _c_u8_p, _c_u64_p, _c_u64_p, _c_u64_p, _c_u64_p, _c_u8],
@@ -91,11 +89,4 @@ def _resolve_magic_kernels_so(force_recompile: bool = False) -> Path:
 
 
 def get_magic_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
-    """Locate (or compile if needed) and return the cached ctypes CDLL for `magic_kernels.cpp`."""
-    return get_lib(
-        sys.modules[__name__],
-        "magic_kernels",
-        "magic_abi_v2",
-        _SPECS,
-        force_recompile=force_recompile,
-    )
+    return get_lib(sys.modules[__name__], "magic_kernels", "magic_abi_v2", _SPECS, force_recompile=force_recompile)

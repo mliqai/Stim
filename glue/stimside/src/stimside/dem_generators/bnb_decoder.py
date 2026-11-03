@@ -40,10 +40,9 @@ from stimside.dem_generators.dem_decoding import (
     matching_supports,
 )
 from stimside.dem_generators.dem_generator_marginal import (
-    Analysis,
-    Builder,
     MarginalLeakageDemGenerator,
 )
+from stimside.dem_generators.marginal_builder import Analysis, Builder
 from stimside.dem_generators.graphlike import nodes_edge_key, prob_xor
 from stimside.dem_generators.leakage_decoder import (
     CompiledLeakageDecoder,
@@ -640,10 +639,6 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
             bitorder="little",
         )
         rw_list = []
-        # One array per distinct accepted graph: a non-PyMatching decoder then
-        # compiles once per graph and batch (decode_with_edge_reweights groups
-        # the shots by array identity).
-        shared: dict[tuple[Any, ...], NDArray[np.float64]] = {}
         groups: dict[tuple[Any, ...], list[int]] = {}
         for s in range(rows.shape[0]):
             events = self._events(raised[s])
@@ -651,13 +646,12 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
             self.stats["shots"] += 1
             self.stats[status] += 1
             key = (tuple(events), tuple(sorted(cons.items())))
-            rw_list.append(shared.setdefault(key, rw))
+            rw_list.append(rw)
             groups.setdefault(key, []).append(s)
         if self.hyper_analysis is not None:
             return self._decode_hyper(groups, bit_packed_detection_event_data)
-        decoder = self._get_matcher() if is_pymatching_decoder(self.decoder) else self.decoder
         return decode_with_edge_reweights(
-            decoder, rw_list, bit_packed_detection_event_data, base_dem=self.search_dem
+            self._get_matcher(), rw_list, bit_packed_detection_event_data, base_dem=self.search_dem
         )
 
     def _hyper_dem(self, events: Sequence[int], cons: dict[int, int]) -> stim.DetectorErrorModel:
@@ -676,8 +670,7 @@ class _CompiledBranchAndBoundDecoder(CompiledLeakageDecoder):
             syms = self.hyper_env_syms[f] if c is None else self.hyper_cand_syms[f][c]
             assert syms is not None, f"event {f} has no undecomposed envelope"
             for sym, p in syms.items():
-                q = sym_probs.get(sym)
-                sym_probs[sym] = p if q is None else q + p - 2 * q * p
+                sym_probs[sym] = prob_xor(sym_probs.get(sym, 0.0), p)
         sym_targets = hyper.get_sym_targets()
         dem = hyper.baseline.copy()
         for sym in sorted(sym_probs):

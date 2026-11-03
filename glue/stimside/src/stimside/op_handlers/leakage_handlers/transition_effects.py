@@ -9,11 +9,15 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
+from stimside.op_handlers.leakage_handlers.leakage_parameters import (
+    LeakageConditioningParams,
+    LeakageMeasurementParams,
+    LeakageSwapParams,
+    LeakageTransition1Params,
+    LeakageTransition2Params,
+)
+
 if TYPE_CHECKING:
-    from stimside.op_handlers.leakage_handlers.leakage_parameters import (
-        LeakageTransition1Params,
-        LeakageTransition2Params,
-    )
     from stimside.simulator_tableau import TablesideSimulator
 
 
@@ -209,20 +213,84 @@ def eval_allowed_state_mask(
     target_states: NDArray[Any],
     is_classical: NDArray[np.bool_],
     allowed_group: Sequence[int | str],
-    full_list: Any,
+    full_list: Any = None,
 ) -> NDArray[np.bool_]:
     """Evaluate allowed-state membership mask for 1Q or 2Q Tableau/Coset targets."""
     mask = np.zeros(target_states.shape, dtype=np.bool_)
     for st in allowed_group:
         if st == "U":
             mask |= is_classical | (target_states < 2)
-        elif isinstance(st, int):
-            mask |= (is_classical & (st < 2)) | ((~is_classical) & (target_states == st))
         else:
-            raise ValueError(
-                f"Unrecognised allowed state {st} in allowed_st_list {full_list}"
-            )
+            st_i = int(st)
+            mask |= (is_classical & (st_i < 2)) | ((~is_classical) & (target_states == st_i))
     return mask
+
+
+def dispatch_tagged_leakage_op(
+    handler: Any,
+    op: stim.CircuitInstruction,
+    sss: Any,
+    *,
+    state2d: NDArray[np.uint8] | None = None,
+) -> None:
+    """Dispatch a parsed leakage op on ``handler`` and record u2l / leakage events on ``sss``."""
+    params = handler.ops_to_params[op]
+    is_transition = isinstance(
+        params, (LeakageTransition1Params, LeakageTransition2Params, LeakageSwapParams)
+    )
+    rec_ev = is_transition and getattr(sss, "record_leakage_events", False)
+    if (sss.record_unleaked_to_leaked or rec_ev) and is_transition:
+        if state2d is None:
+            handler._ensure_batch_size(sss.batch_size)
+            state2d = handler._state
+        target_indices = np.unique(
+            [
+                t.qubit_value if t.qubit_value is not None else t.value
+                for t in op.targets_copy()
+                if (t.qubit_value if t.qubit_value is not None else t.value) >= 0
+            ]
+        )
+        was_unleaked = state2d[target_indices, :] < 2
+        old_states = state2d[target_indices, :].copy() if rec_ev else None
+    else:
+        target_indices = None
+        was_unleaked = None
+        old_states = None
+
+    match params:
+        case LeakageConditioningParams():
+            handler.leakage_conditioning(op=op, tss=sss, params=params)
+        case LeakageTransition1Params():
+            handler.leakage_transition_1(op=op, tss=sss, params=params)
+        case LeakageTransition2Params():
+            handler.leakage_transition_2(op=op, tss=sss, params=params)
+        case LeakageMeasurementParams():
+            handler.leakage_measurement(op=op, tss=sss, params=params)
+        case LeakageSwapParams():
+            handler.leakage_swap(op=op, tss=sss)
+        case _:
+            raise ValueError(f"Unrecognised LEAKAGE params: {params}")
+
+    if state2d is None:
+        state2d = getattr(handler, "_state", None)
+    if (
+        sss.record_unleaked_to_leaked
+        and was_unleaked is not None
+        and target_indices is not None
+        and state2d is not None
+    ):
+        counts = np.count_nonzero(was_unleaked & (state2d[target_indices, :] >= 2), axis=0)
+        sss._record_unleaked_to_leaked_counts(counts, sss._circuit_time)
+    if old_states is not None and target_indices is not None and state2d is not None:
+        new_states = state2d[target_indices, :]
+        for i_q, b in zip(*np.nonzero(old_states != new_states)):
+            sss._record_leakage_event(
+                sss._circuit_time,
+                target_indices[i_q],
+                old_states[i_q, b],
+                new_states[i_q, b],
+                shot_idx=int(b),
+            )
 
 
 def exec_leakage_swap(

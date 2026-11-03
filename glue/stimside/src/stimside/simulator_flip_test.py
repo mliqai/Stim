@@ -147,28 +147,6 @@ class TestFlipsideSimulator:
         assert np.any(before_xs[1] != np.logical_not(before_xs[1]))
         assert np.any(before_xs[3] != np.logical_not(before_xs[3]))
 
-    def test_get_all_clean_known_state(self):
-        # for actual tests of the known state behaviour, see known_states_util_test
-        circuit = stim.Circuit(
-            """
-            R 0 1 2 3
-            X 1
-            H 2 3
-            M 3
-        """
-        )
-        fss = self.make_simulator(circuit)
-        fss.run()
-
-        pX, mX, pY, mY, pZ, mZ = fss._get_all_clean_known_state(circuit_time=4)
-
-        assert pX.tolist() == [False, False, True, False]
-        assert mX.tolist() == [False, False, False, False]
-        assert pY.tolist() == [False, False, False, False]
-        assert mY.tolist() == [False, False, False, False]
-        assert pZ.tolist() == [True, False, False, False]
-        assert mZ.tolist() == [False, True, False, False]
-
     def test_get_clean_known_states(self):
         circuit = stim.Circuit(
             """

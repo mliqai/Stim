@@ -1592,11 +1592,8 @@ def test_malformed_magic_and_clifford_fault_tags_raise(bad_circuit_text: str) ->
 
 def test_malformed_gate_args_and_programmatic_channels_raise() -> None:
     """Verify non-empty `gate_args` on `I[T]`/`I[CLIFFORD_FAULT]` and bad `CliffordFaultChannel` raise `ValueError`."""
-    from stimside._magic.compile import (
-        _validate_and_emit_magic_op,
-        parse_clifford_fault_instruction,
-    )
-    from stimside.util.reference_chp import ReferenceCHPTableau
+    from stimside._magic.compile import parse_clifford_fault_instruction
+    from stimside.op_handlers.leakage_handlers.tag_registry import validate_magic_op
 
     class _MockOpWithArgs:
         def __init__(self, name: str, tag: str, args: Sequence[float]) -> None:
@@ -1624,7 +1621,7 @@ def test_malformed_gate_args_and_programmatic_channels_raise() -> None:
                 parse_clifford_fault_instruction(mock_op, 0)  # type: ignore[arg-type]
         else:
             with pytest.raises(ValueError):
-                _validate_and_emit_magic_op(mock_op, ReferenceCHPTableau(1), [])  # type: ignore[arg-type]
+                validate_magic_op(mock_op)  # type: ignore[arg-type]
 
     # Programmatic FaultBranch / CliffordFaultChannel validation & out-of-range step_index
     with pytest.raises(ValueError):

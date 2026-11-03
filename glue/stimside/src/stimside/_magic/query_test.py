@@ -218,15 +218,16 @@ def test_budget_raise_fallback_and_m4_batch_hooks() -> None:
 def test_runtime_atol_enforcement_and_no_hidden_stream_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify runtime atol drift raises FloatingPointError and non-fallback paths never call run_direct/run_selector."""
     import stimside._magic.compile as mc
+    import stimside._magic.phase_qfe as pq
     import stimside._magic.query as mq
     import stimside._magic.trajectory as mt
 
-    orig_pd, orig_acb = mq.project_diagonal, mq.apply_compiled_block
+    orig_pd, orig_acb = pq.project_diagonal, mq.apply_compiled_block
     for bad_z in (0.1, float("nan")):
-        monkeypatch.setattr(mq, "project_diagonal", lambda t, b, s=0, o=0, _z=bad_z, **kw: (orig_pd(t, b, s, o, **kw)[0], _z))
+        monkeypatch.setattr(pq, "project_diagonal", lambda t, b, s=0, o=0, _z=bad_z, **kw: (orig_pd(t, b, s, o, **kw)[0], _z))
         with pytest.raises(FloatingPointError):
             EvaluateQueries(PrepareQueries(stim.Circuit("H 0\nM 0"), atol=1e-10), {"measurements": {0: 0}})
-    monkeypatch.setattr(mq, "project_diagonal", orig_pd)
+    monkeypatch.setattr(pq, "project_diagonal", orig_pd)
     monkeypatch.setattr(mq, "apply_compiled_block", lambda e, b, **kw: (lambda o: (setattr(o, "weights", o.weights * 0.5), o)[1])(orig_acb(e, b, **kw)))
     with pytest.raises(FloatingPointError):
         EvaluateQueries(PrepareQueries(stim.Circuit("H 0\nI[T] 0\nI[CLIFFORD_FAULT: (0.2, H)] 0\nI[T] 0\nM 0"), atol=1e-10), {"faults": {0: 1}, "measurements": {0: 0}})
@@ -473,12 +474,12 @@ def test_quantum_measurements_query_and_fallback_stream_parity(fault_mode: str) 
 
 
 def test_query_born_split_rejects_negative_mass_matching_magic_compile(monkeypatch: pytest.MonkeyPatch) -> None:
-    import stimside._magic.query as mq
-    from stimside._magic.phase_qfe import project_diagonal as real_pd
+    import stimside._magic.phase_qfe as pq
 
+    real_pd = pq.project_diagonal
     plan = PrepareQueries(stim.Circuit("H 0\nI[T] 0\nM 0"), atol=1e-2)
     monkeypatch.setattr(
-        mq,
+        pq,
         "project_diagonal",
         lambda exp, bd, sg, outcome: (real_pd(exp, bd, sg, outcome)[0], -1e-4 if outcome == 0 else exp.norm_sq()),
     )

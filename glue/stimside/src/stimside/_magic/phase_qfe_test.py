@@ -16,24 +16,21 @@ from stimside._magic.phase_qfe import (
     ImpossiblePostselectionError,
     PhaseQFEComponent,
     ShotExpansion,
-    add_column,
     apply_ccz,
     apply_compiled_block,
     apply_pauli,
     apply_pauli_t,
     apply_quarter_turn,
     coerce_pauli_words,
-    drop_variable,
-    eliminate_zero_amplitude,
+    contract_choi_expansions,
     get_bits_at_qubits,
-    make_principal,
     measure_expansion,
     merge_frames,
     n_words_for_qubits,
     pauli_multiply,
     project_diagonal,
-    restrict_amplitude,
     unit_bit_words,
+    word_dot_parity,
 )
 from stimside.util.bitwords import unpack_bit_vector
 from stimside.util.reference_chp import ReferenceCHPTableau
@@ -215,118 +212,185 @@ def test_component_zero_and_invariants() -> None:
         bad_diag.check_invariants()
 
 
-def test_h0_drop_variable() -> None:
+def _contract_zero_column_via_choi(
+    base: PhaseQFEComponent,
+    j: int,
+    c0: int,
+    lam: np.ndarray,
+    *,
+    weight: complex = 1.0 + 0.0j,
+) -> ShotExpansion:
+    """Contract a formal zero column at index `j` using `contract_choi_expansions` (C++ `WorkShot` H4)."""
+    n = base.n_qubits
+    d0 = base.d
+    nw_ext = n_words_for_qubits(n + 1)
+    nw_choi = n_words_for_qubits(n + 2)
+
+    h_ext = np.zeros(nw_ext, dtype=np.uint64)
+    h_ext[: base.n_words] = base.h_words
+    A_base_ext = np.zeros((d0, nw_ext), dtype=np.uint64)
+    if d0 > 0:
+        A_base_ext[:, : base.n_words] = base.A_words
+    A_ext = np.insert(A_base_ext, j, unit_bit_words(n, nw_ext), axis=0)
+    ell_ext = np.insert(base.ell, j, np.uint8(c0))
+    G_ext = np.insert(np.insert(base.Gamma, j, 0, axis=0), j, 0, axis=1)
+    rem_idx = [idx for idx in range(d0 + 1) if idx != j]
+    G_ext[j, rem_idx] = lam
+    G_ext[rem_idx, j] = lam
+    piv_ext = np.insert(base.pivots, j, np.int32(n))
+
+    right = ShotExpansion.from_component(
+        PhaseQFEComponent(
+            n_qubits=n + 1,
+            d=d0 + 1,
+            h_words=h_ext,
+            A_words=np.ascontiguousarray(A_ext),
+            ell=np.ascontiguousarray(ell_ext),
+            Gamma=np.ascontiguousarray(G_ext),
+            pivots=np.ascontiguousarray(piv_ext),
+        ),
+        weight=weight,
+    )
+    left = ShotExpansion.from_component(
+        PhaseQFEComponent(
+            n_qubits=n + 2,
+            d=1,
+            h_words=np.zeros(nw_choi, dtype=np.uint64),
+            A_words=unit_bit_words(n + 1, nw_choi).reshape(1, nw_choi),
+            ell=np.zeros(1, dtype=np.uint8),
+            Gamma=np.zeros((1, 1), dtype=np.uint8),
+            pivots=np.array([n + 1], dtype=np.int32),
+        )
+    )
+    return contract_choi_expansions(left, right, n_op=n + 1, q_act=[n], right_is_choi=False)
+
+
+def test_h0_drop_variable_via_project_diagonal() -> None:
     rng = np.random.default_rng(101)
     n = 5
     for d in [1, 2, 4]:
         for j in sorted({0, d // 2, d - 1}):
             comp = random_valid_component(rng, n, d)
-            # Zero out generator j so formal sum over u_j gives exact factor 2 * 2^(-1/2) = sqrt(2)
-            comp.A_words[j] = np.zeros(comp.n_words, dtype=np.uint64)
-            comp.ell[j] = np.uint8(0)
-            comp.Gamma[j, :] = 0
-            comp.Gamma[:, j] = 0
-            ket_before = formal_qfe_ket_le(
-                n, comp.h_words, comp.A_words, comp.ell, comp.Gamma
+            keep_cols = [c for c in range(d) if c != j]
+            ket_dropped = formal_qfe_ket_le(
+                n,
+                comp.h_words,
+                comp.A_words[keep_cols],
+                comp.ell[keep_cols],
+                comp.Gamma[np.ix_(keep_cols, keep_cols)],
             )
             expected_pivots = np.delete(comp.pivots, j)
 
             exp = ShotExpansion.from_component(comp, weight=0.7 - 0.3j)
-            drop_variable(exp, j)
+            b_piv = unit_bit_words(int(comp.pivots[j]), comp.n_words)
+            sig = int(word_dot_parity(comp.h_words, b_piv))
+            proj, _ = project_diagonal(exp, b_piv, sigma=sig, outcome=0)
 
-            exp.check_invariants()
-            assert np.array_equal(exp.pivots, expected_pivots)
+            proj.check_invariants()
+            assert proj.d == d - 1
+            assert np.array_equal(proj.pivots, expected_pivots)
             assert (
                 np.max(
                     np.abs(
-                        _SQRT2 * exp.to_statevector() - (0.7 - 0.3j) * ket_before
+                        _SQRT2 * proj.to_statevector() - (0.7 - 0.3j) * ket_dropped
                     )
                 )
                 < 1e-14
             )
 
 
-def test_h1_add_column_all_mod4_cases() -> None:
-    rng = np.random.default_rng(102)
-    n, d = 5, 3
-    base = random_valid_component(rng, n, d)
-    with pytest.raises(ValueError):
-        add_column(ShotExpansion.from_component(base), 1, 1)
+def test_h1_add_column_all_mod4_cases_via_quarter_turn() -> None:
+    n = 6
+    nw = n_words_for_qubits(n)
+    # Columns 0, 1 on qubits 0..3 with pivots 0, 1; qubits 4 and 5 are free for the new column 2.
+    A_base = np.array([[0b0101], [0b1010]], dtype=np.uint64)
+    piv_base = np.array([0, 1], dtype=np.int32)
+    h_zero = np.zeros(nw, dtype=np.uint64)
 
-    for r, s in [(0, 1), (2, 0)]:
-        k = 3 - r - s
+    for r in (0, 1):
+        k = 1 - r
+        a_w = A_base[r] ^ unit_bit_words(4, nw) ^ unit_bit_words(5, nw)
+        a_bits = unpack_bit_vector(a_w, n)
         for ell_r, ell_s, g_rs, g_rk, g_sk in itertools.product(
             range(4), range(4), range(2), range(2), range(2)
         ):
-            comp = base.copy()
-            comp.ell[r] = np.uint8(ell_r)
-            comp.ell[s] = np.uint8(ell_s)
-            comp.Gamma[:, :] = 0
-            comp.Gamma[r, s] = comp.Gamma[s, r] = np.uint8(g_rs)
-            comp.Gamma[r, k] = comp.Gamma[k, r] = np.uint8(g_rk)
-            comp.Gamma[s, k] = comp.Gamma[k, s] = np.uint8(g_sk)
-
-            ket_before = formal_qfe_ket_le(
-                n, comp.h_words, comp.A_words, comp.ell, comp.Gamma
+            G_base = np.zeros((2, 2), dtype=np.uint8)
+            G_base[r, k] = G_base[k, r] = np.uint8(g_rk)
+            ell_base = np.zeros(2, dtype=np.uint8)
+            ell_base[r] = np.uint8(ell_r)
+            ell_base[k] = np.uint8(1)
+            comp = PhaseQFEComponent(
+                n_qubits=n,
+                d=2,
+                h_words=h_zero.copy(),
+                A_words=A_base.copy(),
+                ell=ell_base,
+                Gamma=G_base,
+                pivots=piv_base.copy(),
             )
-            exp = ShotExpansion.from_component(comp)
-            add_column(exp, r, s)
+            # Choose b_w on {piv[r], piv[k], 5} so A[r].b == g_rs, A[k].b == g_sk,
+            # and base_c = (kap + 1) & 3 equals ell_s with Hermitian (kap ^ (a.b)) & 1 == 0.
+            want_ab_parity = 1 - (ell_s & 1)
+            b_q5 = g_rs ^ want_ab_parity
+            b_w = np.zeros(nw, dtype=np.uint64)
+            if g_rs:
+                b_w ^= unit_bit_words(int(piv_base[r]), nw)
+            if g_sk:
+                b_w ^= unit_bit_words(int(piv_base[k]), nw)
+            if b_q5:
+                b_w ^= unit_bit_words(5, nw)
+            kap = (ell_s - 1) & 3
 
-            assert int(exp.Gamma[r, s]) == (g_rs ^ (ell_r & 1))
-            assert int(exp.ell[0, s]) == ((ell_s + ell_r + 2 * g_rs) & 3)
-            ket_exp = formal_qfe_ket_le(
-                n, exp.h_words[0], exp.A_words, exp.ell[0], exp.Gamma
-            )
-            assert np.max(np.abs(ket_exp - ket_before)) < 1e-14
+            ket_before = comp.to_statevector()
+            exp = apply_quarter_turn(ShotExpansion.from_component(comp), a_w, b_w, kap)
+
+            exp.check_invariants()
+            assert exp.d == 3 and int(exp.pivots[2]) == 4
+            assert int(exp.Gamma[r, 2]) == (g_rs ^ (ell_r & 1))
+            assert int(exp.Gamma[k, 2]) == (g_sk ^ g_rk)
+            assert int(exp.ell[0, 2]) == ((ell_s + ell_r + 2 * g_rs) & 3)
+            ket_want = dense_quarter_turn_le(n, a_bits, unpack_bit_vector(b_w, n), kap, 1) @ ket_before
+            assert np.max(np.abs(exp.to_statevector() - ket_want)) < 1e-14
 
 
-def test_h2_make_principal() -> None:
+def test_h2_make_principal_via_quarter_turn() -> None:
     rng = np.random.default_rng(103)
     n = 6
-    for d in [1, 3, 5]:
-        comp = random_valid_component(rng, n, d)
-        j = d - 1
-        # Pick non-pivot qubit or force bit p = 1 in column j and several other columns
-        non_pivs = [q for q in range(n) if q not in set(comp.pivots[:j].tolist())]
+    for d0 in [1, 3, 4]:
+        comp = random_valid_component(rng, n, d0)
+        non_pivs = [q for q in range(n) if q not in set(comp.pivots.tolist())]
         p = non_pivs[-1]
-        comp.A_words[j] |= unit_bit_words(p, comp.n_words)
-        for col_s in range(j):
+        for col_s in range(d0):
             comp.A_words[col_s] |= unit_bit_words(p, comp.n_words)
 
-        ket_before = formal_qfe_ket_le(
-            n, comp.h_words, comp.A_words, comp.ell, comp.Gamma
-        )
-        exp = ShotExpansion.from_component(comp)
-        make_principal(exp, j, p)
+        ket_before = comp.to_statevector()
+        a_w = unit_bit_words(p, comp.n_words)
+        b_w = np.zeros(comp.n_words, dtype=np.uint64)
+        exp = apply_quarter_turn(ShotExpansion.from_component(comp), a_w, b_w, 0)
 
         exp.check_invariants()
-        assert int(exp.pivots[j]) == p
-        assert np.max(np.abs(exp.to_statevector() - ket_before)) < 1e-14
-
-    comp_zero_bit = PhaseQFEComponent.zero(4)
-    comp_zero_bit.A_words = np.zeros((1, 1), dtype=np.uint64)
-    comp_zero_bit.ell = np.zeros(1, dtype=np.uint8)
-    comp_zero_bit.Gamma = np.zeros((1, 1), dtype=np.uint8)
-    comp_zero_bit.pivots = np.array([-1], dtype=np.int32)
-    comp_zero_bit.d = 1
-    with pytest.raises(ValueError):
-        make_principal(ShotExpansion.from_component(comp_zero_bit), 0, 2)
+        assert exp.d == d0 + 1
+        assert int(exp.pivots[d0]) == p
+        ket_want = dense_quarter_turn_le(
+            n, unpack_bit_vector(a_w, n), np.zeros(n, dtype=np.uint8), 0, 1
+        ) @ ket_before
+        assert np.max(np.abs(exp.to_statevector() - ket_want)) < 1e-14
 
 
-def test_h3_restrict_amplitude_all_three_cases() -> None:
+def test_h3_restrict_amplitude_all_three_cases_via_project_diagonal() -> None:
     rng = np.random.default_rng(104)
     n = 5
     for d in range(5):
         comp = random_valid_component(rng, n, d)
-        lam0 = np.zeros(d, dtype=np.uint8)
+        b0 = np.zeros(comp.n_words, dtype=np.uint64)
 
-        e1 = ShotExpansion.from_component(comp)
-        restrict_amplitude(e1, lam0, 0)
-        assert e1.chi == 1 and complex(e1.weights[0]) == 1.0 + 0.0j and e1.d == d
+        e1, z1 = project_diagonal(ShotExpansion.from_component(comp), b0, sigma=0, outcome=0)
+        assert e1.chi == 1 and abs(abs(complex(e1.weights[0])) - 1.0) < 1e-14 and e1.d == d
+        assert abs(z1 - 1.0) < 1e-14
+        assert np.max(np.abs(e1.to_statevector() - comp.to_statevector())) < 1e-14
 
-        e2 = ShotExpansion.from_component(comp)
-        restrict_amplitude(e2, lam0, 1)
-        assert e2.chi == 0 and e2.d == d
+        e2, z2 = project_diagonal(ShotExpansion.from_component(comp), b0, sigma=0, outcome=1)
+        assert e2.chi == 0 and e2.d == d and z2 == 0.0
 
     for d in [1, 2, 4]:
         for weight_target in [w for w in (1, 2, 4) if w <= d]:
@@ -340,7 +404,6 @@ def test_h3_restrict_amplitude_all_three_cases() -> None:
                     comp.ell[int(np.min(chosen))] = np.uint8(ell_val)
 
                     before = comp.to_statevector()
-                    # Oracle: restrict basis index x in coset where lam . ((x ^ h)[pivots]) == eps
                     h_bits = unpack_bit_vector(comp.h_words, n)
                     expected = np.zeros_like(before)
                     for x in range(1 << n):
@@ -353,8 +416,13 @@ def test_h3_restrict_amplitude_all_three_cases() -> None:
                         if (int(lam @ u) & 1) == eps:
                             expected[x] = before[x]
 
-                    exp = ShotExpansion.from_component(comp)
-                    restrict_amplitude(exp, lam, eps)
+                    b_w = np.zeros(comp.n_words, dtype=np.uint64)
+                    for c_idx in np.flatnonzero(lam):
+                        b_w ^= unit_bit_words(int(comp.pivots[int(c_idx)]), comp.n_words)
+                    sig = int(word_dot_parity(comp.h_words, b_w))
+                    exp, _ = project_diagonal(
+                        ShotExpansion.from_component(comp), b_w, sigma=sig, outcome=eps
+                    )
 
                     assert exp.chi == 1 and abs(abs(complex(exp.weights[0])) - _INV_SQRT2) < 1e-14
                     assert exp.d == d - 1
@@ -362,7 +430,7 @@ def test_h3_restrict_amplitude_all_three_cases() -> None:
                     assert np.max(np.abs(exp.to_statevector() - expected)) < 1e-14
 
 
-def test_h4_eliminate_zero_amplitude_all_four_cases() -> None:
+def test_h4_eliminate_zero_amplitude_all_four_cases_via_choi_and_quarter_turn() -> None:
     rng = np.random.default_rng(105)
     n = 5
     for d0 in [0, 1, 2, 3]:
@@ -377,48 +445,56 @@ def test_h4_eliminate_zero_amplitude_all_four_cases() -> None:
                         lam_choices.append(lv)
                 for lam in lam_choices:
                     base = random_valid_component(rng, n, d0)
-                    # Insert a zero column at position j
-                    A_new = np.insert(
+                    A_formal = np.insert(
                         base.A_words, j, np.zeros(base.n_words, dtype=np.uint64), axis=0
                     )
-                    ell_new = np.insert(base.ell, j, np.uint8(c0))
-                    G_new = np.insert(np.insert(base.Gamma, j, 0, axis=0), j, 0, axis=1)
+                    ell_formal = np.insert(base.ell, j, np.uint8(c0))
+                    G_formal = np.insert(np.insert(base.Gamma, j, 0, axis=0), j, 0, axis=1)
                     rem_idx = [idx for idx in range(d0 + 1) if idx != j]
-                    G_new[j, rem_idx] = lam
-                    G_new[rem_idx, j] = lam
-                    piv_new = np.insert(base.pivots, j, np.int32(-1))
-
-                    comp = PhaseQFEComponent(
-                        n_qubits=n,
-                        d=d0 + 1,
-                        h_words=base.h_words.copy(),
-                        A_words=np.ascontiguousarray(A_new),
-                        ell=np.ascontiguousarray(ell_new),
-                        Gamma=np.ascontiguousarray(G_new),
-                        pivots=np.ascontiguousarray(piv_new),
-                    )
+                    G_formal[j, rem_idx] = lam
+                    G_formal[rem_idx, j] = lam
                     ket_before = formal_qfe_ket_le(
-                        n, comp.h_words, comp.A_words, comp.ell, comp.Gamma
+                        n, base.h_words, A_formal, ell_formal, G_formal
                     )
-                    exp = ShotExpansion.from_component(comp)
-                    eliminate_zero_amplitude(exp, j)
+
+                    exp = _contract_zero_column_via_choi(base, j, c0, lam)
                     exp.check_invariants()
 
                     if c0 & 1:
                         assert exp.chi == 1 and abs(abs(exp.weights[0]) - 1.0) < 1e-14
+                        assert exp.d == d0
                     elif np.any(lam):
                         assert exp.chi == 1 and abs(abs(exp.weights[0]) - 1.0) < 1e-14
                         assert exp.d == d0 - 1
                     elif c0 == 0:
-                        assert exp.chi == 1 and abs(complex(exp.weights[0]) - _SQRT2) < 1e-14
+                        assert exp.chi == 1 and abs(abs(complex(exp.weights[0])) - _SQRT2) < 1e-14
+                        assert exp.d == d0
                     else:
                         assert exp.chi == 0
 
-                    assert np.max(np.abs(exp.to_statevector() - ket_before)) < 1e-14
+                    sv_full = exp.to_statevector()
+                    assert np.max(np.abs(sv_full[: 1 << n] - ket_before)) < 1e-14
+                    assert np.max(np.abs(sv_full[1 << n :])) < 1e-14
 
-    non_zero_col = ShotExpansion.from_component(random_valid_component(rng, 4, 2))
-    with pytest.raises(ValueError):
-        eliminate_zero_amplitude(non_zero_col, 0)
+                    # Also exercise odd-c0 H4 directly through apply_quarter_turn(Z(b))
+                    if (c0 & 1) and j == d0:
+                        b_w = np.zeros(base.n_words, dtype=np.uint64)
+                        for r_idx in np.flatnonzero(lam):
+                            b_w ^= unit_bit_words(int(base.pivots[int(r_idx)]), base.n_words)
+                        hb = int(word_dot_parity(base.h_words, b_w))
+                        kap = (c0 - 1 - 2 * hb) & 3
+                        qt = apply_quarter_turn(
+                            ShotExpansion.from_component(base),
+                            np.zeros(base.n_words, dtype=np.uint64),
+                            b_w,
+                            kap,
+                        )
+                        qt.check_invariants()
+                        assert qt.d == d0 and qt.chi == 1
+                        ket_qt = dense_quarter_turn_le(
+                            n, np.zeros(n, dtype=np.uint8), unpack_bit_vector(b_w, n), kap, 1
+                        ) @ base.to_statevector()
+                        assert np.max(np.abs(qt.to_statevector() - ket_qt)) < 1e-14
 
 
 # ---------------------------------------------------------------------------

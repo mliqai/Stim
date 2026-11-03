@@ -153,22 +153,20 @@ class CompiledMagicsideSampler(CompiledSamplerBase):
         postselected_observables_mask: NDArray[np.uint8] | None = None,
         **sim_kwargs: Any,
     ) -> None:
-        self._init_common(
-            circuit,
-            compiled_op_handler,
-            batch_size,
-            compiled_decoder,
-            needs_records,
-            needs_leakage_events,
-            postselection_mask,
-            postselected_observables_mask,
-        )
-        self.simulator = MagicsideSimulator(
+        sim = MagicsideSimulator(
             circuit=circuit,
             compiled_op_handler=compiled_op_handler,
-            batch_size=self.batch_size,
+            batch_size=int(batch_size),
             seed=seed,
             record_unleaked_to_leaked=True,
-            record_leakage_events=self.needs_leakage_events,
+            record_leakage_events=bool(needs_leakage_events),
             **sim_kwargs,
+        )
+        super().__init__(
+            sim,
+            compiled_decoder,
+            needs_records=needs_records,
+            needs_leakage_events=needs_leakage_events,
+            postselection_mask=postselection_mask,
+            postselected_observables_mask=postselected_observables_mask,
         )

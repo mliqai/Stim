@@ -1,42 +1,11 @@
 from __future__ import annotations
 
-import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
 from stimside._sampling import CompiledSamplerBase, SamplerBase
-from stimside.dem_generators.leakage_decoder import (
-    CompiledLeakageDecoder,
-    LeakageDecoderLike,
-)
-from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler
+from stimside.dem_generators.leakage_decoder import CompiledLeakageDecoder
+from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
 from stimside.simulator_tableau import TablesideSimulator
-
-
-class TablesideSampler(SamplerBase):
-    def __init__(
-        self,
-        op_handler: OpHandler[TablesideSimulator],
-        dem_decoder: LeakageDecoderLike,
-        batch_size: int = 1,
-        seed: int | None = None,
-    ) -> None:
-        super().__init__(op_handler, dem_decoder, batch_size, seed)
-
-    def compiled_sampler_for_task(self, task: sinter.Task) -> sinter.CompiledSampler:
-        circuit = self._require_circuit(task)
-        return CompiledTablesideSampler(
-            circuit=circuit,
-            compiled_op_handler=self.op_handler.compile_op_handler(
-                circuit=circuit, batch_size=self.batch_size
-            ),
-            batch_size=self.batch_size,
-            compiled_dem_decoder=self.dem_decoder.compile_for_task(task),
-            needs_records=self.dem_decoder.needs_records,
-            needs_leakage_events=self.dem_decoder.needs_leakage_events,
-            seed=self._next_compiled_seed(),
-            postselection_mask=task.postselection_mask,
-            postselected_observables_mask=task.postselected_observables_mask,
-        )
 
 
 class CompiledTablesideSampler(CompiledSamplerBase):
@@ -53,16 +22,6 @@ class CompiledTablesideSampler(CompiledSamplerBase):
         postselection_mask: object = None,
         postselected_observables_mask: object = None,
     ) -> None:
-        self._init_common(
-            circuit,
-            compiled_op_handler,
-            batch_size,
-            compiled_dem_decoder,
-            needs_records,
-            needs_leakage_events,
-            postselection_mask,  # type: ignore[arg-type]
-            postselected_observables_mask,  # type: ignore[arg-type]
-        )
         self.tab_simulator = TablesideSimulator(
             circuit=circuit,
             compiled_op_handler=compiled_op_handler,
@@ -70,4 +29,16 @@ class CompiledTablesideSampler(CompiledSamplerBase):
             seed=seed,
             record_leakage_events=needs_leakage_events,
         )
-        self.simulator = self.tab_simulator
+        super().__init__(
+            self.tab_simulator,
+            compiled_dem_decoder,
+            needs_records=needs_records,
+            needs_leakage_events=needs_leakage_events,
+            postselection_mask=postselection_mask,  # type: ignore[arg-type]
+            postselected_observables_mask=postselected_observables_mask,  # type: ignore[arg-type]
+        )
+
+
+class TablesideSampler(SamplerBase):
+    _compiled_cls = CompiledTablesideSampler
+    _default_batch_size = 1

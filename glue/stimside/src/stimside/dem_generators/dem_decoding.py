@@ -51,10 +51,6 @@ def matching_supports(*params: str) -> bool:
     return all(p in sig_params for p in params)
 
 
-def _matching_supports_edge_reweights() -> bool:
-    return matching_supports("edge_reweights")
-
-
 def warn_if_pymatching_hyperedge(
     decoder: object, dem: stim.DetectorErrorModel
 ) -> None:
@@ -266,7 +262,7 @@ def decode_with_edge_reweights(
                 rw_list.append(seen_arrays[rid])
 
     if not hasattr(decoder, "decode_batch") and (
-        not is_pymatching_decoder(decoder) or not _matching_supports_edge_reweights()
+        not is_pymatching_decoder(decoder) or not matching_supports("edge_reweights")
     ):
         eff_base_dem = (
             analysis.matching_base_dem if analysis is not None else None
@@ -389,11 +385,7 @@ def decode_with_generated_dems(
     if isinstance(decoder, str):
         decoder = sinter.BUILT_IN_DECODERS[decoder]
 
-    single_imeta = (
-        get_item_analysis_meta(dems)
-        if isinstance(dems, (stim.DetectorErrorModel, np.ndarray))
-        else None
-    )
+    single_imeta = get_item_analysis_meta(dems)
     regen_spec = _extract_regen_spec(dems, single_imeta)
     if regen_spec is not None:
         orig_dec, orig_rew, gen_inst, circ_inst, rec_inst, evs = regen_spec
@@ -402,11 +394,7 @@ def decode_with_generated_dems(
             dems = gen_inst(
                 circ_inst, rec_inst, decompose_errors=eff_dec, reweight_only=eff_rew, leakage_events=evs
             )
-            single_imeta = (
-                get_item_analysis_meta(dems)
-                if isinstance(dems, (stim.DetectorErrorModel, np.ndarray))
-                else None
-            )
+            single_imeta = get_item_analysis_meta(dems)
         dec_flag, rew_flag = eff_dec, eff_rew
         if bit_packed_dets is None:
             return dems

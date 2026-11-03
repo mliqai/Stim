@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-import sys
 from typing import TYPE_CHECKING, Any
 import weakref
 
@@ -31,6 +30,14 @@ from stimside.util.circuit import apply_coords_op, unroll_circuit
 
 if TYPE_CHECKING:
     from stimside.simulator_tableau import TablesideSimulator
+
+STANDARD_LEAKAGE_PARAM_TYPES = (
+    LeakageConditioningParams,
+    LeakageTransition1Params,
+    LeakageTransition2Params,
+    LeakageMeasurementParams,
+    LeakageSwapParams,
+)
 
 
 _STATE_CODE_MAP = {
@@ -122,17 +129,7 @@ class PrecompiledTablesideCircuit:
         # Not circuit.flattened(): it fuses identical consecutive instructions, desyncing steps from step_to_unrolled_idx.
         unrolled_ops = unroll_circuit(circuit) if has_repeat else list(circuit)
         use_supplied_ops = parsed_ops is not None and all(
-            isinstance(
-                v,
-                (
-                    LeakageConditioningParams,
-                    LeakageTransition1Params,
-                    LeakageTransition2Params,
-                    LeakageMeasurementParams,
-                    LeakageSwapParams,
-                ),
-            )
-            for v in parsed_ops.values()
+            isinstance(v, STANDARD_LEAKAGE_PARAM_TYPES) for v in parsed_ops.values()
         )
         self.parsed_ops: dict[stim.CircuitInstruction, LeakageParams] = {}
 
@@ -311,10 +308,8 @@ class PrecompiledTablesideCircuit:
                     kind = 8
                 elif gate_data.is_single_qubit_gate:
                     kind = 1
-                elif gate_data.is_two_qubit_gate:
-                    kind = 2
                 else:
-                    kind = 8
+                    kind = 2
                 emit(bare_inst, bare_inst, kind)
             else:
                 if isinstance(params, LeakageConditioningParams):
@@ -329,7 +324,7 @@ class PrecompiledTablesideCircuit:
                         and len(cond_groups) == 1
                         and cond_groups[0] == ("U",)
                     ):
-                        kind = 2 if stim.gate_data(op_name).is_two_qubit_gate else 1
+                        kind = 1
                     elif (
                         not params.targets
                         and not has_special_targets
@@ -433,7 +428,7 @@ class PrecompiledTablesideCircuit:
 
                 elif isinstance(params, LeakageMeasurementParams):
                     is_mpad = params.targets is not None
-                    p0, p1 = params.p0, params.p1(is_mpad)
+                    p0, p1 = params.p0, params.p1
                     p2 = params.prob_for_input_state.get(2, 0.0)
                     meas_inst = stim.CircuitInstruction(
                         "M" if is_mpad else op_name, raw_t, []
@@ -554,7 +549,6 @@ class PrecompiledTablesideCircuit:
             if all_branches
             else None
         )
-        self._runner_pool: list[CppTablesideRunner] = []
 
     @property
     def m2d_converter(self) -> Any:
@@ -579,18 +573,6 @@ class PrecompiledTablesideCircuit:
         if self._quantum_bare_circuit is None:
             self._quantum_bare_circuit = _circuit_of(self.quantum_bare_insts)
         return self._quantum_bare_circuit
-
-    def acquire_cpp_runner(self, seed: int) -> "CppTablesideRunner":
-        while self._runner_pool:
-            runner = self._runner_pool.pop()
-            if sys.getrefcount(runner._raw_state) == runner._idle_state_refs:
-                runner.clear(seed)
-                return runner
-        return CppTablesideRunner(self, seed)
-
-    def release_cpp_runner(self, runner: "CppTablesideRunner") -> None:
-        if len(self._runner_pool) < 8:
-            self._runner_pool.append(runner)
 
     def get_full_slice(self, f0: int, f1: int) -> stim.Circuit:
         if f0 == 0 < f1 == len(self.full_bare_insts):
@@ -805,7 +787,6 @@ class CppTablesideRunner:
         self._raw_state = raw_state
         self.state = raw_state if pre.num_qubits == n_alloc else raw_state[: pre.num_qubits]
         del owner, c_buf, raw_state
-        self._idle_state_refs = sys.getrefcount(self._raw_state)
         self._fmt_buf = ctypes.create_string_buffer(32768)
 
     def clear(self, new_seed: int) -> None:
@@ -961,8 +942,8 @@ class CppTablesideRunner:
                                 tss._record_leakage_event(u_idx, q_new, self.state[q_new], out_state)
                         self.state[newly_leaked] = out_state
                         if rec_leak:
-                            tss._record_unleaked_to_leaked_count(
-                                len(newly_leaked), pre.step_to_unrolled_idx[s_trans]
+                            tss._record_unleaked_to_leaked_counts(
+                                np.array([len(newly_leaked)]), pre.step_to_unrolled_idx[s_trans]
                             )
                         self.lib.fast_engine_sync_leaked_mask(self._eng)
                         t_new = " ".join(str(q) for q in newly_leaked)

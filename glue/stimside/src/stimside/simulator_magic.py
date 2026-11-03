@@ -45,9 +45,9 @@ from stimside.util.bitwords import (
 )
 from stimside.util.circuit import (
     apply_coords_op,
+    check_replay,
     format_detector_flips,
     pack_shot_flips,
-    replays,
     stack_measurement_columns,
     unroll_circuit,
 )
@@ -348,7 +348,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         )
         recs, trajs = run_query_batch(
             qplan, self.batch_size, rng=self.np_rng, fault_realizations=q_reals,
-            sweep_bits=self._sweep_mat, extract_data=False, retain_states=True,
+            sweep_bits=self._sweep_mat, extract_data=False,
         )
         self._branch_masses = np.array([t.branch_mass for t in trajs], dtype=np.float64)
         self._finish_compiled_batch(
@@ -529,24 +529,17 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         for row in np.asarray(outcomes_per_target, dtype=np.bool_):
             self._measurement_columns.append(row.copy())
 
-    def _check_interactive_op(self, this: stim.CircuitInstruction) -> None:
-        t, n = self._circuit_time, len(self._unrolled_ops)
-        if t < n and not replays(this, self._unrolled_ops[t]):
-            raise ValueError(f"interactive_do: op {t} `{this}` does not match expected `{self._unrolled_ops[t]}`")
-        if t >= n:
-            if this.name in ("DETECTOR", "OBSERVABLE_INCLUDE"):
-                raise ValueError(f"interactive_do past circuit end cannot execute {this.name}")
-            if this.tag and this.tag not in _MAGIC_TAGS and not this.tag.startswith("CLIFFORD_FAULT"):
-                raise ValueError(f"interactive_do past circuit end does not support tag {this.tag!r}")
-            if this.name not in ("MPAD", "QUBIT_COORDS"):
-                for tgt in this.targets_copy():
-                    if tgt.qubit_value is not None and tgt.qubit_value >= self.num_qubits:
-                        raise ValueError(f"interactive_do qubit {tgt.qubit_value} >= num_qubits={self.num_qubits}")
-
     def _do(self, obj: stim.Circuit | stim.CircuitInstruction | stim.CircuitRepeatBlock) -> None:
         for op in unroll_circuit(obj):
             if self._used_interactively:
-                self._check_interactive_op(op)
+                check_replay(
+                    op,
+                    self._unrolled_ops,
+                    self._circuit_time,
+                    "MagicsideSimulator",
+                    num_qubits=self.num_qubits,
+                    allow_tag=lambda tag: tag in _MAGIC_TAGS or tag.startswith("CLIFFORD_FAULT"),
+                )
             self._do_instruction(op)
 
     def _do_instruction(self, op: stim.CircuitInstruction) -> None:

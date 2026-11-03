@@ -1,4 +1,4 @@
-"""DemGenerator contract and MarginalLeakageDemGenerator(loss_oracle=True)."""
+"""MarginalLeakageDemGenerator contract and loss_oracle=True."""
 
 import pickle
 
@@ -8,15 +8,12 @@ import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
 from stimside.dem_generators import (
-    DemGenerator,
     MarginalDecoder,
     MarginalLeakageDemGenerator,
 )
 from stimside.dem_generators.dem_decoding import decode_with_generated_dems
-from stimside.dem_generators.dem_generator_marginal import (
-    Builder,
-    _match_shot_sources,
-)
+from stimside.dem_generators.dem_generator_marginal import _match_shot_sources
+from stimside.dem_generators.marginal_builder import Builder
 from stimside.dem_generators.dem_generator_marginal_test import (
     REP_CIRCUIT,
     _FUSABLE_TAGS_CIRCUIT,
@@ -68,7 +65,6 @@ def test_base_class_contract(loss_oracle):
         reweight_only=True,
         loss_oracle=loss_oracle,
     )
-    assert isinstance(gen, DemGenerator)
     assert gen.unconditional_condition_on_U is False
     assert gen.decompose_errors and gen.reweight_only
     assert gen.loss_oracle is loss_oracle
@@ -88,8 +84,6 @@ def test_base_class_contract(loss_oracle):
     )
     assert len(out) == 2
     assert out[0] == gen.base_dem(REP_CIRCUIT, decompose_errors=False)
-    with pytest.raises(TypeError):
-        DemGenerator()  # type: ignore[abstract]
 
 
 def test_weighted_mode_ignores_leakage_events():

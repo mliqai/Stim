@@ -1,30 +1,26 @@
-import weakref
 from typing import Literal, Iterable
 
 import numpy as np
 import stim  # type: ignore[import-untyped]
 from numpy.typing import NDArray
 
+from stimside._tableau.runner import (
+    STANDARD_LEAKAGE_PARAM_TYPES,
+    CppTablesideRunner,
+    do_sync_bare_inst,
+    get_precompiled_circuit,
+    run_tableside_sync_rng,
+)
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageConditioningParams,
-    LeakageMeasurementParams,
-    LeakageSwapParams,
     LeakageTransition1Params,
     LeakageTransition2Params,
 )
-from stimside.util.circuit import ShotMajorM2DMixin, apply_coords_op, replays, unroll_circuit
+from stimside.util.circuit import ShotMajorM2DMixin, apply_coords_op, check_replay, unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.seeding import derived_seed
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
-
-_STANDARD_LEAKAGE_PARAM_TYPES = (
-    LeakageConditioningParams,
-    LeakageTransition1Params,
-    LeakageTransition2Params,
-    LeakageMeasurementParams,
-    LeakageSwapParams,
-)
 
 
 class TablesideSimulator(
@@ -135,8 +131,6 @@ class TablesideSimulator(
         )
 
         if type(compiled_op_handler) is CompiledLeakageUint8:
-            from stimside._tableau.runner import get_precompiled_circuit
-
             self._precompiled_circuit = get_precompiled_circuit(
                 circuit,
                 bool(compiled_op_handler.unconditional_condition_on_U),
@@ -160,13 +154,8 @@ class TablesideSimulator(
 
         self._cpp_runner = None
         if not self._sync_tableside_rng and self._precompiled_circuit is not None:
-            self._cpp_runner = self._precompiled_circuit.acquire_cpp_runner(
-                seed=self._tab_seed
-            )
-            weakref.finalize(
-                self,
-                self._precompiled_circuit.release_cpp_runner,
-                self._cpp_runner,
+            self._cpp_runner = CppTablesideRunner(
+                self._precompiled_circuit, seed=self._tab_seed
             )
             if hasattr(self._compiled_op_handler, "state"):
                 np.copyto(self._cpp_runner.state, self._compiled_op_handler.state)
@@ -209,7 +198,7 @@ class TablesideSimulator(
             pre is not None
             and coh.ops_to_params == pre.parsed_ops  # type: ignore[attr-defined]
             and all(
-                isinstance(v, _STANDARD_LEAKAGE_PARAM_TYPES)
+                isinstance(v, STANDARD_LEAKAGE_PARAM_TYPES)
                 for v in coh.ops_to_params.values()  # type: ignore[attr-defined]
             )
         )
@@ -217,8 +206,6 @@ class TablesideSimulator(
         if can_use_fast:
             assert pre is not None
             if self._sync_tableside_rng:
-                from stimside._tableau.runner import run_tableside_sync_rng
-
                 run_tableside_sync_rng(self, pre)
             else:
                 assert self._cpp_runner is not None
@@ -347,21 +334,6 @@ class TablesideSimulator(
         self._circuit_time = 0
         self._used_interactively = False
 
-    def _record_unleaked_to_leaked_count(
-        self, count: int, op_idx: int | None = None, shot_idx: int = 0
-    ) -> None:
-        """Record `count` unleaked-to-leaked transitions at unrolled `op_idx` for `shot_idx`."""
-        if not self.record_unleaked_to_leaked or count <= 0:
-            return
-        if op_idx is None:
-            op_idx = self._circuit_time
-        idx_val = int(op_idx)
-        ev = self._unleaked_to_leaked_events[shot_idx]
-        if count == 1:
-            ev.append(idx_val)
-        else:
-            ev.extend([idx_val] * int(count))
-
     def get_current_circuit_time(self) -> int:
         return self._circuit_time
 
@@ -436,29 +408,9 @@ class TablesideSimulator(
                 self._do(loop_body)
         elif isinstance(this, stim.CircuitInstruction):
             if self._used_interactively:
-                self._check_interactive_op(this)
+                assert self._unrolled_ops is not None
+                check_replay(this, self._unrolled_ops, self._circuit_time, "TablesideSimulator")
             self._do_instruction(this)
-
-    def _check_interactive_op(self, this: stim.CircuitInstruction) -> None:
-        """Raise ValueError unless interactive_do may do `this` now (see interactive_do)."""
-        assert self._unrolled_ops is not None
-        t, n = self._circuit_time, len(self._unrolled_ops)
-        if t < n and not replays(this, self._unrolled_ops[t]):
-            raise ValueError(
-                f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` doesn't match the "
-                "circuit the TablesideSimulator was constructed with, which has "
-                f"`{self._unrolled_ops[t]}` there. Its detector/observable converter and op handler "
-                "are precomputed from that circuit, so interactive_do must replay it in order before "
-                "continuing past its end. Pass the circuit itself or its parts, not "
-                "`circuit.flattened()` or `circuit + more`."
-            )
-        if t >= n and (this.tag or this.name in ("DETECTOR", "OBSERVABLE_INCLUDE")):
-            raise ValueError(
-                f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` is past the end "
-                f"of the circuit the TablesideSimulator was constructed with ({n} operations), "
-                "where tagged operations, DETECTOR and OBSERVABLE_INCLUDE aren't supported: the op "
-                "handler and detector/observable converter only know that circuit."
-            )
 
     def _do_instruction(self, op: stim.CircuitInstruction):
         """for each instruction, update the state of the simulator."""
@@ -474,47 +426,32 @@ class TablesideSimulator(
         self._compiled_op_handler.handle_op(op=op, sss=self)
         self._circuit_time += 1
 
-    def _do_bare_instruction(self, op: stim.Circuit | stim.CircuitInstruction):
-        """
-        To be used by op_handler to apply a stabilizer / error instruction directly
-        to the TableauSimulator. Append to the new reference circuit if being constructed.
-        """
+    def _do_bare_instruction(
+        self,
+        op: stim.Circuit | stim.CircuitInstruction,
+        *,
+        include_in_reference: bool = True,
+    ):
+        """Apply a stabilizer / error instruction to `_new_circuit` (and TableauSimulator if running)."""
+        inc_ref = include_in_reference and self._construct_reference_circuit
         if isinstance(op, stim.Circuit):
             self._new_circuit += op
-            if self._construct_reference_circuit:
+            if inc_ref:
                 self._new_reference_circuit += op
             if self._running_tableau:
                 self._tableau_simulator.do_circuit(op)
         else:
             self._new_circuit.append(op)
-            if self._construct_reference_circuit:
+            if inc_ref:
                 self._new_reference_circuit.append(op)
             if self._running_tableau:
                 if self._sync_tableside_rng:
-                    from stimside._tableau.runner import do_sync_bare_inst
-
                     do_sync_bare_inst(self._tableau_simulator, op)
                 else:
                     self._tableau_simulator.do(op)
 
     def _do_bare_only_on_tableau(self, op: stim.Circuit | stim.CircuitInstruction):
-        """
-        To be used by op_handler to apply a stabilizer / error instruction directly
-        to the TableauSimulator
-        """
-        if isinstance(op, stim.Circuit):
-            self._new_circuit += op
-            if self._running_tableau:
-                self._tableau_simulator.do_circuit(op)
-        else:
-            self._new_circuit.append(op)
-            if self._running_tableau:
-                if self._sync_tableside_rng:
-                    from stimside._tableau.runner import do_sync_bare_inst
-
-                    do_sync_bare_inst(self._tableau_simulator, op)
-                else:
-                    self._tableau_simulator.do(op)
+        self._do_bare_instruction(op, include_in_reference=False)
 
     def _append_to_new_reference_circuit(
         self, op: stim.Circuit | stim.CircuitInstruction

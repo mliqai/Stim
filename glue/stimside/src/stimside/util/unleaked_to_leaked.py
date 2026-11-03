@@ -11,13 +11,11 @@ class UnleakedToLeakedRecordsMixin:
     _circuit_time: int
 
     def _record_unleaked_to_leaked_counts(
-        self, counts: np.ndarray, op_idx: int | None = None
+        self, counts: np.ndarray, op_idx: int
     ) -> None:
         """Record unleaked-to-leaked transition counts per shot at unrolled instruction index `op_idx`."""
         if not self.record_unleaked_to_leaked:
             return
-        if op_idx is None:
-            op_idx = self._circuit_time
         idx_val = int(op_idx)
         events = self._unleaked_to_leaked_events
         for b in np.flatnonzero(counts):

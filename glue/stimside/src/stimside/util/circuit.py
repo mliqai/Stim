@@ -49,6 +49,49 @@ def replays(this: stim.CircuitInstruction, op: stim.CircuitInstruction) -> bool:
     )
 
 
+def check_replay(
+    this: stim.CircuitInstruction,
+    unrolled_ops: list[stim.CircuitInstruction],
+    t: int,
+    sim_name: str,
+    *,
+    allow_extension: bool = True,
+    num_qubits: int | None = None,
+    allow_tag: Any = None,
+) -> None:
+    """Validate an ``interactive_do`` instruction against ``unrolled_ops`` at step ``t``."""
+    n = len(unrolled_ops)
+    if t < n or not allow_extension:
+        if t >= n or not replays(this, unrolled_ops[t]):
+            where = (
+                f"which has `{unrolled_ops[t]}` there"
+                if t < n
+                else f"which ends after {n} operations"
+            )
+            raise ValueError(
+                f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` doesn't match "
+                f"the circuit the {sim_name} was constructed with, {where}. Pass the circuit "
+                "itself or its parts, not `circuit.flattened()` or `circuit + more`."
+            )
+        return
+    if this.name in ("DETECTOR", "OBSERVABLE_INCLUDE") or (
+        this.tag and not (allow_tag is not None and allow_tag(this.tag))
+    ):
+        raise ValueError(
+            f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` is past the end "
+            f"of the circuit the {sim_name} was constructed with ({n} operations)."
+        )
+    if num_qubits is not None and this.name not in ("MPAD", "QUBIT_COORDS"):
+        for tgt in this.targets_copy():
+            q = tgt.qubit_value
+            if q is not None and q >= num_qubits:
+                raise ValueError(
+                    f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` targets "
+                    f"qubit {q}, which the {sim_name} wasn't constructed for "
+                    f"(num_qubits={num_qubits})."
+                )
+
+
 def apply_coords_op(
     op: stim.CircuitInstruction,
     qubit_coords: dict[int, list[float]],

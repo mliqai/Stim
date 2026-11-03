@@ -641,7 +641,7 @@ def test_cpp_format_op_round_trips_high_precision_gate_args():
     assert x_err_args == [p_filt, p_meas]
 
 
-def test_retained_handler_state_survives_gc_cache_eviction_and_pool_reuse():
+def test_retained_handler_state_survives_gc_and_cache_eviction():
     import gc
     import weakref
     from stimside._tableau.runner import _PRECOMPILED_CACHE
@@ -653,9 +653,10 @@ def test_retained_handler_state_survives_gc_cache_eviction_and_pool_reuse():
     owner_ref = weakref.ref(sim1._cpp_runner._raw_state.base.obj._engine_owner)
     sim1.run()
     view1 = coh1.state[:2]
+    base1 = coh1.state.base
     assert view1.tolist() == [2, 0]
 
-    # Pool reuse check: a second simulator while coh1/view1 are alive must not alias or clobber view1.
+    # A second simulator while coh1/view1/base1 are alive gets a fresh runner and cannot clobber view1.
     del sim1
     gc.collect()
     coh2 = LeakageUint8().compile_op_handler(circuit=c, batch_size=1)
@@ -663,7 +664,7 @@ def test_retained_handler_state_survives_gc_cache_eviction_and_pool_reuse():
     sim2.clear()
     assert view1.tolist() == [2, 0]
 
-    # Cache eviction + GC check: FastEngine buffer must stay valid until coh1 & view1 are dropped.
+    # Cache eviction + GC check: FastEngine buffer must stay valid until coh1, view1, & base1 are dropped.
     del sim2, coh2
     _PRECOMPILED_CACHE.clear()
     gc.collect()
@@ -672,7 +673,7 @@ def test_retained_handler_state_survives_gc_cache_eviction_and_pool_reuse():
     coh1.clear()
     assert view1.tolist() == [0, 0]
 
-    del coh1, view1
+    del coh1, view1, base1
     gc.collect()
     assert owner_ref() is None
 

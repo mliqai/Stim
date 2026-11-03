@@ -10,7 +10,6 @@ import stim  # type: ignore[import-untyped]
 from stimside._coset.mrqf_state import MRQFState
 from stimside._coset.reference_compile import (
     CompiledReferenceCircuit,
-    InverseCliffordCocycle,
     MeasStepMeta,
     StepMeta,
     UnitaryStepMeta,
@@ -27,7 +26,7 @@ from stimside.util.bitwords import (
 from stimside.util.circuit import (
     ShotMajorM2DMixin,
     apply_coords_op,
-    replays,
+    check_replay,
     stack_measurement_columns,
     unroll_circuit,
 )
@@ -240,11 +239,10 @@ class CosetsideSimulator(
         self._cpp_dirty = False
 
     def _sync_py_to_cpp(self, *, keep_py_dirty: bool = False) -> None:
-        if self._cpp_eng is None or self._cpp_lib is None:
-            return
         if not self._py_dirty and (self._cpp_dirty or len(self._active_shots) == 0):
             return
         lib = self._cpp_lib
+        assert lib is not None and self._cpp_eng is not None
         lib.engine_clear(self._cpp_eng)
         for b, st in self._active_shots.items():
             d = st._d
@@ -519,41 +517,17 @@ class CosetsideSimulator(
                 self._do(loop_body)
         elif isinstance(this, stim.CircuitInstruction):
             if self._used_interactively:
-                self._check_interactive_op(this)
+                assert self._unrolled_ops is not None
+                check_replay(
+                    this,
+                    self._unrolled_ops,
+                    self._circuit_time,
+                    "CosetsideSimulator",
+                    num_qubits=self.num_qubits,
+                )
             self._do_instruction(this)
         else:
             raise NotImplementedError(f"Unsupported circuit object: {type(this)}")
-
-    def _check_interactive_op(self, this: stim.CircuitInstruction) -> None:
-        """Raise ValueError unless interactive_do may do `this` now (see interactive_do)."""
-        assert self._unrolled_ops is not None
-        t, n = self._circuit_time, len(self._unrolled_ops)
-        if t < n and not replays(this, self._unrolled_ops[t]):
-            raise ValueError(
-                f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` doesn't match the "
-                "circuit the CosetsideSimulator was constructed with, which has "
-                f"`{self._unrolled_ops[t]}` there. Its reference tape, detector/observable converter "
-                "and op handler are precomputed from that circuit, so interactive_do must replay it "
-                "in order before continuing past its end. Pass the circuit itself or its parts, "
-                "not `circuit.flattened()` or `circuit + more`."
-            )
-        if t >= n and (this.tag or this.name in ("DETECTOR", "OBSERVABLE_INCLUDE")):
-            raise ValueError(
-                f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` is past the end "
-                f"of the circuit the CosetsideSimulator was constructed with ({n} operations), "
-                "where tagged operations, DETECTOR and OBSERVABLE_INCLUDE aren't supported: the op "
-                "handler and detector/observable converter only know that circuit."
-            )
-        if t >= n and this.name not in ("MPAD", "QUBIT_COORDS"):  # bit values; an annotation
-            for target in this.targets_copy():
-                q = target.qubit_value  # None for rec, sweep and combiner targets
-                if q is not None and q >= self.num_qubits:
-                    raise ValueError(
-                        f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` targets "
-                        f"qubit {q}, which the CosetsideSimulator wasn't constructed for (its "
-                        f"circuit has num_qubits={self.num_qubits}). Construct it with a circuit "
-                        "that uses all qubits."
-                    )
 
     def _do_instruction(self, op: stim.CircuitInstruction) -> None:
         if apply_coords_op(op, self.qubit_coords, self.qubit_tags, self.coords_shifts):
@@ -563,13 +537,8 @@ class CosetsideSimulator(
         self._compiled_op_handler.handle_op(op=op, sss=self)
         self._circuit_time += 1
 
-    def _do_bare_instruction(self, op: stim.Circuit | stim.CircuitInstruction) -> None:
+    def _do_bare_instruction(self, op: stim.CircuitInstruction) -> None:
         """Execute an unconditional instruction across the reference tape and all B shots."""
-        if isinstance(op, stim.Circuit):
-            for sub_op in op:
-                self._do_bare_instruction(sub_op)
-            return
-
         name = op.name
         if name in ("DETECTOR", "OBSERVABLE_INCLUDE", "TICK", "BARRIER"):
             self._next_step_meta(op)
@@ -607,9 +576,6 @@ class CosetsideSimulator(
 
         if gd.is_noisy_gate:
             self.do_conditional_pauli_noise(op, condition_met_mask=None)
-            return
-
-        self._next_step_meta(op)
 
     def _do_heralded_noise(self, op: stim.CircuitInstruction) -> None:
         raw_targets = op.targets_copy()
@@ -781,7 +747,9 @@ class CosetsideSimulator(
     def _inject_inverse_cocycle_on_shot(
         self,
         b_idx: int,
-        cocycle: InverseCliffordCocycle,
+        f_arrs: list[NDArray],
+        g_idx: int,
+        n_fac: int,
         f_x_local: NDArray[np.bool_],
         f_z_local: NDArray[np.bool_],
     ) -> None:
@@ -791,49 +759,37 @@ class CosetsideSimulator(
             mrqf = MRQFState(self.num_qubits, self._n_words)
             self._active_shots[b_idx] = mrqf
 
-        for factor in cocycle.factors:
-            if factor.kind == "P1":
-                mrqf.p1_apply_pauli(factor.a_words, factor.b_words)
+        f_kinds, f_lx1, f_lz1, f_a1, f_b1, f_k1, f_lx2, f_lz2, f_a2, f_b2, f_k2 = f_arrs
+        fx = f_x_local.astype(np.uint8, copy=False)
+        fz = f_z_local.astype(np.uint8, copy=False)
+        for f_i in range(n_fac):
+            kind = int(f_kinds[g_idx, f_i])
+            a1 = f_a1[g_idx, f_i]
+            b1 = f_b1[g_idx, f_i]
+            if kind == 0:
+                mrqf.p1_apply_pauli(a1, b1)
                 continue
             gamma = (
-                int(
-                    np.count_nonzero(
-                        (factor.local_x & f_z_local)
-                        ^ (factor.local_z & f_x_local)
-                    )
-                )
+                int(np.count_nonzero((f_lx1[g_idx, f_i] & fz) ^ (f_lz1[g_idx, f_i] & fx)))
                 & 1
             )
-            kappa_shot = (factor.kappa + (gamma << 1)) & 3
-            if factor.kind == "PCP":
-                assert (
-                    factor.local_x2 is not None
-                    and factor.local_z2 is not None
-                    and factor.a2_words is not None
-                    and factor.b2_words is not None
-                )
+            kappa_shot = (int(f_k1[g_idx, f_i]) + (gamma << 1)) & 3
+            if kind == 2:
                 gamma2 = (
-                    int(
-                        np.count_nonzero(
-                            (factor.local_x2 & f_z_local)
-                            ^ (factor.local_z2 & f_x_local)
-                        )
-                    )
+                    int(np.count_nonzero((f_lx2[g_idx, f_i] & fz) ^ (f_lz2[g_idx, f_i] & fx)))
                     & 1
                 )
-                kappa2_shot = (factor.kappa2 + (gamma2 << 1)) & 3
+                kappa2_shot = (int(f_k2[g_idx, f_i]) + (gamma2 << 1)) & 3
                 mrqf.p2_apply_controlled_pauli(
-                    factor.a_words,
-                    factor.b_words,
+                    a1,
+                    b1,
                     kappa_shot,
-                    factor.a2_words,
-                    factor.b2_words,
+                    f_a2[g_idx, f_i],
+                    f_b2[g_idx, f_i],
                     kappa2_shot,
                 )
             else:
-                mrqf.p2_apply_quarter_turn(
-                    factor.a_words, factor.b_words, kappa_shot
-                )
+                mrqf.p2_apply_quarter_turn(a1, b1, kappa_shot)
 
     def do_conditional_clifford(
         self,
@@ -942,21 +898,20 @@ class CosetsideSimulator(
                 output_xs=True, output_zs=True
             )
             failed_g_indices = np.flatnonzero(~np.all(condition_met_mask, axis=1))
-            for g_idx_np in failed_g_indices:
-                g_idx = int(g_idx_np)
-                group = step_meta.target_groups[g_idx]
-                failed_shots = np.flatnonzero(~condition_met_mask[g_idx])
-                cocycle = step_meta.get_inverse_cocycle(
-                    g_idx, self.num_qubits, self._n_words
-                )
-                group_arr = np.array(group, dtype=np.intp)
-                for b_idx_np in failed_shots:
-                    b_idx = int(b_idx_np)
-                    f_x_local = xs_base[group_arr, b_idx]
-                    f_z_local = zs_base[group_arr, b_idx]
-                    self._inject_inverse_cocycle_on_shot(
-                        b_idx, cocycle, f_x_local, f_z_local
-                    )
+            if len(failed_g_indices) > 0:
+                _, _, n_fac, _, f_arrs = step_meta.get_cpp_cocycle_arrays(self._n_words)
+                for g_idx_np in failed_g_indices:
+                    g_idx = int(g_idx_np)
+                    group = step_meta.target_groups[g_idx]
+                    failed_shots = np.flatnonzero(~condition_met_mask[g_idx])
+                    group_arr = np.array(group, dtype=np.intp)
+                    for b_idx_np in failed_shots:
+                        b_idx = int(b_idx_np)
+                        f_x_local = xs_base[group_arr, b_idx]
+                        f_z_local = zs_base[group_arr, b_idx]
+                        self._inject_inverse_cocycle_on_shot(
+                            b_idx, f_arrs, g_idx, n_fac, f_x_local, f_z_local
+                        )
             if self._active_shots and any(
                 m.d == 0 for m in self._active_shots.values()
             ):
@@ -970,6 +925,7 @@ class CosetsideSimulator(
         if self._use_cpp and self._cpp_dirty:
             self._sync_cpp_to_py()
         group_pws = step_meta.ensure_group_packed_words(packed_words_before)
+        _, _, n_fac, _, f_arrs = step_meta.get_cpp_cocycle_arrays(self._n_words)
         for g_idx, group in enumerate(step_meta.target_groups):
             if condition_group_fn is not None:
                 self._override_packed_words = (
@@ -985,9 +941,6 @@ class CosetsideSimulator(
             failed_shots = np.where(~cm_row)[0]
             if len(failed_shots) == 0:
                 continue
-            cocycle = step_meta.get_inverse_cocycle(
-                g_idx, self.num_qubits, self._n_words
-            )
             xs_base, zs_base, _, _, _ = self._flip_simulator.to_numpy(
                 output_xs=True, output_zs=True
             )
@@ -997,7 +950,7 @@ class CosetsideSimulator(
                 f_x_local = xs_base[group_arr, b_idx]
                 f_z_local = zs_base[group_arr, b_idx]
                 self._inject_inverse_cocycle_on_shot(
-                    b_idx, cocycle, f_x_local, f_z_local
+                    b_idx, f_arrs, g_idx, n_fac, f_x_local, f_z_local
                 )
             if self._active_shots:
                 self._evict_healed_shots(
@@ -1072,9 +1025,7 @@ class CosetsideSimulator(
                 any_x = False
                 any_z = False
                 for t_idx, gt in enumerate(raw_targets):
-                    q = gt.qubit_value
-                    if q is None:
-                        continue
+                    q = int(gt.qubit_value)  # type: ignore[arg-type]
                     hit = (
                         occurred
                         if condition_met_mask is None
@@ -1183,14 +1134,7 @@ class CosetsideSimulator(
         self._any_z_c.value = 0
 
         if det_batch and use_cpp:
-            m_mat = self._exec_det_batch_cpp(step_meta)
-            self._finish_det_batch(
-                step_meta,
-                op_override,
-                m_mat,
-                self._any_x_c.value,
-                self._any_z_c.value,
-            )
+            self._exec_det_batch_cpp(step_meta, op_override)
             return
 
         def _flush_accum() -> None:
@@ -1313,7 +1257,9 @@ class CosetsideSimulator(
                 step_meta, op_override, len(substeps)
             )
 
-    def _exec_det_batch_cpp(self, step_meta: MeasStepMeta) -> NDArray[np.bool_]:
+    def _exec_det_batch_cpp(
+        self, step_meta: MeasStepMeta, op_override: stim.CircuitInstruction | None
+    ) -> None:
         assert self._cpp_lib is not None and self._cpp_eng is not None
         num_sub = len(step_meta.substeps)
         q_arr, m_ref_arr, b_sub_words = step_meta.get_det_batch_arrays()
@@ -1339,7 +1285,22 @@ class CosetsideSimulator(
             *self._cpp_out_args(),
         )
         self._cpp_dirty = True
-        return m_mat
+        any_x = int(self._any_x_c.value)
+        any_z = int(self._any_z_c.value)
+        if step_meta.produces_measurements:
+            for k_idx, substep in enumerate(step_meta.substeps):
+                row = m_mat[k_idx]
+                self._measurement_columns.append(
+                    ~row if substep.invert_result else row.copy()
+                )
+        if step_meta.is_reset:
+            kick_mat = m_mat ^ m_ref_arr[:, None]
+            if np.any(kick_mat):
+                self._scratch_x_mask[q_arr, :] ^= kick_mat
+                any_x = 1
+        self._flush_xz(any_x, any_z)
+        if step_meta.produces_measurements:
+            self._apply_measurement_flip_noise(step_meta, op_override, num_sub)
 
     def _eval_substep_cpp(
         self, meta: Any, xs_c: NDArray[np.uint8]
@@ -1426,29 +1387,6 @@ class CosetsideSimulator(
                 self._any_z_c.value = 1
         return m_shots
 
-    def _finish_det_batch(
-        self,
-        step_meta: MeasStepMeta,
-        op_override: stim.CircuitInstruction | None,
-        m_mat: NDArray[np.bool_],
-        any_x: int,
-        any_z: int,
-    ) -> None:
-        """Record, reset-kick, flush and flip-noise epilogue of a deterministic batched step (C++ and Python)."""
-        q_arr, m_ref_arr, _ = step_meta.get_det_batch_arrays()
-        if step_meta.produces_measurements:
-            for k_idx, substep in enumerate(step_meta.substeps):
-                row = m_mat[k_idx]
-                self._measurement_columns.append(~row if substep.invert_result else row.copy())
-        if step_meta.is_reset:
-            kick_mat = m_mat ^ m_ref_arr[:, None]
-            if np.any(kick_mat):
-                self._scratch_x_mask[q_arr, :] ^= kick_mat
-                any_x = True
-        self._flush_xz(any_x, any_z)
-        if step_meta.produces_measurements:
-            self._apply_measurement_flip_noise(step_meta, op_override, len(step_meta.substeps))
-
     def _apply_measurement_flip_noise(
         self,
         step_meta: MeasStepMeta,
@@ -1497,8 +1435,8 @@ class CosetsideSimulator(
         e_p[p >> 6] = np.uint64(1 << (p & 63))
         return a_is_zero, sign_bool, (b_rot, e_p, (kap + 1) & 3)
 
-    def _project_and_retire(self, b_idx, mrqf, aw, bw, sign_bool, rot, f_q, m, x2z_w, z2z_w, xs_base, zs_base):
-        """Project shot b_idx onto outcome m (P3, or P2/P3/P2 if a != 0) and retire it if healed; returns kicks."""
+    def _project_and_retire(self, mrqf, aw, bw, sign_bool, rot, f_q, m, x2z_w, z2z_w, xs_base, zs_base):
+        """Project active MRQF state onto outcome m (P3, or P2/P3/P2 if a != 0) and retire if healed; returns kicks."""
         if rot is None:
             mrqf.p3_measure_diagonal(bw, (f_q ^ sign_bool) & 1, requested_bit=m)
         else:
@@ -1506,22 +1444,15 @@ class CosetsideSimulator(
             mrqf.p2_apply_quarter_turn(aw, b_rot, k_rot)
             mrqf.p3_measure_diagonal(e_p, 0, requested_bit=(m ^ f_q) & 1)
             mrqf.p2_apply_quarter_turn(aw, b_rot, (k_rot + 2) & 3)
-        any_x = any_z = False
         if mrqf.d == 0:
-            self._active_shots.pop(b_idx, None)
-            if _words_any_nonzero(mrqf.h_words):
-                hw = mrqf.h_words
-                for qq in range(self.num_qubits):
-                    if _word_dot_parity(z2z_w[qq], hw):
-                        self._scratch_x_mask[qq, b_idx] ^= True
-                        xs_base[qq, b_idx] ^= True
-                        any_x = True
-                    if _word_dot_parity(x2z_w[qq], hw):
-                        self._scratch_z_mask[qq, b_idx] ^= True
-                        if zs_base is not None:
-                            zs_base[qq, b_idx] ^= True
-                        any_z = True
-        return any_x, any_z
+            return self._evict_healed_shots(
+                (x2z_w, z2z_w),
+                xs_base=xs_base,
+                zs_base=zs_base,
+                accum_x_mask=self._scratch_x_mask,
+                accum_z_mask=self._scratch_z_mask,
+            )
+        return False, False
 
     def do_unmatched_noisy_reset_z(
         self,
@@ -1626,7 +1557,7 @@ class CosetsideSimulator(
                         mrqf = MRQFState(self.num_qubits, self._n_words)
                         self._active_shots[b_idx] = mrqf
                     kx, kz = self._project_and_retire(
-                        b_idx, mrqf, aw, bw, sign_bool, rot, f_q, m, x2z_w, z2z_w, xs_base, zs_base
+                        mrqf, aw, bw, sign_bool, rot, f_q, m, x2z_w, z2z_w, xs_base, zs_base
                     )
                     any_x_kick |= kx
                     any_z_kick |= kz
@@ -1688,7 +1619,7 @@ class CosetsideSimulator(
                 mrqf = MRQFState(self.num_qubits, self._n_words)
                 self._active_shots[b_idx] = mrqf
             kx, kz = self._project_and_retire(
-                b_idx, mrqf, aw, bw, sign_bool, rot, f_q, m, x2z_w, z2z_w, xs_base, zs_base
+                mrqf, aw, bw, sign_bool, rot, f_q, m, x2z_w, z2z_w, xs_base, zs_base
             )
             any_x_kick |= kx
             any_z_kick |= kz

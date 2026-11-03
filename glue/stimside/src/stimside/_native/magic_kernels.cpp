@@ -12,28 +12,14 @@
 #include <new>
 #include <vector>
 
-#if defined(_MSC_VER)
-#include <intrin.h>
-#endif
-
 namespace {
 
 inline int popcount64(uint64_t x) noexcept {
-#if defined(_MSC_VER)
-    return static_cast<int>(__popcnt64(x));
-#else
     return __builtin_popcountll(x);
-#endif
 }
 
 inline int ctz64(uint64_t x) noexcept {
-#if defined(_MSC_VER)
-    unsigned long idx = 0;
-    _BitScanForward64(&idx, x);
-    return static_cast<int>(idx);
-#else
     return __builtin_ctzll(x);
-#endif
 }
 
 // Exact IEEE-754 float64 constants matching phase_qfe.py:91-118 to 0 ULPs.
@@ -745,10 +731,6 @@ struct WorkShot {
 }  // namespace
 
 extern "C" {
-
-int32_t magic_abi_v1() {
-    return 1;
-}
 
 void magic_apply_pauli_batch(
     size_t chi,

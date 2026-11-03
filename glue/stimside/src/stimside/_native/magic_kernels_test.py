@@ -21,7 +21,6 @@ from stimside._magic.compile import (
 from stimside._native import magic_kernels as mk
 
 EXPECTED_SYMBOLS = (
-    "magic_abi_v1",
     "magic_abi_v2",
     "magic_apply_pauli_batch",
     "magic_apply_quarter_turn",
@@ -68,7 +67,6 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
         assert lib1 is lib2
         for sym in EXPECTED_SYMBOLS:
             assert hasattr(lib1, sym), f"Missing symbol {sym}"
-        assert int(lib1.magic_abi_v1()) == 1
         assert int(lib1.magic_abi_v2()) == 2
 
         with pytest.raises(TypeError, match="use_cpp_kernels"):
@@ -80,13 +78,12 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
         tmp_native = tmp_path / "rebuild_pkg" / "src" / "stimside" / "_native"
         tmp_native.mkdir(parents=True)
         (tmp_path / "rebuild_pkg" / "setup.py").write_text("# dummy\n", encoding="utf-8")
-        abi_syms = ("magic_abi_v1", "magic_abi_v2")
         stub_cpp = (
-            'extern "C" {\nint magic_abi_v1() { return 1; }\nint magic_abi_v2() { return 2; }\n'
+            'extern "C" {\nint magic_abi_v2() { return 2; }\n'
             + "".join(
                 f"int {s}() {{ return 0; }}\n"
                 for s in EXPECTED_SYMBOLS
-                if s not in abi_syms
+                if s != "magic_abi_v2"
             )
             + "}\n"
         )
@@ -100,7 +97,6 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
             assert (tmp_native / "libmagic_kernels.so").is_file()
             assert rebuilt is not lib1 and rebuilt._handle != lib1._handle
             assert mk._LIB_INSTANCE is rebuilt
-            assert int(rebuilt.magic_abi_v1()) == 1
             assert int(rebuilt.magic_abi_v2()) == 2
     finally:
         mk._LIB_INSTANCE = lib1 if lib1 is not None else orig_lib

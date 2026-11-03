@@ -9,14 +9,12 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside.util.bitwords import pauli_multiply
 from stimside.util.reference_chp import (
     DetMeasMeta,
     PackedSymplecticTables,
     RandMeasMeta,
     ReferenceCHPTableau,
     get_cached_gate_tableau,
-    pauli_image,
     pauli_image_batch,
 )
 
@@ -156,31 +154,6 @@ def get_inverse_clifford_mrqf_factors(
     return res
 
 
-@dataclasses.dataclass
-class CompiledFaultFactor:
-    """Single compiled P1 (Pauli), P2 (quarter-turn), or PCP (controlled-Pauli) primitive in reference coordinates B_t."""
-
-    kind: Literal["P1", "P2", "PCP"]
-    local_x: NDArray[np.bool_]  # shape (k,)
-    local_z: NDArray[np.bool_]  # shape (k,)
-    a_words: NDArray[np.uint64]  # shape (n_words,)
-    b_words: NDArray[np.uint64]  # shape (n_words,)
-    kappa: int  # in {0, 1, 2, 3}
-    local_x2: NDArray[np.bool_] | None = None
-    local_z2: NDArray[np.bool_] | None = None
-    a2_words: NDArray[np.uint64] | None = None
-    b2_words: NDArray[np.uint64] | None = None
-    kappa2: int = 0
-
-
-@dataclasses.dataclass
-class InverseCliffordCocycle:
-    """Compiled MRQF decomposition of E = U_t^dagger at step t+1 on target group K."""
-
-    targets: tuple[int, ...]
-    factors: tuple[CompiledFaultFactor, ...]
-
-
 class _StepWordsMixin:
     _packed_words: PackedSymplecticTables | None
 
@@ -205,7 +178,6 @@ class UnitaryStepMeta(_StepWordsMixin):
     quantum_op: stim.CircuitInstruction | None = None
     _group_ops: list[stim.CircuitInstruction] | None = None
     _group_packed_words: list[PackedSymplecticTables] | None = None
-    _cocycle_cache: dict[int, InverseCliffordCocycle] = dataclasses.field(default_factory=dict)
     are_groups_disjoint: bool = True
     _packed_words: PackedSymplecticTables | None = None
     _cpp_cocycle_arrays: (
@@ -231,105 +203,13 @@ class UnitaryStepMeta(_StepWordsMixin):
                 tmp_chp.do_unitary(self.gate_name, grp)
                 group_pws.append(tmp_chp.snapshot_packed())
             self._group_packed_words = group_pws
-            self._cocycle_cache.clear()
             self._cpp_cocycle_arrays = None
         return self._group_packed_words
-
-    def get_inverse_cocycle(
-        self, g_idx: int, num_qubits: int, n_words: int
-    ) -> InverseCliffordCocycle:
-        """Lazily compute and cache the compiled MRQF fault factors for E = U_t^dagger on group g_idx."""
-        cached = self._cocycle_cache.get(g_idx)
-        if cached is not None:
-            return cached
-
-        target_group = self.target_groups[g_idx]
-        raw_factors = get_inverse_clifford_mrqf_factors(self.gate_name)
-        packed_tables = (
-            self._group_packed_words[g_idx]
-            if self._group_packed_words is not None
-            else self._get_packed_words(n_words)
-        )
-
-        single_q_cache: dict[
-            tuple[int, int, int],
-            tuple[NDArray[np.uint64], NDArray[np.uint64], int],
-        ] = {}
-
-        def _compile_pauli_tuple(
-            lx: tuple[int, ...], lz: tuple[int, ...], sgn: int
-        ) -> tuple[NDArray[np.uint64], NDArray[np.uint64], int]:
-            active_terms: list[
-                tuple[NDArray[np.uint64], NDArray[np.uint64], int]
-            ] = []
-            for r in range(len(target_group)):
-                bx, bz = lx[r], lz[r]
-                if bx == 0 and bz == 0:
-                    continue
-                key = (r, bx, bz)
-                term = single_q_cache.get(key)
-                if term is None:
-                    pauli = {(1, 0): "X", (0, 1): "Z"}.get((bx, bz), "Y")
-                    term = pauli_image(pauli, target_group[r], *packed_tables)
-                    single_q_cache[key] = term
-                active_terms.append(term)
-
-            if len(active_terms) == 1:
-                a_w, b_w, kap = active_terms[0]
-                a_w, b_w = a_w.copy(), b_w.copy()
-            else:
-                a_w, b_w, kap = pauli_multiply(*active_terms[0], *active_terms[1])
-
-            if sgn == -1:
-                kap = (kap + 2) & 3
-            return a_w, b_w, kap
-
-        compiled_factors: list[CompiledFaultFactor] = []
-        for f in raw_factors:
-            if f[0] == "PCP":
-                _, lx1, lz1, sgn1, lx2, lz2, sgn2 = f
-                aw1, bw1, kap1 = _compile_pauli_tuple(lx1, lz1, sgn1)
-                aw2, bw2, kap2 = _compile_pauli_tuple(lx2, lz2, sgn2)
-                compiled_factors.append(
-                    CompiledFaultFactor(
-                        kind="PCP",
-                        local_x=np.asarray(lx1, dtype=np.bool_),
-                        local_z=np.asarray(lz1, dtype=np.bool_),
-                        a_words=aw1,
-                        b_words=bw1,
-                        kappa=kap1,
-                        local_x2=np.asarray(lx2, dtype=np.bool_),
-                        local_z2=np.asarray(lz2, dtype=np.bool_),
-                        a2_words=aw2,
-                        b2_words=bw2,
-                        kappa2=kap2,
-                    )
-                )
-            else:
-                kind, lx, lz, sgn = f
-                a_w, b_w, kap = _compile_pauli_tuple(lx, lz, sgn)
-                compiled_factors.append(
-                    CompiledFaultFactor(
-                        kind=kind,
-                        local_x=np.asarray(lx, dtype=np.bool_),
-                        local_z=np.asarray(lz, dtype=np.bool_),
-                        a_words=a_w,
-                        b_words=b_w,
-                        kappa=kap,
-                    )
-                )
-
-        cocycle = InverseCliffordCocycle(
-            targets=target_group,
-            factors=tuple(compiled_factors),
-        )
-        self._cocycle_cache[g_idx] = cocycle
-        return cocycle
 
     def get_cpp_cocycle_arrays(
         self, n_words: int
     ) -> tuple[int, int, int, NDArray[np.int64], list[NDArray]]:
-        """Vectorized compilation of C++ cocycle arrays across all disjoint target groups."""
+        """Vectorized compilation of C++ cocycle arrays across target groups (disjoint or sequential)."""
         if self._cpp_cocycle_arrays is not None:
             return self._cpp_cocycle_arrays
         num_g = len(self.target_groups)
@@ -341,7 +221,8 @@ class UnitaryStepMeta(_StepWordsMixin):
             if num_g > 0
             else np.empty((0, arity), dtype=np.int64)
         )
-        packed_tables = self._get_packed_words(n_words)
+        g_pws = self._group_packed_words
+        packed_tables = None if (g_pws is not None and num_g > 0) else self._get_packed_words(n_words)
         slot_cache: dict[
             tuple[int, int, int],
             tuple[NDArray[np.uint64], NDArray[np.uint64], NDArray[np.uint8]],
@@ -358,7 +239,15 @@ class UnitaryStepMeta(_StepWordsMixin):
                 term = slot_cache.get(key)
                 if term is None:
                     pauli = "X" if (bx, bz) == (1, 0) else ("Z" if (bx, bz) == (0, 1) else "Y")
-                    term = pauli_image_batch(pauli, t_groups[:, r], *packed_tables)
+                    if g_pws is not None and num_g > 0:
+                        sub = tuple(
+                            np.array([g_pws[g][t][t_groups[g, r]] for g in range(num_g)])
+                            for t in range(6)
+                        )
+                        term = pauli_image_batch(pauli, slice(None), *sub)
+                    else:
+                        assert packed_tables is not None
+                        term = pauli_image_batch(pauli, t_groups[:, r], *packed_tables)
                     slot_cache[key] = term
                 terms.append(term)
             if len(terms) == 1:

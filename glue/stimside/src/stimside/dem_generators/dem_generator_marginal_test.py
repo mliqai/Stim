@@ -7,13 +7,13 @@ import sinter  # type: ignore[import-untyped]
 import stim  # type: ignore[import-untyped]
 
 import stimside
-from stimside.dem_generators import dem_generator_marginal
+from stimside.dem_generators import marginal_builder
 from stimside.dem_generators.bnb_decoder import _has_fork_matching
-from stimside.dem_generators.dem_generator_marginal import (
+from stimside.dem_generators.dem_generator_marginal import MarginalLeakageDemGenerator
+from stimside.dem_generators.marginal_builder import (
     _KNOWN_CODE_TO_PAULI_ID,
     _PAULI_STRINGS,
     _PAULI_TO_ID,
-    MarginalLeakageDemGenerator,
     Builder,
 )
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
@@ -470,7 +470,7 @@ def test_failed_known_state_analysis_leaves_sources_unknown(monkeypatch):
     def fail(*args, **kwargs):
         raise ValueError("Backprop known states disagreed with forward prop known states.")
 
-    monkeypatch.setattr(dem_generator_marginal, "compute_known_states_uint8", fail)
+    monkeypatch.setattr(marginal_builder, "compute_known_states_uint8", fail)
     circuit = stim.Circuit(f"R 0\n{_LEAK0}\nS 0\nM 0\nDETECTOR rec[-1]\n{_FLAG0}")
     dem = MarginalLeakageDemGenerator()(circuit, _records(circuit, 1)[0])
     assert _dem_dict(dem) == {(frozenset({0}), frozenset()): pytest.approx(0.5)}
@@ -2143,8 +2143,6 @@ def test_non_pymatching_decoder_and_all_none_reweights():
 def test_kept_candidates_reproduce_flag_envelopes(which, decompose_errors):
     import dataclasses
 
-    from stimside.dem_generators.dem_generator_marginal import Builder
-
     circuit = (
         REP_CIRCUIT if which == "rep" else _make_surface_code_leakage_circuit(3, 2)
     )
@@ -2233,7 +2231,7 @@ def test_reweight_decoding_without_fork_edge_reweights_matches_full_dems(monkeyp
     # decoded by rebuilding each distinct reweighted DEM (forced here on any install).
     from stimside.dem_generators import dem_decoding
 
-    monkeypatch.setattr(dem_decoding, "_matching_supports_edge_reweights", lambda: False)
+    monkeypatch.setattr(dem_decoding, "matching_supports", lambda *params: False)
     sc = _make_surface_code_leakage_circuit(distance=3, rounds=3)
     records = sc.compile_sampler(seed=5).sample(64)
     dets = np.packbits(
