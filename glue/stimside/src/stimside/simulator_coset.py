@@ -1119,7 +1119,7 @@ class CosetsideSimulator(
         det_batch = (
             len(substeps) > 1
             and not any(s.pre_ops or s.post_ops for s in substeps)
-            and all(not s.meta.is_random for s in substeps)
+            and all(not s.meta.is_random and s.meta.q >= 0 for s in substeps)
             and len({s.meta.q for s in substeps}) == len(substeps)
         )
         use_cpp = bool(
@@ -1159,6 +1159,13 @@ class CosetsideSimulator(
             cur_len = 0
             seen_qs: set[int] = set()
             for s_idx, sub in enumerate(substeps):
+                if sub.meta.q < 0:
+                    if cur_len > 0:
+                        seg_end_to_len[s_idx - 1] = cur_len
+                        cur_len = 0
+                        seen_qs.clear()
+                    seg_end_to_len[s_idx] = 1
+                    continue
                 t_qs = {int(sub.meta.q)}
                 for pre_op in sub.pre_ops:
                     for gt in pre_op.targets_copy():
@@ -1305,6 +1312,8 @@ class CosetsideSimulator(
     def _eval_substep_cpp(
         self, meta: Any, xs_c: NDArray[np.uint8]
     ) -> NDArray[np.bool_]:
+        if meta.q < 0:
+            return np.zeros(self.batch_size, dtype=np.bool_)
         assert self._cpp_lib is not None and self._cpp_eng is not None
         if not meta.is_random:
             m_shots = np.empty(self.batch_size, dtype=np.bool_)
@@ -1335,6 +1344,8 @@ class CosetsideSimulator(
     def _eval_substep_py(
         self, meta: Any, xs_base: NDArray[np.bool_]
     ) -> NDArray[np.bool_]:
+        if meta.q < 0:
+            return np.zeros(self.batch_size, dtype=np.bool_)
         f_q_shots = xs_base[meta.q, :].copy()
         m_ref = meta.m_ref
         if not meta.is_random:

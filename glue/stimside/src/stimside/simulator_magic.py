@@ -16,7 +16,7 @@ from stimside._magic.channels import (
     MagicTermRecord, MeasurementRecord, PauliNoiseRecord, ResetRecord, apply_clifford_factors,
     compile_clifford_factors, compile_pauli_measurement_c15, compile_pauli_product, compile_reset_c15,
     emit_magic_terms, infer_total_data_qubits, normalize_choice_map, normalize_pauli_slot_map,
-    reduce_pauli_product_targets, sample_categorical_branch, sample_heralded_pauli_branch,
+    sample_categorical_branch, sample_heralded_pauli_branch,
     split_pauli_product_targets, split_realization_sections,
 )
 from stimside._magic.gates import (
@@ -48,6 +48,7 @@ from stimside.util.circuit import (
     check_replay,
     format_detector_flips,
     pack_shot_flips,
+    reduce_hermitian_pauli_product,
     stack_measurement_columns,
     unroll_circuit,
 )
@@ -714,8 +715,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         specs: list[tuple[set[int], Any, bool]] = []
         if cname == "MPP":
             for grp, inv in split_pauli_product_targets(op):
-                red = reduce_pauli_product_targets(grp)
-                specs.append(({q for q, _ in red}, red, inv))
+                red, neg = reduce_hermitian_pauli_product(self._live_ref_tab.num_qubits, grp)
+                specs.append(({q for q, _ in red}, red, inv ^ neg))
         elif cname in ("MXX", "MYY", "MZZ"):
             pch = cname[-1]
             for a, b_t in zip(raw[::2], raw[1::2]):
@@ -728,7 +729,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 specs.append(({q}, (q, basis) if gd.is_reset else [(q, basis)], inv))
         seen: set[int] = set()
         seg_len = 0
-        for idx, (supp, payload, inv) in enumerate(specs):
+        for supp, payload, inv in specs:
             rec: MeasurementRecord | ResetRecord = (
                 compile_reset_c15(self._live_ref_tab, payload[0], payload[1], meas_index=0 if gd.produces_measurements else None, invert_result=inv, flip_prob=0.0, frame_events=self._live_frame_events)
                 if gd.is_reset
@@ -736,13 +737,20 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             )
             m_shots = self._project_substep_batch(rec)
             if gd.produces_measurements:
-                self._measurement_columns.append(~m_shots if inv else m_shots.copy())
-                seg_len += 1
-                seen |= supp
-                if ((idx + 1 == len(specs)) or (cname in ("MPP", "MXX", "MYY", "MZZ") and bool(seen & specs[idx + 1][0]))) and p_err > 0.0:
-                    self._apply_meas_flip_noise(p_err, seg_len)
+                if cname in ("MPP", "MXX", "MYY", "MZZ") and seg_len > 0 and (not supp or bool(seen & supp)):
+                    if p_err > 0.0:
+                        self._apply_meas_flip_noise(p_err, seg_len)
                     seg_len = 0
                     seen.clear()
+                self._measurement_columns.append(~m_shots if inv else m_shots.copy())
+                if cname == "MPP" and not supp:
+                    if p_err > 0.0:
+                        self._apply_meas_flip_noise(p_err, 1)
+                else:
+                    seg_len += 1
+                    seen |= supp
+        if seg_len > 0 and p_err > 0.0:
+            self._apply_meas_flip_noise(p_err, seg_len)
 
     def _read_classical_cond(self, tgt: stim.GateTarget) -> NDArray[np.bool_]:
         if tgt.is_measurement_record_target:

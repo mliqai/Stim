@@ -112,7 +112,6 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         targets_in_qubit_space = targets_arr[self.state[targets_arr] < 2]
         pauli_states = np.empty(len(targets_in_qubit_space), dtype=np.intp)
         new_state = np.zeros(len(targets_in_qubit_space), dtype=np.uint8)
-        z_dephase_qubits: list[int] = []
 
         for idx, q in enumerate(targets_in_qubit_space):
             pz = tss.peek_z(int(q))
@@ -121,6 +120,51 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                 new_state[idx] = 1
 
         superpos_indices = np.where(pauli_states == 0)[0]
+        if tss.batch_size > 1 and len(targets_in_qubit_space) > 0:
+            if len(superpos_indices) > 0:
+                raise ValueError(
+                    "interactive_do with batch_size > 1 cannot branch or collapse Z superposition "
+                    "on 0/1-conditioned tags; use run() or batch_size=1."
+                )
+            if any(
+                stim.gate_data(inst.name).is_noisy_gate
+                or stim.gate_data(inst.name).produces_measurements
+                for inst in tss._new_circuit
+            ):
+                chk = stim.Circuit()
+                for inst in tss._new_circuit:
+                    gd = stim.gate_data(inst.name)
+                    if gd.is_noisy_gate:
+                        args = [
+                            0.25 if 0.0 < a < 1.0 else a
+                            for a in inst.gate_args_copy()
+                        ]
+                        chk.append(inst.name, inst.targets_copy(), args)
+                    else:
+                        chk.append(inst)
+                d0 = chk.num_detectors
+                n_chk = len(targets_in_qubit_space)
+                chk.append("M", [int(q) for q in targets_in_qubit_space])
+                for k in range(n_chk, 0, -1):
+                    chk.append("DETECTOR", [stim.target_rec(-k)])
+                dem = chk.detector_error_model(
+                    allow_gauge_detectors=True,
+                    approximate_disjoint_errors=True,
+                )
+                if any(
+                    inst.type == "error"
+                    and 0.0 < inst.args_copy()[0] < 1.0
+                    and any(
+                        t.is_relative_detector_id() and t.val >= d0
+                        for t in inst.targets_copy()
+                    )
+                    for inst in dem.flattened()
+                ):
+                    raise ValueError(
+                        "interactive_do with batch_size > 1 cannot apply 0/1-conditioned tags "
+                        "to qubits with non-deterministic Z across the batch; use run() or batch_size=1."
+                    )
+
         for s_i, idx in enumerate(superpos_indices):
             q_int = int(targets_in_qubit_space[idx])
             pz = 0 if s_i == 0 else tss.peek_z(q_int)
@@ -131,12 +175,6 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                 bit = int(tss.np_rng.binomial(1, 0.5))
                 new_state[idx] = bit
                 tss._tableau_simulator.postselect_z(q_int, desired_value=bool(bit))
-                z_dephase_qubits.append(q_int)
-
-        if z_dephase_qubits and tss.batch_size > 1:
-            tss._new_circuit.append(
-                stim.CircuitInstruction("Z_ERROR", z_dephase_qubits, [0.5])
-            )
 
         self.state[targets_in_qubit_space] = new_state
         return targets_in_qubit_space, pauli_states
@@ -615,7 +653,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                         tss._do_bare_only_on_tableau(
                             stim.CircuitInstruction("X_ERROR", anc_comp, [p0])
                         )
-                elif is_mpad and tss.batch_size > 1 and hasattr(tss, "_asymmetric_readout_postproc"):
+                elif tss.batch_size > 1 and hasattr(tss, "_asymmetric_readout_postproc"):
                     # batch_size > 1 frame-samples _new_circuit, so the readout must follow each shot's own Z value:
                     # copy it onto a fresh ancilla (measuring the ancilla Z-collapses a superposed target, as at
                     # batch_size == 1) and apply p(0)/p(1) per shot when the records are sampled.
@@ -632,13 +670,12 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                     )
                     base_meas_idx = tss._new_circuit.num_measurements
                     for i_pos in idx_of_targets_in_qubit_space:
-                        t_raw = raw_op_targets[int(i_pos)]
                         tss._asymmetric_readout_postproc.append(
                             (
                                 int(base_meas_idx + i_pos),
                                 float(p0),
                                 float(p1),
-                                bool(t_raw.value) ^ bool(t_raw.is_inverted_result_target),
+                                inv_flags[int(i_pos)],
                             )
                         )
                 else:
@@ -698,37 +735,21 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                                 )
                             )
                     if np.any(mflip_mask):
-                        if tss.batch_size > 1 and abs(p0 - (1.0 - p1)) > 1e-12:
-                            base_meas_idx = tss._new_circuit.num_measurements
-                            for i_pos in idx_of_targets_in_qubit_space[mflip_mask]:
-                                tss._asymmetric_readout_postproc.append(
-                                    (
-                                        int(base_meas_idx + i_pos),
-                                        float(p0),
-                                        float(p1),
-                                        bool(
-                                            raw_op_targets[
-                                                int(i_pos)
-                                            ].is_inverted_result_target
-                                        ),
-                                    )
-                                )
+                        if p1 >= p0:
+                            x_error_prob = 0.5 * p0 + 0.5 * (1.0 - p1)
                         else:
-                            if p1 >= p0:
-                                x_error_prob = 0.5 * p0 + 0.5 * (1.0 - p1)
-                            else:
-                                tss._do_bare_only_on_tableau(
-                                    stim.CircuitInstruction("X", anc_comp_arr[mflip_mask])
+                            tss._do_bare_only_on_tableau(
+                                stim.CircuitInstruction("X", anc_comp_arr[mflip_mask])
+                            )
+                            x_error_prob = 0.5 * (1.0 - p0) + 0.5 * p1
+                        if x_error_prob > 0:
+                            tss._do_bare_only_on_tableau(
+                                stim.CircuitInstruction(
+                                    "X_ERROR",
+                                    anc_comp_arr[mflip_mask],
+                                    [x_error_prob],
                                 )
-                                x_error_prob = 0.5 * (1.0 - p0) + 0.5 * p1
-                            if x_error_prob > 0:
-                                tss._do_bare_only_on_tableau(
-                                    stim.CircuitInstruction(
-                                        "X_ERROR",
-                                        anc_comp_arr[mflip_mask],
-                                        [x_error_prob],
-                                    )
-                                )
+                            )
 
         # Handle qubits in leaked states (> 1)
         target_leaked_pos = np.where(target_leakage_state > 1)[0]

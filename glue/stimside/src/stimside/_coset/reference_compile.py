@@ -9,6 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
+from stimside.util.circuit import reduce_hermitian_pauli_product
 from stimside.util.reference_chp import (
     DetMeasMeta,
     PackedSymplecticTables,
@@ -465,20 +466,57 @@ class CompiledReferenceCircuit:
 
                 for term in product_terms:
                     invert_res = False
-                    pre_ops: list[stim.CircuitInstruction] = []
-                    post_ops: list[stim.CircuitInstruction] = []
                     term_qubits: list[int] = []
                     for gt in term:
-                        q_r = gt.qubit_value
-                        term_qubits.append(q_r)
+                        term_qubits.append(gt.qubit_value)
                         if gt.is_inverted_result_target:
                             invert_res = not invert_res
-                        if gt.is_x_target or gt.is_y_target:
-                            b_op = stim.CircuitInstruction("H" if gt.is_x_target else "H_YZ", [q_r])
+                    if len(set(term_qubits)) < len(term_qubits):
+                        reduced, neg = reduce_hermitian_pauli_product(
+                            self.num_qubits,
+                            [
+                                (
+                                    gt.qubit_value,
+                                    "X" if gt.is_x_target else ("Y" if gt.is_y_target else "Z"),
+                                )
+                                for gt in term
+                            ],
+                        )
+                        invert_res = invert_res ^ neg
+                        if not reduced:
+                            substeps.append(
+                                MeasSubStepMeta(
+                                    q=-1,
+                                    invert_result=invert_res,
+                                    pre_ops=[],
+                                    post_ops=[],
+                                    meta=DetMeasMeta(
+                                        is_random=False,
+                                        q=-1,
+                                        m_ref=0,
+                                        beta_Z_words=np.zeros(self.n_words, dtype=np.uint64),
+                                    ),
+                                )
+                            )
+                            continue
+                        norm_pairs = reduced
+                    else:
+                        norm_pairs = [
+                            (
+                                gt.qubit_value,
+                                "X" if gt.is_x_target else ("Y" if gt.is_y_target else "Z"),
+                            )
+                            for gt in term
+                        ]
+                    pre_ops: list[stim.CircuitInstruction] = []
+                    post_ops: list[stim.CircuitInstruction] = []
+                    for q_r, pch in norm_pairs:
+                        if pch in ("X", "Y"):
+                            b_op = stim.CircuitInstruction("H" if pch == "X" else "H_YZ", [q_r])
                             pre_ops.append(b_op)
                             post_ops.insert(0, b_op)
-                    q0 = term_qubits[0]
-                    cx_ops = [stim.CircuitInstruction("CX", [q_r, q0]) for q_r in term_qubits[1:]]
+                    q0 = norm_pairs[0][0]
+                    cx_ops = [stim.CircuitInstruction("CX", [q_r, q0]) for q_r, _ in norm_pairs[1:]]
                     pre_ops.extend(cx_ops)
                     post_ops = list(reversed(cx_ops)) + post_ops
                     _add_substep(q0, invert_res, pre_ops, post_ops)

@@ -14,6 +14,7 @@ from stimside._tableau.runner import (
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_parameters import (
     LeakageConditioningParams,
+    LeakageMeasurementParams,
     LeakageTransition1Params,
     LeakageTransition2Params,
 )
@@ -213,6 +214,32 @@ class TablesideSimulator(
         else:
             self._do(self.circuit)
 
+    def _collapses_z(self) -> bool:
+        pre = self._precompiled_circuit
+        coh = self._compiled_op_handler
+        if pre is not None and coh.ops_to_params == pre.parsed_ops:  # type: ignore[attr-defined]
+            return pre.collapses_z
+        if not hasattr(coh, "ops_to_params"):
+            return False
+        ops_to_params = coh.ops_to_params  # type: ignore[attr-defined]
+        if self._ops_collapse_z(ops_to_params):
+            return True
+        found_asym = False
+        for op in unroll_circuit(self.circuit):
+            if op.name in ("DETECTOR", "TICK", "OBSERVABLE_INCLUDE"):
+                continue
+            if found_asym and any(t.is_measurement_record_target for t in op.targets_copy()):
+                return True
+            p_step = ops_to_params.get(op)
+            if isinstance(p_step, LeakageMeasurementParams):
+                is_mp = p_step.targets is not None
+                has_01 = (0 in p_step.prob_for_input_state) or (1 in p_step.prob_for_input_state)
+                if (is_mp and (has_01 or not np.isclose(p_step.p0, p_step.p1))) or (
+                    not is_mp and not np.isclose(p_step.p0, 1.0 - p_step.p1)
+                ):
+                    found_asym = True
+        return False
+
     def run(self):
         """run the simulator."""
         if self._used_interactively or self._circuit_time != 0:
@@ -221,19 +248,7 @@ class TablesideSimulator(
                 "Use .clear() to prepare the simulator for a new run. "
             )
 
-        pre = self._precompiled_circuit
-        coh = self._compiled_op_handler
-        collapses_z = (
-            pre.collapses_z
-            if pre is not None and coh.ops_to_params == pre.parsed_ops  # type: ignore[attr-defined]
-            else (
-                self._ops_collapse_z(coh.ops_to_params)  # type: ignore[attr-defined]
-                if hasattr(coh, "ops_to_params")
-                else False
-            )
-        )
-
-        if (self._sync_tableside_rng or collapses_z) and self.batch_size > 1:
+        if (self._sync_tableside_rng or self._collapses_z()) and self.batch_size > 1:
             orig_batch = self.batch_size
             meas_list = []
             saved_events = [[] for _ in range(orig_batch)] if self.record_unleaked_to_leaked else []
@@ -364,8 +379,7 @@ class TablesideSimulator(
         if not self._used_interactively:
             if self._sync_tableside_rng and self.batch_size > 1:
                 raise ValueError(
-                    "interactive_do with sync_tableside_rng=True requires batch_size=1 "
-                    "(run() simulates independent per-shot trajectories)."
+                    "interactive_do with sync_tableside_rng=True requires batch_size=1."
                 )
             self._used_interactively = True
             self._running_tableau = True
@@ -433,6 +447,16 @@ class TablesideSimulator(
         include_in_reference: bool = True,
     ):
         """Apply a stabilizer / error instruction to `_new_circuit` (and TableauSimulator if running)."""
+        if self.batch_size > 1 and self._asymmetric_readout_postproc:
+            insts = op if isinstance(op, stim.Circuit) else (op,)
+            for inst in insts:
+                if inst.name not in ("DETECTOR", "OBSERVABLE_INCLUDE") and any(
+                    t.is_measurement_record_target for t in inst.targets_copy()
+                ):
+                    raise ValueError(
+                        "interactive_do with batch_size > 1 cannot apply classical rec[-k] feedback "
+                        "after an asymmetric 0/1 readout; use run() or batch_size=1."
+                    )
         inc_ref = include_in_reference and self._construct_reference_circuit
         if isinstance(op, stim.Circuit):
             self._new_circuit += op

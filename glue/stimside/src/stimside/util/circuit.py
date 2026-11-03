@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -12,6 +12,28 @@ def qubit_targets(raw_targets: list[stim.GateTarget]) -> np.ndarray:
     return np.fromiter(
         (t.qubit_value for t in raw_targets if t.qubit_value is not None), dtype=np.intp
     )
+
+
+def reduce_hermitian_pauli_product(
+    num_qubits: int, terms: Sequence[tuple[int, str]]
+) -> tuple[list[tuple[int, str]], bool]:
+    """Algebraically reduce `(qubit, pauli)` terms into `(unique_terms, negate)` or raise on ±i."""
+    ps = stim.PauliString(num_qubits)
+    order: list[int] = []
+    seen: set[int] = set()
+    for q, pch in terms:
+        if q < 0 or q >= num_qubits:
+            raise ValueError(f"Qubit {q} out of range for num_qubits={num_qubits}")
+        if q not in seen:
+            seen.add(q)
+            order.append(q)
+        if pch != "I":
+            single = stim.PauliString(num_qubits)
+            single[q] = pch
+            ps *= single
+    if ps.sign in (1j, -1j):
+        raise ValueError("Acted on an anti-Hermitian Pauli product operator")
+    return [(q, "_XYZ"[ps[q]]) for q in order if ps[q]], bool(ps.sign == -1)
 
 
 def unroll_circuit(

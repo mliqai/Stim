@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import threading
 from typing import TYPE_CHECKING, Any
 import weakref
 
@@ -78,6 +79,9 @@ def _circuit_of(insts: list[stim.CircuitInstruction]) -> stim.Circuit:
     return c
 
 
+_CACHE_LOCK = threading.Lock()
+
+
 def _slice_circuit(
     insts: list[stim.CircuitInstruction],
     cache: dict[tuple[int, int], stim.Circuit],
@@ -88,11 +92,16 @@ def _slice_circuit(
     """Cached circuit of insts[a:b]; spans of >= 64 reuse lazily built 32-instruction blocks."""
     if a >= b:
         return stim.Circuit()
-    sub = cache.get((a, b))
+    with _CACHE_LOCK:
+        sub = cache.get((a, b))
+        need_blocks = sub is None and b - a >= 64 and not blocks
     if sub is None:
         if b - a >= 64:
-            if not blocks:
-                blocks[:] = [_circuit_of(insts[i : i + 32]) for i in range(0, len(insts), 32)]
+            if need_blocks:
+                built_blocks = [_circuit_of(insts[i : i + 32]) for i in range(0, len(insts), 32)]
+                with _CACHE_LOCK:
+                    if not blocks:
+                        blocks[:] = built_blocks
             b0, b1 = (a + 31) >> 5, b >> 5
             sub = _circuit_of(insts[a : b0 << 5])
             for k in range(b0, b1):
@@ -101,9 +110,10 @@ def _slice_circuit(
                 sub.append(inst)
         else:
             sub = _circuit_of(insts[a:b])
-        if len(cache) >= 512:
-            cache.pop(next(iter(cache)))
-        cache[(a, b)] = sub
+        with _CACHE_LOCK:
+            if len(cache) >= 512 and (a, b) not in cache:
+                cache.pop(next(iter(cache)))
+            cache[(a, b)] = sub
     return sub
 
 
@@ -154,6 +164,7 @@ class PrecompiledTablesideCircuit:
         t_running_len = 0
         all_step_masks: list[int] = [0] * self.num_words
         all_branches: list[TransBranchC] = []
+        seen_asym_readout = False
         op_template_cache: dict[
             stim.CircuitInstruction,
             tuple[
@@ -446,6 +457,7 @@ class PrecompiledTablesideCircuit:
                         not is_mpad and not np.isclose(p0, 1.0 - p1)
                     ):
                         self.requires_tableau = True
+                        seen_asym_readout = True
                     if (
                         not is_mpad
                         and not has_dup_targets
@@ -469,6 +481,21 @@ class PrecompiledTablesideCircuit:
         self.step_to_full_idx.append(len(self.full_bare_insts))
         self.step_to_quant_idx.append(len(self.quantum_bare_insts))
         self.num_steps = len(self.steps_py)
+
+        if seen_asym_readout and not self.collapses_z:
+            found_asym = False
+            for op, s_py in zip(self.orig_ops, self.steps_py):
+                if found_asym and any(t.is_measurement_record_target for t in op.targets_copy()):
+                    self.collapses_z = True
+                    break
+                p_step = s_py[5]
+                if isinstance(p_step, LeakageMeasurementParams):
+                    is_mp = p_step.targets is not None
+                    has_01 = (0 in p_step.prob_for_input_state) or (1 in p_step.prob_for_input_state)
+                    if (is_mp and (has_01 or not np.isclose(p_step.p0, p_step.p1))) or (
+                        not is_mp and not np.isclose(p_step.p0, 1.0 - p_step.p1)
+                    ):
+                        found_asym = True
 
         # Fuse adjacent step s (kind==6, LEAKAGE_TRANSITION_1 with 1-->2) + step s+1 (kind==5, M[LEAKAGE_PROJECTION_Z: (1.0, 2)])
         for s in range(self.num_steps - 1):
@@ -602,7 +629,8 @@ def get_precompiled_circuit(
 ) -> PrecompiledTablesideCircuit:
     ucu = bool(unconditional_condition_on_U)
     key = (id(circuit), len(circuit), ucu)
-    entry = _PRECOMPILED_CACHE.get(key)
+    with _CACHE_LOCK:
+        entry = _PRECOMPILED_CACHE.get(key)
     if (
         entry is not None
         and entry[0] == circuit
@@ -612,9 +640,10 @@ def get_precompiled_circuit(
     snap = circuit.copy()
     ops_snap = dict(parsed_ops) if parsed_ops is not None else None
     pre = PrecompiledTablesideCircuit(snap, ucu, ops_snap)
-    if len(_PRECOMPILED_CACHE) >= 4 and key not in _PRECOMPILED_CACHE:
-        _PRECOMPILED_CACHE.pop(next(iter(_PRECOMPILED_CACHE)))
-    _PRECOMPILED_CACHE[key] = (snap, ops_snap, pre)
+    with _CACHE_LOCK:
+        if len(_PRECOMPILED_CACHE) >= 4 and key not in _PRECOMPILED_CACHE:
+            _PRECOMPILED_CACHE.pop(next(iter(_PRECOMPILED_CACHE)))
+        _PRECOMPILED_CACHE[key] = (snap, ops_snap, pre)
     return pre
 
 
@@ -639,7 +668,8 @@ _XY_BASIS_COLLAPSE = frozenset({"MX", "MY", "MRX", "MRY", "RX", "RY", "MXX", "MY
 
 
 def do_sync_bare_inst(tab: stim.TableauSimulator, inst: stim.CircuitInstruction) -> None:
-    if inst.name in _XY_BASIS_COLLAPSE and not inst.gate_args_copy():
+    args = inst.gate_args_copy()
+    if inst.name in _XY_BASIS_COLLAPSE and (not args or args[0] == 0.0):
         for g in inst.target_groups():  # stim collapses fused X/Y targets in sorted order
             tab.do(stim.CircuitInstruction(inst.name, g))
     else:

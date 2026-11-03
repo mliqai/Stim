@@ -1033,3 +1033,133 @@ def test_fused_trans1_meas_records_leakage_events_and_frame_switch(pre_leak: str
             assert int(sim.get_unleaked_to_leaked_records()[0][-1]) == (2 if pre_leak else 1)
     assert 5 <= q0_leaks <= 27
 
+
+@pytest.mark.parametrize(
+    ("target_str", "expected_zero_bit", "expected_mean"),
+    [("0", False, 0.40), ("!0", True, 0.60)],
+)
+def test_multibatch_asymmetric_leakage_projection_z_after_pauli_noise(
+    target_str: str, expected_zero_bit: bool, expected_mean: float
+):
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8Tableau
+
+    c = stim.Circuit(
+        f"X_ERROR(0.5) 0\n"
+        f"CX 0 1\n"
+        f"M[LEAKAGE_PROJECTION_Z: (0.0, 0) (0.8, 1) (1.0, 2)] {target_str}\n"
+        f"M 1"
+    )
+    coh = LeakageUint8Tableau().compile_op_handler(circuit=c, batch_size=64)
+    sim = TablesideSimulator(circuit=c, compiled_op_handler=coh, batch_size=64, seed=123)
+    batches = []
+    for _ in range(80):
+        sim.clear()
+        sim.run()
+        batches.append(sim.get_final_measurement_records())
+    recs = np.vstack(batches)
+    m0, m1 = recs[:, 0], recs[:, 1]
+    assert int(np.sum((m1 == 0) & (m0 != expected_zero_bit))) == 0
+    assert abs(float(np.mean(m0)) - expected_mean) < 0.03
+
+
+def test_interactive_do_multibatch_collapses_z_and_asym_feedback():
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8Tableau
+
+    # 1. Definite-Z 0/1-conditioned tags succeed in interactive_do with batch_size > 1.
+    c_def = stim.Circuit("X 0\nI[LEAKAGE_TRANSITION_1: (1.0, 1-->2)] 0\nM[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0")
+    coh_def = LeakageUint8Tableau().compile_op_handler(circuit=c_def, batch_size=8)
+    sim_def = TablesideSimulator(circuit=c_def, compiled_op_handler=coh_def, batch_size=8, seed=1)
+    sim_def.interactive_do(c_def)
+    sim_def.finish_interactive_run()
+    assert np.all(sim_def.get_final_measurement_records())
+
+    # 2. Z-superposition and shot-dependent Z noise reject interactive_do(batch_size > 1), while run() succeeds.
+    for prog in (
+        "H 0\nX_ERROR[CONDITIONED_ON_SELF: 1](1.0) 0\nM 0\nDETECTOR rec[-1]",
+        "X_ERROR(0.5) 0\nX_ERROR[CONDITIONED_ON_SELF: 1](1.0) 0\nM 0\nDETECTOR rec[-1]",
+    ):
+        c = stim.Circuit(prog)
+        coh_run = LeakageUint8Tableau().compile_op_handler(circuit=c, batch_size=8)
+        sim_run = TablesideSimulator(circuit=c, compiled_op_handler=coh_run, batch_size=8, seed=42)
+        sim_run.run()
+        assert not np.any(sim_run.get_detector_flips())
+
+        coh_int = LeakageUint8Tableau().compile_op_handler(circuit=c, batch_size=8)
+        sim_int = TablesideSimulator(circuit=c, compiled_op_handler=coh_int, batch_size=8, seed=42)
+        with pytest.raises(ValueError, match="batch_size=1"):
+            sim_int.interactive_do(c)
+
+    # 3. Classical rec[-k] feedback after asymmetric 0/1 readout preserves exact m0 == m1 in run(batch_size > 1).
+    c_fb = stim.Circuit(
+        "X_ERROR(0.5) 0\n"
+        "M[LEAKAGE_PROJECTION_Z: (0.0, 0) (0.8, 1) (1.0, 2)] 0\n"
+        "CX rec[-1] 1\n"
+        "M 1"
+    )
+    coh_fb = LeakageUint8Tableau().compile_op_handler(circuit=c_fb, batch_size=64)
+    sim_fb = TablesideSimulator(circuit=c_fb, compiled_op_handler=coh_fb, batch_size=64, seed=9)
+    sim_fb.run()
+    recs_fb = sim_fb.get_final_measurement_records()
+    np.testing.assert_array_equal(recs_fb[:, 0], recs_fb[:, 1])
+
+
+def test_concurrent_slice_and_precompiled_cache_eviction():
+    import sys
+    import threading
+    from stimside._tableau import runner as tab_runner
+
+    old_si = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        c_big = stim.Circuit("\n".join(f"H {i % 6}" for i in range(40)))
+        pre = tab_runner.PrecompiledTablesideCircuit(c_big, True)
+        errs: list[str] = []
+        barrier = threading.Barrier(8)
+
+        def worker(tid: int) -> None:
+            try:
+                barrier.wait()
+                for r in range(50):
+                    a = (tid * 7 + r) % 39
+                    for b in range(a + 1, 41):
+                        pre.get_full_slice(a, b)
+                    c_tmp = stim.Circuit(f"H {(tid + r) % 8}\nX {(tid * 3 + r) % 8}\nM {(tid + r) % 8}")
+                    tab_runner.get_precompiled_circuit(c_tmp, bool(r & 1))
+            except Exception as exc:  # pragma: no cover
+                errs.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=worker, args=(k,)) for k in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errs, f"Concurrent cache eviction raised errors: {errs[:3]}"
+    finally:
+        sys.setswitchinterval(old_si)
+
+
+@pytest.mark.parametrize(
+    "circ_str",
+    ["H 0", "H 0\nX_ERROR[CONDITIONED_ON_SELF: 1](0.5) 0"],
+)
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("sync", [False, True])
+def test_zero_measurement_circuit_bool_dtype_and_detector_shape(
+    circ_str: str, batch_size: int, sync: bool
+):
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8Tableau
+
+    c = stim.Circuit(circ_str)
+    coh = LeakageUint8Tableau().compile_op_handler(circuit=c, batch_size=batch_size)
+    sim = TablesideSimulator(
+        circuit=c, compiled_op_handler=coh, batch_size=batch_size, seed=11, sync_tableside_rng=sync
+    )
+    sim.run()
+    if batch_size == 1:
+        trec = sim.current_tableau_measurement_record()
+        assert trec.dtype == np.bool_ and trec.shape == (0,)
+    rec = sim.get_final_measurement_records()
+    dets = sim.get_detector_flips()
+    assert rec.dtype == np.bool_ and rec.shape == (batch_size, 0)
+    assert dets.dtype == np.bool_ and dets.shape == (batch_size, 0)
+

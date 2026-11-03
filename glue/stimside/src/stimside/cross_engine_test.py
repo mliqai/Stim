@@ -503,11 +503,18 @@ def test_repeated_targets_in_leakage_projection_z_and_mr():
         "MX 3 4 2",
         "MY 2 0 1",
         "MRX 3 4 2",
+        "R 0 1 2 3 4\nCX 2 3 3 4\nMX(0) 3 4 2\nM 0 1 2 3 4",
+        "R 0 1 2 3 4\nCX 2 3 3 4\nMRX(0) 3 4 2\nM 0 1 2 3 4",
+        "MXX(0) 3 1 2 0",
         "H 1 3\nCX 1 0 3 2\nRX 3 1\nM 0 1 2 3",
         "MXX 3 1 2 0",
         "MX 2 2 0",
         "H 0\nM(0.05) 0 0",
         "MRX(0.05) 0 0",
+        "H 0 1\nMPP X0*Z0*X1*Z1 X0*X0 !Y0*Y0\nM 0 1",
+        "H 0 1\nMPP(0.25) X0*X1 X1 X0\nM 0 1",
+        "H 0 2\nMPP(0.25) X0 X1*X1 !Y1*Y1 X2\nM 0 1 2",
+        "H 0 1\nMPP(0.25) X0*Y0*X1*Y1 X0*Z0*X1*Z1\nM 0 1",
     ],
 )
 def test_sync_3way_lockstep_xy_collapses_and_repeated_noisy_1q_meas(program: str):
@@ -538,4 +545,65 @@ def test_sync_3way_lockstep_xy_collapses_and_repeated_noisy_1q_meas(program: str
     t_int.interactive_do(circuit)
     t_int.finish_interactive_run()
     np.testing.assert_array_equal(t_int.get_final_measurement_records()[0], c_rec[0])
+
+
+def test_repeated_qubit_mpp_hermitian_sign_and_antihermitian_rejection():
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+    from stimside.simulator_magic import MagicsideSimulator
+
+    c_det = stim.Circuit("MPP X0*Y0*X1*Y1 X0*X0 !Y0*Y0")
+    expected = np.tile(np.array([[True, False, True]], dtype=np.bool_), (4, 1))
+
+    for sim_cls, h_cls in [
+        (TablesideSimulator, LeakageUint8Tableau),
+        (CosetsideSimulator, LeakageUint8Coset),
+        (FlipsideSimulator, LeakageUint8Flip),
+        (MagicsideSimulator, LeakageUint8Magic),
+    ]:
+        _, rec, _, _, _ = _run_sim(sim_cls, h_cls, c_det, seed=7, batch_size=4, sync=False)
+        np.testing.assert_array_equal(rec, expected)
+
+    sc_py = CosetsideSimulator(
+        c_det,
+        compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=c_det, batch_size=4),
+        seed=7,
+        batch_size=4,
+    )
+    sc_py._use_cpp = False
+    sc_py.run()
+    np.testing.assert_array_equal(sc_py.get_final_measurement_records(), expected)
+
+    for backend in ("STREAM", "QUERY"):
+        for fault_mode in ("DIRECT", "SELECTOR"):
+            sm = MagicsideSimulator(c_det, seed=7, batch_size=4, backend=backend, fault_mode=fault_mode)
+            sm.run()
+            np.testing.assert_array_equal(sm.get_final_measurement_records(), expected)
+
+    c_anti = stim.Circuit("MPP X0*Z0")
+    for make_sim in [
+        lambda: TablesideSimulator(
+            c_anti,
+            compiled_op_handler=LeakageUint8Tableau().compile_op_handler(circuit=c_anti, batch_size=2),
+            batch_size=2,
+            seed=1,
+        ),
+        lambda: CosetsideSimulator(
+            c_anti,
+            compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=c_anti, batch_size=2),
+            batch_size=2,
+            seed=1,
+        ),
+        lambda: FlipsideSimulator(
+            c_anti,
+            compiled_op_handler=LeakageUint8Flip().compile_op_handler(circuit=c_anti, batch_size=2),
+            batch_size=2,
+            seed=1,
+        ),
+        lambda: MagicsideSimulator(c_anti, batch_size=2, seed=1, backend="STREAM", fault_mode="DIRECT"),
+        lambda: MagicsideSimulator(c_anti, batch_size=2, seed=1, backend="QUERY", fault_mode="SELECTOR"),
+    ]:
+        with pytest.raises(ValueError):
+            s = make_sim()
+            s.run()
+            s.get_final_measurement_records()
 
