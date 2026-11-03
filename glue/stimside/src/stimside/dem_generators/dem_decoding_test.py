@@ -298,3 +298,20 @@ def test_generator_metadata_takes_precedence_over_fallback_base_dem():
         )
         np.testing.assert_array_equal(got_single, want_single)
 
+
+def test_fork_reweight_only_explicit_base_dem_adds_missing_edge() -> None:
+    import inspect
+    import pymatching  # type: ignore[import-untyped]
+
+    if "edge_reweights" not in inspect.signature(pymatching.Matching.decode_batch).parameters:
+        pytest.skip("needs the PyMatching version with per-shot edge_reweights")
+
+    explicit_base = stim.DetectorErrorModel("error(0.01) D0 L0\nerror(0.01) D1\n")
+    rw = np.array([[0, 1, 0.1]], dtype=np.float64)
+    dets = np.array([[0b11]], dtype=np.uint8)
+    pred = decode_with_generated_dems(
+        "pymatching", [rw], dets, reweight_only=True, base_dem=explicit_base
+    )
+    np.testing.assert_array_equal(pred, np.array([[0]], dtype=np.uint8))
+
+

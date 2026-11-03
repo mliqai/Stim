@@ -20,7 +20,7 @@ class TestCompiledLeakageUint8:
             )
 
         return TablesideSimulator(
-            circuit=circuit, batch_size=self.simulator_batch_size, compiled_op_handler=cti
+            circuit=circuit, batch_size=self.simulator_batch_size, compiled_op_handler=cti, seed=1
         )
 
     def test_clear(self):

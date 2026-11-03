@@ -121,5 +121,14 @@
   "c15_marginal_dem_pauli_leak": {
     "dem_marginal": "223547970e1549fdd4582a4486d79c17",
     "marginal_decoder": "7ff64ec162db8c97c257ac8f14726a81"
+  },
+  "c16_sparse_multibatch": {
+    "coset_nosync_cpp": "194bcff2a218d94cdaefd274aea930aa",
+    "coset_sync": "c0a5eefb7ad65f0869dea069ad4a3f7f",
+    "flip": "7cb12fb68910d48d7001ba560788ca6d",
+    "magic_ds": "93057c86d13e561af71945f943bb6b10",
+    "magic_sync": "c0a5eefb7ad65f0869dea069ad4a3f7f",
+    "tab_nosync": "71c8038186554376e49e5143ac0c1e8e",
+    "tab_sync": "c0a5eefb7ad65f0869dea069ad4a3f7f"
   }
 }

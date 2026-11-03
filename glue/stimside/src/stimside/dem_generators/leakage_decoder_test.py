@@ -243,12 +243,12 @@ def test_callable_adapter_rejects_mis_shaped_predictions():
 
 
 _CALLABLE_SAMPLERS = {
-    "tab": lambda f: TablesideSampler(op_handler=LeakageUint8(), batch_size=4, dem_decoder=f),
+    "tab": lambda f: TablesideSampler(op_handler=LeakageUint8(), batch_size=4, dem_decoder=f, seed=1),
     "cos": lambda f: CosetsideSampler(
-        op_handler=LeakageUint8Coset(), batch_size=16, dem_decoder=f
+        op_handler=LeakageUint8Coset(), batch_size=16, dem_decoder=f, seed=1
     ),
     "flip": lambda f: FlipsideSampler(
-        op_handler=LeakageUint8Flip(), batch_size=64, dem_decoder=f
+        op_handler=LeakageUint8Flip(), batch_size=64, dem_decoder=f, seed=1
     ),
 }
 

@@ -21,7 +21,7 @@ class MockCompiledOpHandler(CompiledOpHandler[TablesideSimulator]):
         raise NotImplementedError("mock clear called")
 
 
-class TestFlipsideSimulator:
+class TestTablesideSimulator:
 
     batch_size = 128
     coh = MockCompiledOpHandler()
@@ -978,3 +978,58 @@ def test_precompiled_cache_cap_and_metadata_mutation_isolation() -> None:
     assert tss2.qubit_coords == {0: [2.0, 3.0]}
     assert 99 not in tss2.qubit_tags
     assert tss2.coords_shifts == [4.0, 5.0]
+
+
+@pytest.mark.parametrize("extra", ["", " (0.001, 1-->4)"], ids=["cpp", "python"])
+def test_sparse_leakage_transition_rates_cpp_and_python(extra: str) -> None:
+    import math
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    n_q, shots = 8, 4000
+    qs = " ".join(str(q) for q in range(n_q))
+    circ = stim.Circuit(
+        f"R {qs}\nI[LEAKAGE_TRANSITION_1: (0.01, U-->2) (0.02, U-->3){extra}] {qs}\nM {qs}"
+    )
+    coh = LeakageUint8().compile_op_handler(circuit=circ, batch_size=1)
+    sim = TablesideSimulator(circ, compiled_op_handler=coh, batch_size=1, seed=7, record_leakage_events=True)
+    hits = np.zeros((n_q, 5), dtype=np.int64)
+    for s in range(shots):
+        if s:
+            sim.clear()
+        sim.run()
+        for e in sim.get_leakage_events()[0]:
+            if e.old_state < 2 and e.new_state >= 2:
+                hits[e.qubit, e.new_state] += 1
+    for st, p in ((2, 0.01), (3, 0.02)):
+        tol = 5.0 * math.sqrt(p * (1.0 - p) / shots)
+        assert np.all(np.abs(hits[:, st] / shots - p) < tol)
+
+
+@pytest.mark.parametrize("pre_leak", ["", "I[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 1\n"])
+def test_fused_trans1_meas_records_leakage_events_and_frame_switch(pre_leak: str) -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    circ = stim.Circuit(
+        f"X 0\n{pre_leak}I[LEAKAGE_TRANSITION_1: (0.5, 1-->2)] 0 1\n"
+        "M[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0 1"
+    )
+    coh = LeakageUint8().compile_op_handler(circuit=circ, batch_size=1)
+    sim = TablesideSimulator(
+        circ,
+        compiled_op_handler=coh,
+        batch_size=1,
+        seed=11,
+        record_leakage_events=True,
+        record_unleaked_to_leaked=True,
+    )
+    q0_leaks = 0
+    for s in range(32):
+        if s:
+            sim.clear()
+        sim.run()
+        evs = sim.get_leakage_events()[0]
+        if any(e.qubit == 0 and e.new_state == 2 for e in evs):
+            q0_leaks += 1
+            assert int(sim.get_unleaked_to_leaked_records()[0][-1]) == (2 if pre_leak else 1)
+    assert 5 <= q0_leaks <= 27
+

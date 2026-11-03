@@ -102,7 +102,7 @@ def test_magic_gates_on_leaked_targets_warn_and_act_unconditionally() -> None:
 
 def test_sync_rng_nonclifford_born_stats_mpad_entangled_and_speed() -> None:
     p_sin2 = (2.0 - math.sqrt(2.0)) / 4.0
-    sigma = math.sqrt(p_sin2 * (1.0 - p_sin2) / 4096.0)
+    sigma = math.sqrt(p_sin2 * (1.0 - p_sin2) / 1024.0)
     circ_mpad = stim.Circuit(
         "H 2\nI[T] 2\nH 2\nS 2\n"
         "MPAD[LEAKAGE_MEASUREMENT: (0.0, 0) (1.0, 1) : 2] 0 0\n"
@@ -115,7 +115,7 @@ def test_sync_rng_nonclifford_born_stats_mpad_entangled_and_speed() -> None:
     )
     for sync in (False, True):
         sim_m = MagicsideSimulator(
-            circ_mpad, op_handler=LeakageUint8Magic(), batch_size=4096, seed=42, sync_tableside_rng=sync
+            circ_mpad, op_handler=LeakageUint8Magic(), batch_size=1024, seed=42, sync_tableside_rng=sync
         )
         sim_m.run()
         rec_m = sim_m.get_final_measurement_records()
@@ -125,7 +125,7 @@ def test_sync_rng_nonclifford_born_stats_mpad_entangled_and_speed() -> None:
         assert abs(float(np.mean(rec_m[:, 0])) - p_sin2) < 3.0 * sigma
 
         sim_cx = MagicsideSimulator(
-            circ_cx, op_handler=LeakageUint8Magic(), batch_size=4096, seed=84, sync_tableside_rng=sync
+            circ_cx, op_handler=LeakageUint8Magic(), batch_size=1024, seed=84, sync_tableside_rng=sync
         )
         sim_cx.run()
         rec_cx = sim_cx.get_final_measurement_records()

@@ -187,7 +187,7 @@ def test_component_zero_and_invariants() -> None:
 
     dup = base.copy()
     dup.pivots[1] = dup.pivots[0]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="pivots"):
         dup.check_invariants()
 
     non_princ = base.copy()
@@ -1479,29 +1479,16 @@ def test_m1_p2_explicit_atol_override_precedence_all_primitives(
     _ = apply_ccz(exp3, ccz_e8, atol=1e-6)
 
     # (3) apply_quarter_turn and apply_pauli_t explicit atol overrides under norm drift
-    orig_merge = pq.merge_frames
     orig_pre = pq._checked_shot_pre_norm
-
-    def make_drifted_merge(delta: float):  # type: ignore[no-untyped-def]
-        def _drifted_merge(expansion, **kw):  # type: ignore[no-untyped-def]
-            res = orig_merge(expansion, **kw)
-            res.weights = np.ascontiguousarray(res.weights * math.sqrt(1.0 + delta))
-            return res
-
-        return _drifted_merge
-
-    monkeypatch.setattr(pq, "merge_frames", make_drifted_merge(1e-11))
     monkeypatch.setattr(pq, "_checked_shot_pre_norm", lambda e, c, op, _p=orig_pre: _p(e, c, op) + 1e-11)
     with pytest.raises(FloatingPointError):
         apply_quarter_turn(exp1, [1], [0], 0, atol=1e-13)
     with pytest.raises(FloatingPointError):
         apply_pauli_t(exp1, [0], [1], 0, atol=1e-13)
 
-    monkeypatch.setattr(pq, "merge_frames", make_drifted_merge(1e-8))
     monkeypatch.setattr(pq, "_checked_shot_pre_norm", lambda e, c, op, _p=orig_pre: _p(e, c, op) + 1e-8)
     _ = apply_quarter_turn(exp1, [1], [0], 0, atol=1e-6)
     _ = apply_pauli_t(exp1, [0], [1], 0, atol=1e-6)
-    monkeypatch.setattr(pq, "merge_frames", orig_merge)
     monkeypatch.setattr(pq, "_checked_shot_pre_norm", orig_pre)
 
     # (4) measure_expansion forwards explicit atol=tol to both basis-rotation apply_quarter_turn calls

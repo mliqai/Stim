@@ -295,3 +295,144 @@ def test_peek_out_of_bounds_raises_value_error(sync: bool, bad_q: int):
     with pytest.raises(ValueError, match="peek target out of range"):
         sim.peek_z([bad_q])
 
+
+@pytest.mark.parametrize("sync", [False, True])
+@pytest.mark.parametrize("n_q", [1, 70])
+def test_unmatched_noisy_reset_z_eigenstate_with_active_frame(sync: bool, n_q: int) -> None:
+    q = 0 if n_q == 1 else 66
+    c = stim.Circuit(f"H {q}\nCX {q} {n_q - 1}" if n_q > 1 else "H 0")
+    batch = 64
+    coh = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=batch)
+    sim = CosetsideSimulator(c, compiled_op_handler=coh, batch_size=batch, seed=3, sync_tableside_rng=sync)
+    sim.run()
+    rng = np.random.default_rng(0)
+    xmask = np.zeros((sim.num_qubits, batch), dtype=bool)
+    xmask[q] = rng.random(batch) < 0.5
+    sim.apply_pauli("Z", xmask)
+    sim.apply_pauli("X", xmask)
+    r1 = np.zeros((sim.num_qubits, batch), dtype=bool)
+    r1[q] = rng.random(batch) < 0.5
+    r0 = np.zeros_like(r1)
+    r0[q] = ~r1[q]
+    sim.do_unmatched_noisy_reset_z(r0, r1)
+    np.testing.assert_array_equal(sim.peek_pauli_batch([q], "Z")[0], np.where(r1[q], -1, 1))
+
+
+def test_cpp_vs_python_highrank_splitmix_differential() -> None:
+    n_q, batch, layers = 140, 3, 16
+    rng = np.random.default_rng(4242)
+    ops: list[tuple[str, stim.CircuitInstruction]] = [
+        ("bare", stim.CircuitInstruction("H", list(range(0, n_q, 2))))
+    ]
+    for layer in range(layers):
+        perm = [int(x) for x in rng.permutation(n_q)]
+        g2 = ("CZ", "CX", "ISWAP", "SQRT_XX", "CY", "XCZ")[layer % 6]
+        ops.append(("cond", stim.CircuitInstruction(g2, perm[: 2 * (n_q // 2)])))
+        g1 = ("S", "SQRT_X", "H", "C_XYZ")[layer % 4]
+        ops.append(("cond", stim.CircuitInstruction(g1, perm[: n_q // 2])))
+    ops.append(("bare", stim.CircuitInstruction("CX", [q for i in range(0, n_q - 1, 2) for q in (i, i + 1)])))
+
+    circ = stim.Circuit()
+    for _, op in ops:
+        circ.append(op)
+        circ.append("TICK")
+    circ.append("R", [n_q, n_q + 1])
+    circ.append("CX", [0, n_q, 2, n_q + 1])
+    circ.append("TICK")
+    circ.append("M", [n_q, n_q + 1])
+
+    sims = [
+        CosetsideSimulator(
+            circ,
+            compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=circ, batch_size=batch),
+            batch_size=batch,
+            seed=77,
+        )
+        for _ in range(2)
+    ]
+    sims[1]._use_cpp = False
+    tick = stim.CircuitInstruction("TICK", [])
+    max_d = 0
+    for kind, op in ops:
+        masks = rng.random((len(op.target_groups()), batch)) < 0.5
+        for s in sims:
+            s.do_conditional_clifford(op, None if kind == "bare" else masks.copy())
+            s._do_bare_instruction(tick)
+        if sims[0]._cpp_dirty:
+            sims[0]._sync_cpp_to_py()
+            sims[0]._cpp_dirty = True
+        assert sims[0]._active_shots.keys() == sims[1]._active_shots.keys()
+        for b, st0 in sims[0]._active_shots.items():
+            st1 = sims[1]._active_shots[b]
+            max_d = max(max_d, st0.d)
+            np.testing.assert_array_equal(st0.h_words, st1.h_words)
+            np.testing.assert_array_equal(st0.A_words, st1.A_words)
+            np.testing.assert_array_equal(st0.ell, st1.ell)
+            np.testing.assert_array_equal(st0.Gamma, st1.Gamma)
+            assert list(st0.P) == list(st1.P)
+
+    assert max_d > 64
+    qs = list(range(n_q))
+    for p in ("X", "Y", "Z"):
+        np.testing.assert_array_equal(sims[0].peek_pauli_batch(qs, p), sims[1].peek_pauli_batch(qs, p))
+
+    r0 = np.zeros((sim_nq := sims[0].num_qubits, batch), dtype=bool)
+    r1 = np.zeros((sim_nq, batch), dtype=bool)
+    r0[0] = [True, False, True]
+    r1[2] = [False, True, True]
+    for s in sims:
+        s.do_unmatched_noisy_reset_z(r0, r1)
+        s._do_bare_instruction(stim.CircuitInstruction("R", [n_q, n_q + 1]))
+        s._do_bare_instruction(tick)
+        s.do_conditional_clifford(stim.CircuitInstruction("CX", [0, n_q, 2, n_q + 1]), None)
+        s._do_bare_instruction(tick)
+        s._do_bare_instruction(stim.CircuitInstruction("M", [n_q, n_q + 1]))
+    np.testing.assert_array_equal(
+        np.column_stack(sims[0]._measurement_columns),
+        np.column_stack(sims[1]._measurement_columns),
+    )
+
+
+def test_coset_duplicate_target_leakage_projection_z() -> None:
+    circ = stim.Circuit(
+        "R 0 1\nH 0 1\n"
+        "I[LEAKAGE_TRANSITION_1: (0.3, U-->2)] 0 1\n"
+        "M[LEAKAGE_PROJECTION_Z: (0.0, 0) (1.0, 1) (0.5, 2)] 0 0 1\n"
+        "H 0\n"
+        "MR[LEAKAGE_PROJECTION_Z: (0.0, 0) (1.0, 1) (0.5, 2)] 0 0\n"
+    )
+    coh = LeakageUint8Coset().compile_op_handler(circuit=circ, batch_size=128)
+    sim = CosetsideSimulator(circ, compiled_op_handler=coh, batch_size=128, seed=19, sync_tableside_rng=False)
+    sim.run()
+    recs = sim.get_final_measurement_records()
+    unleaked_q0 = coh.state[0] < 2
+    assert np.any(unleaked_q0) and np.any(~unleaked_q0)
+    np.testing.assert_array_equal(recs[unleaked_q0, 0], recs[unleaked_q0, 1])
+    assert not np.any(recs[unleaked_q0, 4])
+
+    with pytest.raises(NotImplementedError, match="Duplicate targets"):
+        CosetsideSimulator(
+            circ,
+            compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=circ, batch_size=8),
+            batch_size=8,
+            seed=19,
+            sync_tableside_rng=True,
+        ).run()
+
+    circ_unleaked = stim.Circuit(
+        "R 0\nH 0\nM[LEAKAGE_PROJECTION_Z: (0.0, 0) (1.0, 1) (0.5, 2)] 0 0\n"
+        "H 0\nMR[LEAKAGE_PROJECTION_Z: (0.0, 0) (1.0, 1) (0.5, 2)] 0 0\n"
+    )
+    sim_sync = CosetsideSimulator(
+        circ_unleaked,
+        compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=circ_unleaked, batch_size=32),
+        batch_size=32,
+        seed=19,
+        sync_tableside_rng=True,
+    )
+    sim_sync.run()
+    recs_sync = sim_sync.get_final_measurement_records()
+    np.testing.assert_array_equal(recs_sync[:, 0], recs_sync[:, 1])
+    assert not np.any(recs_sync[:, 3])
+
+

@@ -278,6 +278,7 @@ def _simulate(circuit: stim.Circuit, uc: bool) -> tuple[np.ndarray, np.ndarray]:
         op_handler=LeakageUint8(unconditional_condition_on_U=uc),
         batch_size=64,
         dem_decoder=MarginalDecoder(MarginalLeakageDemGenerator(uc)),
+        seed=1,
     )
     compiled = sampler.compiled_sampler_for_task(
         sinter.Task(circuit=circuit, decoder="pymatching")
@@ -2348,5 +2349,15 @@ def test_decode_with_generated_dems_zero_shots_multi_byte_observables() -> None:
     base = gen._get_analysis(circ, True).baseline
     pred_list = decode_with_generated_dems("pymatching", [], empty_dets, base_dem=base)
     assert pred_list.shape == (0, 2) and pred_list.dtype == np.uint8
+
+
+def test_mpad_zero_one_false_positive_baseline_halved() -> None:
+    c = stim.Circuit(
+        "R 0\nMPAD[LEAKAGE_MEASUREMENT: (0.02, 0) (0.02, 1) (0.9, 2): 0] 0\n"
+        "DETECTOR rec[-1]\nM 0\nDETECTOR rec[-1]\n"
+    )
+    errs = [str(i) for i in MarginalLeakageDemGenerator().base_dem(c).flattened() if i.type == "error"]
+    assert errs == ["error(0.02) D0"]
+
 
 

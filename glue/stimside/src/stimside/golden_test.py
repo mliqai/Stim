@@ -385,6 +385,26 @@ CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
         OBSERVABLE_INCLUDE(0) rec[-2]
         """,
     ),
+    (
+        "c16_sparse_multibatch",
+        _LEAK_SHARED_TAGS,
+        True,
+        """
+        R 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+        H 0 2 4 6 8 10 12 14 16 18
+        CX 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+        I[LEAKAGE_TRANSITION_1: (0.01, U-->2)] 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+        I[LEAKAGE_TRANSITION_1: (0.01, U-->2) (0.001, 1-->3)] 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+        II[LEAKAGE_TRANSITION_2: (0.02, U_U-->2_U)] 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+        DEPOLARIZE1(0.001) 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+        MPAD[LEAKAGE_MEASUREMENT: (0.9, 2) (0.9, 3): 0 1 2 3] 0 0 0 0
+        MY[LEAKAGE_PROJECTION_Z: (0.9, 2) (0.9, 3)] 0 2
+        MRX[LEAKAGE_PROJECTION_Z: (0.9, 2)] 4 6
+        M[LEAKAGE_PROJECTION_Z: (0.9, 2) (0.9, 3)] 1 3 5 7 8 9 10 11 12 13 14 15 16 17 18 19
+        DETECTOR rec[-1] rec[-2]
+        OBSERVABLE_INCLUDE(0) rec[-3]
+        """,
+    ),
 )
 
 
@@ -394,12 +414,18 @@ def _hash_payload(
     obs: np.ndarray,
     u2l: list[np.ndarray] | None,
     lev: list[Any] | None,
+    packed: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> str:
     h = hashlib.sha256()
     for tag, arr in (("R", recs), ("D", dets), ("O", obs)):
         b = np.ascontiguousarray(arr, dtype=np.bool_)
         h.update(f"{tag}:{b.shape}:".encode())
         h.update(b.tobytes())
+    if packed is not None:
+        for tag, arr in (("PD", packed[0]), ("PO", packed[1])):
+            p = np.ascontiguousarray(arr, dtype=np.uint8)
+            h.update(f"{tag}:{p.shape}:".encode())
+            h.update(p.tobytes())
     if u2l is not None:
         h.update(b"U2L:" + repr([[int(x) for x in row] for row in u2l]).encode())
     if lev is not None:
@@ -415,12 +441,63 @@ def _hash_payload(
     return h.hexdigest()[:32]
 
 
-def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
+def _run_batched_sim(
+    sim: Any,
+    *,
+    num_batches: int,
+    rec_flag: bool,
+    has_lev: bool,
+    transpose_flips: bool = False,
+    include_packed: bool = False,
+    suppress_warnings: bool = False,
+) -> str:
+    recs, dets, obs, pdets, pobs = [], [], [], [], []
+    u2l_all: list[np.ndarray] = []
+    lev_all: list[Any] = []
+    for k in range(num_batches):
+        if k > 0:
+            sim.clear()
+        if suppress_warnings:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                sim.run()
+        else:
+            sim.run()
+        recs.append(sim.get_final_measurement_records().copy())
+        d = sim.get_detector_flips()
+        o = sim.get_observable_flips()
+        dets.append((d.T if transpose_flips else d).copy())
+        obs.append((o.T if transpose_flips else o).copy())
+        if include_packed:
+            pdets.append(sim.get_detector_flips(bit_packed=True).copy())
+            pobs.append(sim.get_observable_flips(bit_packed=True).copy())
+        if rec_flag:
+            u2l_all.extend(sim.get_unleaked_to_leaked_records())
+            if has_lev:
+                lev_all.extend(sim.get_leakage_events())
+    return _hash_payload(
+        np.vstack(recs),
+        np.vstack(dets),
+        np.vstack(obs),
+        u2l_all if rec_flag else None,
+        lev_all if (rec_flag and has_lev) else None,
+        (np.vstack(pdets), np.vstack(pobs)) if include_packed else None,
+    )
+
+
+def _run_case(
+    circuit: stim.Circuit,
+    mode: str,
+    has_leakage: bool,
+    *,
+    batch: int = BATCH,
+    multibatch_packed: bool = False,
+) -> str:
     if mode in ("dem_marginal", "marginal_decoder"):
         sim_d = CosetsideSimulator(
             circuit,
-            compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=BATCH),
-            batch_size=BATCH,
+            compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=batch),
+            batch_size=batch,
             seed=SEED,
         )
         sim_d.run()
@@ -443,23 +520,23 @@ def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
         return h.hexdigest()[:32]
 
     rec_flag = bool(has_leakage)
+    num_batches = 2 if multibatch_packed else 1
     if mode == "flip":
         op_h = LeakageUint8Flip() if has_leakage else TrivialOpHandler()
         sim = FlipsideSimulator(
             circuit,
-            compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=BATCH),
-            batch_size=BATCH,
+            compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=batch),
+            batch_size=batch,
             seed=SEED,
             record_unleaked_to_leaked=rec_flag,
         )
-        sim.run()
-        u2l = sim.get_unleaked_to_leaked_records() if rec_flag else None
-        return _hash_payload(
-            sim.get_final_measurement_records(),
-            sim.get_detector_flips().T,
-            sim.get_observable_flips().T,
-            u2l,
-            None,
+        return _run_batched_sim(
+            sim,
+            num_batches=num_batches,
+            rec_flag=rec_flag,
+            has_lev=False,
+            transpose_flips=True,
+            include_packed=multibatch_packed,
         )
 
     if mode in ("tab_nosync", "tab_sync"):
@@ -467,20 +544,15 @@ def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
         if mode == "tab_sync":
             sim_t = TablesideSimulator(
                 circuit,
-                compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=BATCH),
-                batch_size=BATCH,
+                compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=batch),
+                batch_size=batch,
                 seed=SEED,
                 sync_tableside_rng=True,
                 record_unleaked_to_leaked=rec_flag,
                 record_leakage_events=rec_flag,
             )
-            sim_t.run()
-            return _hash_payload(
-                sim_t.get_final_measurement_records(),
-                sim_t.get_detector_flips(),
-                sim_t.get_observable_flips(),
-                sim_t.get_unleaked_to_leaked_records() if rec_flag else None,
-                sim_t.get_leakage_events() if rec_flag else None,
+            return _run_batched_sim(
+                sim_t, num_batches=num_batches, rec_flag=rec_flag, has_lev=True, include_packed=multibatch_packed
             )
         sim_t = TablesideSimulator(
             circuit,
@@ -491,43 +563,27 @@ def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
             record_leakage_events=rec_flag,
         )
         assert sim_t._cpp_runner is not None
-        recs, dets, obs, u2l_all, lev_all = [], [], [], [], []
-        for s in range(BATCH):
-            if s > 0:
-                sim_t.clear()
-            sim_t.run()
-            recs.append(sim_t.get_final_measurement_records()[0].copy())
-            dets.append(sim_t.get_detector_flips()[0].copy())
-            obs.append(sim_t.get_observable_flips()[0].copy())
-            if rec_flag:
-                u2l_all.append(sim_t.get_unleaked_to_leaked_records()[0])
-                lev_all.append(sim_t.get_leakage_events()[0])
-        return _hash_payload(
-            np.vstack(recs),
-            np.vstack(dets),
-            np.vstack(obs),
-            u2l_all if rec_flag else None,
-            lev_all if rec_flag else None,
+        return _run_batched_sim(
+            sim_t,
+            num_batches=num_batches * batch,
+            rec_flag=rec_flag,
+            has_lev=True,
+            include_packed=multibatch_packed,
         )
 
     if mode.startswith("coset_"):
         op_h = LeakageUint8Coset() if has_leakage else TrivialOpHandler()
         sim_c = CosetsideSimulator(
             circuit,
-            compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=BATCH),
-            batch_size=BATCH,
+            compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=batch),
+            batch_size=batch,
             seed=SEED,
             sync_tableside_rng=(mode == "coset_sync"),
             record_unleaked_to_leaked=rec_flag,
             record_leakage_events=rec_flag,
         )
-        sim_c.run()
-        return _hash_payload(
-            sim_c.get_final_measurement_records(),
-            sim_c.get_detector_flips(),
-            sim_c.get_observable_flips(),
-            sim_c.get_unleaked_to_leaked_records() if rec_flag else None,
-            sim_c.get_leakage_events() if rec_flag else None,
+        return _run_batched_sim(
+            sim_c, num_batches=num_batches, rec_flag=rec_flag, has_lev=True, include_packed=multibatch_packed
         )
 
     m_cfg = {
@@ -540,8 +596,8 @@ def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
     op_h = LeakageUint8Magic() if has_leakage else TrivialOpHandler()
     sim_m = MagicsideSimulator(
         circuit,
-        compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=BATCH),
-        batch_size=BATCH,
+        compiled_op_handler=op_h.compile_op_handler(circuit=circuit, batch_size=batch),
+        batch_size=batch,
         seed=SEED,
         fault_mode=m_cfg[0],
         backend=m_cfg[1],
@@ -549,15 +605,13 @@ def _run_case(circuit: stim.Circuit, mode: str, has_leakage: bool) -> str:
         record_unleaked_to_leaked=rec_flag,
         record_leakage_events=rec_flag,
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        sim_m.run()
-    return _hash_payload(
-        sim_m.get_final_measurement_records(),
-        sim_m.get_detector_flips(),
-        sim_m.get_observable_flips(),
-        sim_m.get_unleaked_to_leaked_records() if rec_flag else None,
-        sim_m.get_leakage_events() if rec_flag else None,
+    return _run_batched_sim(
+        sim_m,
+        num_batches=num_batches,
+        rec_flag=rec_flag,
+        has_lev=True,
+        include_packed=multibatch_packed,
+        suppress_warnings=True,
     )
 
 
@@ -565,7 +619,10 @@ def _compute_all_digests() -> dict[str, dict[str, str]]:
     out: dict[str, dict[str, str]] = {}
     for name, modes, has_leak, text in CORPUS:
         circ = stim.Circuit(text)
-        case_out = {m: _run_case(circ, m, has_leak) for m in modes}
+        mb = name == "c16_sparse_multibatch"
+        case_out = {
+            m: _run_case(circ, m, has_leak, batch=70 if mb else BATCH, multibatch_packed=mb) for m in modes
+        }
         sync_vals = [case_out[m] for m in ("tab_sync", "coset_sync", "magic_sync") if m in case_out]
         assert len(set(sync_vals)) <= 1, f"Sync RNG lockstep diverged on {name}: {case_out}"
         out[name] = case_out

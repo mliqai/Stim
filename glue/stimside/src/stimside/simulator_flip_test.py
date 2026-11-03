@@ -567,3 +567,44 @@ def test_getter_outputs_are_isolated_from_in_place_mutation():
             obs = sim.get_observable_flips(bit_packed=bp)
             obs ^= 1 if bp else True
             np.testing.assert_array_equal(sim.get_observable_flips(bit_packed=bp), orig_obs)
+
+
+@pytest.mark.parametrize(
+    "prog",
+    [
+        "X 1\nM 1\nXCZ 0 rec[-1]\nM 0",
+        "X 1\nM 1\nYCZ 0 rec[-1]\nM 0",
+        "X 1\nH 0\nM 1\nCZ 0 rec[-1]\nMX 0",
+        "X 3\nM 3\nCX rec[-1] 0 1 2\nM 0 1 2",
+    ],
+)
+def test_flip_sync_reference_qubit_first_and_mixed_feedback(prog: str) -> None:
+    from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
+
+    c = stim.Circuit(prog)
+    want = np.broadcast_to(c.compile_sampler(seed=1).sample(1), (4, c.num_measurements))
+    coh = TrivialOpHandler().compile_op_handler(circuit=c, batch_size=4)
+    sim = FlipsideSimulator(c, compiled_op_handler=coh, batch_size=4, seed=1)
+    sim.run()
+    np.testing.assert_array_equal(sim.get_final_measurement_records(), want)
+
+
+def test_flip_ltz_duplicate_targets_and_y_basis_projection() -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8
+
+    c = stim.Circuit(
+        "R 0\n"
+        "I_ERROR[LEAKAGE_TRANSITION_Z: (0.2, 0-->2)] 0 0\n"
+        "X_ERROR(0.5) 0\nZ_ERROR(0.5) 0\n"
+        "MY[LEAKAGE_PROJECTION_Z: (0.0, 0) (1.0, 1) (0.5, 2)] 0 0\n"
+        "MRY[LEAKAGE_PROJECTION_Z: (0.0, 0) (1.0, 1) (0.5, 2)] 0 0\n"
+    )
+    coh = LeakageUint8().compile_op_handler(circuit=c, batch_size=128)
+    sim = FlipsideSimulator(c, compiled_op_handler=coh, batch_size=128, seed=13)
+    sim.run()
+    recs = sim.get_final_measurement_records()
+    unleaked = coh.state[0] < 2
+    assert np.any(unleaked) and np.any(~unleaked)
+    np.testing.assert_array_equal(recs[unleaked, 0], recs[unleaked, 1])
+    assert not np.any(recs[unleaked, 3])
+

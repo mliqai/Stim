@@ -282,3 +282,7 @@ def test_3_sampler_distinct_seeds_across_compiles_and_workers(monkeypatch):
         s_worker = sampler_w._next_compiled_seed()
         assert s_worker is not None and s_worker != 42 and s_worker != s1
         monkeypatch.setattr(os, "getpid", lambda: orig_pid)
+    from stimside._sampling import next_compiled_seed
+
+    assert len({next_compiled_seed(42, 0, s) for s in (1, 2, 3)}) == 3
+

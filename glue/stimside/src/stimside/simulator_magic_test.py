@@ -197,8 +197,10 @@ def test_invalid_inputs_and_lifecycle_errors_raise() -> None:
     sim.run()
     with pytest.raises(ValueError):
         sim.run()
-    with pytest.raises(IndexError):
+    with pytest.raises(IndexError, match="out of range"):
         sim.get_qfe_expansion(2)
+    with pytest.raises(IndexError, match="out of range"):
+        sim.get_qfe_expansion(-3)
     with pytest.raises(ValueError):
         sim.get_statevector(0, endian="middle")  # type: ignore[arg-type]
     sim.clear()
