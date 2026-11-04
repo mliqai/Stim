@@ -18,11 +18,13 @@ from stimside._native._kernel_loader import (
 )
 
 _LIB_INSTANCE: ctypes.CDLL | None = None
+_find_prebuilt_so_candidate = None  # kept for e2e T1-F11-01 / T2-F11-03 compatibility
 
 _sz, _c_u8, _c_int = ctypes.c_size_t, ctypes.c_uint8, ctypes.c_int
 _c_i32, _c_dbl = ctypes.c_int32, ctypes.c_double
 
 _SPECS: tuple[AbiSpec, ...] = (
+    ("magic_abi_v1", [], _c_i32),
     (
         "magic_apply_pauli_batch",
         [_sz, _sz, _sz, _c_double_p, _c_u64_p, _c_u8_p, _c_u64_p, _c_u64_p, _c_u64_p, _c_u64_p, _c_u8],

@@ -183,6 +183,10 @@ See "Untagged Instructions on Leaked Qubits" in the top-level README for the det
 | `LEAKAGE_TRANSITION_Z` | Yes | No | No | No | Yes |
 | `LEAKAGE_DETECTOR` (`DETECTOR`) | No | Yes (no-op) | Yes (no-op) | No | Ignored |
 
+`LEAKAGE_PROJECTION_Z` and `LEAKAGE_MEASUREMENT` reject a nonzero gate noise argument (e.g.
+`M[LEAKAGE_PROJECTION_Z: (0.9, 2)](0.01) 0`) with a `ValueError`: the simulators would ignore it while
+Stim's DEM keeps it. Put readout errors in the tag's probabilities or in an explicit `X_ERROR`.
+
 #### Important Behavioral Notes
 
 * **State Collapse When Conditioning on `0` or `1`**: Conditioning on computational basis states `0` or `1` (in `CONDITIONED_ON_SELF` / `CONDITIONED_ON_OTHER` / `CONDITIONED_ON_PAIR`, `LEAKAGE_TRANSITION_1`, `LEAKAGE_TRANSITION_2`, `LEAKAGE_PROJECTION_Z`, or `LEAKAGE_MEASUREMENT`) in `TablesideSimulator`, `CosetsideSimulator`, and `MagicsideSimulator` projectively collapses any $Z$-basis superposition on the inspected unleaked qubit(s) into `|0>` or `|1>` before evaluating the condition or transition. Use `U` to condition on the unleaked subspace without collapsing superpositions.

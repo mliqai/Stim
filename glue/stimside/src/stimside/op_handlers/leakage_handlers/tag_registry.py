@@ -62,6 +62,15 @@ class TagDef:
                 f"but was attached to '{op.name}'."
             )
 
+        if self.name in ("LEAKAGE_PROJECTION_Z", "LEAKAGE_MEASUREMENT") and any(
+            a != 0 for a in op.gate_args_copy()
+        ):
+            raise ValueError(
+                f"Leakage tag '{self.name}' does not support a gate noise argument (got {op}): "
+                "the simulators would ignore it while Stim's DEM keeps it. Add an explicit "
+                "X_ERROR, or use the tag's own readout probabilities."
+            )
+
 
 # --- THE REGISTRY ---
 

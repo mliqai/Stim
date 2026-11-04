@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import types
 from typing import Any, ClassVar, Literal
 
 import numpy as np
@@ -43,7 +44,8 @@ class LeakageControlledErrorParams:
         for prob, state, pauli in self.args:
             by_state.setdefault(state, []).append((pauli, prob))
         args_by_in = {k: tuple(v) for k, v in by_state.items()}
-        object.__setattr__(self, "args_by_input_state", args_by_in)
+        # Read-only: parse_leakage_tag's lru_cache shares this object between compiles.
+        object.__setattr__(self, "args_by_input_state", types.MappingProxyType(args_by_in))
 
         seen_state_paulis: set[tuple[int, str]] = set()
         probs_by_state: dict[int, float] = {}
@@ -75,6 +77,10 @@ class LeakageControlledErrorParams:
                     f"{self.name} total probability {total_p}>1 for state {state}"
                 )
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Rebuild from the constructor arguments (the read-only map is not picklable).
+        return (type(self), (self.args, self.from_tag))
+
 
 @dataclasses.dataclass(frozen=True)
 class _TransitionParamsBase:
@@ -94,7 +100,8 @@ class _TransitionParamsBase:
         for p, s0, s1 in self.args:
             by_in.setdefault(s0, []).append((s1, p))
         args_by_in = {k: tuple(v) for k, v in by_in.items()}
-        object.__setattr__(self, "args_by_input_state", args_by_in)
+        # Read-only: parse_leakage_tag's lru_cache shares this object between compiles.
+        object.__setattr__(self, "args_by_input_state", types.MappingProxyType(args_by_in))
 
         for s0, transitions in args_by_in.items():
             probs = [p for _, p in transitions]
@@ -107,13 +114,19 @@ class _TransitionParamsBase:
         object.__setattr__(
             self,
             "alias_table_by_input_state",
-            {
-                s0: build_alias_table(
-                    [*tr, (s0, max(0.0, 1 - sum(p for _, p in tr)))]
-                )
-                for s0, tr in args_by_in.items()
-            },
+            types.MappingProxyType(
+                {
+                    s0: build_alias_table(
+                        [*tr, (s0, max(0.0, 1 - sum(p for _, p in tr)))]
+                    )
+                    for s0, tr in args_by_in.items()
+                }
+            ),
         )
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Rebuild from the constructor arguments (the read-only maps are not picklable).
+        return (type(self), (self.args, self.from_tag))
 
     def _check_prob_and_non_identity(self, p: float, s0: Any, s1: Any) -> None:
         if not 0 <= p <= 1:
@@ -262,8 +275,11 @@ class LeakageMeasurementParams:
     )
 
     def __post_init__(self) -> None:
+        # Read-only: parse_leakage_tag's lru_cache shares this object between compiles.
         object.__setattr__(
-            self, "prob_for_input_state", {state: prob for prob, state in self.args}
+            self,
+            "prob_for_input_state",
+            types.MappingProxyType({state: prob for prob, state in self.args}),
         )
         name = self.from_tag.split(":", 1)[0].strip() or self.name
         seen_states: set[int] = set()
@@ -296,6 +312,10 @@ class LeakageMeasurementParams:
     @property
     def p1(self) -> float:
         return self.prob_for_input_state.get(1, 0.0 if self.targets is not None else 1.0)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Rebuild from the constructor arguments (the read-only map is not picklable).
+        return (type(self), (self.args, self.targets, self.from_tag))
 
 
 @dataclasses.dataclass(frozen=True)

@@ -21,6 +21,7 @@ from stimside._magic.compile import (
 from stimside._native import magic_kernels as mk
 
 EXPECTED_SYMBOLS = (
+    "magic_abi_v1",
     "magic_abi_v2",
     "magic_apply_pauli_batch",
     "magic_apply_quarter_turn",
@@ -79,11 +80,11 @@ def test_loader_abi_symbols_caching_rebuild_and_missing_source(
         tmp_native.mkdir(parents=True)
         (tmp_path / "rebuild_pkg" / "setup.py").write_text("# dummy\n", encoding="utf-8")
         stub_cpp = (
-            'extern "C" {\nint magic_abi_v2() { return 2; }\n'
+            'extern "C" {\nint magic_abi_v1() { return 1; }\nint magic_abi_v2() { return 2; }\n'
             + "".join(
                 f"int {s}() {{ return 0; }}\n"
                 for s in EXPECTED_SYMBOLS
-                if s != "magic_abi_v2"
+                if s not in ("magic_abi_v1", "magic_abi_v2")
             )
             + "}\n"
         )

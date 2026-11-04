@@ -598,3 +598,59 @@ def test_nan_probabilities_and_target_multiplicity_raise_value_error() -> None:
     with pytest.raises(ValueError, match="multiple"):
         LeakageUint8Magic().compile_op_handler(circuit=c_other, batch_size=1)
 
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "M[LEAKAGE_PROJECTION_Z: (1.0, 2)](0.2) 0",
+        "MR[LEAKAGE_PROJECTION_Z: (1.0, 2)](0.2) 0",
+        "MPAD[LEAKAGE_MEASUREMENT: (1.0, 2) : 0](0.2) 0",
+    ],
+)
+def test_gate_noise_argument_on_leakage_measurement_tags_is_rejected(text: str) -> None:
+    # Every engine ignored the argument while stim's DEM kept it (OD3-3: reject it).
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+
+    c = stim.Circuit(text)
+    compilers = (
+        lambda: LeakageUint8().compile_op_handler(circuit=c, batch_size=1),
+        lambda: LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=1),
+        lambda: LeakageUint8Flip().compile_op_handler(circuit=c, batch_size=1),
+        lambda: LeakageUint8Magic().compile_op_handler(circuit=c, batch_size=1),
+        lambda: MarginalLeakageDemGenerator()(c, np.zeros((1, c.num_measurements), dtype=np.bool_)),
+    )
+    for compile_fn in compilers:
+        with pytest.raises(ValueError, match="does not support a gate noise argument"):
+            compile_fn()
+    # A zero argument changes nothing anywhere, so it stays accepted.
+    c0 = stim.Circuit(text.replace("(0.2)", "(0)"))
+    LeakageUint8().compile_op_handler(circuit=c0, batch_size=1)
+
+
+def test_cached_leakage_params_are_read_only_and_picklable() -> None:
+    import copy
+    import pickle
+
+    from stimside.op_handlers.leakage_handlers.tag_registry import parse_leakage_tag
+
+    for text, simulator in (
+        ("I[LEAKAGE_TRANSITION_1: (0.1, U-->2)] 0", "tableau"),
+        ("MPAD[LEAKAGE_MEASUREMENT: (0.9, 2) : 0] 0", "tableau"),
+        ("II_ERROR[LEAKAGE_CONTROLLED_ERROR: (0.1, 2-->X)] 0 1", "flip"),
+    ):
+        op = stim.Circuit(text)[0]
+        params = parse_leakage_tag(op, simulator=simulator)
+        maps = [
+            getattr(params, name)
+            for name in ("args_by_input_state", "alias_table_by_input_state", "prob_for_input_state")
+            if hasattr(params, name)
+        ]
+        for m in maps:
+            with pytest.raises(TypeError):
+                m[99] = ()  # shared by parse_leakage_tag's cache: must not be mutable
+        for clone in (pickle.loads(pickle.dumps(params)), copy.deepcopy(params)):
+            assert clone == params
+            for name in ("args_by_input_state", "prob_for_input_state"):
+                if hasattr(params, name):
+                    assert dict(getattr(clone, name)) == dict(getattr(params, name))
+

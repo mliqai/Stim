@@ -732,6 +732,10 @@ struct WorkShot {
 
 extern "C" {
 
+int32_t magic_abi_v1() {
+    return 1;
+}
+
 void magic_apply_pauli_batch(
     size_t chi,
     size_t d,
