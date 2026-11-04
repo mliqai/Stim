@@ -40,6 +40,7 @@ from stimside.dem_generators.graphlike import (
     dets_edge_key,
     graphlike_inst_symptom,
     inst_symptom,
+    preserve_dem_counts,
     prob_xor,
     raw_inst_components,
     sym_to_targets,
@@ -577,6 +578,7 @@ class Builder:
                     _, sym = graphlike_inst_symptom(inst, known_base)
                     if sym != ((), ()):
                         decomposed_base.append("error", p, sym_to_targets(sym))
+                preserve_dem_counts(decomposed_base, baseline)
                 baseline = decomposed_base
 
         (

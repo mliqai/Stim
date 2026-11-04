@@ -453,3 +453,21 @@ def test_marginal_decoder_compile_for_task_isolates_dem_gen_cache():
     assert pred.shape == (8, 1)
     assert not any("hyperedge" in str(w.message).lower() for w in caught)
 
+
+@pytest.mark.parametrize(
+    "noise",
+    [
+        "PAULI_CHANNEL_2(0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01) 0 1",
+        "HERALDED_ERASE(0.05) 0",
+        "HERALDED_PAULI_CHANNEL_1(0.01, 0.01, 0.01, 0.01) 0",
+    ],
+)
+def test_base_decoder_builds_task_dem_with_approximate_disjoint_errors(noise: str) -> None:
+    # Without a pre-filled task DEM, these channels need approximate_disjoint_errors (like sinter).
+    circuit = stim.Circuit(
+        f"R 0 1\n{noise}\nM 0 1\nDETECTOR rec[-2]\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]"
+    )
+    for decoder in (BaseDecoder(), BaseDecoder(decompose_errors=True)):
+        compiled = decoder.compile_for_task(sinter.Task(circuit=circuit))
+        dets = np.zeros((3, 1), dtype=np.uint8)
+        assert compiled.decode_shots_bit_packed(bit_packed_detection_event_data=dets).shape == (3, 1)

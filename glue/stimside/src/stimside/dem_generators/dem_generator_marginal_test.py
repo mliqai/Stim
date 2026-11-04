@@ -2360,4 +2360,25 @@ def test_mpad_zero_one_false_positive_baseline_halved() -> None:
     assert errs == ["error(0.02) D0"]
 
 
-
+def test_decomposed_marginal_decoder_counts_detector_free_observable_errors() -> None:
+    # The hyperedge sends decomposition down the Python path, which used to drop L0's count:
+    # sampling then failed with "Decoder returned shape (B, 0)".
+    circuit = stim.Circuit(
+        "R 0 1 2 9\nCORRELATED_ERROR(0.1) X0 X1 X2\nX_ERROR(0.2) 9\nM 0 1 2 9\n"
+        "DETECTOR rec[-4]\nDETECTOR rec[-3]\nDETECTOR rec[-2]\nOBSERVABLE_INCLUDE(0) rec[-1]"
+    )
+    gen = MarginalLeakageDemGenerator()
+    dems = gen(circuit, np.zeros((2, circuit.num_measurements), dtype=np.bool_), decompose_errors=True)
+    assert dems.base_dem.num_observables == 1
+    assert [d.num_observables for d in dems] == [1, 1]
+    sampler = CosetsideSampler(
+        op_handler=LeakageUint8Coset(),
+        batch_size=256,
+        seed=5,
+        dem_decoder=MarginalDecoder(MarginalLeakageDemGenerator(), decompose_errors=True),
+    )
+    stats = sampler.compiled_sampler_for_task(
+        sinter.Task(circuit=circuit, decoder="pymatching")
+    ).sample(suggested_shots=2048)
+    rate = stats.errors / stats.shots
+    assert abs(rate - 0.2) < 5 * (0.2 * 0.8 / stats.shots) ** 0.5

@@ -315,3 +315,25 @@ def test_fork_reweight_only_explicit_base_dem_adds_missing_edge() -> None:
     np.testing.assert_array_equal(pred, np.array([[0]], dtype=np.uint8))
 
 
+def test_decompose_dem_graphlike_keeps_detector_free_observable_count() -> None:
+    # A detector-free observable mechanism decomposes to nothing; the count must survive.
+    dem = stim.DetectorErrorModel(
+        "error(0.1) D0 D1 D2\nerror(0.1) D0\nerror(0.1) D1 D2\nerror(0.2) L0\n"
+    )
+    out = decompose_dem_graphlike(dem)
+    assert out.num_observables == dem.num_observables == 1
+    assert out.num_detectors == dem.num_detectors
+
+
+@pytest.mark.parametrize("decompose", [False, True])
+def test_reweight_only_decodes_circuit_without_detectors_or_observables(decompose: bool) -> None:
+    # The generator baseline is an empty (falsy) DEM here; it must not count as "missing".
+    circuit = stim.Circuit(
+        "R 0 1\nI[LEAKAGE_TRANSITION_1: (0.3, U-->2)] 0\nCX 0 1\n"
+        "MPAD[LEAKAGE_MEASUREMENT: (1.0, 2) : 0] 0\nM 0 1"
+    )
+    gen = MarginalLeakageDemGenerator()
+    records = np.zeros((4, circuit.num_measurements), dtype=np.bool_)
+    dems = gen(circuit, records, decompose_errors=decompose, reweight_only=True)
+    pred = decode_with_generated_dems("pymatching", dems, np.zeros((4, 0), dtype=np.uint8))
+    assert pred.shape == (4, 0)

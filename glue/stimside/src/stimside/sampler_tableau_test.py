@@ -1,3 +1,4 @@
+import numpy as np
 import sinter
 import stim # type: ignore[import-untyped]
 
@@ -335,3 +336,31 @@ def test_all_four_samplers_support_sinter_postselection_masks() -> None:
         samplers[0].compiled_sampler_for_task(bad_task).sample(64)
 
 
+class _DiscardByteCompiled(CompiledLeakageDecoder):
+    """Predicts no observable flips and flags shots whose first detector fired as discards."""
+
+    def decode_shots_bit_packed(self, *, bit_packed_detection_event_data, records=None, leakage_events=None):
+        dets = np.asarray(bit_packed_detection_event_data)
+        out = np.zeros((dets.shape[0], 2), dtype=np.uint8)
+        out[:, 1] = dets[:, 0] & 1
+        return out
+
+
+class _DiscardByteDecoder(LeakageDecoder):
+    needs_records = False
+
+    @property
+    def name(self) -> str:
+        return "discard_byte"
+
+    def compile_for_task(self, task: sinter.Task) -> CompiledLeakageDecoder:
+        return _DiscardByteCompiled()
+
+
+def test_sample_batches_honours_sinter_decoder_discard_byte() -> None:
+    # Shot = (D0, L0) with L0 = D0 = M0: every flipped shot is discarded, every kept shot is correct.
+    circuit = stim.Circuit("R 0\nX_ERROR(0.4) 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    sampler = TablesideSampler(TrivialOpHandler(), _DiscardByteDecoder(), batch_size=64, seed=5)
+    stats = sampler.compiled_sampler_for_task(sinter.Task(circuit=circuit, decoder="vacuous")).sample(2048)
+    assert stats.errors == 0
+    assert abs(stats.discards / stats.shots - 0.4) < 5 * (0.4 * 0.6 / stats.shots) ** 0.5

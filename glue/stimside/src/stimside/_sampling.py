@@ -85,6 +85,16 @@ def sample_batches(
         if needs_leakage_events:
             decode_kwargs["leakage_events"] = leakage_events
         pred_packed = compiled_dem_decoder.decode_shots_bit_packed(**decode_kwargs)
+        if (
+            pred_packed.ndim == 2
+            and pred_packed.shape[0] == obs_packed.shape[0]
+            and pred_packed.shape[1] == obs_packed.shape[1] + 1
+        ):
+            # sinter's protocol: an extra last byte that is nonzero marks a decoder discard.
+            dec_disc = pred_packed[:, -1] != 0
+            num_discards += int(np.count_nonzero(dec_disc))
+            pred_packed = pred_packed[~dec_disc, :-1]
+            obs_packed = obs_packed[~dec_disc]
         if pred_packed.shape != obs_packed.shape:
             raise ValueError(
                 f"Decoder returned shape {pred_packed.shape}, expected {obs_packed.shape}."

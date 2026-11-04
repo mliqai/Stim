@@ -298,6 +298,24 @@ def dem_has_hyperedge(dem: stim.DetectorErrorModel) -> bool:
     return False
 
 
+def preserve_dem_counts(
+    out: stim.DetectorErrorModel, ref: stim.DetectorErrorModel
+) -> None:
+    """Re-declare the last detector / observable of ``ref`` if ``out`` lost them."""
+    if out.num_detectors < ref.num_detectors:
+        out.append(
+            "detector",
+            [],
+            [stim.target_relative_detector_id(ref.num_detectors - 1)],
+        )
+    if out.num_observables < ref.num_observables:
+        out.append(
+            "logical_observable",
+            [],
+            [stim.target_logical_observable_id(ref.num_observables - 1)],
+        )
+
+
 def decompose_dem_graphlike(
     dem: stim.DetectorErrorModel,
     base_dem: stim.DetectorErrorModel | None = None,
@@ -315,4 +333,5 @@ def decompose_dem_graphlike(
         _, sym = graphlike_inst_symptom(inst, known_graphlike)
         if sym != ((), ()):
             out.append("error", p, sym_to_targets(sym))
+    preserve_dem_counts(out, dem)
     return out

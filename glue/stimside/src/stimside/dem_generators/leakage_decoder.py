@@ -183,12 +183,20 @@ class BaseDecoder(LeakageDecoder):
         if dem is None:
             dem = task.detector_error_model
         if dem is None:
+            # Like sinter's task DEMs: approximate disjoint errors, then fall back
+            # (undecomposed, then flattened loops). With decompose_errors=True the
+            # undecomposed DEM is decomposed below by decompose_dem_graphlike.
+            kw = {"approximate_disjoint_errors": True}
             try:
                 dem = task.circuit.detector_error_model(
-                    decompose_errors=self.decompose_errors or is_pymatching_decoder(decoder)
+                    decompose_errors=self.decompose_errors or is_pymatching_decoder(decoder),
+                    **kw,
                 )
             except ValueError:
-                dem = task.circuit.detector_error_model()
+                try:
+                    dem = task.circuit.detector_error_model(**kw)
+                except ValueError:
+                    dem = task.circuit.detector_error_model(flatten_loops=True, **kw)
         if dem.num_detectors != task.circuit.num_detectors:
             raise ValueError(
                 f"BaseDecoder's dem has num_detectors={dem.num_detectors} but the "
