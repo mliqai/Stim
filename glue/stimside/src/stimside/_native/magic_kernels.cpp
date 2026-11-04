@@ -1298,6 +1298,8 @@ int magic_contract_choi(
         }
         return 0;
     } catch (const std::bad_alloc&) {
+        // OOM policy: report failure code 2 with empty outputs; this handler allocates nothing,
+        // so it is safe to run while the allocator is exhausted.
         if (out_chi) *out_chi = 0;
         if (out_d) *out_d = 0;
         return 2;

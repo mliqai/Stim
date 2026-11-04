@@ -244,9 +244,11 @@ def test_packaging_single_version_source_and_no_sdist_so_globs() -> None:
     setup_src = (root / "setup.py").read_text(encoding="utf-8")
     assert (root / "LICENSE").is_file()
     assert "include LICENSE" in manifest
-    assert 'license = {text = "Apache-2.0"}' in pyproject
+    assert 'license = "Apache-2.0"' in pyproject
+    assert 'license-files = ["LICENSE"]' in pyproject
     assert 'build-backend = "setuptools.build_meta"' in pyproject
-    assert '"setuptools>=64"' in pyproject
+    assert '"setuptools>=77"' in pyproject
+    assert "self.force = True" in setup_src  # rebuild whenever compile flags may differ
     assert '"numpy>=2"' in pyproject
     assert '"stim>=1.16"' in pyproject
     assert '"sinter>=1.16"' in pyproject
@@ -275,13 +277,66 @@ def test_resolve_so_tolerates_flock_ebadf_and_portable_build_flag(
     (tmp_path / "setup.py").write_text("# dummy\n", encoding="utf-8")
     (native / "tiny_nfsv4.cpp").write_text('extern "C" int tiny_nfsv4_abi_v1() { return 7; }\n', encoding="utf-8")
 
-    if _kernel_loader.fcntl is not None:
-        monkeypatch.setattr(
-            _kernel_loader.fcntl,
-            "flock",
-            mock.Mock(side_effect=OSError(errno.EBADF, "Bad file descriptor on NFSv4")),
-        )
+    fcntl = pytest.importorskip("fcntl")  # the loader imports it lazily when compiling
+    monkeypatch.setattr(
+        fcntl,
+        "flock",
+        mock.Mock(side_effect=OSError(errno.EBADF, "Bad file descriptor on NFSv4")),
+    )
     so = _kernel_loader.resolve_so(str(native / "tiny_nfsv4.py"), "tiny_nfsv4", force_recompile=True)
     assert ctypes.CDLL(str(so)).tiny_nfsv4_abi_v1() == 7
     assert list(native.glob("*lock*")) == []
 
+
+@pytest.mark.parametrize("foreign_owner", [False, True])
+def test_resolve_so_only_waits_on_its_own_lock_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, foreign_owner: bool
+) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    native = tmp_path / "src" / "stimside" / "_native"
+    native.mkdir(parents=True)
+    (tmp_path / "setup.py").write_text("# dummy\n", encoding="utf-8")
+    (native / "tiny_lock.cpp").write_text('extern "C" int tiny_lock_abi_v1() { return 5; }\n', encoding="utf-8")
+    flock = mock.Mock()
+    monkeypatch.setattr(fcntl, "flock", flock)
+    if foreign_owner:  # The lock file we create then looks like another user's.
+        real_uid = os.getuid()
+        monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+    so = _kernel_loader.resolve_so(str(native / "tiny_lock.py"), "tiny_lock", force_recompile=True)
+    assert ctypes.CDLL(str(so)).tiny_lock_abi_v1() == 5
+    assert flock.called is not foreign_owner
+
+
+def test_load_cdll_keeps_compiler_error_when_rebuild_also_fails(tmp_path: Path) -> None:
+    bogus = tmp_path / "libbogus.so"
+    bogus.write_bytes(b"not a shared library")
+    compiler_err = FileNotFoundError(2, "No such file or directory", "/nonexistent/c++")
+
+    def resolve(force_recompile: bool = False) -> Path:
+        if not force_recompile:
+            return bogus
+        raise RuntimeError("Failed to compile bogus.cpp") from compiler_err
+
+    with pytest.raises(RuntimeError, match="initial load error") as info:
+        _kernel_loader.load_cdll(resolve)
+    assert info.value.__cause__ is not None
+    assert info.value.__cause__.__cause__ is compiler_err
+
+
+def test_import_stimside_without_fcntl() -> None:
+    import sys
+
+    src_dir = str(Path(stimside.__file__).resolve().parents[1])
+    code = (
+        "import sys; sys.modules['fcntl'] = None\n"
+        "import stimside, stimside._native._kernel_loader\n"
+        "print('ok')"
+    )
+    out = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": src_dir, "PYTHONDONTWRITEBYTECODE": "1"},
+        timeout=120,
+    )
+    assert out.returncode == 0 and out.stdout.strip() == "ok", out.stderr

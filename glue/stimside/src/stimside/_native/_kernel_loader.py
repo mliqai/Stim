@@ -5,7 +5,6 @@ from __future__ import annotations
 import _ctypes
 from collections.abc import Callable, Sequence
 import ctypes
-import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -101,13 +100,20 @@ def resolve_so(
             cmd_variants.append([*cxx, *c_generic, *link_args, str(cpp_path), "-o", str(tmp_so)])
         last_exc: Exception | None = None
         lock_digest = hashlib.sha1(os.fsencode(so_path)).hexdigest()[:16]
-        lock_path = Path(tempfile.gettempdir()) / f".stimside_build_{lock_digest}.lock"
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        lock_path = Path(tempfile.gettempdir()) / f".stimside_build_{uid}_{lock_digest}.lock"
         lf = None
         try:
-            lf = lock_path.open("a+b")
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-        except OSError:
-            pass
+            import fcntl  # POSIX-only, and only needed when compiling.
+
+            fd = os.open(
+                lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
+            )
+            lf = os.fdopen(fd, "a+b")
+            if os.fstat(fd).st_uid == uid:  # Never wait on a lock file another user created.
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass  # Build without the cross-process lock.
         try:
             if (
                 not force_recompile
@@ -157,9 +163,12 @@ def load_cdll(resolve: Callable[..., Path], sentinel: str | None = None) -> ctyp
     try:
         rebuilt_path = resolve(force_recompile=True)
     except Exception as exc:
-        if first_err is not None:
+        if first_err is None:
+            raise
+        if exc.__cause__ is None:
             raise exc from first_err
-        raise
+        # Keep the compiler error as the cause; still report the initial load error.
+        raise RuntimeError(f"{exc} (initial load error: {first_err})") from exc
     lib = ctypes.CDLL(str(rebuilt_path))
     if sentinel is not None and not hasattr(lib, sentinel):
         # dlopen handed back the stale library: another handle keeps it loaded (or the source lacks it).

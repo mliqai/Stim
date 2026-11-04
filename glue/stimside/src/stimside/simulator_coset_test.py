@@ -269,9 +269,13 @@ def test_vectorized_cpp_cocycle_arrays_match_dense_and_per_group_oracle():
                         aw1, bw1, k1 = _oracle_tuple(lx1, lz1, s1)
                         aw2, bw2, k2 = _oracle_tuple(lx2, lz2, s2)
                         assert int(f_arrs[0][g_i, f_i]) == 2
+                        np.testing.assert_array_equal(f_arrs[1][g_i, f_i], lx1)
+                        np.testing.assert_array_equal(f_arrs[2][g_i, f_i], lz1)
                         np.testing.assert_array_equal(f_arrs[3][g_i, f_i], aw1)
                         np.testing.assert_array_equal(f_arrs[4][g_i, f_i], bw1)
                         assert int(f_arrs[5][g_i, f_i]) == k1
+                        np.testing.assert_array_equal(f_arrs[6][g_i, f_i], lx2)
+                        np.testing.assert_array_equal(f_arrs[7][g_i, f_i], lz2)
                         np.testing.assert_array_equal(f_arrs[8][g_i, f_i], aw2)
                         np.testing.assert_array_equal(f_arrs[9][g_i, f_i], bw2)
                         assert int(f_arrs[10][g_i, f_i]) == k2
@@ -279,6 +283,8 @@ def test_vectorized_cpp_cocycle_arrays_match_dense_and_per_group_oracle():
                         kind, lx, lz, sgn = fac
                         aw, bw, kap = _oracle_tuple(lx, lz, sgn)
                         assert int(f_arrs[0][g_i, f_i]) == (0 if kind == "P1" else 1)
+                        np.testing.assert_array_equal(f_arrs[1][g_i, f_i], lx)
+                        np.testing.assert_array_equal(f_arrs[2][g_i, f_i], lz)
                         np.testing.assert_array_equal(f_arrs[3][g_i, f_i], aw)
                         np.testing.assert_array_equal(f_arrs[4][g_i, f_i], bw)
                         assert int(f_arrs[5][g_i, f_i]) == kap

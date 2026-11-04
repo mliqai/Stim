@@ -63,6 +63,9 @@ class StimsideBuildExt(build_ext):
         return out
 
     def run(self) -> None:
+        # The in-tree build_base persists across builds and its up-to-date check ignores
+        # compile-flag changes (e.g. STIMSIDE_PORTABLE_BUILD), so always rebuild.
+        self.force = True
         src_mtimes = self._capture_source_mtimes()
         super().run()
         self._sync_extensions_to_source_dir(src_mtimes)
