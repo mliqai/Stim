@@ -476,7 +476,7 @@ class TestFlipsideSimulator:
             fss.get_observable_flips(bit_packed=True, observable_idx=0)
 
 
-@pytest.mark.parametrize("bad_bs", [0, -1, True])
+@pytest.mark.parametrize("bad_bs", [0, -1, True, 2.0])
 def test_batch_size_validation_across_simulators_and_samplers(bad_bs):
     from stimside import (
         CosetsideSampler,

@@ -919,6 +919,33 @@ def test_subclassed_compiled_leakage_uint8_is_not_bypassed_by_fast_path(sync: bo
     assert coh.coords_seen[0] == {0: [0.0, 0.0], 1: [1.0, 0.0]}
 
 
+def test_subclassed_handler_routes_zero_one_keys_per_shot_in_multibatch_run() -> None:
+    # A subclass takes the slow path; with 0/1 keys at batch_size > 1, run() must still route per shot.
+    import dataclasses
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
+        CompiledLeakageUint8,
+        LeakageUint8,
+    )
+
+    @dataclasses.dataclass
+    class _Sub(CompiledLeakageUint8):
+        pass
+
+    circ = stim.Circuit("H 0\nX_ERROR[CONDITIONED_ON_SELF: 1](1.0) 0\nM 0")
+    base = LeakageUint8().compile_op_handler(circuit=circ, batch_size=64)
+    coh = _Sub(
+        num_qubits=base.num_qubits,
+        batch_size=64,
+        unconditional_condition_on_U=True,
+        ops_to_params=base.ops_to_params,
+    )
+    tss = TablesideSimulator(circuit=circ, compiled_op_handler=coh, batch_size=64, seed=7)
+    for _ in range(8):
+        tss.clear()
+        tss.run()
+        assert not np.any(tss.get_final_measurement_records())
+
+
 def test_slice_circuit_blocks_concurrent_first_run_is_thread_safe() -> None:
     import threading
     from stimside._tableau.runner import get_precompiled_circuit
@@ -1003,6 +1030,10 @@ def test_sparse_leakage_transition_rates_cpp_and_python(extra: str) -> None:
     for st, p in ((2, 0.01), (3, 0.02)):
         tol = 5.0 * math.sqrt(p * (1.0 - p) / shots)
         assert np.all(np.abs(hits[:, st] / shots - p) < tol)
+    n = n_q * shots
+    for st, p in ((2, 0.01), (3, 0.02)):
+        # Pooled over the targets: tight enough to tell the 1:2 branch split from a uniform one.
+        assert abs(hits[:, st].sum() / n - p) < 5.0 * math.sqrt(p * (1.0 - p) / n)
 
 
 @pytest.mark.parametrize("pre_leak", ["", "I[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 1\n"])
@@ -1077,6 +1108,8 @@ def test_interactive_do_multibatch_collapses_z_and_asym_feedback():
     for prog in (
         "H 0\nX_ERROR[CONDITIONED_ON_SELF: 1](1.0) 0\nM 0\nDETECTOR rec[-1]",
         "X_ERROR(0.5) 0\nX_ERROR[CONDITIONED_ON_SELF: 1](1.0) 0\nM 0\nDETECTOR rec[-1]",
+        # Randomness that a Clifford spreads onto the target.
+        "X_ERROR(0.5) 1\nCX 1 0\nX_ERROR[CONDITIONED_ON_SELF: 1](1.0) 0\nM 0\nDETECTOR rec[-1]",
     ):
         c = stim.Circuit(prog)
         coh_run = LeakageUint8Tableau().compile_op_handler(circuit=c, batch_size=8)
@@ -1101,6 +1134,11 @@ def test_interactive_do_multibatch_collapses_z_and_asym_feedback():
     sim_fb.run()
     recs_fb = sim_fb.get_final_measurement_records()
     np.testing.assert_array_equal(recs_fb[:, 0], recs_fb[:, 1])
+    # interactive_do(batch_size > 1) cannot do that per shot, so it must reject the feedback.
+    coh_fb_int = LeakageUint8Tableau().compile_op_handler(circuit=c_fb, batch_size=64)
+    sim_fb_int = TablesideSimulator(circuit=c_fb, compiled_op_handler=coh_fb_int, batch_size=64, seed=9)
+    with pytest.raises(ValueError, match="rec"):
+        sim_fb_int.interactive_do(c_fb)
 
 
 def test_concurrent_slice_and_precompiled_cache_eviction():
@@ -1197,6 +1235,12 @@ def test_interactive_runs_reseed_after_clear(sync: bool) -> None:
         "R 0\nI[LEAKAGE_TRANSITION_1: (0.5, 0-->2)] 0\nM 0 1",
         # A non-deterministic observable elsewhere used to make stim reject the check circuit.
         "H 1\nM 1\nOBSERVABLE_INCLUDE(0) rec[-1]\nR 0\nI[LEAKAGE_TRANSITION_1: (0.5, 0-->2)] 0\nM 0",
+        # The same two with the target touched since its reset (X 0), so the DEM check itself runs.
+        "R 0 1\nPAULI_CHANNEL_2(0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0, 0, 0, 0, 0, 0, 0) 0 1\n"
+        "R 0\nX 0\nI[LEAKAGE_TRANSITION_1: (0.5, 1-->2)] 0\nM 0 1",
+        "H 1\nM 1\nOBSERVABLE_INCLUDE(0) rec[-1]\nX 0\nI[LEAKAGE_TRANSITION_1: (0.5, 1-->2)] 0\nM 0",
+        # Noise on another qubit must not make a definite target look random.
+        "X_ERROR(0.5) 1\nX 0\nI[LEAKAGE_TRANSITION_1: (1.0, 1-->2)] 0\nM[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0\nM 1",
     ],
 )
 def test_interactive_batch_guard_accepts_definite_z_targets(text: str) -> None:

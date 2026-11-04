@@ -279,22 +279,49 @@ def test_reweighted_dem_preserves_observables_and_detectors_when_edges_zeroed():
             )
 
 
+def test_reweight_update_dems_preserve_counts_when_observable_edge_zeroed() -> None:
+    # Update DEMs (not edge arrays) that zero the only L0 edge must keep L0 and D1 in the output.
+    base = stim.DetectorErrorModel("error(0.1) D0 L0\nerror(0.1) D0 D1\nerror(0.1) D1")
+    upd = stim.DetectorErrorModel("error(0) D0 L0")
+    dets = np.array([[0b01], [0b00]], dtype=np.uint8)
+    pred = decode_with_generated_dems(
+        "pymatching", [upd, upd], dets, reweight_only=True, base_dem=base
+    )
+    assert pred.shape == (2, 1)
+    single = decode_with_generated_dems("pymatching", upd, None, reweight_only=True, base_dem=base)
+    assert single.num_observables == 1 and single.num_detectors == 2
+
+
 def test_generator_metadata_takes_precedence_over_fallback_base_dem():
     circuit = _make_surface_code_leakage_circuit(distance=3, rounds=2)
     gen = MarginalLeakageDemGenerator()
-    recs = np.zeros((2, circuit.num_measurements), dtype=bool)
+    shots = 64
+    recs = np.zeros((shots, circuit.num_measurements), dtype=bool)
     recs[1, gen._get_analysis(circuit, False).flag_records[0]] = True
-    dets = np.zeros((2, (circuit.num_detectors + 7) // 8), dtype=np.uint8)
-    other_base = circuit.detector_error_model()
+    # Real syndromes: all-zero ones decode to 0 under any DEM, so they cannot show precedence.
+    dets = np.packbits(
+        circuit.compile_detector_sampler(seed=11).sample(shots), axis=1, bitorder="little"
+    )
+    # Same graph as the generator's baseline, but with every observable stripped.
+    other_base = stim.DetectorErrorModel()
+    for inst in gen._get_analysis(circuit, False).baseline.flattened():
+        if inst.type == "error":
+            targets = [t for t in inst.targets_copy() if not t.is_logical_observable_id()]
+            other_base.append("error", inst.args_copy(), targets)
+        else:
+            other_base.append(inst)
 
     for dec, rew in ((False, True), (True, True)):
         dems = gen(circuit, recs, decompose_errors=dec, reweight_only=rew)
         want = decode_with_generated_dems("pymatching", dems, dets)
+        assert np.any(want)
         got = decode_with_generated_dems("pymatching", dems, dets, base_dem=other_base)
         np.testing.assert_array_equal(got, want)
-        want_single = decode_with_generated_dems("pymatching", dems[1], dets[1:])
+        k = int(np.flatnonzero(want.any(axis=1))[0])
+        want_single = decode_with_generated_dems("pymatching", dems[k], dets[k : k + 1])
+        assert np.any(want_single)
         got_single = decode_with_generated_dems(
-            "pymatching", dems[1], dets[1:], base_dem=other_base
+            "pymatching", dems[k], dets[k : k + 1], base_dem=other_base
         )
         np.testing.assert_array_equal(got_single, want_single)
 

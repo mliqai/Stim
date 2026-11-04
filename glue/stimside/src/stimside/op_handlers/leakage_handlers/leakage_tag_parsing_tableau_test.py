@@ -654,3 +654,12 @@ def test_cached_leakage_params_are_read_only_and_picklable() -> None:
                 if hasattr(params, name):
                     assert dict(getattr(clone, name)) == dict(getattr(params, name))
 
+
+def test_tag_parse_cache_is_hit_on_recompile() -> None:
+    from stimside.op_handlers.leakage_handlers.tag_registry import parse_leakage_tag
+
+    c = stim.Circuit("I[LEAKAGE_TRANSITION_1: (0.1, U-->2)] 0 1\nM 0 1")
+    LeakageUint8().compile_op_handler(circuit=c, batch_size=1)
+    hits = parse_leakage_tag.cache_info().hits
+    LeakageUint8().compile_op_handler(circuit=c, batch_size=1)
+    assert parse_leakage_tag.cache_info().hits > hits

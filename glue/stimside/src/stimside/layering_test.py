@@ -52,6 +52,7 @@ def _runtime_targets(tree: ast.AST, pkg_parts: list[str]) -> set[str]:
             is_tc = (isinstance(t, ast.Name) and t.id == "TYPE_CHECKING") or (
                 isinstance(t, ast.Attribute) and t.attr == "TYPE_CHECKING"
             )
+            self.visit(t)
             if not is_tc:
                 for stmt in node.body:
                     self.visit(stmt)
@@ -74,14 +75,12 @@ def _runtime_targets(tree: ast.AST, pkg_parts: list[str]) -> set[str]:
                 for alias in node.names:
                     targets.add(f"{mod}.{alias.name}")
 
-        def visit_Call(self, node: ast.Call) -> None:
-            fn = node.func
-            name = fn.id if isinstance(fn, ast.Name) else (fn.attr if isinstance(fn, ast.Attribute) else "")
-            if name in ("import_module", "__import__") and node.args:
-                arg0 = node.args[0]
-                if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str) and arg0.value.startswith("stimside"):
-                    targets.add(arg0.value)
-            self.generic_visit(node)
+        def visit_Constant(self, node: ast.Constant) -> None:
+            # Dynamic imports name the module in a string (import_module, __import__, sys.modules,
+            # keyword, aliased or getattr forms), so count every such literal. Prefixes such as
+            # "stimside." + name or f"stimside.{name}" resolve to the root package and fail closed.
+            if isinstance(node.value, str) and node.value.startswith("stimside"):
+                targets.add(node.value)
 
     _Visitor().visit(tree)
     return targets

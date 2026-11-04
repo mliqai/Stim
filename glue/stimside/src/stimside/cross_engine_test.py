@@ -521,6 +521,9 @@ def test_repeated_targets_in_leakage_projection_z_and_mr():
         "H 0 1\nMPP(0.25) Z0*Z1 Z1 Z0\nM 0 1",
         "H 0 1 2\nMPP(0.2) Z0*Z1 Z1*Z2 Z0\nM 0 1 2",
         "H 0 1 2\nMZZ(0.25) 0 1 1 2\nM 0 1 2",
+        "H 0 1 2\nMXX(0.25) 0 1 1 2\nM 0 1 2",
+        "MZZ(0.25) 0 1 1 2 2 0\nM 0 1 2",
+        "H_YZ 0 1\nMYY(0.25) 0 1 0 1\nM 0 1",
     ],
 )
 def test_sync_3way_lockstep_xy_collapses_and_repeated_noisy_1q_meas(program: str):
@@ -585,33 +588,34 @@ def test_repeated_qubit_mpp_hermitian_sign_and_antihermitian_rejection():
             sm.run()
             np.testing.assert_array_equal(sm.get_final_measurement_records(), expected)
 
-    c_anti = stim.Circuit("MPP X0*Z0")
-    for make_sim in [
-        lambda: TablesideSimulator(
-            c_anti,
-            compiled_op_handler=LeakageUint8Tableau().compile_op_handler(circuit=c_anti, batch_size=2),
-            batch_size=2,
-            seed=1,
-        ),
-        lambda: CosetsideSimulator(
-            c_anti,
-            compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=c_anti, batch_size=2),
-            batch_size=2,
-            seed=1,
-        ),
-        lambda: FlipsideSimulator(
-            c_anti,
-            compiled_op_handler=LeakageUint8Flip().compile_op_handler(circuit=c_anti, batch_size=2),
-            batch_size=2,
-            seed=1,
-        ),
-        lambda: MagicsideSimulator(c_anti, batch_size=2, seed=1, backend="STREAM", fault_mode="DIRECT"),
-        lambda: MagicsideSimulator(c_anti, batch_size=2, seed=1, backend="QUERY", fault_mode="SELECTOR"),
-    ]:
-        with pytest.raises(ValueError):
-            s = make_sim()
-            s.run()
-            s.get_final_measurement_records()
+    for anti in ("MPP X0*Z0", "MPP Z0*X0"):  # -iY0 and +iY0
+        c_anti = stim.Circuit(anti)
+        for make_sim in [
+            lambda: TablesideSimulator(
+                c_anti,
+                compiled_op_handler=LeakageUint8Tableau().compile_op_handler(circuit=c_anti, batch_size=2),
+                batch_size=2,
+                seed=1,
+            ),
+            lambda: CosetsideSimulator(
+                c_anti,
+                compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=c_anti, batch_size=2),
+                batch_size=2,
+                seed=1,
+            ),
+            lambda: FlipsideSimulator(
+                c_anti,
+                compiled_op_handler=LeakageUint8Flip().compile_op_handler(circuit=c_anti, batch_size=2),
+                batch_size=2,
+                seed=1,
+            ),
+            lambda: MagicsideSimulator(c_anti, batch_size=2, seed=1, backend="STREAM", fault_mode="DIRECT"),
+            lambda: MagicsideSimulator(c_anti, batch_size=2, seed=1, backend="QUERY", fault_mode="SELECTOR"),
+        ]:
+            with pytest.raises(ValueError):
+                s = make_sim()
+                s.run()
+                s.get_final_measurement_records()
 
 
 @pytest.mark.parametrize(

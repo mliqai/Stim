@@ -336,6 +336,61 @@ def test_all_four_samplers_support_sinter_postselection_masks() -> None:
         samplers[0].compiled_sampler_for_task(bad_task).sample(64)
 
 
+def test_postselection_mask_discards_on_any_detector_byte() -> None:
+    # 10 detectors need a 2-byte mask; postselecting on D0 (byte 0 only) must still discard.
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import (
+        LeakageUint8 as LeakageUint8Flip,
+    )
+    from stimside.sampler_flip import FlipsideSampler
+
+    n = 10
+    qs = " ".join(map(str, range(n)))
+    circ = stim.Circuit(
+        f"R {qs}\nX_ERROR(0.3) 0\nM {qs}\n"
+        + "".join(f"DETECTOR rec[-{n - i}]\n" for i in range(n))
+        + "OBSERVABLE_INCLUDE(0) rec[-1]\n"
+    )
+    task = sinter.Task(
+        circuit=circ, decoder="vacuous", postselection_mask=np.array([1, 0], dtype=np.uint8)
+    )
+    sampler = FlipsideSampler(
+        LeakageUint8Flip(), BaseDecoder(decoder="vacuous"), batch_size=256, seed=3
+    )
+    stats = sampler.compiled_sampler_for_task(task).sample(2048)
+    assert 0.25 * 2048 < stats.discards < 0.35 * 2048
+
+
+class _PerfectCompiled(CompiledLeakageDecoder):
+    """Predicts L0 = D0, which is always right for circuits where the two are equal."""
+
+    def decode_shots_bit_packed(self, *, bit_packed_detection_event_data, records=None, leakage_events=None):
+        return (np.asarray(bit_packed_detection_event_data)[:, :1] & 1).astype(np.uint8)
+
+
+class _PerfectDecoder(LeakageDecoder):
+    needs_records = False
+
+    @property
+    def name(self) -> str:
+        return "perfect"
+
+    def compile_for_task(self, task: sinter.Task) -> CompiledLeakageDecoder:
+        return _PerfectCompiled()
+
+
+def test_postselected_observables_mask_keys_on_mispredictions() -> None:
+    # L0 flips in ~40% of shots, but the decoder always predicts it, so nothing is discarded.
+    circuit = stim.Circuit("R 0\nX_ERROR(0.4) 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    task = sinter.Task(
+        circuit=circuit,
+        decoder="vacuous",
+        postselected_observables_mask=np.array([1], dtype=np.uint8),
+    )
+    sampler = TablesideSampler(TrivialOpHandler(), _PerfectDecoder(), batch_size=64, seed=5)
+    stats = sampler.compiled_sampler_for_task(task).sample(1024)
+    assert stats.discards == 0 and stats.errors == 0
+
+
 class _DiscardByteCompiled(CompiledLeakageDecoder):
     """Predicts no observable flips and flags shots whose first detector fired as discards."""
 

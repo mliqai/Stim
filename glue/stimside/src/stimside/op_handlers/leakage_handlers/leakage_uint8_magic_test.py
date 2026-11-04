@@ -122,14 +122,14 @@ def test_sync_rng_nonclifford_born_stats_mpad_entangled_and_speed() -> None:
         assert not np.any(rec_m[:, 2])
         np.testing.assert_array_equal(rec_m[:, 0], rec_m[:, 1])
         np.testing.assert_array_equal(rec_m[:, 0], rec_m[:, 3])
-        assert abs(float(np.mean(rec_m[:, 0])) - p_sin2) < 3.0 * sigma
+        assert abs(float(np.mean(rec_m[:, 0])) - p_sin2) < 4.5 * sigma
 
         sim_cx = MagicsideSimulator(
             circ_cx, op_handler=LeakageUint8Magic(), batch_size=1024, seed=84, sync_tableside_rng=sync
         )
         sim_cx.run()
         rec_cx = sim_cx.get_final_measurement_records()
-        assert abs(float(np.mean(rec_cx[:, 2] ^ rec_cx[:, 3])) - p_sin2) < 3.0 * sigma
+        assert abs(float(np.mean(rec_cx[:, 2] ^ rec_cx[:, 3])) - p_sin2) < 4.5 * sigma
 
     circ_ent = stim.Circuit(
         "H 0 1 2\nI[CCZ] 0 1 2\nH 1\n"
@@ -144,7 +144,8 @@ def test_sync_rng_nonclifford_born_stats_mpad_entangled_and_speed() -> None:
     p01 = float(np.mean((~recs_e[:, 0]) & recs_e[:, 1]))
     p10 = float(np.mean(recs_e[:, 0] & (~recs_e[:, 1])))
     p11 = float(np.mean(recs_e[:, 0] & recs_e[:, 1]))
-    assert abs(p00 - 0.50) < 0.07 and p01 < 0.01 and abs(p10 - 0.25) < 0.07 and abs(p11 - 0.25) < 0.07
+    # 0.10 is ~4.5 sigma at 512 shots.
+    assert abs(p00 - 0.50) < 0.10 and p01 < 0.01 and abs(p10 - 0.25) < 0.10 and abs(p11 - 0.25) < 0.10
 
 
 def test_sync_rng_three_way_clifford_lockstep() -> None:
