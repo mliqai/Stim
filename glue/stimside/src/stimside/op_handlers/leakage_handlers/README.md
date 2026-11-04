@@ -91,6 +91,10 @@ whereas an unleaked input (`U`, `0`, or `1`) transitioning to `U` keeps its comp
 A `0` or `1` output instead resets the qubit into that Z state without depolarizing it (whatever its input),
 and a leaked qubit transitioning to `X`, `Y` or `Z` is reset to `0` before that Pauli is applied.
 
+When several keys of one tag match a qubit (e.g. `U` and `1` in `(p, U-->2) (q, 1-->3)`), each matching
+key is applied in order; a key's "no transition" outcome leaves the state unchanged, so a later key's
+transition overrides an earlier one (the same in all four simulators and every mode).
+
 On the output side, you can also use `V` to indicate an unleaked state that is not the same
 the input unleaked state. A qubit that selects to transition `U --> U` is left alone, but one
 that transitions `U --> V` is fully depolarized.

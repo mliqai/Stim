@@ -78,7 +78,8 @@ def apply_output_effect(
     """
     out_key = str(out_st)
     if out_key == str(in_st):
-        state[idx] = 0 if in_st in (0, 1, "U") else int(in_st)
+        # "No transition": leave the state as is, so an earlier matching key's transition
+        # in the same instruction is kept (keys apply in order; OD3-2).
         return
 
     entry = _OUTPUT_EFFECT_TABLE.get(out_key)

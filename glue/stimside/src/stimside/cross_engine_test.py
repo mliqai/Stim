@@ -640,3 +640,43 @@ def test_zero_target_leakage_projection_is_a_no_op_on_all_engines(body: str):
         _, rec, _, _, _ = _run_sim(sim_cls, h_cls, circuit, sync=sync)
         assert rec.shape == (4, 2) and not np.any(rec), (sim_cls.__name__, sync)
 
+
+@pytest.mark.parametrize("swap", [False, True])
+def test_overlapping_transition_keys_apply_in_order_on_all_engines(swap: bool):
+    # Every key whose input matches the qubit (here U and 1) is applied in order, and a key's
+    # "no transition" draw leaves the state alone, so a later key's transition overrides an
+    # earlier one. This matches the e2e oracle in every engine and sync mode (OD3-2).
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+    from stimside.simulator_magic import MagicsideSimulator
+
+    keys = "(0.5, 1-->3) (0.5, U-->2)" if swap else "(0.5, U-->2) (0.5, 1-->3)"
+    circuit = stim.Circuit(f"X 0\nI[LEAKAGE_TRANSITION_1: {keys}] 0")
+    first, last = (3, 2) if swap else (2, 3)
+    want = {last: 0.5, first: 0.25}
+
+    samples = []
+    tab_h = LeakageUint8Tableau().compile_op_handler(circuit=circuit, batch_size=1)
+    tab = TablesideSimulator(circuit, compiled_op_handler=tab_h, batch_size=1, seed=11)
+    tab_states = []
+    for i in range(1000):
+        if i:
+            tab.clear()
+        tab.run()
+        tab_states.append(int(tab_h.state[0]))
+    samples.append(("tableside B=1", np.array(tab_states)))
+    for sim_cls, h_cls, sync in [
+        (CosetsideSimulator, LeakageUint8Coset, False),
+        (CosetsideSimulator, LeakageUint8Coset, True),
+        (MagicsideSimulator, LeakageUint8Magic, False),
+        (MagicsideSimulator, LeakageUint8Magic, True),
+        (FlipsideSimulator, LeakageUint8Flip, False),
+    ]:
+        handler = h_cls().compile_op_handler(circuit=circuit, batch_size=2000)
+        kwargs = {"sync_tableside_rng": True} if sync else {}
+        sim = sim_cls(circuit, compiled_op_handler=handler, batch_size=2000, seed=11, **kwargs)
+        sim.run()
+        samples.append((f"{sim_cls.__name__} sync={sync}", np.asarray(handler.state)[0]))
+    for name, states in samples:
+        for state, p in want.items():
+            sigma = (p * (1 - p) / len(states)) ** 0.5
+            assert abs(float(np.mean(states == state)) - p) < 5 * sigma, (name, state)

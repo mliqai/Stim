@@ -46,6 +46,8 @@ When a leakage tag conditions on the computational basis states `0` or `1` (for 
 ### Transitions into `0`, `1`, and `U`
 In all four simulators, a `LEAKAGE_TRANSITION_1`/`LEAKAGE_TRANSITION_2` output of `0` or `1` resets the qubit into that $Z$ eigenstate (like `R`, or `R` then `X`), unleaking it without depolarizing it, whatever its input state. A leaked qubit (`state >= 2`) transitioning to `U` (or `V`/`D`) is unleaked and fully depolarized, whereas an unleaked qubit transitioning to `U` (including `0-->U` or `1-->U`) keeps its computational state untouched (use output `V` or `D` in `LEAKAGE_TRANSITION_2` to depolarize an unleaked qubit). A leaked qubit transitioning to `X`, `Y` or `Z` in `LEAKAGE_TRANSITION_2` is first reset to `|0>` and then has that Pauli applied. `FlipsideSimulator` can only represent a `0`/`1`/`X`/`Y`/`Z` reset when the target's $Z$ value is definite in the noiseless circuit (or collapsed by a `0`/`1` input key of the same instruction); otherwise it raises a `ValueError`.
 
+When several keys of one `LEAKAGE_TRANSITION_1`/`LEAKAGE_TRANSITION_2` match a qubit (for example `U` and `1` in `(p, U-->2) (q, 1-->3)`), each matching key is applied in order, and a key's "no transition" outcome leaves the state unchanged, so a later key's transition overrides an earlier one. All four simulators agree on this in every mode.
+
 ### Instructions with Repeated Qubit Targets
 Instructions that reference the same qubit more than once in a single instruction (for example `CX 0 1 1 0`, `H 0 0`, or tagged leakage operations with repeated targets) are **processed sequentially in target order** (left to right), matching Stim's execution semantics.
 
