@@ -293,7 +293,7 @@ def test_peek_out_of_bounds_raises_value_error(sync: bool, bad_q: int):
     with pytest.raises(ValueError, match="peek target out of range"):
         sim.peek_pauli_batch([bad_q], "Z")
     with pytest.raises(ValueError, match="peek target out of range"):
-        sim.peek_z([bad_q])
+        sim.peek_z(bad_q)
 
 
 @pytest.mark.parametrize("sync", [False, True])
@@ -436,3 +436,32 @@ def test_coset_duplicate_target_leakage_projection_z() -> None:
     assert not np.any(recs_sync[:, 3])
 
 
+@pytest.mark.parametrize("sync", [False, True])
+@pytest.mark.parametrize("bad", [[2.9], [True], ["1"], [[0, 1]]])
+def test_peek_rejects_non_integer_or_non_1d_targets(sync: bool, bad) -> None:
+    # Float/bool/str targets used to be cast silently and 2-D input dropped targets.
+    c = stim.Circuit("R 0 1 2\nH 0\nM 0 1 2")
+    coh = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=4)
+    sim = CosetsideSimulator(c, compiled_op_handler=coh, batch_size=4, seed=1, sync_tableside_rng=sync)
+    with pytest.raises(ValueError, match="1-D sequence of integer"):
+        sim.peek_pauli_batch(bad, "Z")
+    assert sim.peek_pauli_batch(np.array([0, 2], dtype=np.uint8), "Z").shape == (2, 4)
+
+
+def test_interactive_runs_reseed_after_clear() -> None:
+    # clear() after finish_interactive_run must advance the seeded stream, like run().
+    c = stim.Circuit("H 0\nM 0")
+    coh = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=1)
+    sim = CosetsideSimulator(c, compiled_op_handler=coh, batch_size=1, seed=42)
+    outs = []
+    for _ in range(64):
+        sim.interactive_do(c)
+        sim.finish_interactive_run()
+        outs.append(bool(sim.get_final_measurement_records()[0, 0]))
+        sim.clear()
+    assert 0 < sum(outs) < 64
+    ref = CosetsideSimulator(
+        c, compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=1), batch_size=1, seed=42
+    )
+    ref.run()
+    assert bool(ref.get_final_measurement_records()[0, 0]) == outs[0]

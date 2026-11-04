@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 from typing import TYPE_CHECKING, Any
 import weakref
@@ -80,6 +81,16 @@ def _circuit_of(insts: list[stim.CircuitInstruction]) -> stim.Circuit:
 
 
 _CACHE_LOCK = threading.Lock()
+
+
+def _reinit_cache_lock() -> None:
+    # A forked child inherits the lock in whatever state another parent thread left it.
+    global _CACHE_LOCK
+    _CACHE_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reinit_cache_lock)
 
 
 def _slice_circuit(

@@ -34,6 +34,11 @@ from stimside.util.stim_workarounds import split_fused_instruction
 if TYPE_CHECKING:
     from stimside.simulator_tableau import TablesideSimulator
 
+# Instructions that never change a qubit's state; the interactive Z-determinism pre-filter skips them.
+_Z_SCAN_SKIP = frozenset(
+    {"TICK", "DETECTOR", "OBSERVABLE_INCLUDE", "QUBIT_COORDS", "SHIFT_COORDS", "MPAD"}
+)
+
 
 @dataclasses.dataclass
 class LeakageUint8(OpHandler["TablesideSimulator"]):
@@ -88,6 +93,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
     def __post_init__(self):
         self.claimed_ops_keys = set(self.ops_to_params.keys())
         self.state = np.zeros(self.num_qubits, dtype=np.uint8)
+        self._reset_z_scan()
 
     def clear(self):
         """Clear the leakage state array in place (preserving any C++ shared buffer binding)."""
@@ -95,6 +101,42 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
             self.state.fill(0)
         else:
             self.state = np.zeros(self.num_qubits, dtype=np.uint8)
+        self._reset_z_scan()
+
+    def _reset_z_scan(self) -> None:
+        self._z_scan_cursor = 0
+        # True: no instruction has touched the qubit since its last R/MR (or the start).
+        self._z_scan_fresh = np.ones(self.num_qubits, dtype=np.bool_)
+
+    def _z_exact_without_dem_check(
+        self, targets: NDArray[np.int_], tss: TablesideSimulator
+    ) -> bool:
+        """Whether every target's Z is known to be identical in all shots of the batch.
+
+        A qubit's state only changes through instructions that target it, and R/MR leave
+        it in |0> in every shot, so a target untouched since its last R/MR has a
+        deterministic Z. Scans tss._new_circuit incrementally from the last call.
+        """
+        circ = tss._new_circuit
+        n = len(circ)
+        if n < self._z_scan_cursor:
+            self._reset_z_scan()
+        fresh = self._z_scan_fresh
+        # Re-scan the last scanned instruction too: stim may have fused new targets into it.
+        for k in range(max(self._z_scan_cursor - 1, 0), n):
+            inst = circ[k]
+            if isinstance(inst, stim.CircuitRepeatBlock):
+                fresh[:] = False
+                continue
+            if inst.name in _Z_SCAN_SKIP:
+                continue
+            is_reset = inst.name in ("R", "MR")
+            for t in inst.targets_copy():
+                q = t.qubit_value
+                if q is not None and q < len(fresh):
+                    fresh[q] = is_reset
+        self._z_scan_cursor = n
+        return bool(np.all(fresh[targets]))
 
     def _update_state_from_peek_Z(
         self, targets: list[int] | NDArray[np.int_], tss: TablesideSimulator
@@ -126,31 +168,34 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                     "interactive_do with batch_size > 1 cannot branch or collapse Z superposition "
                     "on 0/1-conditioned tags; use run() or batch_size=1."
                 )
-            if any(
+            if not self._z_exact_without_dem_check(targets_in_qubit_space, tss) and any(
                 stim.gate_data(inst.name).is_noisy_gate
                 or stim.gate_data(inst.name).produces_measurements
                 for inst in tss._new_circuit
             ):
-                chk = stim.Circuit()
-                for inst in tss._new_circuit:
-                    gd = stim.gate_data(inst.name)
-                    if gd.is_noisy_gate:
-                        args = [
-                            0.25 if 0.0 < a < 1.0 else a
-                            for a in inst.gate_args_copy()
-                        ]
-                        chk.append(inst.name, inst.targets_copy(), args)
-                    else:
-                        chk.append(inst)
+                # Real probabilities: any p in (0, 1) still gives a DEM error in (0, 1).
+                chk = tss._new_circuit.copy()
+                if chk.num_observables:
+                    # Observables do not affect this check, but stim rejects non-deterministic ones.
+                    chk = stim.Circuit()
+                    for inst in tss._new_circuit:
+                        if inst.name != "OBSERVABLE_INCLUDE":
+                            chk.append(inst)
                 d0 = chk.num_detectors
                 n_chk = len(targets_in_qubit_space)
                 chk.append("M", [int(q) for q in targets_in_qubit_space])
                 for k in range(n_chk, 0, -1):
                     chk.append("DETECTOR", [stim.target_rec(-k)])
-                dem = chk.detector_error_model(
-                    allow_gauge_detectors=True,
-                    approximate_disjoint_errors=True,
-                )
+                try:
+                    dem = chk.detector_error_model(
+                        allow_gauge_detectors=True,
+                        approximate_disjoint_errors=True,
+                    )
+                except ValueError:
+                    raise ValueError(
+                        "interactive_do with batch_size > 1 cannot apply 0/1-conditioned tags "
+                        "to qubits with non-deterministic Z across the batch; use run() or batch_size=1."
+                    ) from None
                 if any(
                     inst.type == "error"
                     and 0.0 < inst.args_copy()[0] < 1.0
@@ -602,7 +647,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
             )
 
         n_qbt = max(
-            tss.num_qubits, tss.num_qubits_in_new_circuit(), max(targets) + 1
+            tss.num_qubits, tss.num_qubits_in_new_circuit(), max(targets, default=-1) + 1
         )
 
         # get actual qubit states

@@ -429,6 +429,8 @@ class CosetsideSimulator(
         self._do(this)
 
     def finish_interactive_run(self) -> None:
+        if not self._finished_running_circuit:
+            self._batches_completed += 1
         self._finished_running_circuit = True
 
     ############################################################################
@@ -1665,7 +1667,12 @@ class CosetsideSimulator(
         """Return exact single-qubit Pauli expectations (+1, -1, or 0) of shape (len(targets), batch_size) via Q1."""
         if pauli not in ("X", "Y", "Z"):
             raise ValueError(f"Unrecognised Pauli: {pauli}")
-        targets_arr = np.ascontiguousarray(targets, dtype=np.int64)
+        targets_in = np.asarray(targets)
+        if targets_in.ndim != 1 or (
+            targets_in.size and not np.issubdtype(targets_in.dtype, np.integer)
+        ):
+            raise ValueError("peek targets must be a 1-D sequence of integer qubit indices")
+        targets_arr = np.ascontiguousarray(targets_in, dtype=np.int64)
         if len(targets_arr) == 0:
             return np.zeros((0, self.batch_size), dtype=np.int8)
         if targets_arr.min() < 0 or targets_arr.max() >= self.num_qubits:

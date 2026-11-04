@@ -730,6 +730,12 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         seen: set[int] = set()
         seg_len = 0
         for supp, payload, inv in specs:
+            if gd.produces_measurements and cname in ("MPP", "MXX", "MYY", "MZZ") and seg_len > 0 and (not supp or bool(seen & supp)):
+                # Flush the previous segment's readout flips before projecting this product (Stim's draw order).
+                if p_err > 0.0:
+                    self._apply_meas_flip_noise(p_err, seg_len)
+                seg_len = 0
+                seen.clear()
             rec: MeasurementRecord | ResetRecord = (
                 compile_reset_c15(self._live_ref_tab, payload[0], payload[1], meas_index=0 if gd.produces_measurements else None, invert_result=inv, flip_prob=0.0, frame_events=self._live_frame_events)
                 if gd.is_reset
@@ -737,11 +743,6 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             )
             m_shots = self._project_substep_batch(rec)
             if gd.produces_measurements:
-                if cname in ("MPP", "MXX", "MYY", "MZZ") and seg_len > 0 and (not supp or bool(seen & supp)):
-                    if p_err > 0.0:
-                        self._apply_meas_flip_noise(p_err, seg_len)
-                    seg_len = 0
-                    seen.clear()
                 self._measurement_columns.append(~m_shots if inv else m_shots.copy())
                 if cname == "MPP" and not supp:
                     if p_err > 0.0:

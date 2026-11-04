@@ -1163,3 +1163,111 @@ def test_zero_measurement_circuit_bool_dtype_and_detector_shape(
     assert rec.dtype == np.bool_ and rec.shape == (batch_size, 0)
     assert dets.dtype == np.bool_ and dets.shape == (batch_size, 0)
 
+
+def _leak_tab_sim(text: str, batch_size: int, seed: int, **kwargs) -> tuple[stim.Circuit, TablesideSimulator]:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    c = stim.Circuit(text)
+    coh = LeakageUint8().compile_op_handler(circuit=c, batch_size=batch_size)
+    return c, TablesideSimulator(c, compiled_op_handler=coh, batch_size=batch_size, seed=seed, **kwargs)
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_interactive_runs_reseed_after_clear(sync: bool) -> None:
+    # clear() after finish_interactive_run must advance the seeded stream, like run().
+    c, sim = _leak_tab_sim("H 0\nM 0", batch_size=1, seed=42, sync_tableside_rng=sync)
+    outs = []
+    for _ in range(64):
+        sim.interactive_do(c)
+        sim.finish_interactive_run()
+        outs.append(bool(sim.get_final_measurement_records()[0, 0]))
+        sim.clear()
+    assert 0 < sum(outs) < 64
+    if sync:  # Only the sync path makes interactive_do bit-exact with run().
+        _, ref = _leak_tab_sim("H 0\nM 0", batch_size=1, seed=42, sync_tableside_rng=True)
+        ref.run()
+        assert bool(ref.get_final_measurement_records()[0, 0]) == outs[0]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # >= 5 nonzero PAULI_CHANNEL_2 args used to make the check circuit invalid (sum > 1).
+        "R 0 1\nPAULI_CHANNEL_2(0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0, 0, 0, 0, 0, 0, 0) 0 1\n"
+        "R 0\nI[LEAKAGE_TRANSITION_1: (0.5, 0-->2)] 0\nM 0 1",
+        # A non-deterministic observable elsewhere used to make stim reject the check circuit.
+        "H 1\nM 1\nOBSERVABLE_INCLUDE(0) rec[-1]\nR 0\nI[LEAKAGE_TRANSITION_1: (0.5, 0-->2)] 0\nM 0",
+    ],
+)
+def test_interactive_batch_guard_accepts_definite_z_targets(text: str) -> None:
+    c, sim = _leak_tab_sim(text, batch_size=8, seed=1)
+    sim.interactive_do(c)
+    sim.finish_interactive_run()
+    assert sim.get_final_measurement_records().shape == (8, c.num_measurements)
+
+
+def test_interactive_batch_guard_rejects_entangled_partner_of_measured_qubit() -> None:
+    # Qubit 1 is never noisy, measured or reset after the CX, yet its Z equals the random M 0.
+    c, sim = _leak_tab_sim(
+        "R 0 1\nH 0\nCX 0 1\nM 0\nX_ERROR[CONDITIONED_ON_SELF: 1](1.0) 1\nM 1", batch_size=8, seed=3
+    )
+    with pytest.raises(ValueError, match="non-deterministic Z"):
+        sim.interactive_do(c)
+    # After a reset the same target is definite, so the tag is accepted and never fires.
+    c2, sim2 = _leak_tab_sim(
+        "R 0 1\nH 0\nCX 0 1\nM 0\nR 1\nX_ERROR[CONDITIONED_ON_SELF: 1](1.0) 1\nM 1", batch_size=8, seed=3
+    )
+    sim2.interactive_do(c2)
+    sim2.finish_interactive_run()
+    assert not np.any(sim2.get_final_measurement_records()[:, 1])
+
+
+def test_sync_forces_running_tableau_for_xy_lockstep() -> None:
+    # running_tableau=False used to replay _new_circuit without the X/Y split under sync.
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
+    from stimside.simulator_coset import CosetsideSimulator
+
+    text = "R 0 1 2 3 4\nCX 2 3 3 4\nMX 3 4 2\nM 0 1 2 3 4"
+    c, tab = _leak_tab_sim(text, batch_size=32, seed=4, sync_tableside_rng=True, running_tableau=False)
+    tab.run()
+    coset = CosetsideSimulator(
+        c,
+        compiled_op_handler=LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=32),
+        batch_size=32,
+        seed=4,
+        sync_tableside_rng=True,
+    )
+    coset.run()
+    np.testing.assert_array_equal(tab.get_final_measurement_records(), coset.get_final_measurement_records())
+
+
+def test_cache_lock_is_reinitialized_in_forked_child() -> None:
+    import os
+    import threading
+    import warnings
+
+    from stimside._tableau import runner as tab_runner
+
+    if not hasattr(os, "fork") or not hasattr(os, "register_at_fork"):
+        pytest.skip("needs os.fork and os.register_at_fork")
+    held, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with tab_runner._CACHE_LOCK:
+            held.set()
+            release.wait(10)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    try:
+        assert held.wait(10)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            pid = os.fork()
+        if pid == 0:  # pragma: no cover - forked child
+            os._exit(0 if tab_runner._CACHE_LOCK.acquire(timeout=2) else 1)
+        _, status = os.waitpid(pid, 0)
+    finally:
+        release.set()
+        t.join()
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0

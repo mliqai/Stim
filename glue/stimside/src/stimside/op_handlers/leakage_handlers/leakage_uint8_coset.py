@@ -1003,7 +1003,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         prob_Read1[in_comp & (pauli_states == 1)] = p0
         prob_Read1[in_comp & (pauli_states == -1)] = p1
         prob_Read1[in_comp & (pauli_states == 0)] = p_super
-        for n in range(2, int(np.max(target_leakage_state)) + 1):
+        for n in range(2, int(np.max(target_leakage_state, initial=0)) + 1):
             if n in params.prob_for_input_state:
                 prob_Read1[target_leakage_state == n] = params.prob_for_input_state[n]
 

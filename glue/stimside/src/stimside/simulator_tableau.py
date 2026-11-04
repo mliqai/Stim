@@ -139,11 +139,11 @@ class TablesideSimulator(
             )
 
         self._compiled_m2d_converter_inst: object | None = None
-        if self._precompiled_circuit is not None:
-            if self._sync_tableside_rng:
-                eff_rt = bool(running_tableau)
-            else:
-                eff_rt = bool(running_tableau and self._precompiled_circuit.requires_tableau)
+        if self._sync_tableside_rng:
+            # Sync lockstep needs the live tableau: the deferred replay skips the X/Y split.
+            eff_rt = True
+        elif self._precompiled_circuit is not None:
+            eff_rt = bool(running_tableau and self._precompiled_circuit.requires_tableau)
         else:
             eff_rt = bool(running_tableau)
 
@@ -387,6 +387,8 @@ class TablesideSimulator(
 
     def finish_interactive_run(self):
         """Finish an interactive run of the simulator."""
+        if not self._finished_running_circuit:
+            self._shot_counter += 1
         self._finished_running_circuit = True
         if self.batch_size > 1:
             self._share_shot0_leakage_events()

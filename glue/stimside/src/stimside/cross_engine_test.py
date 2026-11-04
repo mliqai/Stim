@@ -515,6 +515,12 @@ def test_repeated_targets_in_leakage_projection_z_and_mr():
         "H 0 1\nMPP(0.25) X0*X1 X1 X0\nM 0 1",
         "H 0 2\nMPP(0.25) X0 X1*X1 !Y1*Y1 X2\nM 0 1 2",
         "H 0 1\nMPP(0.25) X0*Y0*X1*Y1 X0*Z0*X1*Z1\nM 0 1",
+        # Overlapping noisy products whose next product collapses randomly: the previous segment's
+        # readout flips must be drawn before the next projection (Stim's order).
+        "H 0 1\nMPP(0.25) X0 Z0",
+        "H 0 1\nMPP(0.25) Z0*Z1 Z1 Z0\nM 0 1",
+        "H 0 1 2\nMPP(0.2) Z0*Z1 Z1*Z2 Z0\nM 0 1 2",
+        "H 0 1 2\nMZZ(0.25) 0 1 1 2\nM 0 1 2",
     ],
 )
 def test_sync_3way_lockstep_xy_collapses_and_repeated_noisy_1q_meas(program: str):
@@ -606,4 +612,31 @@ def test_repeated_qubit_mpp_hermitian_sign_and_antihermitian_rejection():
             s = make_sim()
             s.run()
             s.get_final_measurement_records()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "M[LEAKAGE_PROJECTION_Z: (0.9, 2)]",
+        "MR[LEAKAGE_PROJECTION_Z: (0.9, 2)]",
+        "MX[LEAKAGE_PROJECTION_Z: (0.9, 2)]",
+        "M[LEAKAGE_PROJECTION_Z: (0.1, 0) (0.9, 1)]",
+    ],
+)
+def test_zero_target_leakage_projection_is_a_no_op_on_all_engines(body: str):
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
+    from stimside.simulator_magic import MagicsideSimulator
+
+    circuit = stim.Circuit(f"R 0 1\n{body}\nM 0 1")
+    for sim_cls, h_cls, sync in [
+        (TablesideSimulator, LeakageUint8Tableau, False),
+        (TablesideSimulator, LeakageUint8Tableau, True),
+        (CosetsideSimulator, LeakageUint8Coset, False),
+        (CosetsideSimulator, LeakageUint8Coset, True),
+        (FlipsideSimulator, LeakageUint8Flip, False),
+        (MagicsideSimulator, LeakageUint8Magic, False),
+        (MagicsideSimulator, LeakageUint8Magic, True),
+    ]:
+        _, rec, _, _, _ = _run_sim(sim_cls, h_cls, circuit, sync=sync)
+        assert rec.shape == (4, 2) and not np.any(rec), (sim_cls.__name__, sync)
 
