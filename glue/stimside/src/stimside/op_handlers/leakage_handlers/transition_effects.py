@@ -214,7 +214,6 @@ def eval_allowed_state_mask(
     target_states: NDArray[Any],
     is_classical: NDArray[np.bool_],
     allowed_group: Sequence[int | str],
-    full_list: Any = None,
 ) -> NDArray[np.bool_]:
     """Evaluate allowed-state membership mask for 1Q or 2Q Tableau/Coset targets."""
     mask = np.zeros(target_states.shape, dtype=np.bool_)

@@ -92,8 +92,10 @@ def check_replay(
             )
             raise ValueError(
                 f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` doesn't match "
-                f"the circuit the {sim_name} was constructed with, {where}. Pass the circuit "
-                "itself or its parts, not `circuit.flattened()` or `circuit + more`."
+                f"the circuit the {sim_name} was constructed with, {where}. Its reference, "
+                "detector/observable converter and op handler are precomputed from that circuit, "
+                "so interactive_do must replay it in order before continuing past its end. Pass "
+                "the circuit itself or its parts, not `circuit.flattened()` or `circuit + more`."
             )
         return
     if this.name in ("DETECTOR", "OBSERVABLE_INCLUDE") or (
@@ -101,11 +103,13 @@ def check_replay(
     ):
         raise ValueError(
             f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` is past the end "
-            f"of the circuit the {sim_name} was constructed with ({n} operations)."
+            f"of the circuit the {sim_name} was constructed with ({n} operations), where tagged "
+            "operations, DETECTOR and OBSERVABLE_INCLUDE aren't supported: the op handler and "
+            "detector/observable converter only know that circuit."
         )
-    if num_qubits is not None and this.name not in ("MPAD", "QUBIT_COORDS"):
+    if num_qubits is not None and this.name not in ("MPAD", "QUBIT_COORDS"):  # bit values; an annotation
         for tgt in this.targets_copy():
-            q = tgt.qubit_value
+            q = tgt.qubit_value  # None for rec, sweep and combiner targets
             if q is not None and q >= num_qubits:
                 raise ValueError(
                     f"interactive_do: operation {t} (REPEAT blocks unrolled) `{this}` targets "

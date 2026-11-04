@@ -174,6 +174,7 @@ def _resolve_marginal_dem_kernels_so(force_recompile: bool = False) -> Path:
 
 
 def get_marginal_dem_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
+    """Locate (or compile if needed) and return the cached ctypes CDLL for marginal_dem_kernels.cpp."""
     return get_lib(sys.modules[__name__], "marginal_dem_kernels", "marginal_dem_kernels_abi_v5", _SPECS, force_recompile=force_recompile)
 
 

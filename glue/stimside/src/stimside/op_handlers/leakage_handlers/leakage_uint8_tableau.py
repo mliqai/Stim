@@ -249,7 +249,7 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         target_states = np.where(targets_arr < 0, 0, self.state[safe_qs])
         self.state[self.state == 1] = 0
         return eval_allowed_state_mask(
-            target_states, targets_arr < 0, allowed_st_list[0], allowed_st_list
+            target_states, targets_arr < 0, allowed_st_list[0]
         )
 
     def _filter_targets_2q(
@@ -294,10 +294,10 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
         allowed_mask = np.zeros(num_pairs, dtype=bool)
         for n in range(len(allowed_st_list[0])):
             m0 = eval_allowed_state_mask(
-                target_states[:, 0], is_classical[:, 0], (allowed_st_list[0][n],), allowed_st_list
+                target_states[:, 0], is_classical[:, 0], (allowed_st_list[0][n],)
             )
             m1 = eval_allowed_state_mask(
-                target_states[:, 1], is_classical[:, 1], (allowed_st_list[1][n],), allowed_st_list
+                target_states[:, 1], is_classical[:, 1], (allowed_st_list[1][n],)
             )
             allowed_mask |= m0 & m1
 

@@ -15,6 +15,7 @@ from stimside.dem_generators.leakage_decoder import (
     LeakageDecoderLike,
     as_leakage_decoder,
 )
+from stimside.op_handlers.abstract_op_handler import OpHandler
 
 
 def next_compiled_seed(seed: int | None, idx: int, salt: int) -> int | None:
@@ -137,13 +138,22 @@ def sample_batches(
     )
 
 
-from stimside.op_handlers.abstract_op_handler import OpHandler
+class _DefaultBatchSize:
+    """Sentinel for "use the sampler class's ``_default_batch_size``"."""
 
-_DEFAULT_BATCH: Any = object()
+    def __repr__(self) -> str:
+        return "<class default>"
+
+
+_DEFAULT_BATCH: Any = _DefaultBatchSize()
 
 
 class SamplerBase(sinter.Sampler):
-    """Common Sinter sampler configuration for Flipside, Tableside, and Cosetside."""
+    """Common Sinter sampler configuration for Flipside, Tableside, and Cosetside.
+
+    ``batch_size`` defaults to the class's ``_default_batch_size``: 1 for
+    ``TablesideSampler``, 256 for ``CosetsideSampler`` and 1024 for ``FlipsideSampler``.
+    """
 
     _compiled_cls: type[Any]
     _default_batch_size: int = 256

@@ -1296,6 +1296,7 @@ class CosetsideSimulator(
         self._cpp_dirty = True
         any_x = int(self._any_x_c.value)
         any_z = int(self._any_z_c.value)
+        # Epilogue of a deterministic batched step: record, reset-kick, flush and flip noise.
         if step_meta.produces_measurements:
             for k_idx, substep in enumerate(step_meta.substeps):
                 row = m_mat[k_idx]

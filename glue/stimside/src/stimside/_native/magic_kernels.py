@@ -91,4 +91,5 @@ def _resolve_magic_kernels_so(force_recompile: bool = False) -> Path:
 
 
 def get_magic_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
+    """Locate (or compile if needed) and return the cached ctypes CDLL for `magic_kernels.cpp`."""
     return get_lib(sys.modules[__name__], "magic_kernels", "magic_abi_v2", _SPECS, force_recompile=force_recompile)

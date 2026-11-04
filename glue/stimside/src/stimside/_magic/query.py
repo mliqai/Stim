@@ -880,9 +880,12 @@ def EvaluateQueries(plan: PreparedQueryPlan, realization: Mapping[Any, Any] | No
       Monte-Carlo sampled via `rng`.
     - Unpinned standard Pauli/correlated/heralded noise channels, resets, and
       measurements are summed (marginalized) across all branches unless
-      `"sample_measurements"` is requested or `realization` pins them.
+      `"sample_measurements"` is requested, `rng` is passed with `realization=None`,
+      or `realization` pins them.
     - Unpinned multi-measurement marginal queries branch over dynamic steps and
-      can grow exponentially unless bounded by `QueryBudget`.
+      can grow exponentially. `QueryBudget` stops them with
+      `QueryBudgetExceededError` only with `on_budget_exceeded="raise"` and limits
+      tight enough for the circuit; `"fallback"` re-runs without a budget.
     """
     if not isinstance(plan, PreparedQueryPlan):
         raise TypeError(f"Expected PreparedQueryPlan, got {type(plan)!r}")

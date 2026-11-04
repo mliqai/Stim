@@ -86,7 +86,10 @@ class TablesideSimulator(
         """record_leakage_events: record every leakage-state change of each shot
         (``get_leakage_events()``, see ``stimside.util.leakage_events``). With
         ``batch_size > 1`` (and no ``sync_tableside_rng``) all shots of a batch share
-        one leakage trajectory, so they get the same events."""
+        one leakage trajectory, so they get the same events, except in circuits with
+        0/1-conditioned tags (or rec feedback after an asymmetric readout): run() then
+        simulates each shot independently. ``sync_tableside_rng=True`` always runs a
+        live tableau (``running_tableau`` is ignored)."""
 
         if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
             raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
@@ -369,6 +372,11 @@ class TablesideSimulator(
         Pass the circuit itself or consecutive parts of it, not `circuit.flattened()` (which drops
         SHIFT_COORDS, rewrites DETECTOR coordinates and can merge operations) or `circuit + more`
         (where stim can merge operations at the seam).
+
+        With batch_size > 1 all shots share one trajectory, so these raise ValueError (use run()
+        or batch_size=1 instead): sync_tableside_rng=True; a 0/1-conditioned tag on a target in Z
+        superposition, or whose Z differs between shots; rec[-k] feedback after an asymmetric
+        0/1 readout.
         """
         if self._finished_running_circuit:
             raise RuntimeError(
@@ -448,7 +456,11 @@ class TablesideSimulator(
         *,
         include_in_reference: bool = True,
     ):
-        """Apply a stabilizer / error instruction to `_new_circuit` (and TableauSimulator if running)."""
+        """Apply a stabilizer / error instruction to `_new_circuit` (and TableauSimulator if running).
+
+        To be used by op_handler. Also appended to the new reference circuit, if one is being
+        constructed, unless `include_in_reference=False`.
+        """
         if self.batch_size > 1 and self._asymmetric_readout_postproc:
             insts = op if isinstance(op, stim.Circuit) else (op,)
             for inst in insts:
@@ -477,6 +489,10 @@ class TablesideSimulator(
                     self._tableau_simulator.do(op)
 
     def _do_bare_only_on_tableau(self, op: stim.Circuit | stim.CircuitInstruction):
+        """
+        To be used by op_handler to apply a stabilizer / error instruction directly
+        to the TableauSimulator (and `_new_circuit`), without adding it to the reference circuit.
+        """
         self._do_bare_instruction(op, include_in_reference=False)
 
     def _append_to_new_reference_circuit(

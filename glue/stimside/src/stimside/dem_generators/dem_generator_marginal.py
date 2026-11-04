@@ -83,6 +83,15 @@ from stimside.dem_generators.marginal_builder import (
 )
 from stimside.util.leakage_events import ShotLeakageEvents
 
+__all__ = [
+    "GeneratedDemList",
+    "LEAKAGE_SWAP_UNSUPPORTED",
+    "MarginalLeakageDemGenerator",
+    "get_item_analysis_meta",
+    "get_item_leakage_events",
+    "has_leakage_swap",
+]
+
 
 _ITEM_ANALYSIS_META: dict[
     int,

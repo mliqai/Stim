@@ -205,7 +205,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         if peeked:
             self._clear_transient_ones(valid_qs)
         return eval_allowed_state_mask(
-            target_states, is_classical, allowed_group, allowed_st_list
+            target_states, is_classical, allowed_group
         )
 
     def _filter_targets_2q_mask(
@@ -237,10 +237,10 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         allowed_mask = np.zeros((len(targets_np), css.batch_size), dtype=np.bool_)
         for n in range(len(allowed_st_list[0])):
             m0 = eval_allowed_state_mask(
-                s0, is_c0, (allowed_st_list[0][n],), allowed_st_list
+                s0, is_c0, (allowed_st_list[0][n],)
             )
             m1 = eval_allowed_state_mask(
-                s1, is_c1, (allowed_st_list[1][n],), allowed_st_list
+                s1, is_c1, (allowed_st_list[1][n],)
             )
             allowed_mask |= m0 & m1
         return allowed_mask

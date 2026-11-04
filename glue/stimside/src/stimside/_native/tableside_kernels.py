@@ -106,4 +106,5 @@ def _resolve_tableside_kernels_so(force_recompile: bool = False) -> Path:
 
 
 def get_tableside_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
+    """Locate (or compile if needed) and return the cached ctypes CDLL for tableside_kernels.cpp."""
     return get_lib(sys.modules[__name__], "tableside_kernels", "tableside_kernels_abi_v1", _SPECS, force_recompile=force_recompile)

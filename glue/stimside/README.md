@@ -44,14 +44,14 @@ When a leakage tag conditions on the computational basis states `0` or `1` (for 
 `FlipsideSimulator` does the same for `0`/`1` inputs of `LEAKAGE_TRANSITION_1` and `LEAKAGE_TRANSITION_2`, and for `0`/`1` keys of `MPAD[LEAKAGE_MEASUREMENT: ...]` (see the `MPAD` notes below): each shot's $Z$ value is the noiseless reference value XOR its X frame bit, and a target that is superposed in the noiseless reference is collapsed there (to `0`), with a 50% $Z$ kick on the shot to model the measurement back-action.
 
 ### Transitions into `0`, `1`, and `U`
-In all four simulators, a `LEAKAGE_TRANSITION_1`/`LEAKAGE_TRANSITION_2` output of `0` or `1` resets the qubit into that $Z$ eigenstate (like `R`, or `R` then `X`), unleaking it without depolarizing it, whatever its input state. A leaked qubit (`state >= 2`) transitioning to `U` (or `V`/`D`) is unleaked and fully depolarized, whereas an unleaked qubit transitioning to `U` (including `0-->U` or `1-->U`) keeps its computational state untouched (use output `V` or `D` in `LEAKAGE_TRANSITION_2` to depolarize an unleaked qubit). A leaked qubit transitioning to `X`, `Y` or `Z` in `LEAKAGE_TRANSITION_2` is first reset to `|0>` and then has that Pauli applied. `FlipsideSimulator` can only represent a `0`/`1`/`X`/`Y`/`Z` reset when the target's $Z$ value is definite in the noiseless circuit (or collapsed by a `0`/`1` input key of the same instruction); otherwise it raises a `ValueError`.
+In all four simulators, a `LEAKAGE_TRANSITION_1`/`LEAKAGE_TRANSITION_2` output of `0` or `1` resets the qubit into that $Z$ eigenstate (like `R`, or `R` then `X`), unleaking it without depolarizing it, whatever its input state. A transition to `U` fully depolarizes the qubit when it fires, whether the input is leaked (`state >= 2`, which also unleaks it) or unleaked (`0-->U`, `1-->U`, `U-->U`); `V` and `D` in `LEAKAGE_TRANSITION_2` depolarize too. A leaked qubit transitioning to `X`, `Y` or `Z` in `LEAKAGE_TRANSITION_2` is first reset to `|0>` and then has that Pauli applied. `FlipsideSimulator` can only represent a `0`/`1`/`X`/`Y`/`Z` reset when the target's $Z$ value is definite in the noiseless circuit (or collapsed by a `0`/`1` input key of the same instruction); otherwise it raises a `ValueError`.
 
 When several keys of one `LEAKAGE_TRANSITION_1`/`LEAKAGE_TRANSITION_2` match a qubit (for example `U` and `1` in `(p, U-->2) (q, 1-->3)`), each matching key is applied in order, and a key's "no transition" outcome leaves the state unchanged, so a later key's transition overrides an earlier one. All four simulators agree on this in every mode.
 
 ### Instructions with Repeated Qubit Targets
 Instructions that reference the same qubit more than once in a single instruction (for example `CX 0 1 1 0`, `H 0 0`, or tagged leakage operations with repeated targets) are **processed sequentially in target order** (left to right), matching Stim's execution semantics.
 
-> Exception: in `CosetsideSimulator`, the `0`/`1` conditions of a conditioned noise channel (e.g. `X_ERROR[CONDITIONED_ON_SELF: 0](p) 0 0`) are checked once, for all targets, before the noise is applied, so a repeated qubit does not see the noise applied to its earlier copy; `TablesideSimulator` checks them target group by target group. Separate the copies with `TICK` (stim fuses identical consecutive instructions) to get sequential semantics in both.
+> Exception: in `CosetsideSimulator` and `MagicsideSimulator`, the `0`/`1` conditions of a conditioned noise channel (e.g. `X_ERROR[CONDITIONED_ON_SELF: 0](p) 0 0`, or a repeated pair in `CONDITIONED_ON_PAIR`) are checked once, for all targets, before the noise is applied, so a repeated qubit does not see the noise applied to its earlier copy; `TablesideSimulator` checks them target group by target group. Separate the copies with `TICK` (stim fuses identical consecutive instructions) to get sequential semantics in all three.
 
 ### `LEAKAGE_PROJECTION_Z` and `MPAD` Support
 - `LEAKAGE_PROJECTION_Z` is supported across single-qubit projective and reset measurements in the $Z$, $X$, and $Y$ bases: `M`, `MZ`, `MR`, `MRZ`, `MX`, `MY`, `MRX`, and `MRY`.
@@ -106,12 +106,15 @@ An untagged `SWAP` never moves leakage states, in any simulator: each qubit keep
 
 > [!CAUTION]
 > **Shared Leakage Trajectory Within a Batch (`TablesideSimulator(..., batch_size > 1)`):** Because standard `TablesideSimulator` (`sync_tableside_rng=False`) samples classical leakage transitions once per `run()` call and uses Pauli-frame randomization on `_new_circuit` to produce the `batch_size` shots, **all shots within the same batch share the exact same leakage events and leakage state history**. Only Pauli errors and measurement outcomes conditioned on that fixed leakage realization vary across the `batch_size` shots. To sample independent leakage trajectories for every shot in `TablesideSimulator`, either use `batch_size=1` (where `TablesideSampler` runs independent batches) or set `sync_tableside_rng=True` (which executes an independent tableau and leakage trajectory per shot, seeded with a hash of `seed` and the shot's index in the run).
+>
+> **Exception (per-shot routing):** circuits whose tags condition on the computational state `0`/`1` (or that use `rec` feedback after an asymmetric `0`/`1` readout) cannot share one trajectory, so `run()` executes `batch_size` independent single-shot trajectories instead. Those shots get independent leakage, and the batch costs about `batch_size` times a single shot (29–236× slower than a shared batch in benchmarks). For fast batched `0`/`1` conditioning, use `CosetsideSimulator`.
 
 
 ### Synchronized Shot-for-Shot Equivalence (`sync_tableside_rng=True`)
 Passing `sync_tableside_rng=True` to `TablesideSimulator` and `CosetsideSimulator` (with the same integer `seed` and `batch_size`, and likewise to `MagicsideSimulator` on Clifford-plus-leakage circuits) synchronizes all stabilizer measurement collapses, noise channels, herald draws, and leakage transition alias-table draws per shot (shot `n` of the run, counting across batches, is seeded with a splitmix64 hash of `seed` and `n`; without `sync_tableside_rng`, batch `n` is seeded the same way, so runs with different seeds don't share random streams), producing identical shot-for-shot measurement records, detector flips, observable flips, and `unleaked_to_leaked` event indices across the simulators. Caveats:
 - Condition qubits must be disjoint from target qubits on `CONDITIONED_ON_OTHER` instructions that specify `0`/`1` Z-collapse (whose `0`/`1` conditions the simulators check differently in every mode; see the exception under [Instructions with Repeated Qubit Targets](#instructions-with-repeated-qubit-targets)).
-- Under sync, duplicate targets in `LEAKAGE_PROJECTION_Z` measurements raise `NotImplementedError` in `CosetsideSimulator` when readout is noisy or any target is leaked, repeated-qubit noisy multi-qubit measurements (`MXX(p) 0 1 0 1`, `MPP(p) X0*Z1 X0*Z1`) may draw readout flips in different order, and non-ascending or repeated targets in noisy X/Y-basis measurements (e.g. `MX(p) 3 4 2`, `MRX(p) 3 4 2`) are not guaranteed to match shot-for-shot because Stim's `collapse_x`/`collapse_y` sort and deduplicate superposed targets internally.
+- Under sync, duplicate targets in `LEAKAGE_PROJECTION_Z` measurements raise `NotImplementedError` in `CosetsideSimulator` and `MagicsideSimulator` when the tag gives an unleaked state a readout error (a `(p, 0)` entry with `p > 0` or a `(p, 1)` entry with `p < 1`) or any target is leaked, and non-ascending or repeated targets in noisy X/Y-basis measurements (e.g. `MX(p) 3 4 2`, `MRX(p) 3 4 2`) are not guaranteed to match shot-for-shot because Stim's `collapse_x`/`collapse_y` sort and deduplicate superposed targets internally.
+- Repeated targets in a noise channel conditioned on `0`/`1` (e.g. `X_ERROR[CONDITIONED_ON_SELF: 0](p) 0 0`, or a repeated pair in `CONDITIONED_ON_PAIR`) do not match, because `CosetsideSimulator` and `MagicsideSimulator` check the conditions once for all targets (see [Instructions with Repeated Qubit Targets](#instructions-with-repeated-qubit-targets)).
 
 ## Magicside Non-Clifford Simulator (`MagicsideSimulator` & `MagicsideSampler`)
 
@@ -134,7 +137,7 @@ Stim does not define native opcodes for non-Clifford unitaries or stochastic Cli
 
 For direct query reuse and structural budget enforcement (`QueryBudget` / `QueryBudgetExceededError`), use `PrepareQueries` (`prepare_queries`) and `EvaluateQueries` (`evaluate_queries`):
 
-> **Realization & Marginalization Semantics in `EvaluateQueries`:** Unspecified `CLIFFORD_FAULT` slots in `realization["faults"]` default to `0` (identity / no fault) unless `rng` is passed with `realization=None` (which samples a single Monte Carlo fault realization). By contrast, unpinned Pauli noise (`X_ERROR`, `DEPOLARIZE1`, etc.) is marginalized exactly when not sampling, and pure marginal queries (`mass`, `acceptance`, `fidelity`, `prefix_probs` without `sample_measurements`) over many unpinned random measurements branch exponentially unless bounded via `QueryBudget`.
+> **Realization & Marginalization Semantics in `EvaluateQueries`:** Unspecified `CLIFFORD_FAULT` slots in `realization["faults"]` default to `0` (identity / no fault) unless `rng` is passed with `realization=None` (which samples a single Monte Carlo fault realization). By contrast, unpinned Pauli noise (`X_ERROR`, `DEPOLARIZE1`, etc.) is marginalized exactly when not sampling, and pure marginal queries (`mass`, `acceptance`, `fidelity`, `prefix_probs` without `sample_measurements`) over many unpinned random measurements branch exponentially. A `QueryBudget` with `on_budget_exceeded="raise"` (the default) stops them with `QueryBudgetExceededError` once `max_terms` or `max_contraction_ops` is exceeded (the defaults, 4096 and 1,000,000, still allow minutes of work), while `on_budget_exceeded="fallback"` re-runs the enumeration without a budget.
 
 ```python
 import stim
@@ -223,6 +226,9 @@ if __name__ == "__main__":
     )
     print(stats[0].shots, stats[0].errors)
 ```
+
+> [!NOTE]
+> `sinter.collect` starts its workers with `spawn` and waits on them without a timeout: if a worker process dies without reporting (killed for memory, a native abort, or `os._exit`), `collect` blocks forever. Run long multi-worker collections under an outer timeout (for example `timeout -k 10 <seconds> python ...`), and set `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1` so the workers don't oversubscribe the machine.
 
 ### Top-Level `stimside` Exports
 

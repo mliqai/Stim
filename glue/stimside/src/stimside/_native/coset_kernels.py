@@ -73,4 +73,5 @@ def _resolve_coset_kernels_so(force_recompile: bool = False) -> Path:
 
 
 def get_coset_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
+    """Locate (or compile if needed) and return the cached ctypes CDLL for coset_kernels.cpp."""
     return get_lib(sys.modules[__name__], "coset_kernels", "coset_kernels_abi_v2", _SPECS, force_recompile=force_recompile)

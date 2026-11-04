@@ -1,7 +1,8 @@
 """Phase-preserving Moving-Reference Quadratic-Form Expansion (QFE) engine.
 
 Implements Recipe v3 primitives for `magicside`: `C1` (`PhaseQFEComponent`,
-`ShotExpansion`), `H0`–`H4`, `P1`–`P2`, `K1`, `N1`–`N3`, and `M1`–`M2`.
+`ShotExpansion`), `P1`–`P2`, `K1`, `N1`–`N3`, and `M1`–`M2`. The `H0`–`H4` local
+surgery lives in the C++ `WorkShot` (`_native/magic_kernels.cpp`).
 """
 
 from __future__ import annotations

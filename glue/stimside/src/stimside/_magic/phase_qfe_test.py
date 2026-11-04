@@ -404,6 +404,7 @@ def test_h3_restrict_amplitude_all_three_cases_via_project_diagonal() -> None:
                     comp.ell[int(np.min(chosen))] = np.uint8(ell_val)
 
                     before = comp.to_statevector()
+                    # Oracle: restrict basis index x in coset where lam . ((x ^ h)[pivots]) == eps
                     h_bits = unpack_bit_vector(comp.h_words, n)
                     expected = np.zeros_like(before)
                     for x in range(1 << n):
@@ -445,6 +446,7 @@ def test_h4_eliminate_zero_amplitude_all_four_cases_via_choi_and_quarter_turn() 
                         lam_choices.append(lv)
                 for lam in lam_choices:
                     base = random_valid_component(rng, n, d0)
+                    # Insert a zero column at position j
                     A_formal = np.insert(
                         base.A_words, j, np.zeros(base.n_words, dtype=np.uint64), axis=0
                     )
