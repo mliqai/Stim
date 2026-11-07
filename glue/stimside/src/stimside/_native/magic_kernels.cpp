@@ -864,7 +864,7 @@ int magic_apply_quarter_turn(
     }
 
     work.export_and_merge(
-        1e-13, out_chi, out_d,
+        1e-13, out_chi, out_d,  // Must equal K1_CANCEL_REL_TOL (_magic/phase_qfe.py).
         out_weights_ri, out_h_words, out_ell,
         out_A_words, out_Gamma, out_pivots, out_ell_odd, nullptr
     );
@@ -1308,6 +1308,93 @@ int magic_contract_choi(
         if (out_d) *out_d = 0;
         return 3;
     }
+}
+
+// The C++ half of `measure_expansion` (phase_qfe.py) for many shots measuring one observable,
+// calling the per-shot entry points above. Shot s is packed tightly (shot_chi[s] rows, geometry
+// shot_d[s]); output slot s has room for shot_chi[s] rows and geometry shot_d[s] + 1. Per shot:
+// if has_rot, merge (non-canonical input) and quarter-turn, then check unitarity against z_in[s];
+// then project onto outcome m (out_z[2s + m] = z_m). outcome == nullptr projects both outcomes
+// (slot s keeps m = 1); otherwise only outcome[s]. out_cd[2s..2s+1] = (chi, d) of slot s.
+// Returns -1, or the index of the first shot whose rotation fails.
+int64_t magic_measure_batch(
+    size_t n_shots, size_t n_qubits, size_t nw, const int64_t* shot_chi, const int64_t* shot_d,
+    const uint8_t* shot_canon, const double* z_in, const double* w, const uint64_t* h,
+    const uint8_t* ell, const uint64_t* A, const uint8_t* G, const int32_t* piv, const uint8_t* eo,
+    int has_rot, const uint64_t* rot_a, const uint64_t* rot_b, uint8_t rot_kappa,
+    const uint64_t* diag_b, uint8_t diag_kappa, double cancel_tol, double atol,
+    const uint8_t* outcome, double* out_z, int64_t* out_cd, double* out_w, uint64_t* out_h,
+    uint8_t* out_ell, uint64_t* out_A, uint8_t* out_G, int32_t* out_piv, uint8_t* out_eo,
+    uint64_t* out_a_union
+) {
+    std::vector<double> mw, rw;
+    std::vector<uint64_t> mh, rh, rA;
+    std::vector<uint8_t> mell, rell, rG, reo;
+    std::vector<int32_t> rpiv;
+    for (size_t s = 0; s < n_shots; ++s) {
+        const size_t chi0 = static_cast<size_t>(shot_chi[s]), d0 = static_cast<size_t>(shot_d[s]);
+        const size_t cap = d0 + 1;
+        size_t chi = chi0, d = d0;
+        const double* cw = w;
+        const uint64_t *ch = h, *cA = A;
+        const uint8_t *cl = ell, *cG = G, *ce = eo;
+        const int32_t* cp = piv;
+        w += 2 * chi0, h += chi0 * nw, ell += chi0 * d0, A += d0 * nw, G += d0 * d0;
+        piv += d0, eo += d0;
+        if (has_rot) {
+            if (!shot_canon[s]) {
+                mw.resize(2 * chi0), mh.resize(chi0 * nw), mell.resize(chi0 * d0);
+                magic_canonicalize_and_merge(
+                    chi0, d0, nw, cw, ch, cl, cA, cG, cp, ce, cancel_tol, &chi,
+                    mw.data(), mh.data(), mell.data(), nullptr
+                );
+                cw = mw.data(), ch = mh.data(), cl = mell.data();
+            }
+            double post = 0.0;  // ShotExpansion.norm_sq of the rotated state (sequential sum)
+            if (chi > 0) {
+                rw.resize(2 * chi), rh.resize(chi * nw), rell.resize(chi * cap);
+                rA.resize(cap * nw), rG.resize(cap * cap), rpiv.resize(cap), reo.resize(cap);
+                if (magic_apply_quarter_turn(
+                        chi, d, n_qubits, nw, cw, ch, cl, cA, cG, cp, ce, rot_a, rot_b, rot_kappa,
+                        &chi, &d, rw.data(), rh.data(), rell.data(), rA.data(), rG.data(),
+                        rpiv.data(), reo.data()
+                    ) != 0) {
+                    return static_cast<int64_t>(s);
+                }
+                cw = rw.data(), ch = rh.data(), cl = rell.data(), cA = rA.data(), cG = rG.data();
+                cp = rpiv.data(), ce = reo.data();
+                for (size_t i = 0; i < 2 * chi; i += 2) {
+                    post += cw[i] * cw[i] + cw[i + 1] * cw[i + 1];
+                }
+            }
+            const double pre = z_in[s];  // check_unitary_norm
+            if (!(std::isfinite(post) && std::abs(post - pre) <= atol * std::max(1.0, pre))) {
+                return static_cast<int64_t>(s);
+            }
+        }
+        size_t oc = 0, od = 0;
+        for (uint8_t m = 0; m < 2; ++m) {
+            if (outcome != nullptr && outcome[s] != m) continue;
+            double z = 0.0;
+            oc = od = 0;
+            if (chi > 0) {
+                magic_project_diagonal(
+                    chi, d, nw, cw, ch, cl, cA, cG, cp, ce, diag_b, diag_kappa, m, cancel_tol,
+                    &oc, &od, out_w, out_h, out_ell, out_A, out_G, out_piv, out_eo, &z
+                );
+            }
+            out_z[2 * s + m] = z;
+        }
+        out_cd[2 * s] = static_cast<int64_t>(oc), out_cd[2 * s + 1] = static_cast<int64_t>(od);
+        for (size_t i = 0; i < nw; ++i) {
+            uint64_t u = 0;
+            for (size_t r = 0; r < od; ++r) u |= out_A[r * nw + i];
+            out_a_union[i] = u;
+        }
+        out_w += 2 * chi0, out_h += chi0 * nw, out_ell += chi0 * cap, out_A += cap * nw;
+        out_G += cap * cap, out_piv += cap, out_eo += cap, out_a_union += nw;
+    }
+    return -1;
 }
 
 }  // extern "C"

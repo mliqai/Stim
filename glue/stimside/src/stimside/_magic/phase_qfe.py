@@ -19,11 +19,14 @@ import stim  # type: ignore[import-untyped]
 from stimside._native._kernel_loader import (
     c_ptr as _c_ptr,
     c_w_ptr as _c_w_ptr,
+    f64_p as _c_f64_p,
     i32_p as _c_i32_p,
+    i64_p as _c_i64_p,
     u8_p as _c_u8_p,
     u64_p as _c_u64_p,
 )
 from stimside._native.magic_kernels import get_magic_kernels_lib as _get_cpp_lib
+from stimside._native.magic_kernels import get_magic_measure_batch
 from stimside.util.bitwords import (
     coerce_pauli_words,
     first_set_bit_in_words,
@@ -1416,3 +1419,140 @@ def measure_expansion(
     return MeasurementResult(
         outcome, reported_outcome, readout_flipped, z0, z1, z, chosen_z, out_log_mass, chosen_exp
     )
+
+
+def _measure_batch_kernel(
+    exps: Sequence[ShotExpansion], chi: NDArray[np.int64], z: NDArray[np.float64],
+    w: NDArray[np.complex128], rot: tuple[NDArray[np.uint64], NDArray[np.uint64], int] | None,
+    b_diag: NDArray[np.uint64], sig: int, atol: float,
+) -> tuple[Callable[[NDArray[np.uint8] | None], None], tuple[NDArray[Any], ...]]:
+    """Pack `exps` for `magic_measure_batch`; return `run(outcome)` and its output buffers."""
+    n, n_q = len(exps), exps[0].n_qubits
+    nw = n_words_for_qubits(n_q)
+    d = np.fromiter((e.d for e in exps), np.int64, n)
+    canon = np.fromiter((e._is_canonical_merged for e in exps), np.uint8, n)
+    cat = [np.concatenate([getattr(e, f) for e in exps], axis=None)
+           for f in ("h_words", "ell", "A_words", "Gamma", "pivots", "ell_odd")]
+    cap = d + 1
+    n_cap = int(cap.sum())
+    outs = (
+        np.zeros((n, 2)), np.empty((n, 2), np.int64), np.empty(int(chi.sum()), np.complex128),
+        np.empty(int(chi.sum()) * nw, np.uint64), np.empty(int((chi * cap).sum()), np.uint8),
+        np.empty(n_cap * nw, np.uint64), np.empty(int((cap * cap).sum()), np.uint8),
+        np.empty(n_cap, np.int32), np.empty(n_cap, np.uint8), np.empty((n, nw), np.uint64),
+    )
+    ins: tuple[NDArray[Any], ...] = (chi, d, canon, z, w, *cat)
+    in_t = (_c_i64_p, _c_i64_p, _c_u8_p, _c_f64_p, None, _c_u64_p, _c_u8_p, _c_u64_p, _c_u8_p,
+            _c_i32_p, _c_u8_p)
+    out_t = (_c_f64_p, _c_i64_p, None, _c_u64_p, _c_u8_p, _c_u64_p, _c_u8_p, _c_i32_p, _c_u8_p,
+             _c_u64_p)
+    ra, rb, rk = rot if rot is not None else (b_diag, b_diag, 0)
+    fn = get_magic_measure_batch()
+
+    def ptrs(arrs: tuple[NDArray[Any], ...], types: tuple[Any, ...]) -> list[Any]:
+        return [_c_w_ptr(a) if t is None else _c_ptr(a, t) for a, t in zip(arrs, types)]
+
+    def run(outcome: NDArray[np.uint8] | None) -> None:  # closes over the arrays it points into
+        s = fn(
+            n, n_q, nw, *ptrs(ins, in_t), int(rot is not None), _c_ptr(ra, _c_u64_p),
+            _c_ptr(rb, _c_u64_p), rk, _c_ptr(b_diag, _c_u64_p), sig << 1, K1_CANCEL_REL_TOL, atol,
+            None if outcome is None else _c_ptr(outcome, _c_u8_p), *ptrs(outs, out_t),
+        )
+        if s >= 0:
+            raise FloatingPointError(f"apply_quarter_turn failed while measuring shot {s}")
+
+    return run, outs
+
+
+def measure_expansions_batch(
+    exps: Sequence[ShotExpansion],
+    obs: Any,
+    *,
+    rng: np.random.Generator,
+    sample_outcome: Callable[[int, float], int] | None = None,
+    keep_rotated_frame: bool = False,
+    atol: float = DEFAULT_ATOL,
+) -> tuple[NDArray[np.bool_], NDArray[np.float64], NDArray[np.float64], list[ShotExpansion]]:
+    """`measure_expansion(renormalize=True)` on each shot in order, as one C++ call per phase.
+
+    Gives the same outcomes, post-states and RNG draws. Every shot has `chi > 0` and measures
+    `obs` (a Pauli axis object or `(a, b, kappa)`). Without `sample_outcome`, one `rng.random()`
+    per shot (pinned outcomes too); with it, shot i's outcome is `sample_outcome(i, p1)`.
+    Returns (outcomes, z0, z1, post_states). Raises ValueError for an empty batch, mixed
+    `n_qubits` or a `chi == 0` shot (the C kernel assumes one layout and nonzero chi).
+    """
+    if not exps or any(e.n_qubits != exps[0].n_qubits for e in exps):
+        raise ValueError("measure_expansions_batch needs a non-empty batch with one n_qubits")
+    n_q, tol = exps[0].n_qubits, validate_atol(atol)
+    a_w, b_w, kap = _unpack_pauli_args(obs, None, 0, n_q)
+    kap = validate_hermitian_pauli(a_w, b_w, kap)
+    rot: tuple[NDArray[np.uint64], NDArray[np.uint64], int] | None = None
+    b_diag, sig = b_w, (kap >> 1) & 1
+    if words_any_nonzero(a_w):
+        b_diag, sig = unit_bit_words(first_set_bit_in_words(a_w), n_words_for_qubits(n_q)), 0
+        rot = (a_w, np.ascontiguousarray(b_w ^ b_diag), (kap + 1) & 3)
+    chi = np.fromiter((e.chi for e in exps), np.int64, len(exps))
+    if np.any(chi == 0):
+        raise ValueError("measure_expansions_batch needs chi > 0 for every shot")
+    w = np.concatenate([e.weights for e in exps])
+    z = (w.real * w.real + w.imag * w.imag)[np.cumsum(chi) - chi]  # norm_sq() when chi == 1
+    for i in np.flatnonzero(chi > 1).tolist():
+        z[i] = exps[i].norm_sq()
+    if not np.all(np.isfinite(z) & (z >= 0.0)):
+        raise FloatingPointError(f"Invalid pre-measurement norm squared z={z!r}")
+    run, outs = _measure_batch_kernel(exps, chi, z, w, rot, b_diag, sig, tol)
+    run(None)
+    z0r, z1r = outs[0][:, 0], outs[0][:, 1]
+    scale = np.maximum(1.0, z)
+    if not np.all(np.isfinite(z0r) & np.isfinite(z1r)):
+        raise FloatingPointError(f"Non-finite projected Born masses: z0={z0r!r}, z1={z1r!r}")
+    if np.any((z0r < -1e-12 * scale) | (z1r < -1e-12 * scale)):
+        raise FloatingPointError(f"Significantly negative projected Born mass: {z0r!r}, {z1r!r}")
+    z0, z1 = np.where(z0r > 0.0, z0r, 0.0), np.where(z1r > 0.0, z1r, 0.0)  # max(0.0, z_m)
+    if not np.all(np.abs((z0 + z1) - z) <= tol * scale):
+        raise FloatingPointError(f"M2 Born mass conservation violated: {z0!r}, {z1!r}, z={z!r}")
+    if np.any((z <= 0.0) | ((z0 + z1) <= 0.0)):
+        raise ImpossiblePostselectionError("Cannot sample measurement from a zero-norm expansion")
+    zero_floor = K1_CANCEL_REL_TOL * z
+    if sample_outcome is None:
+        u = rng.random(len(exps))
+        p1 = np.minimum(1.0, np.maximum(0.0, z1 / (z0 + z1)))
+        out = np.where(z0 <= zero_floor, True, np.where(z1 <= zero_floor, False, u < p1))
+    else:
+        out = np.array([bool(sample_outcome(i, min(1.0, max(0.0, z1_i / z_i))))
+                        for i, (z1_i, z_i) in enumerate(zip(z1.tolist(), z.tolist()))])
+    chosen = np.where(out, z1, z0)
+    run(out.astype(np.uint8))
+    if sample_outcome is not None and np.any((chosen <= zero_floor) | (outs[1][:, 0] == 0)):
+        raise ImpossiblePostselectionError("Sampled measurement outcome has zero Born probability")
+    posts = _unpack_measured(exps, chi, outs, chosen, None if keep_rotated_frame else rot, tol)
+    return out, z0, z1, posts
+
+
+def _unpack_measured(
+    exps: Sequence[ShotExpansion], chi: NDArray[np.int64], outs: tuple[NDArray[Any], ...],
+    chosen: NDArray[np.float64],
+    unrotate: tuple[NDArray[np.uint64], NDArray[np.uint64], int] | None, atol: float,
+) -> list[ShotExpansion]:
+    """Post-states from `magic_measure_batch` outputs, finished as in `measure_expansion`."""
+    _, cd, out_w, out_h, out_ell, out_A, out_G, out_piv, out_eo, out_au = outs
+    n_q, nw = exps[0].n_qubits, out_au.shape[1]
+    cap = np.fromiter((e.d + 1 for e in exps), np.int64, len(exps))
+    o_w, o_l = (np.cumsum(chi) - chi).tolist(), (np.cumsum(chi * cap) - chi * cap).tolist()
+    o_g, o_gg = (np.cumsum(cap) - cap).tolist(), (np.cumsum(cap * cap) - cap * cap).tolist()
+    posts = []
+    for i, (e, (oc, od), cz) in enumerate(zip(exps, cd.tolist(), chosen.tolist())):
+        r, g, gg = o_w[i], o_g[i], o_gg[i]
+        post = ShotExpansion(
+            n_q, od, out_A[g * nw:(g + od) * nw].reshape(od, nw), out_au[i],
+            out_G[gg:gg + od * od].reshape(od, od), out_piv[g:g + od], out_w[r:r + oc],
+            out_h[r * nw:(r + oc) * nw].reshape(oc, nw),
+            out_ell[o_l[i]:o_l[i] + oc * od].reshape(oc, od),
+            out_eo[g:g + od], e.log_mass, e.atol,
+        )
+        if unrotate is not None:
+            post = apply_quarter_turn(post, *unrotate, sign=-1, check_unitary=True, atol=atol)
+        post.weights = np.ascontiguousarray(post.weights * (1.0 / math.sqrt(cz)))
+        post.log_mass = e.log_mass + math.log(cz)
+        posts.append(post)
+    return posts

@@ -17,6 +17,7 @@ from stimside._coset.reference_compile import (
 from stimside._native._kernel_loader import i8_p, i32_p, i64_p, u8_p, u64_p
 from stimside._native.coset_kernels import get_coset_kernels_lib
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
+from stimside.op_handlers.seam import SyncRngs
 from stimside.util.bitwords import (
     first_set_bit_in_words as _first_set_bit_in_words,
     word_dot_parity as _word_dot_parity,
@@ -62,12 +63,8 @@ class CosetsideSimulator(
        with O(0) cost on ideal unitary gates and automatic O(1) self-healing eviction back into stim.FlipSimulator
        whenever d_b drops to 0.
 
-    Batched OpHandler seam (also implemented by ``MagicsideSimulator``):
-    - Dispatch & cursor: ``_do_bare_instruction``, ``_next_step_meta``, ``do_copies_on_fused_step``.
-    - Conditioned & unmatched ops: ``do_conditional_clifford``, ``do_conditional_pauli_noise``,
-      ``do_unmatched_noisy_reset_z``, ``apply_pauli``.
-    - State query, projection & direct readout: ``peek_pauli_batch``, ``peek_pauli_born_batch``,
-      ``postselect_z_batch``, ``record_direct_measurements``.
+    Implements the batched OpHandler seam ``op_handlers.seam.BatchedLeakageSimulator`` (as does
+    ``MagicsideSimulator``).
     """
 
     def __init__(
@@ -341,6 +338,23 @@ class CosetsideSimulator(
             self._scratch_z_mask,
         )
         self._flush_xz(any_x, any_z)
+
+    sample_pauli_noise_sync = _sample_pauli_noise_via_tab_rng
+
+    def sync_rngs(self) -> SyncRngs | None:
+        """The per-shot sync RNGs, or None unless ``sync_tableside_rng=True``."""
+        if self._tab_rngs is None:
+            return None
+        assert self._tab_rngs_x is not None and self._shot_np_rngs is not None
+        return SyncRngs(self._tab_rngs, self._tab_rngs_x, self._shot_np_rngs)
+
+    def measurement_column(self, index: int) -> NDArray[np.bool_]:
+        """Measurement record column ``index`` (one bit per shot). Do not modify it in place."""
+        return self._measurement_columns[index]
+
+    def overwrite_measurement_column(self, index: int, values: NDArray[np.bool_]) -> None:
+        """Overwrite measurement record column ``index`` in place."""
+        self._measurement_columns[index][:] = values
 
     ############################################################################
     # Public lifecycle methods

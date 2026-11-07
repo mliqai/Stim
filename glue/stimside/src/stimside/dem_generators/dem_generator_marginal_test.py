@@ -2382,3 +2382,46 @@ def test_decomposed_marginal_decoder_counts_detector_free_observable_errors() ->
     ).sample(suggested_shots=2048)
     rate = stats.errors / stats.shots
     assert abs(rate - 0.2) < 5 * (0.2 * 0.8 / stats.shots) ** 0.5
+
+
+def test_per_shot_dems_match_cosetside_detector_rates_per_flag_pattern():
+    """Monte-Carlo check of the per-shot DEMs, in a regime where they are exact.
+
+    Leaks only on ancillas (after DEPOLARIZE1), each heralded at MR and fully unleaked there; the
+    README's "Does Not Model Exactly" section lists the approximations this regime avoids.
+    """
+    lt1 = "LEAKAGE_TRANSITION_1: "
+    tags = {
+        lt1 + "(0.001, U-->2) (0.001, 2-->U)": lt1 + "(0.003, U-->2)",
+        lt1 + "(0.95, 2-->U)": lt1 + "(1.0, 2-->U)",
+    }
+    circuit = stim.Circuit()
+    for inst in _make_surface_code_leakage_circuit(distance=3, rounds=3):
+        if not inst.tag.startswith("LEAKAGE_TRANSITION_2"):
+            args = (inst.name, inst.targets_copy(), inst.gate_args_copy())
+            circuit.append(stim.CircuitInstruction(*args, tag=tags.get(inst.tag, inst.tag)))
+    shots = 100_000
+    handler = LeakageUint8Coset().compile_op_handler(circuit=circuit, batch_size=shots)
+    sim = stimside.CosetsideSimulator(
+        circuit, compiled_op_handler=handler, batch_size=shots, seed=2
+    )
+    sim.run()
+    records = np.asarray(sim.get_final_measurement_records(), dtype=bool)
+    dets = circuit.compile_m2d_converter().convert(measurements=records, append_observables=False)
+    dems = MarginalLeakageDemGenerator()(circuit, records)
+    groups: dict[int, list[int]] = {}
+    for i, dem in enumerate(dems):  # shots with the same flag pattern share one DEM object
+        groups.setdefault(id(dem), []).append(i)
+    tested = []
+    for idx in (g for g in groups.values() if len(g) >= 200):
+        prod = np.ones(circuit.num_detectors)
+        for err in dems[idx[0]].flattened():
+            if err.type == "error":
+                for t in err.targets_copy():
+                    if t.is_relative_detector_id():
+                        prod[t.val] *= 1 - 2 * err.args_copy()[0]
+        p, n, rate = (1 - prod) / 2, len(idx), dets[idx].mean(axis=0)
+        sigma = np.sqrt(np.maximum(p * (1 - p), 1 / n) / n)  # the floor keeps p = 0 testable
+        assert np.all(np.abs(rate - p) < 5 * sigma), (n, p, rate)
+        tested.append(p)
+    assert len(tested) >= 10 and any(((p > 0.2) & (p < 0.3)).any() for p in tested)

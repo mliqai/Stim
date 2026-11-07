@@ -1,3 +1,4 @@
+import warnings
 from typing import Literal, Iterable
 
 import numpy as np
@@ -7,17 +8,13 @@ from numpy.typing import NDArray
 from stimside._tableau.runner import (
     STANDARD_LEAKAGE_PARAM_TYPES,
     CppTablesideRunner,
+    collapses_z,
     do_sync_bare_inst,
     get_precompiled_circuit,
     run_tableside_sync_rng,
 )
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
-from stimside.op_handlers.leakage_handlers.leakage_parameters import (
-    LeakageConditioningParams,
-    LeakageMeasurementParams,
-    LeakageTransition1Params,
-    LeakageTransition2Params,
-)
+from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import CompiledLeakageUint8Tableau
 from stimside.util.circuit import ShotMajorM2DMixin, apply_coords_op, check_replay, unroll_circuit
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.seeding import derived_seed
@@ -130,16 +127,23 @@ class TablesideSimulator(
 
         self._compiled_op_handler = compiled_op_handler
         self._precompiled_circuit = None
-        from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
-            CompiledLeakageUint8,
-        )
-
-        if type(compiled_op_handler) is CompiledLeakageUint8:
-            self._precompiled_circuit = get_precompiled_circuit(
-                circuit,
-                bool(compiled_op_handler.unconditional_condition_on_U),
-                compiled_op_handler.ops_to_params,
-            )
+        if isinstance(compiled_op_handler, CompiledLeakageUint8Tableau):
+            if compiled_op_handler.supports_cpp_fast_path():
+                self._precompiled_circuit = get_precompiled_circuit(
+                    circuit,
+                    bool(compiled_op_handler.unconditional_condition_on_U),
+                    compiled_op_handler.ops_to_params,
+                )
+            else:
+                path = "precompiled sync replay" if self._sync_tableside_rng else "C++ fast path"
+                warnings.warn(
+                    f"The Tableside {path} is disabled because "
+                    f"{type(compiled_op_handler).__name__} overrides "
+                    f"{', '.join(compiled_op_handler._fast_path_overrides())}; "
+                    "this is much slower.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         self._compiled_m2d_converter_inst: object | None = None
         if self._sync_tableside_rng:
@@ -173,27 +177,11 @@ class TablesideSimulator(
         self._detector_flips: NDArray[np.bool_] | None = None
         self._observable_flips: NDArray[np.bool_] | None = None
         self._asymmetric_readout_postproc: list[tuple[int, float, float, bool]] = []
+        self._collapses_z_memo: bool | None = None
 
     ############################################################################
     # Public methods without running interactively
     ############################################################################
-
-    @staticmethod
-    def _ops_collapse_z(ops_to_params: dict[object, object]) -> bool:
-        for p in ops_to_params.values():
-            if isinstance(p, LeakageConditioningParams) and any(
-                0 in g or 1 in g for g in p.args
-            ):
-                return True
-            if isinstance(p, LeakageTransition1Params) and (
-                0 in p.args_by_input_state or 1 in p.args_by_input_state
-            ):
-                return True
-            if isinstance(p, LeakageTransition2Params) and any(
-                0 in k or 1 in k for k in p.args_by_input_state
-            ):
-                return True
-        return False
 
     def _run_single_trajectory(self):
         pre = self._precompiled_circuit
@@ -218,30 +206,22 @@ class TablesideSimulator(
             self._do(self.circuit)
 
     def _collapses_z(self) -> bool:
-        pre = self._precompiled_circuit
-        coh = self._compiled_op_handler
-        if pre is not None and coh.ops_to_params == pre.parsed_ops:  # type: ignore[attr-defined]
-            return pre.collapses_z
-        if not hasattr(coh, "ops_to_params"):
-            return False
-        ops_to_params = coh.ops_to_params  # type: ignore[attr-defined]
-        if self._ops_collapse_z(ops_to_params):
-            return True
-        found_asym = False
-        for op in unroll_circuit(self.circuit):
-            if op.name in ("DETECTOR", "TICK", "OBSERVABLE_INCLUDE"):
-                continue
-            if found_asym and any(t.is_measurement_record_target for t in op.targets_copy()):
-                return True
-            p_step = ops_to_params.get(op)
-            if isinstance(p_step, LeakageMeasurementParams):
-                is_mp = p_step.targets is not None
-                has_01 = (0 in p_step.prob_for_input_state) or (1 in p_step.prob_for_input_state)
-                if (is_mp and (has_01 or not np.isclose(p_step.p0, p_step.p1))) or (
-                    not is_mp and not np.isclose(p_step.p0, 1.0 - p_step.p1)
-                ):
-                    found_asym = True
-        return False
+        # Memoised: depends only on the circuit and the handler's ops_to_params.
+        if self._collapses_z_memo is None:
+            pre = self._precompiled_circuit
+            coh = self._compiled_op_handler
+            if (
+                pre is not None
+                and coh.ops_to_params == pre.parsed_ops  # type: ignore[attr-defined]
+            ):
+                self._collapses_z_memo = pre.collapses_z
+            elif not hasattr(coh, "ops_to_params"):
+                self._collapses_z_memo = False
+            else:
+                self._collapses_z_memo = collapses_z(
+                    unroll_circuit(self.circuit), coh.ops_to_params  # type: ignore[attr-defined]
+                )
+        return self._collapses_z_memo
 
     def run(self):
         """run the simulator."""
@@ -251,7 +231,7 @@ class TablesideSimulator(
                 "Use .clear() to prepare the simulator for a new run. "
             )
 
-        if (self._sync_tableside_rng or self._collapses_z()) and self.batch_size > 1:
+        if self.batch_size > 1 and (self._sync_tableside_rng or self._collapses_z()):
             orig_batch = self.batch_size
             meas_list = []
             saved_events = [[] for _ in range(orig_batch)] if self.record_unleaked_to_leaked else []
@@ -582,8 +562,11 @@ class TablesideSimulator(
 
     def current_tableau_measurement_record(self) -> NDArray[np.bool_]:
         if self.batch_size > 1:
-            print( "Warning when calling current_tableau_measurement_record: "
-                "The tableau simulator is not directly called if batch_size > 1."
+            warnings.warn(
+                "Warning when calling current_tableau_measurement_record: "
+                "The tableau simulator is not directly called if batch_size > 1.",
+                UserWarning,
+                stacklevel=2,
             )
         self._run_tableau()
         return np.array(self._tableau_simulator.current_measurement_record(), dtype=np.bool_)

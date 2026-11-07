@@ -45,4 +45,5 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["src"]
 norecursedirs = ["build", "dist", "python_build_stimside", "*.egg-info", ".benchmarks", ".git"]
+markers = ["slow: long-running test (> 10 s)"]
 

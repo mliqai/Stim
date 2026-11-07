@@ -15,7 +15,7 @@ from stimside.dem_generators.leakage_decoder import (
     LeakageDecoderLike,
     as_leakage_decoder,
 )
-from stimside.op_handlers.abstract_op_handler import OpHandler
+from stimside.op_handlers.abstract_op_handler import OpHandler, TrivialOpHandler
 
 
 def next_compiled_seed(seed: int | None, idx: int, salt: int) -> int | None:
@@ -149,10 +149,11 @@ _DEFAULT_BATCH: Any = _DefaultBatchSize()
 
 
 class SamplerBase(sinter.Sampler):
-    """Common Sinter sampler configuration for Flipside, Tableside, and Cosetside.
+    """Common Sinter sampler configuration for Flipside, Tableside, Cosetside and Magicside.
 
     ``batch_size`` defaults to the class's ``_default_batch_size``: 1 for
     ``TablesideSampler``, 256 for ``CosetsideSampler`` and 1024 for ``FlipsideSampler``.
+    ``op_handler=None`` means ``TrivialOpHandler()``.
     """
 
     _compiled_cls: type[Any]
@@ -160,7 +161,7 @@ class SamplerBase(sinter.Sampler):
 
     def __init__(
         self,
-        op_handler: OpHandler[Any],
+        op_handler: OpHandler[Any] | None,
         dem_decoder: LeakageDecoderLike,
         batch_size: int = _DEFAULT_BATCH,
         seed: int | None = None,
@@ -175,28 +176,55 @@ class SamplerBase(sinter.Sampler):
         self.seed = seed
         self._init_pid = os.getpid()
         self._compile_count = 0
+        self._spawn_count = 0
+        self._worker_index: int | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Each pickled copy (sinter pickles one per worker) gets its own seed salt.
+        state = self.__dict__.copy()
+        state["_worker_index"] = self._spawn_count
+        self._spawn_count += 1
+        return state
 
     def _next_compiled_seed(self) -> int | None:
         idx = self._compile_count
         self._compile_count = idx + 1
-        return next_compiled_seed(self.seed, idx, (os.getpid() - self._init_pid) & 0xFFFFFFFF)
+        salt = self._worker_index
+        if salt is None:  # not a pickled copy: salt by process
+            salt = (os.getpid() - self._init_pid) & 0xFFFFFFFF
+        return next_compiled_seed(self.seed, idx, salt)
 
     def compiled_sampler_for_task(self, task: sinter.Task) -> sinter.CompiledSampler:
         if task.circuit is None:
             raise ValueError(
                 f"{type(self).__name__} requires a circuit in the task to compile a sampler."
             )
-        circuit = task.circuit
+        handler = TrivialOpHandler() if self.op_handler is None else self.op_handler
+        compiled_handler = handler.compile_op_handler(
+            circuit=task.circuit, batch_size=self.batch_size
+        )
+        compiled_decoder = self.dem_decoder.compile_for_task(task)
+        # The seed is drawn last, so a compile that raises does not consume a seed index.
+        return self._make_compiled(
+            task, compiled_handler, compiled_decoder, self._next_compiled_seed()
+        )
+
+    def _make_compiled(
+        self,
+        task: sinter.Task,
+        compiled_handler: Any,
+        compiled_decoder: CompiledLeakageDecoder,
+        seed: int | None,
+    ) -> sinter.CompiledSampler:
+        """Builds the compiled sampler; subclasses override it to pass engine options."""
         return self._compiled_cls(
-            circuit=circuit,
-            compiled_op_handler=self.op_handler.compile_op_handler(
-                circuit=circuit, batch_size=self.batch_size
-            ),
+            circuit=task.circuit,
+            compiled_op_handler=compiled_handler,
             batch_size=self.batch_size,
-            compiled_dem_decoder=self.dem_decoder.compile_for_task(task),
+            compiled_dem_decoder=compiled_decoder,
             needs_records=self.dem_decoder.needs_records,
             needs_leakage_events=self.dem_decoder.needs_leakage_events,
-            seed=self._next_compiled_seed(),
+            seed=seed,
             postselection_mask=task.postselection_mask,
             postselected_observables_mask=task.postselected_observables_mask,
         )

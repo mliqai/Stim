@@ -195,3 +195,39 @@ def test_compiled_magicside_sampler_compiled_dem_decoder_kwarg() -> None:
         CompiledMagicsideSampler(
             circuit=circ, compiled_op_handler=None, compiled_dem_decoder=cdec, compiled_decoder=cdec, needs_records=False
         )
+
+
+@pytest.mark.parametrize("task_decoder", ["my_magic", None])
+def test_sampler_without_dem_decoder_warns_on_pymatching_fallback(task_decoder: str | None) -> None:
+    import warnings
+
+    circ = stim.Circuit("R 0\nX_ERROR(0.1) 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    sampler = MagicsideSampler(seed=1)
+    assert sampler.op_handler is None
+    with pytest.warns(UserWarning, match=f"task.decoder={task_decoder!r}.*'pymatching'"):
+        sampler.compiled_sampler_for_task(sinter.Task(circuit=circ, decoder=task_decoder))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sampler.compiled_sampler_for_task(sinter.Task(circuit=circ, decoder="pymatching"))
+        MagicsideSampler(dem_decoder="pymatching", seed=1).compiled_sampler_for_task(
+            sinter.Task(circuit=circ, decoder=task_decoder)
+        )
+
+
+def test_pickled_copies_of_every_sampler_get_distinct_worker_seeds() -> None:
+    import pickle
+
+    from stimside import CosetsideSampler, FlipsideSampler, TablesideSampler
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8Flip
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8Tableau
+
+    for sampler in (
+        MagicsideSampler(seed=777),
+        FlipsideSampler(LeakageUint8Flip(), BaseDecoder(), seed=777),
+        TablesideSampler(LeakageUint8Tableau(), BaseDecoder(), seed=777),
+        CosetsideSampler(LeakageUint8Coset(), BaseDecoder(), seed=777),
+    ):
+        w0, w1 = pickle.loads(pickle.dumps(sampler)), pickle.loads(pickle.dumps(sampler))
+        s0, s1 = w0._next_compiled_seed(), w1._next_compiled_seed()
+        assert s0 == 777 and s1 is not None and s1 != s0, type(sampler).__name__

@@ -6,7 +6,7 @@ Stimside enables classical state transition, tracking, and conditioning to emula
 - `FlipsideSimulator` / `FlipsideSampler` (`LeakageUint8Flip`): batched Pauli-frame simulation.
 - `TablesideSimulator` / `TablesideSampler` (`LeakageUint8Tableau`): stabilizer tableau trajectory simulation.
 - `CosetsideSimulator` / `CosetsideSampler` (`LeakageUint8Coset`): batched stabilizer coset (`MRQF`) simulation.
-- `MagicsideSimulator` / `MagicsideSampler` (`LeakageUint8Magic`): exact non-Clifford Phase-QFE simulation.
+- `MagicsideSimulator` / `MagicsideSampler` (`LeakageUint8Magic`): non-Clifford Phase-QFE simulation, exact up to float64 rounding (components with relative weight below 1e-13 are pruned).
 
 ## Setup & Installation
 
@@ -85,10 +85,12 @@ An untagged `SWAP` never moves leakage states, in any simulator: each qubit keep
   - `BaseDecoder` is unaffected: it decodes with a static DEM, and stim ignores the tag.
 
 ### What `MarginalLeakageDemGenerator` Does Not Model Exactly
-`MarginalLeakageDemGenerator` (and so `MarginalDecoder`, `BranchAndBoundDecoder` and the loss oracle) builds each shot's DEM from per-leak flows that approximate the simulators. Besides `SWAP[LEAKAGE_SWAP]` (above):
+`MarginalLeakageDemGenerator` (and so `MarginalDecoder`, `BranchAndBoundDecoder` and the loss oracle) builds each shot's DEM from per-leak flows that approximate the simulators. The flows follow the frozen leaked qubits of `TablesideSimulator` and `CosetsideSimulator` (untagged gates skipped by default), not `FlipsideSimulator`'s scrambled ones, so `FlipsideSampler` raises `ValueError` when it compiles a task with `MarginalDecoder` or `BranchAndBoundDecoder`; use those with `TablesideSampler` or `CosetsideSampler`, or use `BaseDecoder` with `FlipsideSampler`. Besides `SWAP[LEAKAGE_SWAP]` (above):
 - **A qubit reused by a later pair of a two-qubit instruction can raise.** The depolarization that stands for a pair that a leaked qubit skips (an untagged two-qubit unitary with `unconditional_condition_on_U=True`, or a `CONDITIONED_ON_PAIR` gate that does not fire) is placed per instruction, not per pair: after the whole instruction for a gate that is not a controlled Pauli (e.g. `SWAP`, `ISWAP`, `SQRT_XX`), so a later pair that acts on the skipped pair's other qubit does not spread it; before the whole instruction for a controlled Pauli (e.g. `CX`, `CZ`, `XCZ`), so a later pair of the leaked qubit with another control basis does not get its own. The DEM can then give probability 0 to a detector that fires, or other error mechanisms with the same detector distribution (e.g. `ISWAP 0 1 0 1` with qubit 0 leaked). When another pair of the instruction uses a qubit of such a depolarization, the generator builds its analysis again with the pairs applied one by one and raises `NotImplementedError` if any shot's DEM would differ, e.g. for `SWAP 1 2 2 0` with qubit 1 leaked or `CX 2 0 0 3 3 0` with qubit 0 leaked. Separate the pairs with `TICK`; stim fuses identical consecutive instructions, so `SWAP 1 2` followed by `SWAP 2 0` is one instruction.
 - **`LEAKAGE_TRANSITION_2` keys with both inputs leaked are ignored.** Each leak is followed with an unleaked partner, so a transition keyed on two leaked states, e.g. `(p, 2_3<->3_4)` or `(p, 2_3-->U_U)`, never applies in the model, and the DEM misses what it does: after `(1.0, 2_3-->U_U)` both qubits unleak and are depolarized in the simulators, but the DEM gives their measurements probability 0.
 - **Spreads** (a `LEAKAGE_TRANSITION_2` outcome where the leaked qubit stays leaked and its partner leaks too, e.g. `2_U-->2_2`): the partner's leak is followed as a new leak from the transition on. The flag-weighted mode sees it only if a flag on the partner follows (like any leak), and only from a leak's first flow, not from its hop or leaked-state branches. The loss oracle matches each spread from the shot's leakage events.
+- **A skipped controlled Pauli is depolarized when its leaked qubit's state comes only from the noiseless reference.** A leaked qubit frozen in the gate's control basis makes skipping, e.g., `CX` the same as applying it, but the flows trust that only for a state they tracked themselves (e.g. after a reset in the flow), not for one taken from the noiseless reference, which Pauli noise can change. This is conservative: in a repetition code whose data qubits leak and are heralded every round, the flag-weighted DEM gives 0.5 to first-round detectors that, without Pauli noise, never fire.
+- **Unheralded leaks are not modelled by the flag-weighted mode.** It builds a shot's DEM from the leaks its raised flags herald, so a leak that no flag follows adds nothing and the DEM under-states its detectors (e.g. 0.013 vs about 0.022–0.023 measured with `CosetsideSimulator` in shots with no raised flag of a d=3 surface code that heralds only the ancillas).
 
 > [!WARNING]
 > **Random leaked-to-leaked transitions are approximated.**
@@ -108,6 +110,8 @@ An untagged `SWAP` never moves leakage states, in any simulator: each qubit keep
 > **Shared Leakage Trajectory Within a Batch (`TablesideSimulator(..., batch_size > 1)`):** Because standard `TablesideSimulator` (`sync_tableside_rng=False`) samples classical leakage transitions once per `run()` call and uses Pauli-frame randomization on `_new_circuit` to produce the `batch_size` shots, **all shots within the same batch share the exact same leakage events and leakage state history**. Only Pauli errors and measurement outcomes conditioned on that fixed leakage realization vary across the `batch_size` shots. To sample independent leakage trajectories for every shot in `TablesideSimulator`, either use `batch_size=1` (where `TablesideSampler` runs independent batches) or set `sync_tableside_rng=True` (which executes an independent tableau and leakage trajectory per shot, seeded with a hash of `seed` and the shot's index in the run).
 >
 > **Exception (per-shot routing):** circuits whose tags condition on the computational state `0`/`1` (or that use `rec` feedback after an asymmetric `0`/`1` readout) cannot share one trajectory, so `run()` executes `batch_size` independent single-shot trajectories instead. Those shots get independent leakage, and the batch costs about `batch_size` times a single shot (29–236× slower than a shared batch in benchmarks). For fast batched `0`/`1` conditioning, use `CosetsideSimulator`.
+>
+> **`TablesideSampler` statistics:** sinter counts every shot of a shared-trajectory batch as independent, so its error bars are too narrow; `TablesideSampler` therefore emits a `UserWarning` when constructed with `batch_size > 1` (it has no `sync_tableside_rng` option), and `batch_size=1` (the default) or `CosetsideSampler` gives independent shots.
 
 
 ### Synchronized Shot-for-Shot Equivalence (`sync_tableside_rng=True`)
@@ -118,7 +122,7 @@ Passing `sync_tableside_rng=True` to `TablesideSimulator` and `CosetsideSimulato
 
 ## Magicside Non-Clifford Simulator (`MagicsideSimulator` & `MagicsideSampler`)
 
-`MagicsideSimulator` and `MagicsideSampler` extend `stimside` to exact non-Clifford Phase-QFE (Quadratic-Form Expansion) simulation over moving CHP stabilizer references, supporting arbitrary interleavings of Clifford gates, Pauli measurements/resets/feedback, non-Clifford magic gates (`T`, `T_DAG`, `CCZ`), non-Pauli Clifford fault channels, and batched leakage tracking (`LeakageUint8Magic`).
+`MagicsideSimulator` and `MagicsideSampler` extend `stimside` to non-Clifford Phase-QFE (Quadratic-Form Expansion) simulation over moving CHP stabilizer references, supporting arbitrary interleavings of Clifford gates, Pauli measurements/resets/feedback, non-Clifford magic gates (`T`, `T_DAG`, `CCZ`), non-Pauli Clifford fault channels, and batched leakage tracking (`LeakageUint8Magic`).
 
 ### Supported Magic Gates & `CLIFFORD_FAULT` Tags
 
@@ -129,7 +133,7 @@ Stim does not define native opcodes for non-Clifford unitaries or stochastic Cli
 
 ### Execution Modes (`fault_mode` $\times$ `backend`) and Query Reuse (`PrepareQueries` / `EvaluateQueries`)
 
-`MagicsideSimulator` supports four exact execution combinations via `fault_mode` (`"DIRECT"` or `"SELECTOR"`) and `backend` (`"STREAM"` or `"QUERY"`):
+`MagicsideSimulator` supports four execution combinations via `fault_mode` (`"DIRECT"` or `"SELECTOR"`) and `backend` (accepted values: `"STREAM"` and `"QUERY"`):
 - **`fault_mode="DIRECT"`** compiles conjugated Clifford faults directly as sequential trajectory phase-rotation records without ancilla qubits.
 - **`fault_mode="SELECTOR"`** activates stochastic Clifford faults via joint one-hot selector ancillas at $t=0$ (compiling controlled-Pauli faults via exact 1-gate `CCZ` shortcuts and analytically tracing out selector ancillas at readout via `get_qfe_expansion(..., trace_selectors=True)`).
 - **`backend="STREAM"`** advances shot trajectories chronologically (supporting `fault_mode="DIRECT"` live streaming with `interactive_do(...)`, `sync_tableside_rng=True`, and `LeakageUint8Magic`, as well as compiled `"DIRECT"`/`"SELECTOR"` trajectories).

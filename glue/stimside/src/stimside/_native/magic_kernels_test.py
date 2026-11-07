@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import functools
 from pathlib import Path
 import subprocess
 from unittest import mock
@@ -521,3 +522,106 @@ def test_magic_contract_choi_preserves_idle_ket_qubits_and_validates_q_act() -> 
     )
     assert rc == 1 and out_chi.value == 0 and out_d.value == 0
 
+
+
+def _rand_hermitian(
+    rng: np.random.Generator, n: int, kind: str
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """A random Hermitian Pauli: kind "x" (has an X part), "z" (diagonal) or "z1" (single Z)."""
+    a = pq.coerce_pauli_words(rng.integers(0, 2, n) if kind == "x" else np.zeros(n, int), n)
+    bits = rng.integers(0, 2, n) if kind != "z1" else np.eye(n, dtype=int)[int(rng.integers(0, 2))]
+    b = pq.coerce_pauli_words(bits, n)
+    return a, b, (int(pq.word_dot_parity(a, b)) + 2 * int(rng.integers(0, 2))) & 3
+
+
+def _rand_shot(rng: np.random.Generator, n: int, chi: int, kind: str) -> pq.ShotExpansion:
+    """Random rows on a random geometry; kind "basis" (d = 0, low qubits fixed) pins outcomes."""
+    geom = pq.ShotExpansion.zero(n)
+    for _ in range(0 if kind == "basis" else int(rng.integers(0, min(n, 10) + 1))):
+        geom = pq.apply_quarter_turn(geom, *_rand_hermitian(rng, n, "x"))
+    d, eo = geom.d, geom.ell_odd
+    assert eo is not None
+    h = np.stack([pq.coerce_pauli_words(rng.integers(0, 2, n), n) for _ in range(chi)])
+    h[:, 0] &= ~np.uint64(3)
+    for p in geom.pivots.tolist():
+        h[:, p >> 6] &= ~np.uint64(1 << (p & 63))
+    ell = (2 * rng.integers(0, 2, (chi, d)) + eo[None, :]).astype(np.uint8)
+    w = (rng.standard_normal(chi) + 1j * rng.standard_normal(chi)) * 10.0 ** rng.uniform(-3, 3)
+    exp = pq.ShotExpansion(
+        n, d, geom.A_words, geom.a_union, geom.Gamma, geom.pivots, w, h, ell, eo,
+        float(rng.normal()), _is_canonical_merged=False,
+    )
+    return exp if kind == "noncanon" else pq.merge_frames(exp)
+
+
+_SHOT_FIELDS = ("A_words", "a_union", "Gamma", "pivots", "weights", "h_words", "ell", "ell_odd")
+
+
+@pytest.mark.parametrize("n_qubits", [5, 64, 70])
+@pytest.mark.parametrize("chi", [1, 4, 64])
+def test_measure_expansions_batch_matches_per_shot_measure_expansion_exactly(
+    n_qubits: int, chi: int
+) -> None:
+    rng = np.random.default_rng(1000 * n_qubits + chi)
+    for case in range(24):
+        kind = ("canon", "noncanon", "basis")[case % 3]
+        shots = [_rand_shot(rng, n_qubits, chi, kind) for _ in range(int(rng.integers(1, 9)))]
+        obs = _rand_hermitian(rng, n_qubits, ("x", "z", "z1")[int(rng.integers(0, 3))])
+        keep_rot, sync = bool(case & 4), bool(case & 8)
+        tab = rng.random(len(shots))  # stand-in for the per-shot sync streams
+        seed = int(rng.integers(0, 2**31))
+        g_ref, g_batch = np.random.default_rng(seed), np.random.default_rng(seed)
+
+        def sample(i: int, p1: float) -> int:
+            return int(tab[i] < p1)
+
+        ref = [
+            pq.measure_expansion(
+                e, obs, rng=g_ref, renormalize=True, keep_rotated_frame=keep_rot,
+                sample_outcome=functools.partial(sample, i) if sync else None,
+            )
+            for i, e in enumerate(shots)
+        ]
+        out, z0, z1, posts = pq.measure_expansions_batch(
+            shots, obs, rng=g_batch, keep_rotated_frame=keep_rot,
+            sample_outcome=sample if sync else None,
+        )
+        assert g_ref.random() == g_batch.random()  # same number of draws
+        for r, o, z0_b, z1_b, post in zip(ref, out.tolist(), z0.tolist(), z1.tolist(), posts):
+            assert (o, z0_b.hex(), z1_b.hex()) == (bool(r.outcome), r.z0.hex(), r.z1.hex())
+            want = r.post_state
+            meta = ("n_qubits", "d", "chi", "atol", "_is_canonical_merged")
+            assert [getattr(post, f) for f in meta] == [getattr(want, f) for f in meta]
+            assert post.log_mass.hex() == want.log_mass.hex()
+            for f in _SHOT_FIELDS:
+                got, ref_arr = getattr(post, f), getattr(want, f)
+                assert (got.dtype, got.shape) == (ref_arr.dtype, ref_arr.shape), f
+                assert got.tobytes() == ref_arr.tobytes(), f
+
+
+def test_measure_expansions_batch_rebinds_after_cache_reset_and_rejects_zero_norm() -> None:
+    lib = mk.get_magic_kernels_lib()
+    try:
+        mk._LIB_INSTANCE = None  # e.g. kernels_build_test / E2E T1-F11-01 reset the cache
+        fn = mk.get_magic_measure_batch()
+        assert mk._LIB_INSTANCE is not lib and fn.argtypes is not None
+        zero = pq.ShotExpansion.zero(3)
+        zero.weights = np.zeros(1, np.complex128)
+        obs = _rand_hermitian(np.random.default_rng(0), 3, "z1")
+        g = np.random.default_rng(5)
+        with pytest.raises(pq.ImpossiblePostselectionError):
+            pq.measure_expansions_batch([pq.ShotExpansion.zero(3), zero], obs, rng=g)
+        with pytest.raises(pq.ImpossiblePostselectionError):
+            pq.measure_expansion(zero, obs, rng=g)
+    finally:
+        mk._LIB_INSTANCE = lib
+
+
+def test_measure_expansions_batch_rejects_empty_mixed_width_and_chi0_batches() -> None:
+    rng = np.random.default_rng(3)
+    obs = _rand_hermitian(rng, 5, "z1")
+    chi0 = pq.ShotExpansion.from_components((), n_qubits=5)
+    for shots in ([], [_rand_shot(rng, 5, 2, "canon"), _rand_shot(rng, 70, 2, "canon")],
+                  [_rand_shot(rng, 5, 2, "canon"), chi0], [chi0, _rand_shot(rng, 5, 2, "canon")]):
+        with pytest.raises(ValueError, match="measure_expansions_batch"):
+            pq.measure_expansions_batch(shots, obs, rng=rng)

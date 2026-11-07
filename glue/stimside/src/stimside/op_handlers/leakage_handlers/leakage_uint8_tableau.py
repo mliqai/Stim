@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import types
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -38,10 +39,43 @@ if TYPE_CHECKING:
 _Z_SCAN_SKIP = frozenset(
     {"TICK", "DETECTOR", "OBSERVABLE_INCLUDE", "QUBIT_COORDS", "SHIFT_COORDS", "MPAD"}
 )
+# Names that Python (3.10-3.14), abc, typing and dataclasses put in a class body; no behaviour.
+_CLASS_BOOKKEEPING = frozenset(
+    {
+        "__module__", "__doc__", "__firstlineno__", "__static_attributes__", "__annotations__",
+        "__annotate_func__", "__annotations_cache__", "__parameters__", "__orig_bases__",
+        "__abstractmethods__", "_abc_impl", "__slots__", "__dict__", "__weakref__", "__slotnames__",
+        "__dataclass_fields__", "__dataclass_params__", "__match_args__", "__type_params__",
+    }
+)
+
+
+def _is_plain_member(name: str, value: object, is_field: bool) -> bool:
+    """Whether a class-body name is bookkeeping, the base handler's own object, a method that
+    dataclasses generated, or a new dataclass field with a plain-data default (or a slot)."""
+    base = CompiledLeakageUint8Tableau
+    if name in _CLASS_BOOKKEEPING or value is getattr(base, name, object()):
+        return True
+    if name == "__repr__":  # dataclasses wraps it in reprlib.recursive_repr
+        value = getattr(value, "__wrapped__", value)
+    code = getattr(value, "__code__", None)
+    if code is not None:  # dataclasses exec()s __init__, __eq__, ... (co_qualname: Python 3.11+)
+        qualname = getattr(code, "co_qualname", "__create_fn__.<locals>.")
+        return (
+            name[:2] == name[-2:] == "__"  # every generated method is a dunder (needed on 3.10)
+            and code.co_filename == "<string>"
+            and qualname.startswith("__create_fn__.<locals>.")
+        )
+    descriptor = any(hasattr(type(value), a) for a in ("__get__", "__set__", "__delete__"))
+    return (
+        is_field
+        and not hasattr(base, name)
+        and (isinstance(value, types.MemberDescriptorType) or not descriptor)
+    )
 
 
 @dataclasses.dataclass
-class LeakageUint8(OpHandler["TablesideSimulator"]):
+class LeakageUint8Tableau(OpHandler["TablesideSimulator"]):
     """Implementing leakage using an array of 8bit Uints.
 
     Basically, we're straight up storing the leakage state for each qubit.
@@ -68,10 +102,10 @@ class LeakageUint8(OpHandler["TablesideSimulator"]):
 
     def compile_op_handler(
         self, *, circuit: stim.Circuit, batch_size: int
-    ) -> "CompiledLeakageUint8":
+    ) -> "CompiledLeakageUint8Tableau":
         parsed_ops = parse_leakage_in_circuit(circuit)
         check_tag_qubits(parsed_ops, circuit.num_qubits)
-        return CompiledLeakageUint8(
+        return CompiledLeakageUint8Tableau(
             num_qubits=circuit.num_qubits,
             batch_size=batch_size,
             ops_to_params=parsed_ops,
@@ -80,7 +114,7 @@ class LeakageUint8(OpHandler["TablesideSimulator"]):
 
 
 @dataclasses.dataclass
-class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
+class CompiledLeakageUint8Tableau(CompiledOpHandler["TablesideSimulator"]):
 
     num_qubits: int
     batch_size: int
@@ -97,11 +131,34 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
 
     def clear(self):
         """Clear the leakage state array in place (preserving any C++ shared buffer binding)."""
-        if hasattr(self, "state") and self.state is not None and len(self.state) == self.num_qubits:
+        if self.state is not None and len(self.state) == self.num_qubits:
             self.state.fill(0)
         else:
             self.state = np.zeros(self.num_qubits, dtype=np.uint8)
         self._reset_z_scan()
+
+    def _fast_path_overrides(self) -> list[str]:
+        """Every name that this handler's class (or a class it mixes in) defines beyond plain
+        dataclass fields, every instance attribute of a subclass that shadows a base member, plus
+        "claimed_ops_keys" if it differs from ops_to_params (the runners read only the latter):
+        the precompiled runners would silently skip any of these."""
+        base_mro = CompiledLeakageUint8Tableau.__mro__
+        names = [
+            n
+            for k in type(self).__mro__
+            if k not in base_mro
+            for n, v in vars(k).items()
+            if not _is_plain_member(n, v, n in vars(k).get("__dataclass_fields__", ()))
+        ]
+        if type(self) is not CompiledLeakageUint8Tableau:  # the base type stays exempt (as at HEAD)
+            names += [n for n in vars(self) if hasattr(CompiledLeakageUint8Tableau, n)]
+        if self.claimed_ops_keys != self.ops_to_params.keys():
+            names.append("claimed_ops_keys")
+        return list(dict.fromkeys(names))
+
+    def supports_cpp_fast_path(self) -> bool:
+        """True iff the precompiled (C++ and sync) runners would not skip any handler behaviour."""
+        return not self._fast_path_overrides()
 
     def _reset_z_scan(self) -> None:
         self._z_scan_cursor = 0
@@ -855,5 +912,5 @@ class CompiledLeakageUint8(CompiledOpHandler["TablesideSimulator"]):
                 )
 
 
-LeakageUint8Tableau = LeakageUint8
-CompiledLeakageUint8Tableau = CompiledLeakageUint8
+LeakageUint8 = LeakageUint8Tableau
+CompiledLeakageUint8 = CompiledLeakageUint8Tableau

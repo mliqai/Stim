@@ -80,6 +80,10 @@ _CAT_NOISE_META: dict[str, tuple[int, int]] = {
     "DEPOLARIZE1": (1, 3), "PAULI_CHANNEL_1": (1, 3),
     "DEPOLARIZE2": (2, 15), "PAULI_CHANNEL_2": (2, 15),
 }
+# Default C2 fusion cap: max commuting Pauli axes fused into one block. A block is expanded
+# densely (<= 2**rank terms) only if that fits the term budget, else into "sequential" steps.
+# PrepareQueries passes smaller caps (see _QUERY_C2_MAX_RANK in query.py).
+_C2_MAX_RANK = 12
 
 
 def _instruction_num_measurements(op: stim.CircuitInstruction, canon_name: str) -> int:
@@ -601,7 +605,7 @@ def compile_open_block(
     *,
     n_qubits: int | None = None,
     budget: int = 64,
-    c2_max_rank: int = 12,
+    c2_max_rank: int = _C2_MAX_RANK,
     c2_max_poly_terms: int = 64,
 ) -> tuple[CompiledRecord, ...]:
     """`C2`: Fuse consecutive pairwise-commuting `MagicTermRecord`s, never crossing barriers."""
@@ -820,7 +824,7 @@ def compile_direct(
     fault_channels: Sequence[CliffordFaultChannel] | None = None,
     *,
     c2_budget: int = 64,
-    c2_max_rank: int = 12,
+    c2_max_rank: int = _C2_MAX_RANK,
     c2_max_poly_terms: int = 64,
 ) -> DirectPlan:
     """`A1`: Compile `circuit` for zero-branching `DIRECT` trajectory execution."""
@@ -837,7 +841,7 @@ def compile_selector(
     *,
     gadgetize_pauli_noise: bool = False,
     c2_budget: int = 64,
-    c2_max_rank: int = 12,
+    c2_max_rank: int = _C2_MAX_RANK,
     c2_max_poly_terms: int = 64,
 ) -> SelectorPlan:
     """`B1`: Compile `circuit` into private-selector-ancilla template (`SELECTOR` mode)."""

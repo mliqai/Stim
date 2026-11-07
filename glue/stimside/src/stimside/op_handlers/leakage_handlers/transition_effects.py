@@ -280,12 +280,12 @@ def dispatch_tagged_leakage_op(
         and state2d is not None
     ):
         counts = np.count_nonzero(was_unleaked & (state2d[target_indices, :] >= 2), axis=0)
-        sss._record_unleaked_to_leaked_counts(counts, sss._circuit_time)
+        sss.record_u2l_counts(counts, sss.get_current_circuit_time())
     if old_states is not None and target_indices is not None and state2d is not None:
         new_states = state2d[target_indices, :]
         for i_q, b in zip(*np.nonzero(old_states != new_states)):
-            sss._record_leakage_event(
-                sss._circuit_time,
+            sss.record_leakage_event(
+                sss.get_current_circuit_time(),
                 target_indices[i_q],
                 old_states[i_q, b],
                 new_states[i_q, b],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 import ctypes
 import os
 import threading
@@ -40,6 +41,46 @@ STANDARD_LEAKAGE_PARAM_TYPES = (
     LeakageMeasurementParams,
     LeakageSwapParams,
 )
+
+
+def _is_asymmetric_readout(p: LeakageMeasurementParams) -> bool:
+    if p.targets is not None:
+        has_01 = 0 in p.prob_for_input_state or 1 in p.prob_for_input_state
+        return has_01 or not np.isclose(p.p0, p.p1)
+    return not np.isclose(p.p0, 1.0 - p.p1)
+
+
+def collapses_z(
+    ops: Iterable[stim.CircuitInstruction], ops_to_params: Mapping[Any, object]
+) -> bool:
+    """True if shots cannot share one trajectory: a 0/1-conditioned tag, or rec feedback
+    after an asymmetric readout."""
+    any_asym = False
+    for p in ops_to_params.values():
+        if isinstance(p, LeakageConditioningParams) and any(0 in g or 1 in g for g in p.args):
+            return True
+        if isinstance(p, LeakageTransition1Params) and (
+            0 in p.args_by_input_state or 1 in p.args_by_input_state
+        ):
+            return True
+        if isinstance(p, LeakageTransition2Params) and any(
+            0 in k or 1 in k for k in p.args_by_input_state
+        ):
+            return True
+        if isinstance(p, LeakageMeasurementParams) and _is_asymmetric_readout(p):
+            any_asym = True
+    if not any_asym:
+        return False
+    found_asym = False
+    for op in ops:
+        if op.name in ("DETECTOR", "TICK", "OBSERVABLE_INCLUDE"):
+            continue
+        if found_asym and any(t.is_measurement_record_target for t in op.targets_copy()):
+            return True
+        p = ops_to_params.get(op)
+        if isinstance(p, LeakageMeasurementParams) and _is_asymmetric_readout(p):
+            found_asym = True
+    return False
 
 
 _STATE_CODE_MAP = {
@@ -167,7 +208,6 @@ class PrecompiledTablesideCircuit:
         self.step_to_quant_idx: list[int] = []
         self.step_has_bare_op: list[bool] = []
         self.requires_tableau = False
-        self.collapses_z = False
 
         c_steps: list[StepDescC] = []
         raw_t_chunks: list[np.ndarray] = []
@@ -175,7 +215,6 @@ class PrecompiledTablesideCircuit:
         t_running_len = 0
         all_step_masks: list[int] = [0] * self.num_words
         all_branches: list[TransBranchC] = []
-        seen_asym_readout = False
         op_template_cache: dict[
             stim.CircuitInstruction,
             tuple[
@@ -338,7 +377,6 @@ class PrecompiledTablesideCircuit:
                     cond_groups = params.args
                     if any(0 in g or 1 in g for g in cond_groups):
                         self.requires_tableau = True
-                        self.collapses_z = True
                         kind = 6
                     elif (
                         not params.targets
@@ -364,8 +402,6 @@ class PrecompiledTablesideCircuit:
                     has_01 = (0 in params.args_by_input_state) or (
                         1 in params.args_by_input_state
                     )
-                    if has_01:
-                        self.collapses_z = True
                     if has_01 or has_dup_targets:
                         self.requires_tableau = True
                         p1_tot = sum(
@@ -409,7 +445,6 @@ class PrecompiledTablesideCircuit:
                     )
                     if has_01:
                         self.requires_tableau = True
-                        self.collapses_z = True
                         emit(None, None, 6)
                     elif has_overlapping_pairs:
                         emit(None, None, 6)
@@ -461,14 +496,8 @@ class PrecompiledTablesideCircuit:
                         1,
                         2,
                     }
-                    has_01_cond = (0 in params.prob_for_input_state) or (
-                        1 in params.prob_for_input_state
-                    )
-                    if (is_mpad and (has_01_cond or not np.isclose(p0, p1))) or (
-                        not is_mpad and not np.isclose(p0, 1.0 - p1)
-                    ):
+                    if _is_asymmetric_readout(params):
                         self.requires_tableau = True
-                        seen_asym_readout = True
                     if (
                         not is_mpad
                         and not has_dup_targets
@@ -493,20 +522,7 @@ class PrecompiledTablesideCircuit:
         self.step_to_quant_idx.append(len(self.quantum_bare_insts))
         self.num_steps = len(self.steps_py)
 
-        if seen_asym_readout and not self.collapses_z:
-            found_asym = False
-            for op, s_py in zip(self.orig_ops, self.steps_py):
-                if found_asym and any(t.is_measurement_record_target for t in op.targets_copy()):
-                    self.collapses_z = True
-                    break
-                p_step = s_py[5]
-                if isinstance(p_step, LeakageMeasurementParams):
-                    is_mp = p_step.targets is not None
-                    has_01 = (0 in p_step.prob_for_input_state) or (1 in p_step.prob_for_input_state)
-                    if (is_mp and (has_01 or not np.isclose(p_step.p0, p_step.p1))) or (
-                        not is_mp and not np.isclose(p_step.p0, 1.0 - p_step.p1)
-                    ):
-                        found_asym = True
+        self.collapses_z = collapses_z(self.orig_ops, self.parsed_ops)
 
         # Fuse adjacent step s (kind==6, LEAKAGE_TRANSITION_1 with 1-->2) + step s+1 (kind==5, M[LEAKAGE_PROJECTION_Z: (1.0, 2)])
         for s in range(self.num_steps - 1):
@@ -719,12 +735,15 @@ class _StepCursor:
             self.q = q_end
 
     def flush(self, f_end: int, q_end: int) -> None:
-        self.flush_full(f_end)
-        self.flush_quant(q_end)
+        if f_end > self.f:
+            self.flush_full(f_end)
+        if self.use_tab:
+            self.flush_quant(q_end)
 
     def emit(self, s_idx: int, txt: str, consumes: int) -> None:
         f_s = self.pre.step_to_full_idx[s_idx]
-        self.flush_full(f_s)
+        if f_s > self.f:
+            self.flush_full(f_s)
         if txt:
             self.tss._new_circuit.append_from_stim_program_text(txt)
         self.f = f_s + consumes

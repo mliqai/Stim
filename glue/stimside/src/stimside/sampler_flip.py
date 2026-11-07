@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import sinter
 import stim  # type: ignore[import-untyped]
 
 from stimside._sampling import CompiledSamplerBase, SamplerBase, _DEFAULT_BATCH
+from stimside.dem_generators import BranchAndBoundDecoder, MarginalDecoder
 from stimside.dem_generators.leakage_decoder import (
     CompiledLeakageDecoder,
+    LeakageDecoder,
     LeakageDecoderLike,
 )
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler
@@ -17,6 +20,16 @@ def _reject_loss_oracle(needs_leakage_events: bool) -> None:
             "FlipsideSampler cannot run a dem_decoder that needs the shots' leakage events "
             "(e.g. MarginalLeakageDemGenerator(loss_oracle=True)): FlipsideSimulator does "
             "not record them. Use TablesideSampler or CosetsideSampler."
+        )
+
+
+def _reject_skip_semantics_decoder(dem_decoder: LeakageDecoder) -> None:
+    if isinstance(dem_decoder, (MarginalDecoder, BranchAndBoundDecoder)):
+        raise ValueError(
+            f"FlipsideSampler cannot run {type(dem_decoder).__name__}: its DEMs model leaked "
+            "qubits as frozen, with untagged gates skipped by default, but FlipsideSimulator "
+            "depolarizes leaked qubits and applies the gates. Use TablesideSampler or "
+            "CosetsideSampler, or BaseDecoder with FlipsideSampler."
         )
 
 
@@ -64,3 +77,10 @@ class FlipsideSampler(SamplerBase):
     ) -> None:
         super().__init__(op_handler, dem_decoder, batch_size, seed)
         _reject_loss_oracle(self.dem_decoder.needs_leakage_events)
+
+    def compiled_sampler_for_task(self, task: sinter.Task) -> sinter.CompiledSampler:
+        # After compiling, so that the decoder's own task errors come first (e.g. MarginalDecoder's
+        # NotImplementedError for SWAP[LEAKAGE_SWAP]).
+        compiled = super().compiled_sampler_for_task(task)
+        _reject_skip_semantics_decoder(self.dem_decoder)
+        return compiled

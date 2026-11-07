@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import math
+import time
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 import pytest
 import stim
@@ -13,6 +17,7 @@ from stimside._magic.query import (
     QueryBudget,
     QueryBudgetExceededError,
 )
+from stimside.golden_test import CORPUS
 from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
 from stimside.sampler_magic import MagicsideSampler
 from stimside.simulator_magic import MagicsideSimulator
@@ -602,3 +607,117 @@ def test_presample_stream_maps_heralded_and_correlated_branches() -> None:
     assert recs[1, 4:6].tolist() == [False, True]
 
 
+def test_empty_fault_realizations_match_none() -> None:
+    circ = stim.Circuit("H 0 1\nI[T] 0\nCX 0 1\nI[T] 1\nX_ERROR(0.3) 0 1\nM 0 1")
+    b = 64
+
+    def recs(fr: object) -> np.ndarray:
+        sim = MagicsideSimulator(circ, batch_size=b, seed=5, fault_realizations=fr)
+        sim.run()
+        return sim.get_final_measurement_records()
+
+    want = recs(None)
+    for fr in ({}, [{}] * b):
+        np.testing.assert_array_equal(recs(fr), want)
+
+
+def test_magic_chi_envelope_commuting_t_and_scaling_pattern() -> None:
+    """Chi growth and frame merging, with a loose time bound (about 0.2 s locally)."""
+    t0 = time.perf_counter()
+    qs = " ".join(map(str, range(12)))
+    t_layer = "\n".join(f"I[T] {q}" for q in range(12))
+    t_dag_layer = "\n".join(f"I[T_DAG] {q}" for q in range(12))
+    # 12 commuting T gates: chi = 2^12 and the state is (|0> + e^{i pi/4}|1>)^{x12} / 2^6.
+    sim = MagicsideSimulator(stim.Circuit(f"H {qs}\n{t_layer}"), batch_size=1, seed=1)
+    sim.run()
+    assert sim.get_qfe_expansion(0)[1].chi == 4096
+    one = np.array([1, np.exp(1j * np.pi / 4)]) / np.sqrt(2)
+    ref = one
+    for _ in range(11):
+        ref = np.kron(ref, one)
+    assert abs(abs(np.vdot(ref, sim.state_vector(0))) - 1) < 1e-9
+    # The M on spare qubit 12 splits the open block, so T_DAG must merge the 4096 frames back to 1.
+    sim = MagicsideSimulator(
+        stim.Circuit(f"H {qs}\n{t_layer}\nM 12\n{t_dag_layer}"), batch_size=1, seed=1
+    )
+    sim.run()
+    exp = sim.get_qfe_expansion(0)[1]
+    assert exp.chi == 1
+    assert abs(exp.norm_sq() - 1) < 1e-9
+    # magic_scaling.py's pattern: 8 qubits, k=8 layers of {I[T] j % 8; CX j % 8, (j + 1) % 8}.
+    c = stim.Circuit()
+    c.append("H", range(8))
+    for j in range(8):
+        c.append("I", [j % 8], tag="T")
+        c.append("CX", [j % 8, (j + 1) % 8])
+        c.append("TICK")
+    sim = MagicsideSimulator(c, batch_size=4, seed=1)
+    sim.run()
+    assert [sim.get_qfe_expansion(s)[1].chi for s in range(4)] == [256] * 4
+    assert time.perf_counter() - t0 < 10.0
+
+
+def test_live_branch_mass_is_exact_product_and_survives_underflow() -> None:
+    # Each block measures through the live Born path with P(0) = cos^2(pi/8), so the exact mass
+    # is the product of P(outcome) over the records. n=2000 takes it below e^-745 (float minimum).
+    p0 = (1.0 + 0.5**0.5) / 2.0
+    for n in (40, 2000):
+        circ = stim.Circuit("R 0\nH 0\nI[T] 0\nH 0\nM 0\n" * n)
+        sim = MagicsideSimulator(circ, batch_size=2, seed=7)
+        sim.run()
+        assert sim._active_plan is None  # The live engine ran, not the compiled one.
+        for s, row in enumerate(np.reshape(sim.get_final_measurement_records(), (2, n))):
+            log_m = math.fsum(math.log(1.0 - p0 if m else p0) for m in row)
+            assert math.isclose(sim.get_branch_mass(s), math.exp(log_m), rel_tol=1e-12)
+            amp = float(np.max(np.abs(sim.state_vector(s, normalize=False))))
+            assert math.isclose(amp, math.exp(0.5 * log_m), rel_tol=1e-9)
+            assert n == 40 or log_m < -745.0
+
+
+def _engine_chunk(job: tuple[str, int, bool]) -> np.ndarray:
+    """Records of one fixed-seed 2048-shot chunk from the live or the forced compiled engine."""
+    text, seed, compiled = job
+    sim = MagicsideSimulator(stim.Circuit(text), batch_size=2048, seed=seed)
+    if compiled:
+        sim._run_compiled_stream()  # The engine run() picks only for SELECTOR / realizations.
+    else:
+        sim.run()  # DIRECT, trivial handler, no realizations: the live interpreter.
+    assert (sim._active_plan is not None) == compiled  # Only the compiled engine sets a plan.
+    return np.stack([sim.measurement_column(k) for k in range(sim.num_measurements)], axis=1)
+
+
+def _max_z(a: np.ndarray, b: np.ndarray) -> float:
+    """Largest pooled two-proportion z over all bit means and all pairwise XOR parities."""
+    i, j = np.triu_indices(a.shape[1], 1)
+    a, b = np.hstack([a, a[:, i] ^ a[:, j]]), np.hstack([b, b[:, i] ^ b[:, j]])
+    pa, pb = a.mean(axis=0), b.mean(axis=0)
+    p = (pa + pb) / 2
+    # Pooled p in {0, 1} means sigma = 0 and pa == pb exactly (both engines deterministic there).
+    sigma = np.sqrt(p * (1 - p) * 2 / len(a))
+    return float(np.max(np.where(sigma > 0, np.abs(pa - pb) / np.where(sigma > 0, sigma, 1), 0)))
+
+
+@pytest.mark.slow
+def test_live_and_compiled_stream_engines_sample_the_same_distribution() -> None:
+    """Means and pairwise XOR parities of all measurements agree within 5 sigma (n = 8192).
+
+    XOR parities plus means fix every pairwise correlation. At most 105 comparisons per circuit
+    (168 in total), so a false failure is about 1e-4 family-wise. Each engine's 8192 shots are
+    4 fixed-seed chunks of 2048; the 48 chunks run on 8 processes (about 30 s wall).
+    """
+    names = [
+        "c01_clifford_noise_feedback",
+        "c02_mpp_mxx_heralded_corr",
+        "c02b_spp_clifford",
+        "c06_magic_t_ccz_clifford",
+        "c07_magic_inline_faults",
+        "c10_magic_multiword_68q",
+    ]
+    texts = [next(text for c, _, _, text in CORPUS if c == name) for name in names]
+    jobs = [(t, 100 * c + 10 * comp + k, comp) for c, t in enumerate(texts)
+            for comp in (False, True) for k in range(4)]
+    with ProcessPoolExecutor(8) as pool:
+        res = list(pool.map(_engine_chunk, jobs))
+    z = {n: _max_z(np.vstack(res[8 * c:8 * c + 4]), np.vstack(res[8 * c + 4:8 * c + 8]))
+         for c, n in enumerate(names)}
+    assert max(z.values()) < 5, z

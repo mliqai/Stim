@@ -125,7 +125,7 @@ CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
     ),
     (
         "c03_leakage_transitions_swap_meas",
-        _LEAK_SHARED_TAGS,
+        _LEAK_SHARED_TAGS + ("tab_nosync_b8",),
         True,
         """
         R 0 1 2 3
@@ -148,7 +148,7 @@ CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
     ),
     (
         "c04_leakage_conditioning_and_repeated_targets",
-        _LEAK_NO_FLIP_TAGS,
+        _LEAK_NO_FLIP_TAGS + ("tab_routed_b8",),
         True,
         """
         R 0 1 2 3
@@ -566,6 +566,27 @@ def _run_case(
         return _run_batched_sim(
             sim_t,
             num_batches=num_batches * batch,
+            rec_flag=rec_flag,
+            has_lev=True,
+            include_packed=multibatch_packed,
+        )
+
+    if mode in ("tab_nosync_b8", "tab_routed_b8"):
+        # B > 1 without sync: one shared trajectory, or per-shot routing for 0/1 conditioning.
+        coh_b = LeakageUint8Tableau().compile_op_handler(circuit=circuit, batch_size=batch)
+        sim_b = TablesideSimulator(
+            circuit,
+            compiled_op_handler=coh_b,
+            batch_size=batch,
+            seed=SEED,
+            record_unleaked_to_leaked=rec_flag,
+            record_leakage_events=rec_flag,
+        )
+        assert sim_b._cpp_runner is not None
+        assert sim_b._collapses_z() == (mode == "tab_routed_b8")
+        return _run_batched_sim(
+            sim_b,
+            num_batches=num_batches,
             rec_flag=rec_flag,
             has_lev=True,
             include_packed=multibatch_packed,

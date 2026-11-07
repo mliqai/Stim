@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import warnings
 from typing import Any, Literal, Sequence
 
 import numpy as np
@@ -13,13 +13,12 @@ import stim  # type: ignore[import-untyped]
 from stimside._magic.gates import CliffordFaultChannel
 from stimside._magic.phase_qfe import DEFAULT_ATOL, validate_atol
 from stimside._magic.query import QueryBudget
-from stimside._sampling import CompiledSamplerBase, next_compiled_seed
+from stimside._sampling import CompiledSamplerBase, SamplerBase
 from stimside.dem_generators.leakage_decoder import (
     BaseDecoder,
     CompiledLeakageDecoder,
     LeakageDecoder,
     LeakageDecoderLike,
-    as_leakage_decoder,
 )
 from stimside.op_handlers.abstract_op_handler import OpHandler, TrivialOpHandler
 from stimside.simulator_magic import (
@@ -33,19 +32,25 @@ from stimside.simulator_magic import (
 from stimside.util.seeding import derived_seed
 
 
-def _coerce_magic_decoder(
-    dem_decoder: LeakageDecoderLike | sinter.Decoder | str | None,
-) -> LeakageDecoder | None:
-    if dem_decoder is None:
-        return None
-    return (
-        BaseDecoder(decoder=dem_decoder)
-        if isinstance(dem_decoder, (str, sinter.Decoder))
-        else as_leakage_decoder(dem_decoder, "MagicsideSampler")
-    )
+class _TaskDecoder(LeakageDecoder):
+    """``dem_decoder=None``: use ``task.decoder`` if sinter has it built in, else pymatching."""
+
+    name = "task_decoder"
+
+    def compile_for_task(self, task: sinter.Task) -> CompiledLeakageDecoder:
+        decoder = getattr(task, "decoder", None)
+        if decoder not in sinter.BUILT_IN_DECODERS:
+            warnings.warn(
+                f"MagicsideSampler(dem_decoder=None): task.decoder={decoder!r} is not a sinter "
+                "built-in decoder, so 'pymatching' is used instead. Pass dem_decoder to choose.",
+                UserWarning,
+                stacklevel=3,
+            )
+            decoder = "pymatching"
+        return BaseDecoder(decoder=decoder).compile_for_task(task)
 
 
-class MagicsideSampler(sinter.Sampler):
+class MagicsideSampler(SamplerBase):
     """Sinter sampler running MagicsideSimulator with an arbitrary OpHandler and LeakageDecoder."""
 
     def __init__(
@@ -67,20 +72,20 @@ class MagicsideSampler(sinter.Sampler):
     ) -> None:
         if op_handler is not None and not isinstance(op_handler, OpHandler):
             raise TypeError(f"Expected OpHandler or None, got {type(op_handler).__name__}")
-        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
-            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
-        self.op_handler, self.dem_decoder, self.batch_size = (
-            op_handler,
-            _coerce_magic_decoder(dem_decoder),
-            int(batch_size),
-        )
+        if dem_decoder is None:
+            dem_decoder = _TaskDecoder()
+        elif isinstance(dem_decoder, (str, sinter.Decoder)):
+            dem_decoder = BaseDecoder(decoder=dem_decoder)
+        super().__init__(op_handler, dem_decoder, batch_size, seed)
         fm: Literal["DIRECT", "SELECTOR"] = parse_enum(fault_mode, FAULT_MODES, "fault_mode")
         be: Literal["STREAM", "QUERY"] = parse_enum(backend, BACKENDS, "backend")
-        if (be == "QUERY" or fm == "SELECTOR") and op_handler is not None and not isinstance(op_handler, TrivialOpHandler):
-            raise ValueError(f"backend={be!r}, fault_mode={fm!r} is incompatible with non-trivial op_handler")
+        trivial = op_handler is None or isinstance(op_handler, TrivialOpHandler)
+        if (be == "QUERY" or fm == "SELECTOR") and not trivial:
+            raise ValueError(
+                f"backend={be!r}, fault_mode={fm!r} is incompatible with non-trivial op_handler"
+            )
         if seed is not None:
             derived_seed(seed, 0)
-        self.seed = seed
         qb, mc, obe = resolve_budget(query_budget, max_components, on_budget_exceeded)
         self._sim_kwargs: dict[str, Any] = {
             "batch_size": self.batch_size,
@@ -94,40 +99,21 @@ class MagicsideSampler(sinter.Sampler):
             "on_budget_exceeded": obe,
             "atol": validate_atol(atol),
         }
-        self._init_pid, self._compile_count = os.getpid(), 0
-        self._spawn_count, self._worker_index = 0, None
 
-    def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
-        w_idx = self._spawn_count
-        self._spawn_count = w_idx + 1
-        state["_worker_index"] = w_idx
-        return state
-
-    def _next_compiled_seed(self) -> int | None:
-        idx = self._compile_count
-        self._compile_count = idx + 1
-        salt = int(self._worker_index) if self._worker_index is not None else ((os.getpid() - self._init_pid) & 0xFFFFFFFF)
-        return next_compiled_seed(self.seed, idx, salt)
-
-    def compiled_sampler_for_task(self, task: sinter.Task) -> CompiledMagicsideSampler:
-        if task.circuit is None:
-            raise ValueError("MagicsideSampler requires a circuit in the task.")
-        eff_dec = self.dem_decoder or BaseDecoder(
-            decoder=task.decoder if getattr(task, "decoder", None) in sinter.BUILT_IN_DECODERS else "pymatching"
-        )
-        compiled_handler = (
-            None
-            if self.op_handler is None
-            else self.op_handler.compile_op_handler(circuit=task.circuit, batch_size=self.batch_size)
-        )
+    def _make_compiled(
+        self,
+        task: sinter.Task,
+        compiled_handler: Any,
+        compiled_decoder: CompiledLeakageDecoder,
+        seed: int | None,
+    ) -> CompiledMagicsideSampler:
         return CompiledMagicsideSampler(
             circuit=task.circuit,
             compiled_op_handler=compiled_handler,
-            compiled_dem_decoder=eff_dec.compile_for_task(task),
-            needs_records=eff_dec.needs_records,
-            needs_leakage_events=eff_dec.needs_leakage_events,
-            seed=self._next_compiled_seed(),
+            compiled_dem_decoder=compiled_decoder,
+            needs_records=self.dem_decoder.needs_records,
+            needs_leakage_events=self.dem_decoder.needs_leakage_events,
+            seed=seed,
             postselection_mask=task.postselection_mask,
             postselected_observables_mask=task.postselected_observables_mask,
             **self._sim_kwargs,

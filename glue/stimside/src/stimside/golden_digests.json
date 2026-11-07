@@ -40,6 +40,7 @@
     "magic_ds": "f846e56d7843b4c0d9dcb88b884e746e",
     "magic_sync": "2f1848c052fccbc02e7ab9353cf2916e",
     "tab_nosync": "a44fab1aa767babfebdf4916bc0c19a4",
+    "tab_nosync_b8": "718dcedab4b797675779b7a0c74c1f2f",
     "tab_sync": "2f1848c052fccbc02e7ab9353cf2916e"
   },
   "c04_leakage_conditioning_and_repeated_targets": {
@@ -48,6 +49,7 @@
     "magic_ds": "6206c720695e50d2339378302cef371d",
     "magic_sync": "a67c7499c65c2b47bfa8e4c1f30a480e",
     "tab_nosync": "4ccd2f37b2ce9cc3b061631935016855",
+    "tab_routed_b8": "4ccd2f37b2ce9cc3b061631935016855",
     "tab_sync": "a67c7499c65c2b47bfa8e4c1f30a480e"
   },
   "c04b_leakage_detector_tab_coset": {

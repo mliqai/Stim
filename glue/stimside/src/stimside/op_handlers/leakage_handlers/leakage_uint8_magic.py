@@ -144,7 +144,7 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
             for grp in ([qs[i : i + 3] for i in range(0, len(qs), 3)] if op.tag == "CCZ" else [[q] for q in qs]):
                 if np.any(self._state[grp, :] >= 2):
                     warnings.warn(f"Magic gate I[{op.tag}] applied to leaked group {tuple(grp)}", UserWarning, stacklevel=2)
-            sss._emit_magic_op(op, qs)
+            sss.emit_magic_op(op, qs)
             return
         if op.tag != "" and op not in self.ops_to_params and not op.tag.startswith("CLIFFORD_FAULT"):
             parsed, is_u = _parse_leakage_tag_magic(op)
@@ -154,7 +154,7 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
                 self.claimed_ops_keys.add(op)
                 if is_u:
                     self.u_measurement_ops.add(op)
-        super().handle_op(op, sss)  # type: ignore[arg-type]
+        super().handle_op(op, sss)
 
     def leakage_measurement(self, op: stim.CircuitInstruction, tss: MagicsideSimulator, params: LeakageMeasurementParams) -> None:  # type: ignore[override]
         if op.name == "MPAD" and op in self.u_measurement_ops:
@@ -164,7 +164,7 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
         raw_t, is_mpad = op.targets_copy(), params.targets is not None
         p0, p1 = params.p0, params.p1
         need_slow = (0 in params.prob_for_input_state or 1 in params.prob_for_input_state) if is_mpad else (p0 != 0.0 or p1 != 1.0)
-        if tss._tab_rngs is not None and need_slow:
+        if (sync := tss.sync_rngs()) is not None and need_slow:
             qs = list(dict.fromkeys(params.targets if is_mpad else (int(t.qubit_value) for t in raw_t if t.is_qubit_target)))  # type: ignore[arg-type]
             valid_op = (op.name == "MPAD" and len(raw_t) == len(params.targets or ())) if is_mpad else (op.name in ("M", "MZ", "MR", "MRZ", "MX", "MY", "MRX", "MRY") and len(qs) == len(raw_t))
             if valid_op:
@@ -176,9 +176,9 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
                     if np.any(sup):
                         des = np.zeros(tss.batch_size, dtype=np.uint8)
                         for b in np.flatnonzero(sup):
-                            des[b] = tss._shot_np_rngs[b].binomial(1, 0.5 if abs(pb_row[b] - 0.5) <= 1e-12 else min(1.0, max(0.0, float(pb_row[b]))))  # type: ignore[index]
+                            des[b] = sync.shot_np_rngs[b].binomial(1, 0.5 if abs(pb_row[b] - 0.5) <= 1e-12 else min(1.0, max(0.0, float(pb_row[b]))))
                         tss.postselect_z_batch(q_i, sup, des, pauli=basis)  # type: ignore[arg-type]
-        super().leakage_measurement(op, tss, params)  # type: ignore[arg-type]
+        super().leakage_measurement(op, tss, params)
 
     def _eval_u_mpad(self, op: stim.CircuitInstruction, tss: MagicsideSimulator, params: LeakageMeasurementParams) -> None:
         raw_t, t_qubits = op.targets_copy(), list(params.targets or ())
@@ -190,13 +190,13 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
             if st >= 2 and p_val > 0.0:
                 probs[states == st] = p_val
         outcomes = np.zeros((len(t_qubits), self.batch_size), dtype=np.bool_)
-        if tss._tab_rngs is not None:
+        if tss.sync_rngs() is not None:
             for b in range(self.batch_size):
                 st_b = states[:, b]
                 for mask_g, pr in [(st_b < 2, p_u)] + [(st_b == n, params.prob_for_input_state[n]) for n in range(2, 10) if n in params.prob_for_input_state]:
                     idx_g = np.flatnonzero(mask_g)
                     if len(idx_g) and pr > 0.0:
-                        outcomes[idx_g, b] = self._tab_flips(tss, b, [t_qubits[k] for k in idx_g], pr)  # type: ignore[arg-type]
+                        outcomes[idx_g, b] = self._tab_flips(tss, b, [t_qubits[k] for k in idx_g], pr)
         elif np.any(probs > 0.0):
             pos = probs > 0.0
             outcomes[pos] = tss.np_rng.random(int(np.count_nonzero(pos))) < probs[pos]

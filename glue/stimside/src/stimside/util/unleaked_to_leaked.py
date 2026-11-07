@@ -25,6 +25,8 @@ class UnleakedToLeakedRecordsMixin:
             else:
                 events[b].extend([idx_val] * c)
 
+    record_u2l_counts = _record_unleaked_to_leaked_counts
+
     def get_unleaked_to_leaked_records(self) -> list[np.ndarray]:
         """Return per-shot 1D int64 arrays of unrolled circuit instruction indices (`op_idx`)
         where a qubit transitioned from an unleaked state (state < 2) to a leaked state (state >= 2).

@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 
 @dataclasses.dataclass
-class LeakageUint8(OpHandler["FlipsideSimulator"]):
+class LeakageUint8Flip(OpHandler["FlipsideSimulator"]):
     """Implementing leakage using an array of 8bit Uints.
 
     Basically, we store the leakage state as an int for each qubit.
@@ -50,12 +50,12 @@ class LeakageUint8(OpHandler["FlipsideSimulator"]):
 
     def compile_op_handler(
             self, *, circuit: stim.Circuit, batch_size: int
-            ) -> "CompiledLeakageUint8":
+            ) -> "CompiledLeakageUint8Flip":
 
         parsed_ops = parse_leakage_in_circuit(circuit)
         check_tag_qubits(parsed_ops, circuit.num_qubits)
 
-        return CompiledLeakageUint8(
+        return CompiledLeakageUint8Flip(
             num_qubits=circuit.num_qubits,
             batch_size=batch_size,
             ops_to_params=parsed_ops,
@@ -95,7 +95,7 @@ def _reset_value(s_in: object, s_out: object) -> int | None:
 
 
 @dataclasses.dataclass
-class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
+class CompiledLeakageUint8Flip(CompiledOpHandler["FlipsideSimulator"]):
 
     num_qubits: int
     batch_size: int
@@ -931,6 +931,6 @@ class CompiledLeakageUint8(CompiledOpHandler["FlipsideSimulator"]):
                 )
 
 
-LeakageUint8Flip = LeakageUint8
-CompiledLeakageUint8Flip = CompiledLeakageUint8
+LeakageUint8 = LeakageUint8Flip
+CompiledLeakageUint8 = CompiledLeakageUint8Flip
 

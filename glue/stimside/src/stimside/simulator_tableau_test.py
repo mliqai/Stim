@@ -1315,3 +1315,368 @@ def test_cache_lock_is_reinitialized_in_forked_child() -> None:
         release.set()
         t.join()
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+@pytest.mark.parametrize(
+    ("prog", "exact"),
+    [
+        # bias_check.py: a qubit in |1> leaks and a leaked qubit reads 0, so P(m=1) = 0 exactly.
+        (
+            (
+                "R 0\nX_ERROR(0.5) 0\nI[LEAKAGE_TRANSITION_1: (1.0, 1-->2)] 0\n"
+                "M[LEAKAGE_PROJECTION_Z: (0.0, 2)] 0"
+            ),
+            [0.0],
+        ),
+        # The conditioned X resets qubit 0 per shot; qubit 1 keeps the 0.3 bit.
+        ("R 0 1\nX_ERROR(0.3) 0\nCX 0 1\nX[CONDITIONED_ON_SELF: 1] 0\nM 0 1", [0.0, 0.3]),
+    ],
+)
+def test_batch1_batchN_sync_statistically_equivalent_on_zero_one_conditioning(
+    prog: str, exact: list[float]
+) -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    circ = stim.Circuit(prog)
+    n = 4096
+    rates = []
+    # Distinct seeds: with one seed the three modes give bit-identical records.
+    for seed, batch, sync in ((11, 1, False), (12, 64, False), (13, 64, True)):
+        coh = LeakageUint8().compile_op_handler(circuit=circ, batch_size=batch)
+        sim = TablesideSimulator(
+            circ, compiled_op_handler=coh, batch_size=batch, seed=seed, sync_tableside_rng=sync
+        )
+        recs = []
+        for _ in range(n // batch):
+            sim.clear()
+            sim.run()
+            recs.append(sim.get_final_measurement_records())
+        rates.append(np.vstack(recs).mean(axis=0))
+    for i, e in enumerate(exact):
+        got = [r[i] for r in rates]
+        if e in (0.0, 1.0):
+            assert got == [e] * 3, rates
+        else:
+            sigma = np.sqrt(e * (1 - e) / n)
+            assert all(abs(g - e) < 5 * sigma for g in got), rates
+            assert max(got) - min(got) < 5 * np.sqrt(2) * sigma, rates
+
+
+def test_field_only_subclass_keeps_cpp_fast_path_and_records() -> None:
+    # A subclass that only adds fields overrides nothing the fast path bypasses: it must keep the
+    # C++ runner, raise no warning, and reproduce the base handler's records for the same seed.
+    import dataclasses
+    import warnings
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
+        CompiledLeakageUint8,
+        LeakageUint8,
+    )
+
+    @dataclasses.dataclass
+    class _Fields(CompiledLeakageUint8):
+        label: str = "extra field"
+
+    circ = stim.Circuit(
+        "R 0 1\nX_ERROR(0.3) 0\nI[LEAKAGE_TRANSITION_1: (0.2, U-->2)] 0 1\n"
+        "CX 0 1\nM[LEAKAGE_PROJECTION_Z: (0.5, 2)] 0 1"
+    )
+    recs = []
+    for cls in (CompiledLeakageUint8, _Fields):
+        base = LeakageUint8().compile_op_handler(circuit=circ, batch_size=8)
+        coh = cls(
+            num_qubits=base.num_qubits,
+            batch_size=8,
+            unconditional_condition_on_U=base.unconditional_condition_on_U,
+            ops_to_params=base.ops_to_params,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            tss = TablesideSimulator(circ, compiled_op_handler=coh, batch_size=8, seed=5)
+        assert tss._cpp_runner is not None
+        out = []
+        for _ in range(16):
+            tss.clear()
+            tss.run()
+            out.append(tss.get_final_measurement_records())
+        recs.append(np.vstack(out))
+    np.testing.assert_array_equal(recs[0], recs[1])
+    assert 0 < recs[0].mean() < 1
+
+
+def _run_wp09_subclass(cls, circ: stim.Circuit, sync: bool, runs: int = 4):
+    """Build cls from LeakageUint8's compiled params, run, and return (tss, records, warnings)."""
+    import warnings
+
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import LeakageUint8
+
+    base = LeakageUint8().compile_op_handler(circuit=circ, batch_size=4)
+    coh = cls(
+        num_qubits=base.num_qubits,
+        batch_size=4,
+        unconditional_condition_on_U=True,
+        ops_to_params=base.ops_to_params,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        tss = TablesideSimulator(
+            circ, compiled_op_handler=coh, batch_size=4, seed=7, sync_tableside_rng=sync
+        )
+    out = []
+    for _ in range(runs):
+        tss.clear()
+        tss.run()
+        out.append(tss.get_final_measurement_records())
+    return tss, np.vstack(out), caught
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_subclass_clear_rebinding_state_is_honoured(sync: bool) -> None:
+    # A subclass clear() that rebinds self.state (q0 starts leaked) falls back to the generic path
+    # and must give its records: q0 is leaked, so the projection reads 1; q1 reads 0.
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import CompiledLeakageUint8
+
+    class _Rebind(CompiledLeakageUint8):
+        def clear(self):
+            super().clear()
+            self.state = np.array([2] + [0] * (self.num_qubits - 1), dtype=np.uint8)
+
+    class _RebindGeneric(_Rebind):  # overriding handle_op forces the generic path
+        def handle_op(self, op, sss):
+            super().handle_op(op, sss)
+
+    circ = stim.Circuit("R 0 1\nM[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0 1")
+    fast, fast_recs, _ = _run_wp09_subclass(_Rebind, circ, sync)
+    _, slow_recs, _ = _run_wp09_subclass(_RebindGeneric, circ, sync)
+    assert fast._precompiled_circuit is None
+    np.testing.assert_array_equal(fast_recs, slow_recs)
+    np.testing.assert_array_equal(fast_recs, np.tile([True, False], (16, 1)))
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_subclass_changing_claimed_ops_keys_is_honoured(sync: bool) -> None:
+    # Unclaimed tagged ops run as bare ops: the transition is skipped and M is a plain M.
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import CompiledLeakageUint8
+
+    class _NoClaim(CompiledLeakageUint8):
+        def __post_init__(self):
+            super().__post_init__()
+            self.claimed_ops_keys = set()
+
+    circ = stim.Circuit(
+        "R 0\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nM[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0"
+    )
+    tss, recs, caught = _run_wp09_subclass(_NoClaim, circ, sync)
+    assert not recs.any()
+    assert not tss._compiled_op_handler.state.any()
+    assert [str(w.message).count("claimed_ops_keys") for w in caught] == [1]
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_non_qualifying_subclass_warns_exactly_once_naming_method(sync: bool) -> None:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import CompiledLeakageUint8
+
+    class _Swap(CompiledLeakageUint8):
+        def leakage_swap(self, *args, **kwargs):
+            return super().leakage_swap(*args, **kwargs)
+
+    circ = stim.Circuit("R 0 1\nM 0 1")
+    tss, _, caught = _run_wp09_subclass(_Swap, circ, sync, runs=1)
+    assert tss._precompiled_circuit is None
+    assert [w.category for w in caught] == [UserWarning]
+    msg = str(caught[0].message)
+    assert "_Swap overrides leakage_swap" in msg and "much slower" in msg
+
+
+@pytest.mark.parametrize("sync", [False, True])
+@pytest.mark.parametrize("case", ["persist", "clear_claim", "clear_ucu"])
+def test_subclass_overriding_clear_falls_back_with_generic_records(case: str, sync: bool) -> None:
+    # A clear() override may keep state across runs or change claimed_ops_keys / ucu; the C++
+    # runner would ignore all three, so the subclass must fall back (one warning) to generic.
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import CompiledLeakageUint8
+
+    class _Persist(CompiledLeakageUint8):
+        def clear(self):  # leakage carries over between runs
+            self._reset_z_scan()
+
+    class _ClearClaim(CompiledLeakageUint8):
+        def clear(self):
+            super().clear()
+            self.claimed_ops_keys = set()
+
+    class _ClearUCU(CompiledLeakageUint8):
+        def clear(self):
+            super().clear()
+            self.unconditional_condition_on_U = False
+
+    leak = "R 0\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\n"
+    project = "M[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0"
+    cls, text = {
+        "persist": (_Persist, "I[LEAKAGE_TRANSITION_1: (0.3, U-->2)] 0\n" + project),
+        "clear_claim": (_ClearClaim, leak + project),
+        "clear_ucu": (_ClearUCU, leak + "X 0\nM 0"),
+    }[case]
+    generic = type("_Generic", (cls,), {"handle_op": lambda s, op, sss: cls.handle_op(s, op, sss)})
+    circ = stim.Circuit(text)
+    tss, recs, caught = _run_wp09_subclass(cls, circ, sync, runs=8)
+    _, generic_recs, _ = _run_wp09_subclass(generic, circ, sync, runs=8)
+    assert tss._precompiled_circuit is None
+    assert [f"{cls.__name__} overrides clear;" in str(w.message) for w in caught] == [True]
+    np.testing.assert_array_equal(recs, generic_recs)
+    if case != "persist":  # unclaimed ops run bare (never leaked); ucu=False lets X act: always 1
+        assert (recs == (case == "clear_ucu")).all()
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_subclass_overriding_post_init_falls_back_and_keeps_its_state_alias(sync: bool) -> None:
+    # The C++ path rebinds handler.state to its own buffer, which would orphan any reference to
+    # state that a subclass __post_init__ keeps; such a subclass must fall back with one warning.
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import CompiledLeakageUint8
+
+    class _Alias(CompiledLeakageUint8):
+        def __post_init__(self):
+            super().__post_init__()
+            self.leaked_view = self.state
+
+    circ = stim.Circuit("R 0\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nM 0")
+    tss, _, caught = _run_wp09_subclass(_Alias, circ, sync, runs=1)
+    coh = tss._compiled_op_handler
+    assert tss._precompiled_circuit is None
+    assert ["_Alias overrides __post_init__;" in str(w.message) for w in caught] == [True]
+    assert coh.leaked_view is coh.state and (coh.leaked_view == 2).all()
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_subclass_overriding_reset_z_scan_falls_back_with_generic_records(sync: bool) -> None:
+    # Base clear() calls _reset_z_scan; here its 2nd+ calls set ucu=False (so X acts on the leaked
+    # qubit), which the C++ runner would ignore. The subclass must fall back with one warning.
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import CompiledLeakageUint8
+
+    class _ScanUCU(CompiledLeakageUint8):
+        def _reset_z_scan(self):
+            super()._reset_z_scan()
+            if hasattr(self, "_seen"):
+                self.unconditional_condition_on_U = False
+            self._seen = True
+
+    class _ScanUCUGeneric(_ScanUCU):  # overriding handle_op forces the generic path
+        def handle_op(self, op, sss):
+            super().handle_op(op, sss)
+
+    circ = stim.Circuit("R 0\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nX 0\nM 0")
+    tss, recs, caught = _run_wp09_subclass(_ScanUCU, circ, sync, runs=2)
+    _, generic_recs, _ = _run_wp09_subclass(_ScanUCUGeneric, circ, sync, runs=2)
+    assert tss._precompiled_circuit is None
+    assert ["_ScanUCU overrides _reset_z_scan;" in str(w.message) for w in caught] == [True]
+    np.testing.assert_array_equal(recs, generic_recs)
+    assert recs.all()
+
+
+def _wp09_property_or_setattr_classes() -> dict:
+    """Fresh handler subclasses for the test below, keyed by class name."""
+    import dataclasses
+    import functools
+
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import CompiledLeakageUint8
+
+    def leaked(h) -> bool:
+        return getattr(h, "state", None) is not None and bool((h.state >= 2).any())
+
+    def no_leak(**_) -> None:  # replaces leakage_transition_1: the qubit never leaks
+        return None
+
+    class DynUCU(CompiledLeakageUint8):  # ucu is off while any qubit is leaked
+        unconditional_condition_on_U = property(  # type: ignore[assignment]
+            lambda s: s._ucu and not leaked(s), lambda s, v: setattr(s, "_ucu", v)
+        )
+
+    class DynClaim(CompiledLeakageUint8):  # no claims while any qubit is leaked
+        claimed_ops_keys = property(
+            lambda s: set() if leaked(s) else s._claimed, lambda s, v: setattr(s, "_claimed", v)
+        )
+
+    class CopyState(CompiledLeakageUint8):
+        state = property(  # type: ignore[assignment]
+            lambda s: s._st, lambda s, v: setattr(s, "_st", np.array(v, dtype=np.uint8))
+        )
+
+    class SetattrCopy(CompiledLeakageUint8):
+        def __setattr__(self, k, v):
+            object.__setattr__(self, k, np.array(v, dtype=np.uint8) if k == "state" else v)
+
+    @dataclasses.dataclass
+    class FactoryHook(CompiledLeakageUint8):
+        leakage_transition_1: object = dataclasses.field(  # type: ignore[assignment]
+            default_factory=lambda: no_leak
+        )
+
+    def hook_after_init(cls):
+        init = cls.__init__
+
+        @functools.wraps(init)
+        def __init__(self, *args, **kwargs):
+            init(self, *args, **kwargs)
+            self.leakage_transition_1 = no_leak
+
+        cls.__init__ = __init__
+        return cls
+
+    @hook_after_init
+    @dataclasses.dataclass
+    class WrapsInit(CompiledLeakageUint8):
+        pass
+
+    class _CopyOnSet:  # a set-only data descriptor
+        def __set__(self, obj, v):
+            obj.__dict__["state"] = None if v is self else np.array(v, dtype=np.uint8)
+
+    @dataclasses.dataclass
+    class SetOnlyState(CompiledLeakageUint8):
+        state: object = dataclasses.field(init=False, default=_CopyOnSet())
+
+    class _NoLeakMixin:
+        def leakage_transition_1(self, op, tss, params) -> None:
+            return None
+
+    class MixinHook(_NoLeakMixin, CompiledLeakageUint8):
+        pass
+
+    classes = (DynUCU, DynClaim, CopyState, SetattrCopy)
+    return {c.__name__: c for c in classes + (FactoryHook, WrapsInit, SetOnlyState, MixinHook)}
+
+
+@pytest.mark.parametrize("sync", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    ["DynUCU", "DynClaim", "CopyState", "SetattrCopy"]
+    + ["FactoryHook", "WrapsInit", "SetOnlyState", "MixinHook"],
+)
+def test_subclass_with_property_or_setattr_falls_back_with_generic_records(
+    case: str, sync: bool
+) -> None:
+    # Properties / __setattr__ (no method override) that make ucu or claims depend on the leakage
+    # state, or copy state on assignment (breaking the C++ shared buffer), would be silently
+    # ignored by the precompiled runners: the subclass must fall back with one warning naming them.
+    # Likewise for an instance attribute shadowing a base method (set by a default_factory field
+    # or by a functools.wraps-wrapped __init__), a set-only descriptor, or a mixin's method.
+    leak = "R 0\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\n"
+    swap = "R 0 1\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nSWAP[LEAKAGE_SWAP] 0 1\n"
+    project = "M[LEAKAGE_PROJECTION_Z: (1.0, 2)] "
+    name, text, expected = {
+        "DynUCU": ("unconditional_condition_on_U", leak + "X 0\nM 0", True),
+        "DynClaim": ("claimed_ops_keys", leak + project + "0", False),
+        "CopyState": ("state", swap + project + "1", True),
+        "SetattrCopy": ("__setattr__", swap + project + "1", True),
+        "FactoryHook": ("leakage_transition_1", leak + project + "0", False),
+        "WrapsInit": ("__init__, leakage_transition_1", leak + project + "0", False),
+        "SetOnlyState": ("state", swap + project + "1", True),
+        "MixinHook": ("leakage_transition_1", leak + project + "0", False),
+    }[case]
+    cls = _wp09_property_or_setattr_classes()[case]
+    generic = type("_Generic", (cls,), {"handle_op": lambda s, op, sss: cls.handle_op(s, op, sss)})
+    circ = stim.Circuit(text)
+    tss, recs, caught = _run_wp09_subclass(cls, circ, sync)
+    _, generic_recs, _ = _run_wp09_subclass(generic, circ, sync)
+    assert tss._precompiled_circuit is None and tss._cpp_runner is None
+    assert [f"{case} overrides {name};" in str(w.message) for w in caught] == [True]
+    np.testing.assert_array_equal(recs, generic_recs)
+    assert (recs == expected).all()

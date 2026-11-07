@@ -175,7 +175,7 @@ See "Untagged Instructions on Leaked Qubits" in the top-level README for the det
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | `LEAKAGE_TRANSITION_1` | Yes (`0`/`1` out needs known Z) | Yes | Yes | Yes | Yes (`U`, `2..9` inputs; `0`/`1` inputs raise `NotImplementedError`) |
 | `LEAKAGE_TRANSITION_2` | Yes (`0`/`1`/`X`/`Y`/`Z` out needs known Z) | Yes | Yes | Yes | Yes (1 leaked leg; `0`/`1` inputs raise `NotImplementedError`) |
-| `LEAKAGE_PROJECTION_Z` | Yes | Yes | Yes | Yes | Yes |
+| `LEAKAGE_PROJECTION_Z` | Yes (asymmetric `0`/`1` readout needs known Z) | Yes | Yes | Yes | Yes |
 | `LEAKAGE_MEASUREMENT` (`MPAD`) | Yes (`0`,`1`,`2..9`) | Yes (`0`,`1`,`2..9`) | Yes (`0`,`1`,`2..9`) | Yes (`U`,`0`,`1`,`2..9`) | Yes (`0`,`1`,`2..9`) |
 | `LEAKAGE_SWAP` (`SWAP`) | Yes | Yes | Yes | Yes | `loss_oracle=True` only (approx.) |
 | `CONDITIONED_ON_SELF` / `OTHER` / `PAIR` | No | Yes | Yes | Yes | Yes (`U`, `2..9`; `0`/`1` raise `NotImplementedError`) |

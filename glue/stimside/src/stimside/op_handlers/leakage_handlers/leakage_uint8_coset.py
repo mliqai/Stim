@@ -29,6 +29,7 @@ from stimside.op_handlers.leakage_handlers.transition_effects import (
     sample_batched_group_transitions,
     unpack_leakage_measurement_targets,
 )
+from stimside.op_handlers.seam import BatchedLeakageSimulator
 from stimside.util.stim_workarounds import split_fused_instruction
 
 if TYPE_CHECKING:
@@ -66,7 +67,7 @@ class LeakageUint8Coset(OpHandler["CosetsideSimulator"]):
 
 
 @dataclasses.dataclass
-class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
+class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
     """Compiled batched uint8 leakage OpHandler for CosetsideSimulator."""
 
     num_qubits: int
@@ -133,7 +134,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         )
 
     def _update_state_from_peek_Z(
-        self, targets: Sequence[int] | NDArray[np.int_], css: CosetsideSimulator
+        self, targets: Sequence[int] | NDArray[np.int_], css: BatchedLeakageSimulator
     ) -> None:
         self._ensure_batch_size(css.batch_size)
         unique_targets = list(dict.fromkeys(int(t) for t in targets if int(t) >= 0))
@@ -157,10 +158,10 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
             flip_mask = comp_mask & (p1_row > 1e-12) & ~det_one
             num_flips = int(np.count_nonzero(flip_mask))
             if num_flips > 0:
-                if css._shot_np_rngs is not None:
+                if (rngs := css.sync_rngs()) is not None:
                     new_row[flip_mask] = np.asarray(
                         [
-                            css._shot_np_rngs[int(b)].binomial(
+                            rngs.shot_np_rngs[int(b)].binomial(
                                 1,
                                 0.5 if abs(p1_row[b] - 0.5) <= 1e-12 else float(p1_row[b]),
                             )
@@ -188,7 +189,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         self,
         targets: Sequence[int] | NDArray[np.int_],
         allowed_st_list: tuple[tuple[int | str, ...], ...],
-        css: CosetsideSimulator,
+        css: BatchedLeakageSimulator,
     ) -> NDArray[np.bool_]:
         self._ensure_batch_size(css.batch_size)
         targets_arr = np.asarray(targets, dtype=np.intp)
@@ -212,7 +213,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         self,
         targets: Sequence[Sequence[int]] | NDArray[np.int_],
         allowed_st_list: tuple[tuple[int | str, ...], tuple[int | str, ...]],
-        css: CosetsideSimulator,
+        css: BatchedLeakageSimulator,
     ) -> NDArray[np.bool_]:
         self._ensure_batch_size(css.batch_size)
         targets_np = np.asarray(targets, dtype=np.intp)  # (num_pairs, 2)
@@ -246,7 +247,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         return allowed_mask
 
     def handle_op(
-        self, op: stim.CircuitInstruction, sss: CosetsideSimulator
+        self, op: stim.CircuitInstruction, sss: BatchedLeakageSimulator
     ) -> None:
         self._ensure_batch_size(sss.batch_size)
         if op not in self.claimed_ops_keys:
@@ -335,14 +336,14 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
 
         dispatch_tagged_leakage_op(self, op, sss)
 
-    def leakage_swap(self, op: stim.CircuitInstruction, tss: CosetsideSimulator) -> None:
+    def leakage_swap(self, op: stim.CircuitInstruction, tss: BatchedLeakageSimulator) -> None:
         """SWAP[LEAKAGE_SWAP]: SWAP the qubits in every shot, then swap leakage states."""
         exec_leakage_swap(op, tss, self._state)
 
     def leakage_conditioning(
         self,
         op: stim.CircuitInstruction,
-        tss: CosetsideSimulator,
+        tss: BatchedLeakageSimulator,
         params: LeakageConditioningParams,
     ) -> None:
         condition_groups = params.args
@@ -472,16 +473,21 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
             tss.do_conditional_pauli_noise(op, cond_mask)
 
     def _tab_flips(
-        self, tss: CosetsideSimulator, b: int, qs: Sequence[int] | NDArray[np.int_], p: float
+        self,
+        tss: BatchedLeakageSimulator,
+        b: int,
+        qs: Sequence[int] | NDArray[np.int_],
+        p: float,
     ) -> NDArray[np.bool_]:
         q_list = [int(q) for q in qs]
         flips = np.zeros(len(q_list), dtype=np.bool_)
         if q_list and p > 0.0:
-            assert tss._tab_rngs is not None and tss._tab_rngs_x is not None
-            tr = tss._tab_rngs[b]
+            rngs = tss.sync_rngs()
+            assert rngs is not None
+            tr = rngs.tab_rngs[b]
             inst = stim.CircuitInstruction("X_ERROR", q_list, [p])
             tr.do(inst)
-            tss._tab_rngs_x[b].do(inst)
+            rngs.tab_rngs_x[b].do(inst)
             for i, q in enumerate(q_list):
                 if tr.peek_z(q) == -1:
                     tr.x(q)
@@ -493,7 +499,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         return [list(np.where(mask[:, b])[0]) for b in range(mask.shape[1])]
 
     def _apply_transition_effects(
-        self, tss: CosetsideSimulator, effects: TransitionEffectMasks
+        self, tss: BatchedLeakageSimulator, effects: TransitionEffectMasks
     ) -> None:
         if np.any(effects.set_zero):
             tss.do_unmatched_noisy_reset_z(
@@ -504,8 +510,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                 self._scratch_zero_mask, effects.set_one
             )
         if np.any(effects.depolarize):
-            if tss._tab_rngs is not None:
-                tss._sample_pauli_noise_via_tab_rng(
+            if tss.sync_rngs() is not None:
+                tss.sample_pauli_noise_sync(
                     "DEPOLARIZE1", self._targets_per_shot(effects.depolarize), [0.75]
                 )
             else:
@@ -523,8 +529,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
             ("Z_ERROR", "Z", effects.rand_phase),
         ):
             if arr is not None and np.any(arr):
-                if tss._tab_rngs is not None:
-                    tss._sample_pauli_noise_via_tab_rng(
+                if tss.sync_rngs() is not None:
+                    tss.sample_pauli_noise_sync(
                         gate, self._targets_per_shot(arr), [0.5]
                     )
                 else:
@@ -533,7 +539,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
     def leakage_transition_1(
         self,
         op: stim.CircuitInstruction,
-        tss: CosetsideSimulator,
+        tss: BatchedLeakageSimulator,
         params: LeakageTransition1Params,
         *,
         _advance_step: bool = True,
@@ -573,7 +579,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
             self._update_state_from_peek_Z(sorted_target_indices, tss)
         target_states = self._state[sorted_target_indices, :].copy()
 
-        if tss._shot_np_rngs is not None or (
+        if (rngs := tss.sync_rngs()) is not None or (
             tss.batch_size == 1 and tss.seed is not None
         ):
             for input_state in params.args_by_input_state.keys():
@@ -586,7 +592,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     ow_qs = sorted_target_indices[in_mask_b]
                     if len(ow_qs) == 0:
                         continue
-                    rng_b = tss._shot_np_rngs[b] if tss._shot_np_rngs is not None else tss.np_rng
+                    rng_b = rngs.shot_np_rngs[b] if rngs is not None else tss.np_rng
                     out_b = params.sample_transitions_from_state(
                         input_state=input_state, num_samples=len(ow_qs), np_rng=rng_b
                     ).astype(str)
@@ -615,7 +621,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
     def leakage_transition_2(
         self,
         op: stim.CircuitInstruction,
-        tss: CosetsideSimulator,
+        tss: BatchedLeakageSimulator,
         params: LeakageTransition2Params,
         *,
         _advance_step: bool = True,
@@ -671,7 +677,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
             assert arr is not None
             arr.fill(False)
 
-        if tss._shot_np_rngs is not None or (
+        if (rngs := tss.sync_rngs()) is not None or (
             tss.batch_size == 1 and tss.seed is not None
         ):
             for input_state in params.args_by_input_state.keys():
@@ -694,7 +700,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     trig_pairs_b = np.column_stack(
                         (even_targets_arr[t_mask_b], odd_targets_arr[t_mask_b])
                     )
-                    rng_b = tss._shot_np_rngs[b] if tss._shot_np_rngs is not None else tss.np_rng
+                    rng_b = rngs.shot_np_rngs[b] if rngs is not None else tss.np_rng
                     out_b = params.sample_transitions_from_state(
                         input_state=input_state, num_samples=samples_b, np_rng=rng_b
                     ).astype(str)
@@ -741,7 +747,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
 
     def _sample_leaked_tab_outcomes(
         self,
-        tss: CosetsideSimulator,
+        tss: BatchedLeakageSimulator,
         targets_arr: NDArray[np.intp],
         target_leakage_state: NDArray[np.uint8],
         params: LeakageMeasurementParams,
@@ -760,7 +766,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
 
     def _finish_sync_proj_z(
         self,
-        tss: CosetsideSimulator,
+        tss: BatchedLeakageSimulator,
         op: stim.CircuitInstruction,
         raw_op_targets: list[stim.GateTarget],
         targets: list[int],
@@ -777,7 +783,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         if replace_mask is not None or has_leaked:
             net_x_flip = np.zeros((self.num_qubits, tss.batch_size), dtype=np.bool_)
             for k_i, q in enumerate(targets):
-                m_col = tss._measurement_columns[-num_m + k_i]
+                m_col = tss.measurement_column(-num_m + k_i)
                 target_out = outcomes[k_i] ^ inv_flags[k_i]
                 if replace_mask is not None:
                     mask_k = replace_mask[k_i]
@@ -788,7 +794,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                     new_col = target_out
                 diff = m_col ^ new_col
                 if np.any(diff):
-                    m_col[:] = new_col
+                    tss.overwrite_measurement_column(-num_m + k_i, new_col)
                     leaked_diff = diff & (target_leakage_state[k_i] > 1)
                     if np.any(leaked_diff):
                         net_x_flip[q, :] ^= leaked_diff
@@ -796,21 +802,21 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                 tss.apply_pauli("Z" if basis == "X" else "X", net_x_flip)
         elif replace_mask is None:
             for k_i in range(num_m):
-                m_col = tss._measurement_columns[-num_m + k_i]
+                m_col = tss.measurement_column(-num_m + k_i)
                 target_out = outcomes[k_i] ^ inv_flags[k_i]
                 if np.any(m_col ^ target_out):
-                    m_col[:] = target_out
+                    tss.overwrite_measurement_column(-num_m + k_i, target_out)
         if has_leaked:
             leaked_per_shot = [
                 list(targets_arr[target_leakage_state[:, b] > 1])
                 for b in range(tss.batch_size)
             ]
-            tss._sample_pauli_noise_via_tab_rng("DEPOLARIZE1", leaked_per_shot, [0.75])
+            tss.sample_pauli_noise_sync("DEPOLARIZE1", leaked_per_shot, [0.75])
 
     def leakage_measurement(
         self,
         op: stim.CircuitInstruction,
-        tss: CosetsideSimulator,
+        tss: BatchedLeakageSimulator,
         params: LeakageMeasurementParams,
     ) -> None:
         if params.targets:
@@ -831,8 +837,9 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         basis: Literal["X", "Y", "Z"] = meas_basis(op.name)
         leaked_mask = target_leakage_state > 1
         has_leaked = bool(np.any(leaked_mask))
+        sync = tss.sync_rngs()
 
-        if not is_mpad and tss._tab_rngs is not None and len(set(targets)) < len(targets):
+        if not is_mpad and sync is not None and len(set(targets)) < len(targets):
             if p0 > 0.0 or p1 < 1.0 or has_leaked:
                 raise NotImplementedError(
                     f"Duplicate targets in {op.name} with LEAKAGE_PROJECTION_Z are not supported with "
@@ -840,7 +847,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                 )
 
         # Fast-path for LEAKAGE_PROJECTION_Z measurements with noiseless computational readout (p0=0, p1=1) and sync_tableside_rng
-        if not is_mpad and tss._tab_rngs is not None and p0 == 0.0 and p1 == 1.0:
+        if not is_mpad and sync is not None and p0 == 0.0 and p1 == 1.0:
             leaked_read_one = np.zeros((len(targets), tss.batch_size), dtype=np.bool_)
             if has_leaked:
                 leaked_zero_mask = self._scratch_set_zero
@@ -881,18 +888,18 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
         has_01_cond = (0 in params.prob_for_input_state) or (
             1 in params.prob_for_input_state
         )
-        if is_mpad and has_01_cond and tss._tab_rngs is None:
+        if is_mpad and has_01_cond and sync is None:
             self._update_state_from_peek_Z(targets, tss)
             self._clear_transient_ones(targets)
 
-        need_pauli_peek = tss._tab_rngs is not None or is_mpad or has_01_cond
+        need_pauli_peek = sync is not None or is_mpad or has_01_cond
         pauli_states = (
             tss.peek_pauli_batch(targets, basis)
             if need_pauli_peek
             else np.zeros((len(targets), tss.batch_size), dtype=np.int8)
         )
 
-        if tss._tab_rngs is not None:
+        if sync is not None:
             final_outcomes = np.zeros((len(targets), tss.batch_size), dtype=np.bool_)
             # Resolve superpositions via _shot_np_rngs + postselect_z_batch when not (is_mpad and not has_01_cond and np.isclose(p0, p1))
             if not (is_mpad and not has_01_cond and np.isclose(p0, p1)):
@@ -909,7 +916,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                             continue
                         pz = 0 if s_i == 0 else int(tss.peek_pauli_batch([q_int], basis)[0, b])
                         if pz == 0:
-                            bit = int(tss._shot_np_rngs[b].binomial(1, 0.5))
+                            bit = int(sync.shot_np_rngs[b].binomial(1, 0.5))
                             flip_mask_1d = np.zeros(tss.batch_size, dtype=np.bool_)
                             flip_mask_1d[b] = True
                             desired_1d = np.zeros(tss.batch_size, dtype=np.uint8)
@@ -1016,7 +1023,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
 
         num_m = len(targets)
         for k_i in range(num_m):
-            m_col = tss._measurement_columns[-num_m + k_i]
+            m_col = tss.measurement_column(-num_m + k_i)
             m_phys = m_col ^ inv_flags[k_i]
             super_k = in_comp[k_i] & (pauli_states[k_i] == 0)
             if np.any(super_k):
@@ -1036,8 +1043,10 @@ class CompiledLeakageUint8Coset(CompiledOpHandler["CosetsideSimulator"]):
                 mask_k = need_resample[k_i]
                 if not np.any(mask_k):
                     continue
-                m_col = tss._measurement_columns[-num_m + k_i]
-                m_col[:] = np.where(mask_k, sampled_outcomes[k_i] ^ inv_flags[k_i], m_col)
+                m_col = tss.measurement_column(-num_m + k_i)
+                tss.overwrite_measurement_column(
+                    -num_m + k_i, np.where(mask_k, sampled_outcomes[k_i] ^ inv_flags[k_i], m_col)
+                )
         if has_leaked:
             to_dep = self._scratch_depolarize
             to_dep.fill(False)

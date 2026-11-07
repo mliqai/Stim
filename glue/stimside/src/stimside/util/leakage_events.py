@@ -76,6 +76,8 @@ class LeakageEventsRecorderMixin:
                 LeakageEvent(int(op_idx), int(qubit), old_i, new_i)
             )
 
+    record_leakage_event = _record_leakage_event
+
     def get_leakage_events(self) -> list[list[LeakageEvent]]:
         """Per-shot lists of the LeakageEvents of the last run (see ``stimside.util.leakage_events``)."""
         if not self.record_leakage_events:

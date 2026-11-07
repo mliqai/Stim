@@ -3,7 +3,7 @@ from typing import Any, Generic, TypeVar
 
 import stim  # type: ignore[import-untyped]
 
-T = TypeVar("T")
+T = TypeVar("T", contravariant=True)
 
 
 class OpHandler(abc.ABC, Generic[T]):

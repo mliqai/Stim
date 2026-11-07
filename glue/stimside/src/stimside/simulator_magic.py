@@ -17,7 +17,7 @@ from stimside._magic.channels import (
     compile_clifford_factors, compile_pauli_measurement_c15, compile_pauli_product, compile_reset_c15,
     emit_magic_terms, infer_total_data_qubits, normalize_choice_map, normalize_pauli_slot_map,
     sample_categorical_branch, sample_heralded_pauli_branch,
-    split_pauli_product_targets, split_realization_sections,
+    split_pauli_product_targets,
 )
 from stimside._magic.gates import (
     CliffordFaultChannel, CompiledPauliAxis, canonical_clifford_gate_name_and_arity,
@@ -29,12 +29,15 @@ from stimside._magic.statevector import extract_data_expansion, reconstruct_stat
 from stimside._magic.trajectory import prepare_run_maps, run_direct, run_selector
 from stimside._magic.phase_qfe import (
     DEFAULT_ATOL, ImpossiblePostselectionError, K1_CANCEL_REL_TOL, ShotExpansion, apply_compiled_block, apply_pauli,
-    apply_quarter_turn, measure_expansion, project_diagonal, validate_atol,
+    apply_quarter_turn, measure_expansion, measure_expansions_batch, project_diagonal,
+    validate_atol,
 )
 from stimside._magic.query import (
     PrepareQueries, PreparedQueryPlan, QueryBudget, QueryBudgetExceededError, run_query_batch,
+    _normalize_realization,
 )
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler, _TrivialCompiledOpHandler
+from stimside.op_handlers.seam import SyncRngs
 from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic, _strip_circuit_for_noiseless_ref
 from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS, validate_magic_op
 from stimside.util.bitwords import (
@@ -94,19 +97,9 @@ def resolve_budget(
 def _normalize_shot_realization(
     raw: Any, fault_max: Sequence[int], fault_id_to_slot: Mapping[int, int], num_measurements: int
 ) -> dict[str, Any]:
-    if raw is None:
-        return {}
-    if not isinstance(raw, Mapping):
-        raise ValueError(f"Expected Mapping fault realization, got {type(raw)!r}")
-    sec = split_realization_sections(raw)
-    if "faults" in sec:
-        sec["faults"] = normalize_choice_map(
-            sec["faults"], fault_max, "faults",
-            key_to_slot=fault_id_to_slot, allow_none_zero=True, allow_binary_bool=True, strict_length=True,
-        )
-    for mk in ("measurements", "quantum_measurements"):
-        if mk in sec:
-            sec[mk] = normalize_choice_map(sec[mk], (1,) * num_measurements, mk, allow_bool_values=True)
+    sec = _normalize_realization(
+        raw, fault_max, fault_id_to_slot, num_measurements, strict_faults=True
+    )
     if "sweep_bits" in sec:
         sw = sec["sweep_bits"]
         w = (max(coerce_strict_int(k, "sweep_bits key") for k in sw) + 1) if isinstance(sw, Mapping) and sw else (len(sw) if not isinstance(sw, (str, bytes, Mapping)) and hasattr(sw, "__len__") else 0)
@@ -124,6 +117,12 @@ def _normalize_stream_paulis(plan: DirectPlan | SelectorPlan, raw_p: Any) -> Any
         if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord, CorrelatedNoiseRecord))
     }
     return normalize_pauli_slot_map(raw_p, plan.noise_channel_max_choices, kinds)
+
+
+def _log0(x: Any) -> Any:
+    """Natural log with log(0) = -inf (no warning): branch masses are stored as logs."""
+    with np.errstate(divide="ignore"):
+        return np.log(x)
 
 
 def parse_enum(val: Any, table: Mapping[str, Any], name: str, *, lower: bool = False) -> Any:
@@ -215,6 +214,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             raw_seq = [fault_realizations] if isinstance(fault_realizations, Mapping) else fault_realizations
             parsed = [_normalize_shot_realization(r, f_max, f_id_map, int(circuit.num_measurements)) for r in raw_seq]
             self._norm_reals = parsed * self.batch_size if isinstance(fault_realizations, Mapping) else parsed
+            if not any(parsed):  # all-empty realizations must behave exactly like None
+                self._norm_reals = None
             self._has_non_fault_reals = any(bool(set(nr) - {"faults"}) for nr in parsed)
             if self._has_non_fault_reals and (not self._has_trivial_handler or self.sync_tableside_rng):
                 raise ValueError("Non-fault keys in fault_realizations require trivial op_handler and sync_tableside_rng=False")
@@ -258,6 +259,23 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._apply_pauli_mask("X", xm)
         self._apply_pauli_mask("Z", zm)
 
+    sample_pauli_noise_sync = _sample_pauli_noise_via_tab_rng
+
+    def sync_rngs(self) -> SyncRngs | None:
+        """The per-shot sync RNGs, or None unless ``sync_tableside_rng=True``."""
+        if self._tab_rngs is None:
+            return None
+        assert self._tab_rngs_x is not None and self._shot_np_rngs is not None
+        return SyncRngs(self._tab_rngs, self._tab_rngs_x, self._shot_np_rngs)
+
+    def measurement_column(self, index: int) -> NDArray[np.bool_]:
+        """Measurement record column ``index`` (one bit per shot). Do not modify it in place."""
+        return self._measurement_columns[index]
+
+    def overwrite_measurement_column(self, index: int, values: NDArray[np.bool_]) -> None:
+        """Overwrite measurement record column ``index`` in place."""
+        self._measurement_columns[index][:] = values
+
     def clear(self) -> None:
         self._measurement_columns.clear()
         self._cached_m2d: tuple[NDArray[np.bool_], NDArray[np.bool_]] | None = None
@@ -279,7 +297,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._shot_tabs: list[ReferenceCHPTableau] | None = None
         self._active_plan: DirectPlan | SelectorPlan | None = None
         self._shot_sel_bits: list[NDArray[np.bool_] | None] | None = None
-        self._branch_masses = np.ones(self.batch_size, dtype=np.float64)
+        self._log_branch_masses = np.zeros(self.batch_size, dtype=np.float64)
         self._pending_magic: list[MagicTermRecord] = []
         self._corr_occurred = np.zeros(self.batch_size, dtype=np.bool_)
 
@@ -351,7 +369,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             qplan, self.batch_size, rng=self.np_rng, fault_realizations=q_reals,
             sweep_bits=self._sweep_mat, extract_data=False,
         )
-        self._branch_masses = np.array([t.branch_mass for t in trajs], dtype=np.float64)
+        self._log_branch_masses = _log0(np.array([t.branch_mass for t in trajs], dtype=np.float64))
         self._finish_compiled_batch(
             qplan.compiled_plan, recs, [t.final_tableau for t in trajs],  # type: ignore[misc]
             [t.expansion for t in trajs], [t.selector_bits for t in trajs],  # type: ignore[misc]
@@ -415,7 +433,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             try:
                 res = run_selector(plan, extract_data=False, **kw) if isinstance(plan, SelectorPlan) else run_direct(plan, **kw)
             except ImpossiblePostselectionError:
-                recs[s], self._branch_masses[s] = [bool(c_map.get(j, 0)) for j in range(plan.num_measurements)], 0.0
+                recs[s] = [bool(c_map.get(j, 0)) for j in range(plan.num_measurements)]
+                self._log_branch_masses[s] = -math.inf
                 exps.append(ShotExpansion.from_components((), n_qubits=plan.final_tableau.num_qubits, merge=False, atol=self.atol))
                 tabs.append(plan.final_tableau.copy())
                 sel_bits.append(np.zeros(plan.num_selector_qubits, dtype=np.bool_) if isinstance(plan, SelectorPlan) else None)
@@ -424,7 +443,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                     raise QueryBudgetExceededError(str(exc)) from exc
                 raise
             else:
-                recs[s], self._branch_masses[s] = res.measurements, res.branch_mass * mass_scale
+                recs[s] = res.measurements
+                self._log_branch_masses[s] = res.log_branch_mass + _log0(mass_scale)
                 exps.append(res.expansion)
                 tabs.append(res.final_tableau)
                 sel_bits.append(res.selector_bits)
@@ -513,12 +533,12 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             if c > 0:
                 self._apply_factor_list(s, facs[c - 1])
 
-    def _next_step_meta(self, _op: stim.CircuitInstruction) -> None:
+    def _next_step_meta(self, op: stim.CircuitInstruction) -> None:
         pass
 
     def do_copies_on_fused_step(
         self,
-        _op: stim.CircuitInstruction,
+        op: stim.CircuitInstruction,
         copies: list[stim.CircuitInstruction],
         do_copy: Callable[[stim.CircuitInstruction], None],
     ) -> None:
@@ -564,6 +584,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         emit_magic_terms(
             op.tag, validate_magic_op(op) if qs is None else qs, self._live_ref_tab, self._pending_magic
         )
+
+    emit_magic_op = _emit_magic_op
 
     def _do_bare_instruction(self, op: stim.Circuit | stim.CircuitInstruction) -> None:
         if isinstance(op, stim.Circuit):
@@ -672,10 +694,11 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def _project_substep_batch(self, rec: MeasurementRecord | ResetRecord) -> NDArray[np.bool_]:
         m_shots = np.zeros(self.batch_size, dtype=np.bool_)
         obs = rec.obs_axis
+        idx: list[int] = []
         for b in range(self.batch_size):
             exp = self._live_exps[b]
             if exp.chi == 0:
-                self._branch_masses[b] = 0.0
+                self._log_branch_masses[b] = -math.inf
                 continue
             if rec.rot_axis is None and exp.d == 0 and exp.chi == 1:
                 bit = ((obs.kappa >> 1) ^ word_dot_parity(obs.b_words, exp.h_words[0])) & 1
@@ -683,26 +706,27 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 if isinstance(rec, ResetRecord) and (bool(bit) != rec.reset_flip_ref):
                     self._live_exps[b] = apply_pauli(exp, rec.reset_kick_axis)
                 continue
-            sampler = (
-                None
-                if self._tab_rngs is None
-                else lambda p1, s=b: (
-                    0
-                    if p1 <= K1_CANCEL_REL_TOL
-                    else (1 if p1 >= 1.0 - K1_CANCEL_REL_TOL else self._sample_sync_born_bit(s, p1))
-                )
+            idx.append(b)
+        if not idx:
+            return m_shots
+        sampler = (
+            None
+            if self._tab_rngs is None
+            else lambda i, p1: (
+                0 if p1 <= K1_CANCEL_REL_TOL
+                else 1 if p1 >= 1.0 - K1_CANCEL_REL_TOL
+                else self._sample_sync_born_bit(idx[i], p1)
             )
-            m_res = measure_expansion(
-                exp, obs, rng=self.np_rng, sample_outcome=sampler,
-                renormalize=True, keep_rotated_frame=(rec.rot_axis is not None), atol=self.atol,
-            )
-            post = m_res.post_state
-            zin = m_res.z0 + m_res.z1
-            if zin > 0.0:
-                self._branch_masses[b] *= (m_res.z1 if m_res.outcome else m_res.z0) / zin
-            if isinstance(rec, ResetRecord) and (bool(m_res.outcome) != rec.reset_flip_ref):
+        )
+        out, z0, z1, posts = measure_expansions_batch(
+            [self._live_exps[b] for b in idx], obs, rng=self.np_rng, sample_outcome=sampler,
+            keep_rotated_frame=(rec.rot_axis is not None), atol=self.atol,
+        )
+        self._log_branch_masses[idx] += _log0(np.where(out, z1, z0) / (z0 + z1))
+        m_shots[idx] = out
+        for b, post, outcome in zip(idx, posts, out.tolist()):
+            if isinstance(rec, ResetRecord) and (outcome != rec.reset_flip_ref):
                 post = apply_pauli(post, rec.reset_kick_axis)
-            m_shots[b] = bool(m_res.outcome)
             self._live_exps[b] = post
         return m_shots
 
@@ -953,7 +977,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._live_exps[b] = m_res.post_state
             zin = m_res.z0 + m_res.z1
             if zin > 0.0:
-                self._branch_masses[b] *= (m_res.z1 if m_res.outcome else m_res.z0) / zin
+                self._log_branch_masses[b] += _log0((m_res.z1 if m_res.outcome else m_res.z0) / zin)
 
     def do_unmatched_noisy_reset_z(self, reset_zero_mask: NDArray[np.bool_], reset_one_mask: NDArray[np.bool_], pauli: Literal["X", "Y", "Z"] = "Z", order: Sequence[int] | None = None) -> None:
         comb = reset_zero_mask | reset_one_mask
@@ -1086,7 +1110,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
     def get_branch_mass(self, shot: int = 0) -> float:
         self._flush_magic()
-        return float(self._branch_masses[self._validate_shot_idx(shot)])
+        return math.exp(float(self._log_branch_masses[self._validate_shot_idx(shot)]))
 
     def state_vector(
         self, shot: int = 0, *, endian: Literal["little", "big"] = "little", trace_selectors: bool = True, normalize: bool = True,
@@ -1095,7 +1119,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         s = self._validate_shot_idx(shot)
         if endian not in ("little", "big"):
             raise ValueError(f"endian must be 'little' or 'big', got {endian!r}")
-        scale = 1.0 if normalize else math.sqrt(max(0.0, float(self._branch_masses[s])))
+        scale = 1.0 if normalize else math.exp(0.5 * float(self._log_branch_masses[s]))
         if self._logical_nq == 0:
             return np.array([complex(scale)], dtype=np.complex128)
         tab, exp, fevs = self._resolve_shot_state(s, bool(trace_selectors))

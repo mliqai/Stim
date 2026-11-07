@@ -1,4 +1,8 @@
+import pickle
+import warnings
+
 import numpy as np
+import pytest
 import sinter
 import stim # type: ignore[import-untyped]
 
@@ -419,3 +423,21 @@ def test_sample_batches_honours_sinter_decoder_discard_byte() -> None:
     stats = sampler.compiled_sampler_for_task(sinter.Task(circuit=circuit, decoder="vacuous")).sample(2048)
     assert stats.errors == 0
     assert abs(stats.discards / stats.shots - 0.4) < 5 * (0.4 * 0.6 / stats.shots) ** 0.5
+
+
+def test_batch_size_above_one_warns_once_about_shared_trajectory() -> None:
+    task = sinter.Task(circuit=stim.Circuit("R 0\nM 0\nDETECTOR rec[-1]"), decoder="vacuous")
+    with pytest.warns(UserWarning, match="share one leakage trajectory") as caught:
+        sampler = TablesideSampler(
+            TrivialOpHandler(), BaseDecoder(decoder="vacuous"), batch_size=64
+        )
+        sampler.compiled_sampler_for_task(task).sample(64)
+        pickle.loads(pickle.dumps(sampler)).compiled_sampler_for_task(task).sample(64)
+    assert sum("share one leakage trajectory" in str(w.message) for w in caught) == 1
+
+
+def test_batch_size_one_does_not_warn() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        TablesideSampler(TrivialOpHandler(), BaseDecoder(decoder="vacuous"), batch_size=1)
+        TablesideSampler(TrivialOpHandler(), BaseDecoder(decoder="vacuous"))

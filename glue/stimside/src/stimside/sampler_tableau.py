@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import warnings
+
 import stim  # type: ignore[import-untyped]
 
-from stimside._sampling import CompiledSamplerBase, SamplerBase
-from stimside.dem_generators.leakage_decoder import CompiledLeakageDecoder
-from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
+from stimside._sampling import _DEFAULT_BATCH, CompiledSamplerBase, SamplerBase
+from stimside.dem_generators.leakage_decoder import CompiledLeakageDecoder, LeakageDecoderLike
+from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler
 from stimside.simulator_tableau import TablesideSimulator
 
 
@@ -42,3 +44,22 @@ class CompiledTablesideSampler(CompiledSamplerBase):
 class TablesideSampler(SamplerBase):
     _compiled_cls = CompiledTablesideSampler
     _default_batch_size = 1
+
+    def __init__(
+        self,
+        op_handler: OpHandler[TablesideSimulator],
+        dem_decoder: LeakageDecoderLike,
+        batch_size: int = _DEFAULT_BATCH,
+        seed: int | None = None,
+    ) -> None:
+        super().__init__(op_handler, dem_decoder, batch_size, seed)
+        if self.batch_size > 1:
+            warnings.warn(
+                f"TablesideSampler(batch_size={self.batch_size}): the shots of a batch share one "
+                "leakage trajectory unless the circuit conditions on 0/1 (or sync mode is on, "
+                "which TablesideSampler does not enable), so sinter's error bars treat "
+                "correlated shots as independent. Use batch_size=1 or CosetsideSampler for "
+                "independent shots.",
+                UserWarning,
+                stacklevel=2,
+            )
