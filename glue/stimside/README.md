@@ -20,6 +20,8 @@ pip install -e .
 pip install .
 ```
 
+The kernels are compiled with `-march=native` on x86 and ARM64 machines, so a build made on one CPU may not run on a different one. Set `STIMSIDE_PORTABLE_BUILD=1` in the environment of the build (`STIMSIDE_PORTABLE_BUILD=1 pip install .`, or the first `import stimside` that compiles a kernel from source) to leave `-march=native` out, e.g. for a build you will copy to other machines. `pip install` always rebuilds the kernels, but an `import` recompiles a kernel only if its library is missing or older than its source, so to switch an existing in-tree build to portable, reinstall with `pip install` (or delete the `lib*.so` files).
+
 `BranchAndBoundDecoder`, and so the paper examples `examples/paper_static_surface_code.py` and `examples/paper_moonwalking_surface_code.py`, need the PyMatching version with per-shot `edge_reweights` (and `return_no_matching`) in `Matching.decode_batch`; with the released `pymatching` package it raises `ImportError`. `MarginalDecoder(decompose_errors=True, reweight_only=True)` works with either: without per-shot `edge_reweights` it decodes each distinct reweighted DEM instead, which is slower. So does `decode_with_generated_dems` with a `sinter.Decoder` or `"pymatching"`, but not with a `pymatching.Matching` instance: that decodes `edge_reweights` with `Matching.decode_batch(..., edge_reweights=...)`, which raises `TypeError` with the released package.
 
 ## Running Tests
@@ -236,7 +238,7 @@ if __name__ == "__main__":
 
 ### Top-Level `stimside` Exports
 
-All four simulators, samplers, op handlers (with `LeakageUint8Flip` and `LeakageUint8Tableau` aliases alongside the submodule `LeakageUint8` names), `TrivialOpHandler`, decoders, and Magicside query primitives are exported directly at the package root (`import stimside`):
+All four simulators, samplers, op handlers (the classes are named `LeakageUint8Flip`, `LeakageUint8Tableau`, `LeakageUint8Coset` and `LeakageUint8Magic`; the older names `LeakageUint8` and `CompiledLeakageUint8` survive only as aliases inside the `leakage_uint8_flip` and `leakage_uint8_tableau` submodules and are not exported at the package root), `TrivialOpHandler`, decoders, and Magicside query primitives are exported directly at the package root (`import stimside`):
 - **Simulators & samplers:** `FlipsideSimulator`, `FlipsideSampler`, `TablesideSimulator`, `TablesideSampler`, `CosetsideSimulator`, `CosetsideSampler`, `MagicsideSimulator`, `MagicsideSampler`, `CompiledMagicsideSampler`.
 - **Op handlers:** `OpHandler`, `CompiledOpHandler`, `TrivialOpHandler`, `LeakageUint8Flip`, `CompiledLeakageUint8Flip`, `LeakageUint8Tableau`, `CompiledLeakageUint8Tableau`, `LeakageUint8Coset`, `CompiledLeakageUint8Coset`, `LeakageUint8Magic`, `CompiledLeakageUint8Magic`.
 - **Decoders & DEM generation:** `LeakageDecoder`, `BaseDecoder`, `CallableDecoder`, `MarginalDecoder`, `BranchAndBoundDecoder`, `MarginalLeakageDemGenerator`.

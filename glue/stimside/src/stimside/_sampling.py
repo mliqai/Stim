@@ -18,14 +18,20 @@ from stimside.dem_generators.leakage_decoder import (
 from stimside.op_handlers.abstract_op_handler import OpHandler, TrivialOpHandler
 
 
-def next_compiled_seed(seed: int | None, idx: int, salt: int) -> int | None:
-    """Return `seed` on `(idx=0, salt=0)` or a deterministic per-compile/per-worker 30-bit seed."""
+def next_compiled_seed(seed: int | None, idx: int, salt: int | tuple[int, ...]) -> int | None:
+    """Return `seed` for `(idx=0, salt=0)`, else a deterministic per-copy/per-compile 63-bit seed.
+
+    `salt` is a `SeedSequence` spawn key (an int is a 1-tuple). Keys whose entries are below 2**32
+    give distinct streams; `SeedSequence` splits larger entries into 32-bit words, so e.g.
+    `(2**32,)` and `(0, 1)` would coincide (unreachable: copy indices and pid deltas stay small).
+    """
     if seed is None:
         return None
-    if idx == 0 and salt == 0:
+    key = (salt,) if isinstance(salt, int) else tuple(salt)
+    if idx == 0 and key == (0,):
         return int(seed)
-    ss = np.random.SeedSequence([int(seed), int(idx), int(salt)])
-    return int(ss.generate_state(1, dtype=np.uint32)[0] & 0x3FFFFFFF)
+    ss = np.random.SeedSequence(int(seed), spawn_key=(*key, int(idx)))
+    return int(ss.generate_state(1, dtype=np.uint64)[0]) & 0x7FFFFFFFFFFFFFFF
 
 
 def sample_batches(
@@ -178,21 +184,30 @@ class SamplerBase(sinter.Sampler):
         self._compile_count = 0
         self._spawn_count = 0
         self._worker_index: int | None = None
+        self._spawn_key: tuple[int, ...] = ()
 
     def __getstate__(self) -> dict[str, Any]:
-        # Each pickled copy (sinter pickles one per worker) gets its own seed salt.
+        # Each pickled copy gets its own spawn key, extending its parent's, so that copies of
+        # copies never share a stream with each other or with their parent.
         state = self.__dict__.copy()
         state["_worker_index"] = self._spawn_count
+        state["_spawn_key"] = (*self._spawn_key, self._spawn_count)
         self._spawn_count += 1
         return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        if "_spawn_key" not in state:  # pickled before spawn keys: its copy index is the key
+            wi = state.get("_worker_index")
+            state = {**state, "_spawn_key": () if wi is None else (wi,)}
+        self.__dict__.update(state)
 
     def _next_compiled_seed(self) -> int | None:
         idx = self._compile_count
         self._compile_count = idx + 1
-        salt = self._worker_index
-        if salt is None:  # not a pickled copy: salt by process
-            salt = (os.getpid() - self._init_pid) & 0xFFFFFFFF
-        return next_compiled_seed(self.seed, idx, salt)
+        key = self._spawn_key
+        if not key:  # not a pickled copy: salt by process
+            key = ((os.getpid() - self._init_pid) & 0xFFFFFFFF,)
+        return next_compiled_seed(self.seed, idx, key)
 
     def compiled_sampler_for_task(self, task: sinter.Task) -> sinter.CompiledSampler:
         if task.circuit is None:

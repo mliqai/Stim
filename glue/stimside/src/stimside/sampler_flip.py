@@ -4,7 +4,7 @@ import sinter
 import stim  # type: ignore[import-untyped]
 
 from stimside._sampling import CompiledSamplerBase, SamplerBase, _DEFAULT_BATCH
-from stimside.dem_generators import BranchAndBoundDecoder, MarginalDecoder
+from stimside.dem_generators import BranchAndBoundDecoder, CallableDecoder, MarginalDecoder
 from stimside.dem_generators.leakage_decoder import (
     CompiledLeakageDecoder,
     LeakageDecoder,
@@ -24,9 +24,14 @@ def _reject_loss_oracle(needs_leakage_events: bool) -> None:
 
 
 def _reject_skip_semantics_decoder(dem_decoder: LeakageDecoder) -> None:
-    if isinstance(dem_decoder, (MarginalDecoder, BranchAndBoundDecoder)):
+    inner: object = dem_decoder
+    seen: set[int] = set()  # a cyclic wrapper chain holds no decoder to reject: stop unwrapping
+    while isinstance(inner, CallableDecoder) and id(inner) not in seen:
+        seen.add(id(inner))  # a wrapper must not hide the decoder it calls
+        inner = inner.fn
+    if isinstance(inner, (MarginalDecoder, BranchAndBoundDecoder)):
         raise ValueError(
-            f"FlipsideSampler cannot run {type(dem_decoder).__name__}: its DEMs model leaked "
+            f"FlipsideSampler cannot run {type(inner).__name__}: its DEMs model leaked "
             "qubits as frozen, with untagged gates skipped by default, but FlipsideSimulator "
             "depolarizes leaked qubits and applies the gates. Use TablesideSampler or "
             "CosetsideSampler, or BaseDecoder with FlipsideSampler."

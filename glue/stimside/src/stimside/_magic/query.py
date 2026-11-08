@@ -22,7 +22,6 @@ from stimside._magic.channels import (
     FeedbackPauliRecord,
     HeraldedNoiseRecord,
     LeakageBarrierRecord,
-    MagicTermRecord,
     MeasurementRecord,
     MPadRecord,
     PauliNoiseRecord,
@@ -41,7 +40,6 @@ from stimside._magic.plan import (
     SelectorPlan,
     TrajectoryRunResult,
     compile_direct,
-    compile_open_block,
     compile_selector,
 )
 from stimside._magic.statevector import extract_data_expansion
@@ -91,6 +89,7 @@ __all__ = [
 # which bounds each segment-tree leaf. The target_spec ket is compiled once per PrepareQueries call
 # (and again per EvaluateQueries call that overrides target_spec). It is only applied to a ket, not
 # contracted per node, so it does not need that bound; no reason is recorded for its 8.
+_C2_BUDGET = 64
 _QUERY_C2_MAX_RANK = 6
 _TARGET_C2_MAX_RANK = 8
 _EMPTY_DEPS = ((), (), ())
@@ -269,6 +268,12 @@ class _SegTreeNode:
 
 
 class _EvalCtx:
+    visited: set[int]
+    p_map: dict[int, int]
+    r_map: dict[int, int]
+    m_map: dict[int, int]
+    q_map: dict[int, int]
+
     def __init__(
         self,
         budget: QueryBudget,
@@ -439,7 +444,7 @@ def _tensor_pairs(
         a_un,
         G_tot,
         piv_tot,
-        np.kron(L.weights, R.weights),
+        np.asarray(np.kron(L.weights, R.weights), dtype=np.complex128),
         h_tot,
         np.hstack([ell_L, ell_R]) if d_tot else ell_L,
         np.concatenate([L.ell_odd, R.ell_odd]),
@@ -493,6 +498,60 @@ def _contract_choi(
     return out_se
 
 
+_TargetPair = tuple[Any, ShotExpansion]
+
+
+def _target_pair_from_circuit(target_spec: stim.Circuit, k: int, atol: float) -> _TargetPair | str:
+    """Compile a unitary Clifford(+T/CCZ) target circuit to `(tableau, ket)`, or "empty" (k=0)."""
+    if target_spec.num_qubits > k:
+        raise ValueError(f"target_spec circuit qubits {target_spec.num_qubits} > {k}")
+    padded = target_spec.copy()
+    if k > 0 and padded.num_qubits < k:
+        padded.append("I", [k - 1])
+    t_plan = compile_direct(padded, c2_budget=_C2_BUDGET, c2_max_rank=_TARGET_C2_MAX_RANK)
+    blocks = [r for r in t_plan.records if isinstance(r, CompiledOpenBlockRecord)]
+    if t_plan.fault_channels or len(blocks) != len(t_plan.records):
+        raise ValueError(
+            "target_spec circuit must contain only unitary Clifford and I[T]/I[T_DAG]/I[CCZ] gates"
+        )
+    if k == 0:
+        return "empty"
+    exp_c = ShotExpansion.zero(k, atol=atol)
+    for rec in blocks:
+        exp_c = apply_compiled_block(exp_c, rec.block, check_unitary=True, atol=atol)
+    return (t_plan.final_tableau, exp_c)
+
+
+def _target_pair_from_dense(target_spec: Any, k: int, atol: float) -> _TargetPair | str:
+    """Convert a dense statevector target to `(tableau, ket)`, or "empty" (k=0)."""
+    if k > 20:
+        raise ValueError(f"Dense statevector target_spec exceeds 20 qubits (k={k})")
+    arr = np.asarray(target_spec, dtype=np.complex128)
+    nrm2 = float(np.vdot(arr, arr).real) if (arr.ndim == 1 and arr.shape == (1 << k,)) else -1.0
+    if not math.isfinite(nrm2) or nrm2 <= 1e-15:
+        raise ValueError("Invalid dense target_spec shape or norm")
+    if k == 0:
+        return "empty"
+    nz = np.flatnonzero(np.abs(arr) > 1e-15 * math.sqrt(nrm2))
+    return (
+        ReferenceCHPTableau(k),
+        ShotExpansion(
+            k,
+            0,
+            np.zeros((0, 1), dtype=np.uint64),
+            np.zeros(1, dtype=np.uint64),
+            np.zeros((0, 0), dtype=np.uint8),
+            np.zeros(0, dtype=np.int32),
+            np.ascontiguousarray(arr[nz] / math.sqrt(nrm2), dtype=np.complex128),
+            np.ascontiguousarray(nz.astype(np.uint64)[:, None]),
+            np.zeros((int(nz.shape[0]), 0), dtype=np.uint8),
+            np.zeros(0, dtype=np.uint8),
+            atol=atol,
+            _is_canonical_merged=True,
+        ),
+    )
+
+
 def _compile_target_spec(
     target_spec: Any, output_qubits: tuple[int, ...], atol: float
 ) -> tuple[ReferenceCHPTableau, ShotExpansion] | str | None:
@@ -504,36 +563,10 @@ def _compile_target_spec(
             raise ValueError(f"target_spec Tableau length {len(target_spec)} > {k}")
         target_spec = target_spec.to_circuit(method="elimination")
     if isinstance(target_spec, stim.Circuit):
-        if target_spec.num_qubits > k:
-            raise ValueError(f"target_spec circuit qubits {target_spec.num_qubits} > {k}")
-        padded = target_spec.copy()
-        if k > 0 and padded.num_qubits < k:
-            padded.append("I", [k - 1])
-        t_plan = compile_direct(padded, c2_budget=64, c2_max_rank=_TARGET_C2_MAX_RANK)
-        if t_plan.fault_channels or any(
-            not isinstance(r, (CompiledOpenBlockRecord, MagicTermRecord)) for r in t_plan.records
-        ):
-            raise ValueError(
-                "target_spec circuit must contain only unitary Clifford and "
-                "I[T]/I[T_DAG]/I[CCZ] gates"
-            )
-        if k == 0:
-            return "empty"
-        exp_c = ShotExpansion.zero(k, atol=atol)
-        for rec in t_plan.records:
-            for sb in (
-                (rec,)
-                if isinstance(rec, CompiledOpenBlockRecord)
-                else compile_open_block(
-                    (rec,), n_qubits=k, budget=64, c2_max_rank=_TARGET_C2_MAX_RANK
-                )
-            ):
-                exp_c = (
-                    apply_compiled_block(exp_c, sb.block, check_unitary=True, atol=atol)
-                    if isinstance(sb, CompiledOpenBlockRecord)
-                    else exp_c
-                )
-        target_spec = (t_plan.final_tableau, exp_c)
+        pair = _target_pair_from_circuit(target_spec, k, atol)
+        if isinstance(pair, str):
+            return pair
+        target_spec = pair
     elif isinstance(target_spec, (PhaseQFEComponent, ShotExpansion)):
         target_spec = (ReferenceCHPTableau(target_spec.n_qubits), target_spec)
     elif isinstance(target_spec, ReferenceCHPTableau):
@@ -544,35 +577,10 @@ def _compile_target_spec(
         and isinstance(target_spec[0], (stim.Tableau, ReferenceCHPTableau))
     )
     if isinstance(target_spec, (np.ndarray, list, tuple)) and not is_pair:
-        if k > 20:
-            raise ValueError(f"Dense statevector target_spec exceeds 20 qubits (k={k})")
-        arr = np.asarray(target_spec, dtype=np.complex128)
-        nrm2 = float(np.vdot(arr, arr).real) if (arr.ndim == 1 and arr.shape == (1 << k,)) else -1.0
-        if not math.isfinite(nrm2) or nrm2 <= 1e-15:
-            raise ValueError("Invalid dense target_spec shape or norm")
-        if k == 0:
-            return "empty"
-        nz = np.flatnonzero(np.abs(arr) > 1e-15 * math.sqrt(nrm2))
-        target_spec, is_pair = (
-            (
-                ReferenceCHPTableau(k),
-                ShotExpansion(
-                    k,
-                    0,
-                    np.zeros((0, 1), dtype=np.uint64),
-                    np.zeros(1, dtype=np.uint64),
-                    np.zeros((0, 0), dtype=np.uint8),
-                    np.zeros(0, dtype=np.int32),
-                    np.ascontiguousarray(arr[nz] / math.sqrt(nrm2), dtype=np.complex128),
-                    np.ascontiguousarray(nz.astype(np.uint64)[:, None]),
-                    np.zeros((int(nz.shape[0]), 0), dtype=np.uint8),
-                    np.zeros(0, dtype=np.uint8),
-                    atol=atol,
-                    _is_canonical_merged=True,
-                ),
-            ),
-            True,
-        )
+        pair = _target_pair_from_dense(target_spec, k, atol)
+        if isinstance(pair, str):
+            return pair
+        target_spec, is_pair = pair, True
     if not is_pair:
         raise TypeError(f"Unsupported target_spec type: {type(target_spec)!r}")
     raw_ref_t, exp_t = target_spec
@@ -605,7 +613,8 @@ def _normalize_acceptance_spec(acc_spec: Any, num_meas: int) -> tuple[str, Any]:
         return ("all", None) if acc_spec is None else ("callable", acc_spec)
     if not isinstance(acc_spec, Mapping):
         raise TypeError(f"Invalid acceptance_spec: {type(acc_spec)!r}")
-    norm_map, imp = {}, False
+    norm_map: dict[int, int] = {}
+    imp = False
     for raw_k, raw_v in acc_spec.items():
         idx = coerce_strict_int(raw_k, "acceptance_spec key")
         idx, bit = (
@@ -766,8 +775,6 @@ def _compute_partial_trace_fidelity_mass(
 def _record_axes(rec: Any) -> Sequence[CompiledPauliAxis]:
     if isinstance(rec, CompiledOpenBlockRecord):
         return rec.axes
-    if isinstance(rec, MagicTermRecord):
-        return rec.term.axes
     if isinstance(rec, DirectFaultSlotRecord):
         return [
             ax
@@ -787,70 +794,32 @@ def _record_axes(rec: Any) -> Sequence[CompiledPauliAxis]:
     return ()
 
 
-def PrepareQueries(
-    circuit: stim.Circuit,
-    *,
-    fault_mode: str = "DIRECT",
-    fault_channels: Sequence[CliffordFaultChannel] | None = None,
-    target_spec: Any = None,
-    output_qubits: Sequence[int] | None = None,
-    acceptance_spec: Mapping[int, int | bool] | Callable[[NDArray[np.bool_]], bool] | None = None,
-    budget: QueryBudget | None = None,
-    atol: float = DEFAULT_ATOL,
-) -> PreparedQueryPlan:
-    """`Q1`: Compile `circuit` into a dependency-tracked QFE Choi/Ket segment-tree plan."""
-    if not isinstance(circuit, stim.Circuit):
-        raise TypeError(f"Expected stim.Circuit, got {type(circuit)!r}")
-    if not isinstance(fault_mode, str) or fault_mode.strip().upper() not in ("DIRECT", "SELECTOR"):
-        raise ValueError(f"fault_mode must be 'DIRECT' or 'SELECTOR', got {fault_mode!r}")
-    mode_norm, tol, eff_budget = (
-        fault_mode.strip().upper(),
-        validate_atol(atol),
-        (QueryBudget() if budget is None else budget),
-    )
-    if not isinstance(eff_budget, QueryBudget):
-        raise TypeError(f"Expected QueryBudget, got {type(eff_budget)!r}")
+def _compile_plan(
+    circuit: stim.Circuit, mode_norm: str, fault_channels: Sequence[CliffordFaultChannel] | None
+) -> DirectPlan | SelectorPlan:
     compiled: DirectPlan | SelectorPlan = (
         compile_direct(
-            circuit, fault_channels=fault_channels, c2_budget=64, c2_max_rank=_QUERY_C2_MAX_RANK
+            circuit,
+            fault_channels=fault_channels,
+            c2_budget=_C2_BUDGET,
+            c2_max_rank=_QUERY_C2_MAX_RANK,
         )
         if mode_norm == "DIRECT"
         else compile_selector(
             circuit,
             fault_channels=fault_channels,
             gadgetize_pauli_noise=False,
-            c2_budget=64,
+            c2_budget=_C2_BUDGET,
             c2_max_rank=_QUERY_C2_MAX_RANK,
         )
     )
     if any(isinstance(rec, LeakageBarrierRecord) for rec in compiled.records):
         raise ValueError("Unsupported leakage tag in PrepareQueries")
-    n_data, n_op = (
-        (compiled.num_qubits if isinstance(compiled, DirectPlan) else compiled.num_data_qubits),
-        max(
-            1,
-            compiled.num_qubits if isinstance(compiled, DirectPlan) else compiled.num_total_qubits,
-        ),
-    )
-    nw_op, logical_nq = (
-        n_words_for_qubits(n_op),
-        max(
-            [int(circuit.num_qubits)]
-            + [q + 1 for ch in compiled.fault_channels for br in ch.branches for q in br.targets]
-        ),
-    )
-    out_qs = (
-        tuple(range(logical_nq))
-        if output_qubits is None
-        else tuple(coerce_strict_int(q, "output_qubit") for q in output_qubits)
-    )
-    if any(q < 0 or q >= logical_nq for q in out_qs) or len(set(out_qs)) != len(out_qs):
-        raise ValueError(f"Invalid output_qubits={list(out_qs)} for num_data_qubits={logical_nq}")
-    comp_target = _compile_target_spec(target_spec, out_qs, tol)
-    _normalize_acceptance_spec(acceptance_spec, compiled.num_measurements)
-    slot_id_to_idx = {i: i for i in range(len(compiled.fault_channels))} | {
-        int(ch.slot_id): i for i, ch in enumerate(compiled.fault_channels) if ch.slot_id is not None
-    }
+    return compiled
+
+
+def _active_qubits(compiled: DirectPlan | SelectorPlan, nw_op: int, n_op: int) -> tuple[int, ...]:
+    """Qubits touched by any record axis or selector group (never empty)."""
     x_union = np.zeros(nw_op, dtype=np.uint64)
     for rec in compiled.records:
         for ax in _record_axes(rec):
@@ -861,8 +830,14 @@ def PrepareQueries(
         for sq in s_grp
     ):
         x_union[sq >> 6] |= np.uint64(1) << np.uint64(sq & 63)
-    q_act = tuple(q for q in range(n_op) if ((int(x_union[q >> 6]) >> (q & 63)) & 1)) or (0,)
-    n_choi, sel_ins = n_op + len(q_act), {}
+    return tuple(q for q in range(n_op) if ((int(x_union[q >> 6]) >> (q & 63)) & 1)) or (0,)
+
+
+def _selector_slot_inserts(
+    compiled: DirectPlan | SelectorPlan, nw_op: int
+) -> dict[int, list[DirectFaultSlotRecord]]:
+    """Fault-slot records inserted before the first record each selector group touches."""
+    sel_ins: dict[int, list[DirectFaultSlotRecord]] = {}
     if isinstance(compiled, SelectorPlan):
         z0 = np.zeros(nw_op, dtype=np.uint64)
         for s_idx, s_grp in enumerate(compiled.fault_selector_groups):
@@ -888,19 +863,25 @@ def PrepareQueries(
             sel_ins.setdefault(fpos, []).append(
                 DirectFaultSlotRecord(s_idx, bfacs, np.empty(0, dtype=np.float64))
             )
-    ops, dyn, noise_meta, rc, cs = [], [], {}, 0, ()
+    return sel_ins
+
+
+def _build_ops(
+    compiled: DirectPlan | SelectorPlan,
+    sel_ins: dict[int, list[DirectFaultSlotRecord]],
+    n_op: int,
+    n_choi: int,
+) -> tuple[tuple[Any, ...], tuple[Any, ...], dict[int, str]]:
+    """Flatten records into segment-tree leaves `ops` plus dynamic records `dyn` and noise kinds."""
+    ops: list[tuple[Any, Any, Any]] = []
+    dyn: list[tuple[int, Any, Any]] = []
+    noise_meta: dict[int, str] = {}
+    rc = 0
+    cs: tuple[int, ...] = ()
     for r_i, rec in enumerate(compiled.records):
         ops.extend((sr, None, ((sr.slot_index,), (), ())) for sr in sel_ins.get(r_i, ()))
         if isinstance(rec, CompiledOpenBlockRecord):
             ops.append((_pad_block(rec.block, n_op), _pad_block(rec.block, n_choi), _EMPTY_DEPS))
-        elif isinstance(rec, MagicTermRecord):
-            ops.extend(
-                (_pad_block(sb.block, n_op), _pad_block(sb.block, n_choi), _EMPTY_DEPS)
-                for sb in compile_open_block(
-                    (rec,), n_qubits=n_op, budget=64, c2_max_rank=_QUERY_C2_MAX_RANK
-                )
-                if isinstance(sb, CompiledOpenBlockRecord)
-            )
         elif isinstance(rec, DirectFaultSlotRecord):
             ops.append((rec, None, ((rec.slot_index,), (), ())))
         elif isinstance(rec, FeedbackPauliRecord):
@@ -917,7 +898,7 @@ def PrepareQueries(
                 (cs if getattr(rec, "is_else", False) else ()),
             )
             noise_meta[ni], cs = (
-                ("CORRELATED_ERROR" if is_corr else rec.kind),
+                ("CORRELATED_ERROR" if isinstance(rec, CorrelatedNoiseRecord) else rec.kind),
                 ((*prior, ni) if is_corr else cs),
             )
             dyn.append((len(ops), rec, (ni, prior) if is_corr else ni))
@@ -927,11 +908,18 @@ def PrepareQueries(
     ops.extend(
         (sr, None, ((sr.slot_index,), (), ())) for sr in sel_ins.get(len(compiled.records), ())
     )
-    otup, nodes = tuple(ops), []
+    return tuple(ops), tuple(dyn), noise_meta
+
+
+def _build_segment_tree(
+    otup: tuple[Any, ...],
+) -> tuple[_SegTreeNode | None, tuple[_SegTreeNode | None, ...]]:
+    """Pre-order segment tree over the op leaves; returns `(root, nodes)` indexed by node id."""
+    nodes: list[_SegTreeNode | None] = []
 
     def _build(l: int, r: int) -> _SegTreeNode:
         nid = len(nodes)
-        nodes.append(None)  # type: ignore[arg-type]
+        nodes.append(None)
         if r - l == 1:
             u = _SegTreeNode(nid, l, r, leaf=otup[l], deps=otup[l][2])
         else:
@@ -951,6 +939,74 @@ def PrepareQueries(
         return u
 
     root = _build(0, len(otup)) if otup else None
+    return root, tuple(nodes)
+
+
+def _resolve_output_qubits(
+    circuit: stim.Circuit,
+    compiled: DirectPlan | SelectorPlan,
+    output_qubits: Sequence[int] | None,
+) -> tuple[int, ...]:
+    """Validated output qubits (default: every logical qubit, incl. fault-channel targets)."""
+    logical_nq = max(
+        [int(circuit.num_qubits)]
+        + [q + 1 for ch in compiled.fault_channels for br in ch.branches for q in br.targets]
+    )
+    out_qs = (
+        tuple(range(logical_nq))
+        if output_qubits is None
+        else tuple(coerce_strict_int(q, "output_qubit") for q in output_qubits)
+    )
+    if any(q < 0 or q >= logical_nq for q in out_qs) or len(set(out_qs)) != len(out_qs):
+        raise ValueError(f"Invalid output_qubits={list(out_qs)} for num_data_qubits={logical_nq}")
+    return out_qs
+
+
+def PrepareQueries(
+    circuit: stim.Circuit,
+    *,
+    fault_mode: str = "DIRECT",
+    fault_channels: Sequence[CliffordFaultChannel] | None = None,
+    target_spec: Any = None,
+    output_qubits: Sequence[int] | None = None,
+    acceptance_spec: Mapping[int, int | bool] | Callable[[NDArray[np.bool_]], bool] | None = None,
+    budget: QueryBudget | None = None,
+    atol: float = DEFAULT_ATOL,
+) -> PreparedQueryPlan:
+    """`Q1`: Compile `circuit` into a dependency-tracked QFE Choi/Ket segment-tree plan."""
+    if not isinstance(circuit, stim.Circuit):
+        raise TypeError(f"Expected stim.Circuit, got {type(circuit)!r}")
+    if not isinstance(fault_mode, str) or fault_mode.strip().upper() not in ("DIRECT", "SELECTOR"):
+        raise ValueError(f"fault_mode must be 'DIRECT' or 'SELECTOR', got {fault_mode!r}")
+    mode_norm, tol, eff_budget = (
+        fault_mode.strip().upper(),
+        validate_atol(atol),
+        (QueryBudget() if budget is None else budget),
+    )
+    if not isinstance(eff_budget, QueryBudget):
+        raise TypeError(f"Expected QueryBudget, got {type(eff_budget)!r}")
+    compiled = _compile_plan(circuit, mode_norm, fault_channels)
+    n_data, n_op = (
+        (compiled.num_qubits if isinstance(compiled, DirectPlan) else compiled.num_data_qubits),
+        max(
+            1,
+            compiled.num_qubits if isinstance(compiled, DirectPlan) else compiled.num_total_qubits,
+        ),
+    )
+    nw_op, out_qs = (
+        n_words_for_qubits(n_op),
+        _resolve_output_qubits(circuit, compiled, output_qubits),
+    )
+    comp_target = _compile_target_spec(target_spec, out_qs, tol)
+    _normalize_acceptance_spec(acceptance_spec, compiled.num_measurements)
+    slot_id_to_idx = {i: i for i in range(len(compiled.fault_channels))} | {
+        int(ch.slot_id): i for i, ch in enumerate(compiled.fault_channels) if ch.slot_id is not None
+    }
+    q_act = _active_qubits(compiled, nw_op, n_op)
+    n_choi = n_op + len(q_act)
+    sel_ins = _selector_slot_inserts(compiled, nw_op)
+    otup, dyn, noise_meta = _build_ops(compiled, sel_ins, n_op, n_choi)
+    root, nodes = _build_segment_tree(otup)
     bcache: dict[Any, Any] = {}
     if isinstance(comp_target, tuple) and out_qs:
         ref_final = (
@@ -966,9 +1022,9 @@ def PrepareQueries(
         "noise": noise_meta,
         "q_act": q_act,
         "ops": otup,
-        "dyn": tuple(dyn),
+        "dyn": dyn,
         "root": root,
-        "nodes": tuple(nodes),
+        "nodes": nodes,
         "lru": OrderedDict(),
         "bytes": 0,
     }
@@ -1035,6 +1091,59 @@ def _apply_op_to_ket(
     return ket
 
 
+def _bell_expansion(q_act: tuple[int, ...], n_op: int, atol: float) -> _ScaledExpansion:
+    """The Choi identity leaf: Bell pairs between each active qubit and its ancilla."""
+    m, nw = len(q_act), n_words_for_qubits(n_op + len(q_act))
+    A = np.zeros((m, nw), dtype=np.uint64)
+    for r, q in enumerate(q_act):
+        A[r, q >> 6] ^= np.uint64(1) << np.uint64(q & 63)
+        A[r, (n_op + r) >> 6] ^= np.uint64(1) << np.uint64((n_op + r) & 63)
+    return _ScaledExpansion(
+        ShotExpansion(
+            n_op + m,
+            m,
+            A,
+            np.bitwise_or.reduce(A, axis=0),
+            np.zeros((m, m), dtype=np.uint8),
+            np.array(q_act, dtype=np.int32),
+            np.array([1.0 + 0.0j], dtype=np.complex128),
+            np.zeros((1, nw), dtype=np.uint64),
+            np.zeros((1, m), dtype=np.uint8),
+            np.zeros(m, dtype=np.uint8),
+            atol=atol,
+        ),
+        0,
+    )
+
+
+def _value_nbytes(v: Any) -> int:
+    """Approximate cache footprint of a node value (expansion or tuple of deferred pieces)."""
+    if isinstance(v, _ScaledExpansion):
+        e = v.exp
+        return int(
+            e.weights.nbytes
+            + e.h_words.nbytes
+            + e.ell.nbytes
+            + e.A_words.nbytes
+            + e.Gamma.nbytes
+            + 64
+        )
+    return sum(_value_nbytes(x) if isinstance(x, _ScaledExpansion) else 64 for x in v)
+
+
+def _cache_store(st: dict[str, Any], ckey: Any, val: Any, cap: int) -> None:
+    """LRU-insert `val` under `ckey` when it fits in `cap`, evicting oldest entries over budget."""
+    nb = _value_nbytes(val)
+    if 0 < nb <= cap:
+        old = st["lru"].pop(ckey, None)
+        st["bytes"], st["lru"][ckey] = (
+            st["bytes"] + nb - (_value_nbytes(old) if old is not None else 0),
+            (val.copy() if isinstance(val, _ScaledExpansion) else val),
+        )
+        while st["bytes"] > cap and st["lru"]:
+            st["bytes"] -= _value_nbytes(st["lru"].popitem(last=False)[1])
+
+
 def _eval_node(plan: PreparedQueryPlan, ctx: _EvalCtx, node: _SegTreeNode, *, is_choi: bool) -> Any:
     df, dm, ds = node.deps
     dkey = (
@@ -1062,27 +1171,7 @@ def _eval_node(plan: PreparedQueryPlan, ctx: _EvalCtx, node: _SegTreeNode, *, is
         allow_defer, choi_cap = ctx.budget.max_terms > 256, min(ctx.budget.max_terms, 256)
         if node.leaf is not None:
             ctx.diagnostics.node_evaluations += 1
-            m, nw = len(q_act), n_words_for_qubits(n_op + len(q_act))
-            A = np.zeros((m, nw), dtype=np.uint64)
-            for r, q in enumerate(q_act):
-                A[r, q >> 6] ^= np.uint64(1) << np.uint64(q & 63)
-                A[r, (n_op + r) >> 6] ^= np.uint64(1) << np.uint64((n_op + r) & 63)
-            bell = _ScaledExpansion(
-                ShotExpansion(
-                    n_op + m,
-                    m,
-                    A,
-                    np.bitwise_or.reduce(A, axis=0),
-                    np.zeros((m, m), dtype=np.uint8),
-                    np.array(q_act, dtype=np.int32),
-                    np.array([1.0 + 0.0j], dtype=np.complex128),
-                    np.zeros((1, nw), dtype=np.uint64),
-                    np.zeros((1, m), dtype=np.uint8),
-                    np.zeros(m, dtype=np.uint8),
-                    atol=ctx.atol,
-                ),
-                0,
-            )
+            bell = _bell_expansion(q_act, n_op, ctx.atol)
             se = _apply_leaf(bell, node.leaf, ctx, is_choi=True, enforce_terms=not allow_defer)
             val: Any = (node.leaf,) if (allow_defer and se.exp.chi > choi_cap) else se
         else:
@@ -1121,27 +1210,7 @@ def _eval_node(plan: PreparedQueryPlan, ctx: _EvalCtx, node: _SegTreeNode, *, is
         )
         ctx.diagnostics.node_evaluations += 1
         val = _apply_op_to_ket(plan, ctx, op_r, ket_l)
-    sz = lambda v: (
-        int(
-            v.exp.weights.nbytes
-            + v.exp.h_words.nbytes
-            + v.exp.ell.nbytes
-            + v.exp.A_words.nbytes
-            + v.exp.Gamma.nbytes
-            + 64
-        )
-        if isinstance(v, _ScaledExpansion)
-        else sum(sz(x) if isinstance(x, _ScaledExpansion) else 64 for x in v)
-    )
-    nb = sz(val)
-    if 0 < nb <= cap:
-        old = st["lru"].pop(ckey, None)
-        st["bytes"], st["lru"][ckey] = (
-            st["bytes"] + nb - (sz(old) if old is not None else 0),
-            (val.copy() if isinstance(val, _ScaledExpansion) else val),
-        )
-        while st["bytes"] > cap and st["lru"]:
-            st["bytes"] -= sz(st["lru"].popitem(last=False)[1])
+    _cache_store(st, ckey, val, cap)
     return val.copy() if isinstance(val, _ScaledExpansion) else val
 
 
@@ -1278,6 +1347,572 @@ def _unpack_realization(
     return faults, meas, qmeas, paulis, resets, _norm_sweep(sec.get("sweep_bits"))
 
 
+_TreeOut = tuple[
+    tuple[float, int],
+    tuple[float, int],
+    tuple[float, int],
+    bool,
+    list[tuple[float, float]],
+    NDArray[np.bool_],
+    _ScaledExpansion,
+    dict[int, int],
+    QueryDiagnostics,
+]
+
+
+@dataclass
+class _TreeRun:
+    """Mutable state shared by the helpers of one `_eval_via_tree` call."""
+
+    plan: PreparedQueryPlan
+    ctx: _EvalCtx
+    faults: dict[int, int]
+    meas_in: dict[int, int]
+    qmeas_in: dict[int, int]
+    paulis_in: dict[int, int]
+    resets_in: dict[int, int]
+    q_set: frozenset[str]
+    norm_acc: tuple[str, Any]
+    comp_target: Any
+    r_gen: np.random.Generator | None
+    stream_only: bool
+    pin: Any
+    step_w: list[list[tuple[float, int]]]
+    totals: list[tuple[float, int]]
+    m_vals: dict[int, set[int]]
+    last_ket: _ScaledExpansion
+    last_m: dict[int, int]
+
+
+def _sample_faults(
+    plan: PreparedQueryPlan, faults_in: dict[int, int], r_gen: np.random.Generator | None
+) -> dict[int, int]:
+    return {
+        i: (
+            faults_in[i]
+            if i in faults_in
+            else sample_categorical_branch(
+                [b.prob for b in ch.branches],
+                r_gen,  # type: ignore[arg-type]
+            )
+        )
+        for i, ch in enumerate(plan.compiled_plan.fault_channels)
+    }
+
+
+def _run_segment(
+    run: _TreeRun, kt: _ScaledExpansion, cl: int, cr: int, iv: bool
+) -> _ScaledExpansion:
+    if cl >= cr:
+        return kt
+    if not run.stream_only:
+        return _apply_node_range(
+            run.plan, run.ctx, run.plan._state["root"], cl, cr, kt, is_vacuum=iv
+        )
+    out = kt
+    for ki in range(cl, cr):
+        if out.exp.chi == 0:
+            break
+        out = _apply_leaf(out, run.plan._state["ops"][ki], run.ctx, is_choi=False)
+    return out
+
+
+def _tree_leaf(
+    run: _TreeRun,
+    ket: _ScaledExpansion,
+    cur_l: int,
+    pi_w: tuple[float, int],
+    m_map: dict[int, int],
+    di: int,
+) -> None:
+    """Accumulate the mass / acceptance / fidelity totals of one fully resolved trajectory."""
+    plan, ctx, totals = run.plan, run.ctx, run.totals
+    ket_e = _run_segment(run, ket, cur_l, len(plan._state["ops"]), di == 0)
+    z_b = _fp_mul(pi_w, ket_e.exp.norm_sq() if ket_e.exp.chi > 0 else 0.0, 2 * ket_e.log2_scale)
+    run.last_ket, run.last_m = ket_e, m_map
+    if z_b[0] <= 0.0:
+        return
+    totals[0] = _fp_add(totals[0], z_b)
+    m_bits = np.array([bool(m_map.get(j, 0)) for j in range(plan.num_measurements)], dtype=np.bool_)
+    if not _check_acc(run.norm_acc, m_bits):
+        return
+    totals[1] = _fp_add(totals[1], z_b)
+    if "fidelity" in run.q_set and run.comp_target is not None:
+        d_state = (
+            extract_data_expansion(
+                plan.compiled_plan, ket_e.exp, fault_selector_bits(plan.compiled_plan, run.faults)
+            )
+            if isinstance(plan.compiled_plan, SelectorPlan)
+            else (plan.compiled_plan.final_tableau.copy(), ket_e.exp.copy())
+        )
+        totals[2] = _fp_add(
+            totals[2],
+            _fp_mul(
+                pi_w,
+                *_compute_partial_trace_fidelity_mass(
+                    *d_state,
+                    ket_e.log2_scale,
+                    run.comp_target,
+                    plan.output_qubits,
+                    ctx,
+                    plan._state["bcache"],
+                ),
+            ),
+        )
+
+
+def _noise_dist(
+    rec: Any, aux: Any, p_map: dict[int, int]
+) -> tuple[int | None, Any, Any, list[tuple[int | None, int | None, float]]]:
+    """`(meas_index, noise_index, prior, dist)`; `dist` rows are `(choice, meas_bit, prob)`."""
+    mi = rec.meas_index if isinstance(rec, (HeraldedNoiseRecord, MPadRecord)) else None
+    dist: list[tuple[int | None, int | None, float]]
+    if isinstance(rec, PauliNoiseRecord):
+        ni, prior, dist = (
+            aux,
+            False,
+            (
+                [(p_map[aux], None, 1.0)]
+                if aux in p_map
+                else [
+                    (0, None, max(0.0, 1.0 - sum(rec.probs))),
+                    *((i + 1, None, p) for i, p in enumerate(rec.probs)),
+                ]
+            ),
+        )
+    elif isinstance(rec, CorrelatedNoiseRecord):
+        ni, cs = aux
+        prior = any(p_map.get(j, 0) > 0 for j in cs)
+        dist = (
+            [(0, None, 1.0)]
+            if prior
+            else (
+                [(p_map[ni], None, 1.0)]
+                if ni in p_map
+                else [(0, None, 1.0 - rec.prob), (1, None, rec.prob)]
+            )
+        )
+    elif isinstance(rec, HeraldedNoiseRecord):
+        ni, prior, dist = (
+            aux,
+            False,
+            (
+                [(p_map[aux], int(p_map[aux] > 0), 1.0)]
+                if aux in p_map
+                else [
+                    (0, 0, max(0.0, 1.0 - sum(rec.probs))),
+                    *((i + 1, 1, p) for i, p in enumerate(rec.probs)),
+                ]
+            ),
+        )
+    else:
+        ni, prior, dist = (
+            None,
+            False,
+            [
+                (None, 0, rec.flip_prob if rec.pad_bit else 1.0 - rec.flip_prob),
+                (None, 1, 1.0 - rec.flip_prob if rec.pad_bit else rec.flip_prob),
+            ],
+        )
+    return mi, ni, prior, dist
+
+
+def _pin_match_noise(
+    rec: Any, mi: Any, ni: Any, surv: list[tuple[Any, Any, float]], pin: Any
+) -> tuple[Any, Any, float] | None:
+    """The surviving noise branch that agrees with the pinned STREAM trajectory, if any."""
+    if not pin:
+        return None
+    return next(
+        (
+            s
+            for s in surv
+            if (
+                (mi in pin[0] and s[1] == pin[0][mi])
+                if isinstance(rec, MPadRecord)
+                else (ni in pin[3] and s[0] == pin[3][ni])
+            )
+        ),
+        None,
+    )
+
+
+def _draw_noise_branch(
+    run: _TreeRun,
+    rec: Any,
+    mi: Any,
+    ni: Any,
+    prior: bool,
+    surv: list[tuple[Any, Any, float]],
+    p_map: dict[int, int],
+) -> list[tuple[Any, Any, float]]:
+    """Sample one surviving noise branch (or take the pinned one); record it in `run.ctx`."""
+    ctx, r_gen, meas_in = run.ctx, run.r_gen, run.meas_in
+    assert r_gen is not None
+    w_sum = sum(pr for _, _, pr in surv)
+    ps = _pin_match_noise(rec, mi, ni, surv, run.pin)
+    if ps is None and isinstance(rec, MPadRecord) and mi not in meas_in:
+        mb = int(
+            bool(rec.pad_bit) ^ (rec.flip_prob > 0.0 and float(r_gen.random()) < rec.flip_prob)
+        )
+        if bool(mb) == bool(rec.pad_bit):
+            p_step = 1.0 - rec.flip_prob
+        elif rec.pad_bit:
+            # Match trajectory.py's `1.0 - (1.0 - flip_prob)` rounding for
+            # fallback cancellation.
+            p_step = (1.0 - (1.0 - rec.flip_prob)) or rec.flip_prob
+        else:
+            p_step = rec.flip_prob
+        cb, ctx.extra_cl_log = None, ctx.extra_cl_log + _ln(p_step)
+    elif ps is None and isinstance(rec, CorrelatedNoiseRecord) and ni not in p_map and not prior:
+        cb, mb = int(float(r_gen.random()) < rec.prob), None
+    elif (
+        ps is None
+        and isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord))
+        and ni not in p_map
+        and (mi is None or mi not in meas_in)
+    ):
+        cb = sample_categorical_branch(rec.probs, r_gen)
+        mb = int(cb > 0) if mi is not None else None
+    else:
+        cb, mb, _ = (
+            ps
+            if ps is not None
+            else surv[
+                sample_categorical_branch([pr / w_sum for _, _, pr in surv[:-1]], r_gen) - 1
+                if len(surv) > 1
+                else 0
+            ]
+        )
+    if ni is not None and cb is not None and ni not in run.paulis_in:
+        ctx.p_map[ni] = cb
+    if mi is not None and mb is not None and mi not in meas_in:
+        ctx.m_map[mi] = mb
+    return [(cb, mb, w_sum if (mi is not None and mi in meas_in) else 1.0)]
+
+
+def _step_noise(
+    run: _TreeRun,
+    rec: Any,
+    aux: Any,
+    ket: _ScaledExpansion,
+    z_in_fp: tuple[float, int],
+    pi_w: tuple[float, int],
+    p_map: dict[int, int],
+    r_map: dict[int, int],
+    m_map: dict[int, int],
+) -> list[Any]:
+    """Expand one Pauli / correlated / heralded / MPAD record into its successor states."""
+    ctx, step_w, meas_in = run.ctx, run.step_w, run.meas_in
+    mi, ni, prior, dist = _noise_dist(rec, aux, p_map)
+    for _, mb, pr in dist if mi is not None else ():
+        step_w[int(bool(mb))][mi] = _fp_add(  # type: ignore[index]
+            step_w[int(bool(mb))][mi],  # type: ignore[index]
+            _fp_mul(z_in_fp, pr),
+        )
+    surv = [
+        (cb, mb, pr)
+        for cb, mb, pr in dist
+        if pr > 0.0 and (mi is None or mi not in meas_in or meas_in[mi] == mb)
+    ]
+    if run.r_gen is not None and surv:
+        surv = _draw_noise_branch(run, rec, mi, ni, prior, surv, p_map)
+    nxt = []
+    for cb, mb, pw in surv:
+        ax = (
+            (
+                rec.branch_axes[cb - 1]
+                if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord))
+                else rec.axis
+            )
+            if (cb is not None and cb > 0 and not isinstance(rec, MPadRecord))
+            else None
+        )
+        if ax is not None:
+            ctx.bump_op()
+            sk = _normalize_frexp(
+                apply_pauli(ket.exp.copy(), *_ax_tup(ax, ket.exp.n_words)), ket.log2_scale
+            )
+            ctx.check_exp(sk.exp, is_choi=False)
+        else:
+            sk = ket
+        nxt.append(
+            (
+                sk,
+                _fp_mul(pi_w, pw),
+                ({**p_map, ni: cb} if (ni is not None and cb is not None) else p_map),
+                r_map,
+                ({**m_map, mi: mb} if (mi is not None and mb is not None) else m_map),
+            )
+        )
+    return nxt
+
+
+def _born_branches(
+    run: _TreeRun, rec: Any, ket: _ScaledExpansion
+) -> tuple[_ScaledExpansion, float, _ScaledExpansion, float]:
+    """Born-split `ket` on `rec.obs_axis`: `(s0, p0, s1, p1)` normalised outcome branches."""
+    ctx = run.ctx
+    ctx.bump_op()
+    nw = ket.exp.n_words
+    e0, z0_c, e1, z1_c, z_in_r, work, _ = born_split_expansion(
+        ket.exp, *_ax_tup(rec.obs_axis, nw), atol=ctx.atol
+    )
+    if rec.rot_axis is not None:
+        ctx.check_exp(work, is_choi=False)
+    brs = []
+    for qb, eb, zb_c in ((0, e0, z0_c), (1, e1, z1_c)):
+        if z_in_r > 0.0 and zb_c > K1_CANCEL_REL_TOL * z_in_r and eb.chi > 0:
+            eb.weights = np.ascontiguousarray(eb.weights * (1.0 / math.sqrt(zb_c)))
+            eb = (
+                apply_pauli(eb, *_ax_tup(rec.reset_kick_axis, nw))
+                if (isinstance(rec, ResetRecord) and bool(qb) != rec.reset_flip_ref)
+                else eb
+            )
+            sk = _normalize_frexp(eb, 0)
+            ctx.check_exp(sk.exp, is_choi=False)
+            brs.append((qb, sk, zb_c / (z0_c + z1_c)))
+        else:
+            brs.append((qb, _empty_se(ket.exp.n_qubits, ctx.atol), 0.0))
+    (_, s0, pb0), (_, s1, pb1) = brs
+    return s0, pb0, s1, pb1
+
+
+def _pin_match_born(run: _TreeRun, rec: Any, aux: Any, mi: Any, cands: list[Any]) -> Any:
+    """The measurement / reset candidate that agrees with the pinned STREAM trajectory."""
+    pin = run.pin
+    if not pin:
+        return None
+    return next(
+        (
+            c
+            for c in cands
+            if (
+                (aux in pin[2] and c[0] == pin[2][aux])
+                if mi is None
+                else (
+                    mi in pin[1]
+                    and c[0] == pin[1][mi]
+                    and (mi in run.meas_in or c[3] == pin[0].get(mi))
+                )
+            )
+        ),
+        None,
+    )
+
+
+def _draw_born_branch(
+    run: _TreeRun,
+    rec: Any,
+    aux: Any,
+    mi: Any,
+    fp: float,
+    iota: int,
+    brs: tuple[_ScaledExpansion, float, _ScaledExpansion, float],
+    q_cands: list[Any],
+    cands: list[Any],
+) -> list[Any]:
+    """Sample one measurement / reset outcome (or take the pinned one); record it in `run.ctx`."""
+    ctx, r_gen = run.ctx, run.r_gen
+    assert r_gen is not None
+    s0, pb0, s1, pb1 = brs
+    pc = _pin_match_born(run, rec, aux, mi, cands)
+    if mi is None or mi not in run.meas_in:
+        qb = (
+            pc[0]
+            if pc
+            else (q_cands[0][0] if len(q_cands) == 1 else int(float(r_gen.random()) < pb1))
+        )
+        fl = (
+            (qb ^ iota ^ int(pc[3]))
+            if (pc and mi is not None)
+            else (int(float(r_gen.random()) < fp) if (mi is not None and fp > 0.0) else 0)
+        )
+        sk, pb, pfl, rp = (
+            *((s1, pb1) if qb else (s0, pb0)),
+            ((fp if fl else (1.0 - fp)) if mi is not None else 1.0),
+            (None if mi is None else (qb ^ iota ^ fl)),
+        )
+        if mi is not None:
+            ctx.m_map[mi], ctx.q_map[mi], ctx.extra_cl_log = (
+                rp,
+                qb,
+                ctx.extra_cl_log + _ln(pfl),
+            )
+        cands = [(qb, sk, pb, rp, pb)] if pb > 0.0 else []
+    else:
+        w_sum = sum(pb * pfl for _, _, pb, _, pfl in cands)
+        qb, sk, pb, rp, pfl = (
+            pc
+            if pc is not None
+            else cands[
+                int(float(r_gen.random()) < (cands[1][2] * cands[1][4]) / w_sum)
+                if (len(cands) > 1 and w_sum > 0.0)
+                else 0
+            ]
+        )
+        ctx.q_map[mi], ctx.extra_cl_log, cands = (
+            qb,
+            ctx.extra_cl_log + (_ln((pb * pfl) / w_sum) if w_sum > 0.0 else -math.inf),
+            [(qb, sk, pb, rp, w_sum)],
+        )
+    if isinstance(rec, ResetRecord) and aux not in run.resets_in and cands:
+        ctx.r_map[aux] = cands[0][0]
+    return cands
+
+
+def _step_born(
+    run: _TreeRun,
+    rec: Any,
+    aux: Any,
+    ket: _ScaledExpansion,
+    z_in_fp: tuple[float, int],
+    p_map: dict[int, int],
+    r_map: dict[int, int],
+    m_map: dict[int, int],
+) -> list[Any]:
+    """Expand one measurement / reset record into its successor states."""
+    step_w, meas_in = run.step_w, run.meas_in
+    brs = _born_branches(run, rec, ket)
+    s0, pb0, s1, pb1 = brs
+    mi, fp, iota = (
+        rec.meas_index,
+        (rec.flip_prob if rec.meas_index is not None else 0.0),
+        int(rec.invert_result),
+    )
+    fl_opts = ((0, 1.0),) if mi is None else ((0, 1.0 - fp), (1, fp))
+    for qb, pb in ((0, pb0), (1, pb1)) if mi is not None else ():
+        for fl, pfl in fl_opts if pb > 0.0 else ():
+            step_w[qb ^ iota ^ fl][mi] = _fp_add(  # type: ignore[index]
+                step_w[qb ^ iota ^ fl][mi],  # type: ignore[index]
+                _fp_mul(z_in_fp, pb * pfl),
+            )
+    q_cands = [
+        (qb, sk, pb)
+        for qb, sk, pb in ((0, s0, pb0), (1, s1, pb1))
+        if pb > 0.0
+        and (not isinstance(rec, ResetRecord) or aux not in r_map or r_map[aux] == qb)
+        and (mi is None or mi not in run.qmeas_in or run.qmeas_in[mi] == qb)
+    ]
+    cands = [
+        (qb, sk, pb, (None if mi is None else (qb ^ iota ^ fl)), pfl)
+        for qb, sk, pb in q_cands
+        for fl, pfl in fl_opts
+        if pfl > 0.0 and (mi is None or mi not in meas_in or meas_in[mi] == (qb ^ iota ^ fl))
+    ]
+    if run.r_gen is not None and cands:
+        cands = _draw_born_branch(run, rec, aux, mi, fp, iota, brs, q_cands, cands)
+    else:
+        cands = [(qb, sk, pb, rp, pb * pfl) for qb, sk, pb, rp, pfl in cands]
+    return [
+        (
+            sk,
+            _fp_mul(z_in_fp, pw),
+            p_map,
+            ({**r_map, aux: qb} if isinstance(rec, ResetRecord) else r_map),
+            ({**m_map, mi: rp} if (mi is not None and rp is not None) else m_map),
+        )
+        for qb, sk, _, rp, pw in cands
+    ]
+
+
+def _update_node_keys(run: _TreeRun, sweep_in: dict[int, int]) -> None:
+    """Record each visited node's dependency key; count the nodes whose inputs changed."""
+    ctx = run.ctx
+    for u in () if run.stream_only else run.plan._state["nodes"]:
+        if not (any(not run.m_vals.get(i) for i in u.deps[1]) and u.node_id not in ctx.visited):
+            ck = (
+                tuple(run.faults.get(i, 0) for i in u.deps[0]),
+                tuple(tuple(sorted(run.m_vals.get(i, ()))) for i in u.deps[1]),
+                tuple(sweep_in.get(i, 0) for i in u.deps[2]),
+            )
+            ctx.diagnostics.invalidated_nodes += int(u.last_key is not None and u.last_key != ck)
+            u.last_key = ck if (u.node_id in ctx.visited or u.last_key is not None) else None
+
+
+def _tree_outputs(run: _TreeRun, is_mixed: bool, m_map: dict[int, int]) -> _TreeOut:
+    """`(mass, acceptance, fidelity, accepted, prefix_probs, m_arr, last_ket, faults, diag)`."""
+    plan, totals = run.plan, run.totals
+    m_arr = np.array(
+        [
+            bool((run.last_m if is_mixed else (run.last_m | m_map)).get(j, 0))
+            for j in range(plan.num_measurements)
+        ],
+        dtype=np.bool_,
+    )
+    acc = (
+        (True if (run.norm_acc[0] == "all" and totals[0][0] > 0.0) else (totals[1][0] > 0.0))
+        if (is_mixed and len(run.meas_in) < plan.num_measurements)
+        else _check_acc(run.norm_acc, m_arr)
+    )
+    p_probs = [
+        (
+            (_fp_div(w0, _fp_add(w0, w1)), _fp_div(w1, _fp_add(w0, w1)))
+            if _fp_add(w0, w1)[0] > 0.0
+            else (0.0, 0.0)
+        )
+        for w0, w1 in zip(run.step_w[0], run.step_w[1])
+    ]
+    return (
+        totals[0],
+        totals[1],
+        totals[2],
+        acc,
+        p_probs,
+        m_arr,
+        run.last_ket,
+        run.faults,
+        run.ctx.diagnostics,
+    )
+
+
+def _start_tree_run(
+    plan: PreparedQueryPlan,
+    faults: dict[int, int],
+    pins: tuple[dict[int, int], ...],
+    query: tuple[frozenset[str], tuple[str, Any]],
+    mode: tuple[Any, np.random.Generator | None, bool, Any],
+    prev_diag: QueryDiagnostics | None,
+    out_ctx: list[_EvalCtx] | None,
+) -> _TreeRun:
+    """Build the `_EvalCtx` (published to `out_ctx` first) and the zeroed accumulators."""
+    meas_in, qmeas_in, paulis_in, resets_in, sweep_in = pins
+    comp_target, r_gen, stream_only, pin = mode
+    ctx = _EvalCtx(
+        plan.budget,
+        plan.atol,
+        len(plan._state["q_act"]),
+        faults,
+        dict(meas_in),
+        dict(sweep_in),
+        enforce_budget=not stream_only,
+        prev_diag=prev_diag,
+    )
+    if out_ctx is not None:
+        out_ctx.append(ctx)
+    n_m = plan.num_measurements
+    return _TreeRun(
+        plan,
+        ctx,
+        faults,
+        meas_in,
+        qmeas_in,
+        paulis_in,
+        resets_in,
+        query[0],
+        query[1],
+        comp_target,
+        r_gen,
+        stream_only,
+        pin,
+        [[_FP_ZERO] * n_m, [_FP_ZERO] * n_m],
+        [_FP_ZERO] * 3,
+        {k: {v} for k, v in meas_in.items()},
+        _empty_se(plan.num_total_qubits, plan.atol),
+        dict(meas_in),
+    )
+
+
 def _eval_via_tree(
     plan: PreparedQueryPlan,
     faults_in: dict[int, int],
@@ -1297,475 +1932,53 @@ def _eval_via_tree(
     prev_diag: QueryDiagnostics | None = None,
     out_ctx: list[_EvalCtx] | None = None,
     pin: Any = None,
-) -> tuple[
-    tuple[float, int],
-    tuple[float, int],
-    tuple[float, int],
-    bool,
-    list[tuple[float, float]],
-    NDArray[np.bool_],
-    _ScaledExpansion,
-    dict[int, int],
-    QueryDiagnostics,
-]:
+) -> _TreeOut:
     use_sampling = ("sample_measurements" in q_set) or sample_mc_faults
     r_gen = (rng_obj if rng_obj is not None else np.random.default_rng()) if use_sampling else None
-    faults = (
-        {
-            i: (
-                faults_in[i]
-                if i in faults_in
-                else sample_categorical_branch(
-                    [b.prob for b in ch.branches],
-                    r_gen,  # type: ignore[arg-type]
-                )
-            )
-            for i, ch in enumerate(plan.compiled_plan.fault_channels)
-        }
-        if sample_mc_faults
-        else dict(faults_in)
-    )
-    m_act, otup, dyn, nodes, root, bcache = (
-        len(plan._state["q_act"]),
-        plan._state["ops"],
-        plan._state["dyn"],
-        plan._state["nodes"],
-        plan._state["root"],
-        plan._state["bcache"],
-    )
-    ctx = _EvalCtx(
-        plan.budget,
-        plan.atol,
-        m_act,
+    faults = _sample_faults(plan, faults_in, r_gen) if sample_mc_faults else dict(faults_in)
+    run = _start_tree_run(
+        plan,
         faults,
-        dict(meas_in),
-        dict(sweep_in),
-        enforce_budget=not stream_only,
-        prev_diag=prev_diag,
+        (meas_in, qmeas_in, paulis_in, resets_in, sweep_in),
+        (q_set, norm_acc),
+        (comp_target, r_gen, stream_only, pin),
+        prev_diag,
+        out_ctx,
     )
-    if out_ctx is not None:
-        out_ctx.append(ctx)
-    init_ket, step_w = (
-        _ScaledExpansion(ShotExpansion.zero(plan.num_total_qubits, atol=plan.atol), 0),
-        [[_FP_ZERO] * plan.num_measurements, [_FP_ZERO] * plan.num_measurements],
-    )
-    totals, last_ket, last_m, m_vals = (
-        [_FP_ZERO, _FP_ZERO, _FP_ZERO],
-        _empty_se(plan.num_total_qubits, plan.atol),
-        dict(meas_in),
-        {k: {v} for k, v in meas_in.items()},
-    )
-
-    def run_seg(kt: _ScaledExpansion, cl: int, cr: int, iv: bool) -> _ScaledExpansion:
-        if cl >= cr:
-            return kt
-        if not stream_only:
-            return _apply_node_range(plan, ctx, root, cl, cr, kt, is_vacuum=iv)
-        out = kt
-        for ki in range(cl, cr):
-            if out.exp.chi == 0:
-                break
-            out = _apply_leaf(out, otup[ki], ctx, is_choi=False)
-        return out
-
-    stack: list[
-        tuple[
-            int,
-            int,
-            _ScaledExpansion,
-            tuple[float, int],
-            dict[int, int],
-            dict[int, int],
-            dict[int, int],
-        ]
-    ] = [(0, 0, init_ket, (0.5, 1), dict(paulis_in), dict(resets_in), {})]
+    ctx, dyn = run.ctx, plan._state["dyn"]
+    init_ket = _ScaledExpansion(ShotExpansion.zero(plan.num_total_qubits, atol=plan.atol), 0)
+    stack: list[tuple[Any, ...]] = [
+        (0, 0, init_ket, (0.5, 1), dict(paulis_in), dict(resets_in), {})
+    ]
     while stack:
         di, cur_l, ket, pi_w, p_map, r_map, m_map = stack.pop()
         if pi_w[0] <= 0.0 or ket.exp.chi == 0:
             continue
         ctx.meas = m_map
         for mk, mv in () if stream_only else m_map.items():
-            m_vals.setdefault(mk, set()).add(mv)
+            run.m_vals.setdefault(mk, set()).add(mv)
         if di >= len(dyn):
-            ket_e = run_seg(ket, cur_l, len(otup), di == 0)
-            last_ket, last_m, z_b = (
-                ket_e,
-                m_map,
-                _fp_mul(
-                    pi_w, ket_e.exp.norm_sq() if ket_e.exp.chi > 0 else 0.0, 2 * ket_e.log2_scale
-                ),
-            )
-            if z_b[0] > 0.0:
-                totals[0] = _fp_add(totals[0], z_b)
-                if _check_acc(
-                    norm_acc,
-                    np.array(
-                        [bool(m_map.get(j, 0)) for j in range(plan.num_measurements)],
-                        dtype=np.bool_,
-                    ),
-                ):
-                    totals[1] = _fp_add(totals[1], z_b)
-                    if "fidelity" in q_set and comp_target is not None:
-                        d_state = (
-                            extract_data_expansion(
-                                plan.compiled_plan,
-                                ket_e.exp,
-                                fault_selector_bits(plan.compiled_plan, faults),
-                            )
-                            if isinstance(plan.compiled_plan, SelectorPlan)
-                            else (plan.compiled_plan.final_tableau.copy(), ket_e.exp.copy())
-                        )
-                        totals[2] = _fp_add(
-                            totals[2],
-                            _fp_mul(
-                                pi_w,
-                                *_compute_partial_trace_fidelity_mass(
-                                    *d_state,
-                                    ket_e.log2_scale,
-                                    comp_target,
-                                    plan.output_qubits,
-                                    ctx,
-                                    bcache,
-                                ),
-                            ),
-                        )
+            _tree_leaf(run, ket, cur_l, pi_w, m_map, di)
             continue
         op_off, rec, aux = dyn[di]
-        ket = run_seg(ket, cur_l, op_off, di == 0)
+        ket = _run_segment(run, ket, cur_l, op_off, di == 0)
         if ket.exp.chi == 0:
             continue
-        z_in_fp, nxt = _fp_mul(pi_w, ket.exp.norm_sq(), 2 * ket.log2_scale), []
+        z_in_fp = _fp_mul(pi_w, ket.exp.norm_sq(), 2 * ket.log2_scale)
         if isinstance(
             rec, (PauliNoiseRecord, CorrelatedNoiseRecord, HeraldedNoiseRecord, MPadRecord)
         ):
-            mi = rec.meas_index if isinstance(rec, (HeraldedNoiseRecord, MPadRecord)) else None
-            if isinstance(rec, PauliNoiseRecord):
-                ni, prior, dist = (
-                    aux,
-                    False,
-                    (
-                        [(p_map[aux], None, 1.0)]
-                        if aux in p_map
-                        else [
-                            (0, None, max(0.0, 1.0 - sum(rec.probs))),
-                            *((i + 1, None, p) for i, p in enumerate(rec.probs)),
-                        ]
-                    ),
-                )
-            elif isinstance(rec, CorrelatedNoiseRecord):
-                ni, cs = aux
-                prior = any(p_map.get(j, 0) > 0 for j in cs)
-                dist = (
-                    [(0, None, 1.0)]
-                    if prior
-                    else (
-                        [(p_map[ni], None, 1.0)]
-                        if ni in p_map
-                        else [(0, None, 1.0 - rec.prob), (1, None, rec.prob)]
-                    )
-                )
-            elif isinstance(rec, HeraldedNoiseRecord):
-                ni, prior, dist = (
-                    aux,
-                    False,
-                    (
-                        [(p_map[aux], int(p_map[aux] > 0), 1.0)]
-                        if aux in p_map
-                        else [
-                            (0, 0, max(0.0, 1.0 - sum(rec.probs))),
-                            *((i + 1, 1, p) for i, p in enumerate(rec.probs)),
-                        ]
-                    ),
-                )
-            else:
-                ni, prior, dist = (
-                    None,
-                    False,
-                    [
-                        (None, 0, rec.flip_prob if rec.pad_bit else 1.0 - rec.flip_prob),
-                        (None, 1, 1.0 - rec.flip_prob if rec.pad_bit else rec.flip_prob),
-                    ],
-                )
-            for _, mb, pr in dist if mi is not None else ():
-                step_w[int(bool(mb))][mi] = _fp_add(  # type: ignore[index]
-                    step_w[int(bool(mb))][mi],  # type: ignore[index]
-                    _fp_mul(z_in_fp, pr),
-                )
-            surv = [
-                (cb, mb, pr)
-                for cb, mb, pr in dist
-                if pr > 0.0 and (mi is None or mi not in meas_in or meas_in[mi] == mb)
-            ]
-            if use_sampling and surv:
-                assert r_gen is not None
-                w_sum = sum(pr for _, _, pr in surv)
-                ps = (
-                    next(
-                        (
-                            s
-                            for s in surv
-                            if (
-                                (mi in pin[0] and s[1] == pin[0][mi])
-                                if isinstance(rec, MPadRecord)
-                                else (ni in pin[3] and s[0] == pin[3][ni])
-                            )
-                        ),
-                        None,
-                    )
-                    if pin
-                    else None
-                )
-                if ps is None and isinstance(rec, MPadRecord) and mi not in meas_in:
-                    mb = int(
-                        bool(rec.pad_bit)
-                        ^ (rec.flip_prob > 0.0 and float(r_gen.random()) < rec.flip_prob)
-                    )
-                    if bool(mb) == bool(rec.pad_bit):
-                        p_step = 1.0 - rec.flip_prob
-                    elif rec.pad_bit:
-                        # Match trajectory.py's `1.0 - (1.0 - flip_prob)` rounding for
-                        # fallback cancellation.
-                        p_step = (1.0 - (1.0 - rec.flip_prob)) or rec.flip_prob
-                    else:
-                        p_step = rec.flip_prob
-                    cb, ctx.extra_cl_log = None, ctx.extra_cl_log + _ln(p_step)
-                elif (
-                    ps is None
-                    and isinstance(rec, CorrelatedNoiseRecord)
-                    and ni not in p_map
-                    and not prior
-                ):
-                    cb, mb = int(float(r_gen.random()) < rec.prob), None
-                elif (
-                    ps is None
-                    and isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord))
-                    and ni not in p_map
-                    and (mi is None or mi not in meas_in)
-                ):
-                    cb = sample_categorical_branch(rec.probs, r_gen)
-                    mb = int(cb > 0) if mi is not None else None
-                else:
-                    cb, mb, _ = (
-                        ps
-                        if ps is not None
-                        else surv[
-                            sample_categorical_branch([pr / w_sum for _, _, pr in surv[:-1]], r_gen)
-                            - 1
-                            if len(surv) > 1
-                            else 0
-                        ]
-                    )
-                if ni is not None and cb is not None and ni not in paulis_in:
-                    ctx.p_map[ni] = cb
-                if mi is not None and mb is not None and mi not in meas_in:
-                    ctx.m_map[mi] = mb
-                surv = [(cb, mb, w_sum if (mi is not None and mi in meas_in) else 1.0)]
-            for cb, mb, pw in surv:
-                ax = (
-                    (
-                        rec.branch_axes[cb - 1]
-                        if isinstance(rec, (PauliNoiseRecord, HeraldedNoiseRecord))
-                        else rec.axis
-                    )
-                    if (cb is not None and cb > 0 and not isinstance(rec, MPadRecord))
-                    else None
-                )
-                if ax is not None:
-                    ctx.bump_op()
-                    sk = _normalize_frexp(
-                        apply_pauli(ket.exp.copy(), *_ax_tup(ax, ket.exp.n_words)), ket.log2_scale
-                    )
-                    ctx.check_exp(sk.exp, is_choi=False)
-                else:
-                    sk = ket
-                nxt.append(
-                    (
-                        sk,
-                        _fp_mul(pi_w, pw),
-                        ({**p_map, ni: cb} if (ni is not None and cb is not None) else p_map),
-                        r_map,
-                        ({**m_map, mi: mb} if (mi is not None and mb is not None) else m_map),
-                    )
-                )
+            nxt = _step_noise(run, rec, aux, ket, z_in_fp, pi_w, p_map, r_map, m_map)
         else:
             assert isinstance(rec, (MeasurementRecord, ResetRecord))
-            ctx.bump_op()
-            nw = ket.exp.n_words
-            e0, z0_c, e1, z1_c, z_in_r, work, _ = born_split_expansion(
-                ket.exp, *_ax_tup(rec.obs_axis, nw), atol=ctx.atol
-            )
-            if rec.rot_axis is not None:
-                ctx.check_exp(work, is_choi=False)
-            brs = []
-            for qb, eb, zb_c in ((0, e0, z0_c), (1, e1, z1_c)):
-                if z_in_r > 0.0 and zb_c > K1_CANCEL_REL_TOL * z_in_r and eb.chi > 0:
-                    eb.weights = np.ascontiguousarray(eb.weights * (1.0 / math.sqrt(zb_c)))
-                    eb = (
-                        apply_pauli(eb, *_ax_tup(rec.reset_kick_axis, nw))
-                        if (isinstance(rec, ResetRecord) and bool(qb) != rec.reset_flip_ref)
-                        else eb
-                    )
-                    sk = _normalize_frexp(eb, 0)
-                    ctx.check_exp(sk.exp, is_choi=False)
-                    brs.append((qb, sk, zb_c / (z0_c + z1_c)))
-                else:
-                    brs.append((qb, _empty_se(ket.exp.n_qubits, ctx.atol), 0.0))
-            (_, s0, pb0), (_, s1, pb1) = brs
-            mi, fp, iota = (
-                rec.meas_index,
-                (rec.flip_prob if rec.meas_index is not None else 0.0),
-                int(rec.invert_result),
-            )
-            fl_opts = ((0, 1.0),) if mi is None else ((0, 1.0 - fp), (1, fp))
-            for qb, pb in ((0, pb0), (1, pb1)) if mi is not None else ():
-                for fl, pfl in fl_opts if pb > 0.0 else ():
-                    step_w[qb ^ iota ^ fl][mi] = _fp_add(  # type: ignore[index]
-                        step_w[qb ^ iota ^ fl][mi],  # type: ignore[index]
-                        _fp_mul(z_in_fp, pb * pfl),
-                    )
-            q_cands = [
-                (qb, sk, pb)
-                for qb, sk, pb in ((0, s0, pb0), (1, s1, pb1))
-                if pb > 0.0
-                and (not isinstance(rec, ResetRecord) or aux not in r_map or r_map[aux] == qb)
-                and (mi is None or mi not in qmeas_in or qmeas_in[mi] == qb)
-            ]
-            cands = [
-                (qb, sk, pb, (None if mi is None else (qb ^ iota ^ fl)), pfl)
-                for qb, sk, pb in q_cands
-                for fl, pfl in fl_opts
-                if pfl > 0.0
-                and (mi is None or mi not in meas_in or meas_in[mi] == (qb ^ iota ^ fl))
-            ]
-            if use_sampling and cands:
-                assert r_gen is not None
-                pc = (
-                    next(
-                        (
-                            c
-                            for c in cands
-                            if (
-                                (aux in pin[2] and c[0] == pin[2][aux])
-                                if mi is None
-                                else (
-                                    mi in pin[1]
-                                    and c[0] == pin[1][mi]
-                                    and (mi in meas_in or c[3] == pin[0].get(mi))
-                                )
-                            )
-                        ),
-                        None,
-                    )
-                    if pin
-                    else None
-                )
-                if mi is None or mi not in meas_in:
-                    qb = (
-                        pc[0]
-                        if pc
-                        else (
-                            q_cands[0][0] if len(q_cands) == 1 else int(float(r_gen.random()) < pb1)
-                        )
-                    )
-                    fl = (
-                        (qb ^ iota ^ int(pc[3]))
-                        if (pc and mi is not None)
-                        else (
-                            int(float(r_gen.random()) < fp) if (mi is not None and fp > 0.0) else 0
-                        )
-                    )
-                    sk, pb, pfl, rp = (
-                        *((s1, pb1) if qb else (s0, pb0)),
-                        ((fp if fl else (1.0 - fp)) if mi is not None else 1.0),
-                        (None if mi is None else (qb ^ iota ^ fl)),
-                    )
-                    if mi is not None:
-                        ctx.m_map[mi], ctx.q_map[mi], ctx.extra_cl_log = (
-                            rp,
-                            qb,
-                            ctx.extra_cl_log + _ln(pfl),
-                        )
-                    cands = [(qb, sk, pb, rp, pb)] if pb > 0.0 else []
-                else:
-                    w_sum = sum(pb * pfl for _, _, pb, _, pfl in cands)
-                    qb, sk, pb, rp, pfl = (
-                        pc
-                        if pc is not None
-                        else cands[
-                            int(float(r_gen.random()) < (cands[1][2] * cands[1][4]) / w_sum)
-                            if (len(cands) > 1 and w_sum > 0.0)
-                            else 0
-                        ]
-                    )
-                    ctx.q_map[mi], ctx.extra_cl_log, cands = (
-                        qb,
-                        ctx.extra_cl_log + (_ln((pb * pfl) / w_sum) if w_sum > 0.0 else -math.inf),
-                        [(qb, sk, pb, rp, w_sum)],
-                    )
-                if isinstance(rec, ResetRecord) and aux not in resets_in and cands:
-                    ctx.r_map[aux] = cands[0][0]
-            else:
-                cands = [(qb, sk, pb, rp, pb * pfl) for qb, sk, pb, rp, pfl in cands]
-            for qb, sk, _, rp, pw in cands:
-                nxt.append(
-                    (
-                        sk,
-                        _fp_mul(z_in_fp, pw),
-                        p_map,
-                        ({**r_map, aux: qb} if isinstance(rec, ResetRecord) else r_map),
-                        ({**m_map, mi: rp} if (mi is not None and rp is not None) else m_map),
-                    )
-                )
+            nxt = _step_born(run, rec, aux, ket, z_in_fp, p_map, r_map, m_map)
         for br in reversed(nxt):
             stack.append((di + 1, op_off, *br))
-    for u in () if stream_only else nodes:
-        if not (any(not m_vals.get(i) for i in u.deps[1]) and u.node_id not in ctx.visited):
-            ck = (
-                tuple(faults.get(i, 0) for i in u.deps[0]),
-                tuple(tuple(sorted(m_vals.get(i, ()))) for i in u.deps[1]),
-                tuple(sweep_in.get(i, 0) for i in u.deps[2]),
-            )
-            ctx.diagnostics.invalidated_nodes += int(u.last_key is not None and u.last_key != ck)
-            u.last_key = ck if (u.node_id in ctx.visited or u.last_key is not None) else None
-    m_arr = np.array(
-        [
-            bool((last_m if is_mixed else (last_m | m_map)).get(j, 0))
-            for j in range(plan.num_measurements)
-        ],
-        dtype=np.bool_,
-    )
-    acc = (
-        (True if (norm_acc[0] == "all" and totals[0][0] > 0.0) else (totals[1][0] > 0.0))
-        if (is_mixed and len(meas_in) < plan.num_measurements)
-        else _check_acc(norm_acc, m_arr)
-    )
-    p_probs = [
-        (
-            (_fp_div(w0, _fp_add(w0, w1)), _fp_div(w1, _fp_add(w0, w1)))
-            if _fp_add(w0, w1)[0] > 0.0
-            else (0.0, 0.0)
-        )
-        for w0, w1 in zip(step_w[0], step_w[1])
-    ]
-    return totals[0], totals[1], totals[2], acc, p_probs, m_arr, last_ket, faults, ctx.diagnostics
+    _update_node_keys(run, sweep_in)
+    return _tree_outputs(run, is_mixed, m_map)
 
 
-def _run_stream_trajectory(
-    plan: PreparedQueryPlan,
-    faults: dict[int, int],
-    meas: dict[int, int],
-    qmeas: dict[int, int],
-    paulis: dict[int, int],
-    resets: dict[int, int],
-    sweep: dict[int, int],
-    rng_obj: np.random.Generator | None,
-    *,
-    sample_mc_faults: bool,
-    use_sampling: bool,
-    extract_data: bool,
-    pctx: _EvalCtx | None = None,
-    skip: bool = False,
-) -> tuple[
+_StreamOut = tuple[
     TrajectoryRunResult | None,
     tuple[float, int],
     NDArray[np.bool_],
@@ -1773,53 +1986,41 @@ def _run_stream_trajectory(
     Any,
     bool,
     QueryDiagnostics,
-]:
-    f_in, fb_dg = (
-        (pctx.faults if (pctx is not None and sample_mc_faults) else faults),
-        (pctx.diagnostics if pctx else QueryDiagnostics(used_fallback=True)),
-    )
-    mp, qp, rp, pp = (
-        (dict(pctx.m_map), dict(pctx.q_map), dict(pctx.r_map), dict(pctx.p_map))
-        if pctx
-        else ({}, {}, {}, {})
-    )
-    if skip or resets:
-        return (
-            None,
-            _FP_ZERO,
-            np.empty(0, dtype=np.bool_),
-            dict(f_in),
-            (mp, qp, rp, pp),
-            True,
-            fb_dg,
-        )
-    r_gen, eff_m, eff_q, p_seed = (
-        (rng_obj if rng_obj is not None else np.random.default_rng(0)),
-        {**meas, **mp},
-        {**qmeas, **qp},
-        {**paulis, **pp},
-    )
-    f_tr = [
-        (f_in[i] if i in f_in else sample_categorical_branch([b.prob for b in ch.branches], r_gen))
-        if sample_mc_faults
-        else f_in.get(i, 0)
-        for i, ch in enumerate(plan.compiled_plan.fault_channels)
-    ]
-    m_log, p_tr = (
-        ((-pctx.extra_cl_log if math.isfinite(pctx.extra_cl_log) else -math.inf) if pctx else 0.0),
-        (None if (use_sampling and not p_seed) else {}),
-    )
-    for _, rec, aux in plan._state["dyn"] if p_tr is not None else ():
+]
+_Pins = tuple[dict[int, int], dict[int, int], dict[int, int], dict[int, int]]
+
+
+def _stream_dead(f_pin: dict[int, int], pins: Any, diag: QueryDiagnostics) -> _StreamOut:
+    """`_run_stream_trajectory` result for "no trajectory" (skip, resets, impossible)."""
+    return None, _FP_ZERO, np.empty(0, dtype=np.bool_), f_pin, pins, True, diag
+
+
+def _stream_pauli_trace(
+    plan: PreparedQueryPlan,
+    p_seed: dict[int, int],
+    paulis: dict[int, int],
+    meas: dict[int, int],
+    eff_m: dict[int, int],
+    r_gen: np.random.Generator,
+    use_sampling: bool,
+    pctx: _EvalCtx | None,
+) -> tuple[dict[int, int] | None, float]:
+    """Pre-sample the noise trace in `dyn` order; None lets the trajectory sample its own noise."""
+    m_log = (-pctx.extra_cl_log if math.isfinite(pctx.extra_cl_log) else -math.inf) if pctx else 0.0
+    if use_sampling and not p_seed:
+        return None, m_log
+    p_tr: dict[int, int] = {}
+    for _, rec, aux in plan._state["dyn"]:
         if isinstance(rec, PauliNoiseRecord):
-            p_tr[aux] = (  # type: ignore[index]
+            p_tr[aux] = (
                 p_seed[aux]
                 if aux in p_seed
                 else (sample_categorical_branch(rec.probs, r_gen) if use_sampling else 0)
             )
         elif isinstance(rec, CorrelatedNoiseRecord):
-            p_tr[aux[0]] = (  # type: ignore[index]
+            p_tr[aux[0]] = (
                 0
-                if any(p_tr.get(j, 0) > 0 for j in aux[1])  # type: ignore[union-attr]
+                if any(p_tr.get(j, 0) > 0 for j in aux[1])
                 else (
                     p_seed[aux[0]]
                     if aux[0] in p_seed
@@ -1830,7 +2031,7 @@ def _run_stream_trajectory(
             ph = min(1.0, max(0.0, float(sum(rec.probs))))
             if aux not in paulis and rec.meas_index in meas:
                 m_log += _ln(ph if bool(eff_m[rec.meas_index]) else max(0.0, 1.0 - ph))
-            p_tr[aux] = (  # type: ignore[index]
+            p_tr[aux] = (
                 p_seed[aux]
                 if aux in p_seed
                 else (
@@ -1845,12 +2046,26 @@ def _run_stream_trajectory(
                     else (sample_categorical_branch(rec.probs, r_gen) if use_sampling else 0)
                 )
             )
+    return p_tr, m_log
+
+
+def _stream_kwargs(
+    plan: PreparedQueryPlan,
+    r_gen: np.random.Generator,
+    f_tr: list[int],
+    p_tr: dict[int, int] | None,
+    rp: dict[int, int],
+    eff_m: dict[int, int],
+    eff_q: dict[int, int],
+    sweep: dict[int, int],
+) -> dict[str, Any]:
+    """Keyword arguments of the `run_direct`/`run_selector` call that replays the pinned trace."""
     sw_m = (
         max((k for k in plan._state["root"].deps[2] if sweep.get(k, 0)), default=-1)
         if (sweep and plan._state["root"])
         else -1
     )
-    kw: dict[str, Any] = dict(
+    return dict(
         rng=r_gen,
         fault_trace=f_tr,
         pauli_noise_trace=p_tr,
@@ -1860,45 +2075,39 @@ def _run_stream_trajectory(
         sweep_bits=([sweep.get(i, 0) for i in range(sw_m + 1)] if sw_m >= 0 else None),
         atol=plan.atol,
     )
-    try:
-        tr = (
-            _traj.run_selector(plan.compiled_plan, extract_data=extract_data, **kw)
-            if isinstance(plan.compiled_plan, SelectorPlan)
-            else _traj.run_direct(plan.compiled_plan, **kw)
-        )
-    except ImpossiblePostselectionError:
-        return (
-            None,
-            _FP_ZERO,
-            np.empty(0, dtype=np.bool_),
-            dict(enumerate(f_tr)),
-            (mp, qp, rp, dict(p_tr) if p_tr is not None else pp),
-            True,
-            fb_dg,
-        )
+
+
+def _stream_diag(pctx: _EvalCtx | None, tr: TrajectoryRunResult) -> QueryDiagnostics:
     pd = pctx.diagnostics if pctx is not None else None
-    dg = (
-        replace(
-            pd,
-            peak_terms=max(pd.peak_terms, tr.peak_components),
-            peak_dim=max(pd.peak_dim, tr.peak_dim),
-            used_fallback=True,
-        )
-        if pd is not None
-        else QueryDiagnostics(
+    if pd is None:
+        return QueryDiagnostics(
             peak_terms=tr.peak_components, peak_dim=tr.peak_dim, used_fallback=True
         )
+    return replace(
+        pd,
+        peak_terms=max(pd.peak_terms, tr.peak_components),
+        peak_dim=max(pd.peak_dim, tr.peak_dim),
+        used_fallback=True,
     )
-    lg2, bm_it, clip = (
-        (
-            (tr.log_branch_mass + m_log) / math.log(2.0)
-            if (math.isfinite(m_log) and math.isfinite(tr.log_branch_mass))
-            else -math.inf
-        ),
-        iter(tr.born_masses),
-        False,
-    )
-    for _, rec, aux in () if math.isfinite(lg2) else plan._state["dyn"]:
+
+
+def _stream_pin_dead_ends(
+    plan: PreparedQueryPlan,
+    tr: TrajectoryRunResult,
+    eff_m: dict[int, int],
+    p_tr: dict[int, int] | None,
+    p_seed: dict[int, int],
+    pins: _Pins,
+) -> bool:
+    """Reverse-engineer the pins of a zero-mass trajectory up to its first dead record.
+
+    Fills `pins` (meas, qmeas, resets, paulis) in place and returns whether the dead branch
+    can be re-sampled (`clip`).
+    """
+    mp, qp, rp, pp = pins
+    bm_it = iter(tr.born_masses)
+    clip = False
+    for _, rec, aux in plan._state["dyn"]:
         mi, ni = (
             getattr(rec, "meas_index", None),
             (
@@ -1955,28 +2164,74 @@ def _run_stream_trajectory(
             mp[mi] = int(tr.measurements[mi])
             if isinstance(rec, (MeasurementRecord, ResetRecord)):
                 qp[mi] = int(tr.quantum_outcomes[mi])
-    if math.isfinite(lg2):
-        return (
-            tr,
-            _fp(2.0 ** (lg2 - math.floor(lg2)), math.floor(lg2)),
-            tr.measurements,
-            {},
-            None,
-            False,
-            dg,
+    return clip
+
+
+def _run_stream_trajectory(
+    plan: PreparedQueryPlan,
+    faults: dict[int, int],
+    meas: dict[int, int],
+    qmeas: dict[int, int],
+    paulis: dict[int, int],
+    resets: dict[int, int],
+    sweep: dict[int, int],
+    rng_obj: np.random.Generator | None,
+    *,
+    sample_mc_faults: bool,
+    use_sampling: bool,
+    extract_data: bool,
+    pctx: _EvalCtx | None = None,
+    skip: bool = False,
+) -> _StreamOut:
+    f_in, fb_dg = (
+        (pctx.faults if (pctx is not None and sample_mc_faults) else faults),
+        (pctx.diagnostics if pctx else QueryDiagnostics(used_fallback=True)),
+    )
+    mp, qp, rp, pp = (
+        (dict(pctx.m_map), dict(pctx.q_map), dict(pctx.r_map), dict(pctx.p_map))
+        if pctx
+        else ({}, {}, {}, {})
+    )
+    if skip or resets:
+        return _stream_dead(dict(f_in), (mp, qp, rp, pp), fb_dg)
+    r_gen, eff_m, eff_q, p_seed = (
+        (rng_obj if rng_obj is not None else np.random.default_rng(0)),
+        {**meas, **mp},
+        {**qmeas, **qp},
+        {**paulis, **pp},
+    )
+    f_tr = [
+        (f_in[i] if i in f_in else sample_categorical_branch([b.prob for b in ch.branches], r_gen))
+        if sample_mc_faults
+        else f_in.get(i, 0)
+        for i, ch in enumerate(plan.compiled_plan.fault_channels)
+    ]
+    p_tr, m_log = _stream_pauli_trace(plan, p_seed, paulis, meas, eff_m, r_gen, use_sampling, pctx)
+    kw = _stream_kwargs(plan, r_gen, f_tr, p_tr, rp, eff_m, eff_q, sweep)
+    try:
+        tr = (
+            _traj.run_selector(plan.compiled_plan, extract_data=extract_data, **kw)
+            if isinstance(plan.compiled_plan, SelectorPlan)
+            else _traj.run_direct(plan.compiled_plan, **kw)
         )
+    except ImpossiblePostselectionError:
+        pins = (mp, qp, rp, dict(p_tr) if p_tr is not None else pp)
+        return _stream_dead(dict(enumerate(f_tr)), pins, fb_dg)
+    dg = _stream_diag(pctx, tr)
+    lg2 = (
+        (tr.log_branch_mass + m_log) / math.log(2.0)
+        if (math.isfinite(m_log) and math.isfinite(tr.log_branch_mass))
+        else -math.inf
+    )
+    if math.isfinite(lg2):
+        mass_fp = _fp(2.0 ** (lg2 - math.floor(lg2)), math.floor(lg2))
+        return tr, mass_fp, tr.measurements, {}, None, False, dg
+    clip = _stream_pin_dead_ends(plan, tr, eff_m, p_tr, p_seed, (mp, qp, rp, pp))
     m_out = np.array(
         [bool((meas | mp).get(j, 0)) for j in range(plan.num_measurements)], dtype=np.bool_
     )
-    return (
-        tr,
-        _FP_ZERO,
-        m_out,
-        {i: int(c) for i, c in enumerate(tr.fault_choices)},
-        (mp, qp, rp, pp),
-        clip,
-        dg,
-    )
+    f_out = {i: int(c) for i, c in enumerate(tr.fault_choices)}
+    return tr, _FP_ZERO, m_out, f_out, (mp, qp, rp, pp), clip, dg
 
 
 def _has_unpinned_branching(
@@ -2022,6 +2277,224 @@ def _has_unpinned_branching(
     return False
 
 
+_RealizationMaps = tuple[
+    dict[int, int], dict[int, int], dict[int, int], dict[int, int], dict[int, int]
+]
+
+
+def _as_generator(rng: np.random.Generator | int | None) -> np.random.Generator:
+    """`rng` itself if it is a Generator, else a fresh one from the (strict-int or None) seed."""
+    if isinstance(rng, np.random.Generator):
+        return rng
+    return np.random.default_rng(None if rng is None else coerce_strict_int(rng, "rng seed"))
+
+
+def _make_result(
+    q_set: frozenset[str],
+    cond: bool,
+    z_fp: tuple[float, int],
+    a_fp: tuple[float, int],
+    b_fp: tuple[float, int],
+    ac: bool,
+    pp: Any,
+    ma: NDArray[np.bool_] | None,
+    dg: QueryDiagnostics,
+) -> QueryResult:
+    return QueryResult(
+        _ldexp(*z_fp) if "mass" in q_set else None,
+        ((_fp_div(a_fp, z_fp) if cond else _ldexp(*a_fp)) if "acceptance" in q_set else None),
+        ((_fp_div(b_fp, z_fp) if cond else _ldexp(*b_fp)) if "fidelity" in q_set else None),
+        pp if "prefix_probs" in q_set else None,
+        ma.copy() if ("sample_measurements" in q_set and ma is not None) else None,
+        bool(ac) if "acceptance" in q_set else None,
+        dg,
+    )
+
+
+def _check_queries(queries: Any) -> None:
+    if (
+        isinstance(queries, (str, bytes))
+        or not isinstance(queries, Sequence)
+        or not queries
+        or any(not isinstance(q, str) or q not in _VALID_QUERIES for q in queries)
+    ):
+        raise ValueError(f"Invalid or unknown query metrics: {queries!r}")
+
+
+def _evaluate_tree(
+    plan: PreparedQueryPlan,
+    maps: _RealizationMaps,
+    sweep: dict[int, int],
+    q_set: frozenset[str],
+    norm_acc: tuple[str, Any],
+    comp_target: Any,
+    rng_obj: np.random.Generator | None,
+    flags: tuple[bool, bool, bool],
+    c_box: list[_EvalCtx],
+) -> tuple[Any, ...]:
+    """Tree-path evaluation of `EvaluateQueries`; returns the raw fields for `_make_result`."""
+    faults, meas, qmeas, paulis, resets = maps
+    sample_mc_faults, _, is_mixed = flags
+    z_fp, a_fp, b_fp, acc, p_probs, m_arr, _, _, diag = _eval_via_tree(
+        plan,
+        faults,
+        meas,
+        qmeas,
+        paulis,
+        resets,
+        sweep,
+        q_set,
+        norm_acc,
+        comp_target,
+        rng_obj,
+        sample_mc_faults=sample_mc_faults,
+        is_mixed=is_mixed,
+        out_ctx=c_box,
+    )
+    return z_fp, a_fp, b_fp, acc, p_probs, None if is_mixed else m_arr, diag
+
+
+def _fallback_fidelity_mass(
+    plan: PreparedQueryPlan,
+    tr: TrajectoryRunResult,
+    z_fp: tuple[float, int],
+    acc: bool,
+    q_set: frozenset[str],
+    comp_target: Any,
+    f_ctx: _EvalCtx,
+) -> tuple[float, int]:
+    if not ("fidelity" in q_set and acc and z_fp[0] > 0.0 and comp_target is not None):
+        return _FP_ZERO
+    return _fp_mul(
+        z_fp,
+        *_compute_partial_trace_fidelity_mass(
+            tr.final_tableau,
+            tr.expansion,
+            0,
+            comp_target,
+            plan.output_qubits,
+            f_ctx,
+            plan._state["bcache"],
+        ),
+    )
+
+
+def _fallback_prefix_probs(
+    plan: PreparedQueryPlan,
+    tr: TrajectoryRunResult,
+    paulis: dict[int, int],
+    q_set: frozenset[str],
+) -> list[tuple[float, float]] | None:
+    """Per-measurement outcome probabilities recovered from the STREAM trajectory."""
+    if "prefix_probs" not in q_set:
+        return None
+    probs = [(0.0, 0.0)] * plan.num_measurements
+    bm = {m_i: (z0, z1, zin) for m_i, z0, z1, zin in tr.born_masses if m_i is not None}
+    for _, rec, aux in plan._state["dyn"]:
+        if (
+            isinstance(rec, (MeasurementRecord, ResetRecord))
+            and rec.meas_index is not None
+            and sum(bm.get(rec.meas_index, (0.0, 0.0, 0.0))[:2]) > 0.0
+            and bm[rec.meas_index][2] > 0.0
+        ):
+            q0, fp = (
+                (bm[rec.meas_index][1 if rec.invert_result else 0]) / sum(bm[rec.meas_index][:2]),
+                rec.flip_prob,
+            )
+            probs[rec.meas_index] = (
+                max(0.0, min(1.0, (1.0 - fp) * q0 + fp * (1.0 - q0))),
+                max(0.0, min(1.0, (1.0 - fp) * (1.0 - q0) + fp * q0)),
+            )
+        elif isinstance(rec, (MPadRecord, HeraldedNoiseRecord)):
+            ph_r = (
+                min(1.0, max(0.0, sum(rec.probs))) if isinstance(rec, HeraldedNoiseRecord) else 0.0
+            )
+            probs[rec.meas_index] = (
+                (
+                    (rec.flip_prob, 1.0 - rec.flip_prob)
+                    if rec.pad_bit
+                    else (1.0 - rec.flip_prob, rec.flip_prob)
+                )
+                if isinstance(rec, MPadRecord)
+                else (
+                    (1.0 - float(paulis[aux] > 0), float(paulis[aux] > 0))
+                    if aux in paulis
+                    else (max(0.0, 1.0 - ph_r), ph_r)
+                )
+            )
+    return probs
+
+
+def _evaluate_fallback(
+    plan: PreparedQueryPlan,
+    maps: _RealizationMaps,
+    sweep: dict[int, int],
+    q_set: frozenset[str],
+    norm_acc: tuple[str, Any],
+    comp_target: Any,
+    rng_obj: np.random.Generator | None,
+    flags: tuple[bool, bool, bool],
+    c_box: list[_EvalCtx],
+) -> tuple[Any, ...]:
+    """`STREAM` fallback of `EvaluateQueries`; returns the raw fields for `_make_result`.
+
+    `flags` is `(sample_mc_faults, use_sampling, is_mixed)`.
+    """
+    faults, meas, qmeas, paulis, resets = maps
+    sample_mc_faults, use_sampling, is_mixed = flags
+    tr, z_fp, m_out, f_pin, pin, clip, diag = _run_stream_trajectory(
+        plan,
+        faults,
+        meas,
+        qmeas,
+        paulis,
+        resets,
+        sweep,
+        rng_obj,
+        sample_mc_faults=sample_mc_faults,
+        use_sampling=use_sampling,
+        extract_data=True,
+        pctx=c_box[0] if c_box else None,
+        skip=is_mixed,
+    )
+    if tr is None or (z_fp[0] <= 0.0 and (clip or "prefix_probs" in q_set)):
+        z_fp, a_fp, b_fp, acc, p_probs, m_arr, _, _, diag = _eval_via_tree(
+            plan,
+            f_pin,
+            meas,
+            qmeas,
+            paulis,
+            resets,
+            sweep,
+            q_set,
+            norm_acc,
+            comp_target,
+            rng_obj,
+            sample_mc_faults=sample_mc_faults,
+            is_mixed=is_mixed,
+            stream_only=True,
+            prev_diag=diag,
+            pin=pin,
+        )
+        return z_fp, a_fp, b_fp, acc, p_probs, None if is_mixed else m_arr, diag
+    acc, f_ctx = (
+        _check_acc(norm_acc, m_out),
+        _EvalCtx(
+            plan.budget,
+            plan.atol,
+            len(plan._state["q_act"]),
+            faults,
+            meas,
+            sweep,
+            enforce_budget=False,
+            prev_diag=diag,
+        ),
+    )
+    b_fp = _fallback_fidelity_mass(plan, tr, z_fp, acc, q_set, comp_target, f_ctx)
+    p_probs_fb = _fallback_prefix_probs(plan, tr, paulis, q_set)
+    return z_fp, z_fp if acc else _FP_ZERO, b_fp, acc, p_probs_fb, m_out, f_ctx.diagnostics
+
+
 def EvaluateQueries(
     plan: PreparedQueryPlan,
     realization: Mapping[Any, Any] | None = None,
@@ -2049,13 +2522,7 @@ def EvaluateQueries(
     """
     if not isinstance(plan, PreparedQueryPlan):
         raise TypeError(f"Expected PreparedQueryPlan, got {type(plan)!r}")
-    if (
-        isinstance(queries, (str, bytes))
-        or not isinstance(queries, Sequence)
-        or not queries
-        or any(not isinstance(q, str) or q not in _VALID_QUERIES for q in queries)
-    ):
-        raise ValueError(f"Invalid or unknown query metrics: {queries!r}")
+    _check_queries(queries)
     q_set, cond, comp_target = (
         frozenset(queries),
         bool(conditional),
@@ -2078,50 +2545,114 @@ def EvaluateQueries(
         ((realization is None) and (rng is not None)),
         (("sample_measurements" in q_set) or ((realization is None) and (rng is not None))),
     )
-    rng_obj = (
-        (
-            rng
-            if isinstance(rng, np.random.Generator)
-            else np.random.default_rng(coerce_strict_int(rng, "rng seed"))
-        )
-        if rng is not None
-        else (np.random.default_rng() if use_sampling else None)
-    )
+    rng_obj = _as_generator(rng) if (rng is not None or use_sampling) else None
     is_mixed = (not use_sampling) and _has_unpinned_branching(
         plan._state["dyn"], meas, qmeas, paulis, resets
     )
-    pack = lambda z_fp, a_fp, b_fp, ac, pp, ma, dg: QueryResult(
-        _ldexp(*z_fp) if "mass" in q_set else None,
-        ((_fp_div(a_fp, z_fp) if cond else _ldexp(*a_fp)) if "acceptance" in q_set else None),
-        ((_fp_div(b_fp, z_fp) if cond else _ldexp(*b_fp)) if "fidelity" in q_set else None),
-        pp if "prefix_probs" in q_set else None,
-        ma.copy() if ("sample_measurements" in q_set and ma is not None) else None,
-        bool(ac) if "acceptance" in q_set else None,
-        dg,
-    )
+    maps, flags = (faults, meas, qmeas, paulis, resets), (sample_mc_faults, use_sampling, is_mixed)
     c_box: list[_EvalCtx] = []
     try:
-        z_fp, a_fp, b_fp, acc, p_probs, m_arr, _, _, diag = _eval_via_tree(
-            plan,
-            faults,
-            meas,
-            qmeas,
-            paulis,
-            resets,
-            sweep,
-            q_set,
-            norm_acc,
-            comp_target,
-            rng_obj,
-            sample_mc_faults=sample_mc_faults,
-            is_mixed=is_mixed,
-            out_ctx=c_box,
-        )
-        return pack(z_fp, a_fp, b_fp, acc, p_probs, None if is_mixed else m_arr, diag)
+        raw = _evaluate_tree(plan, maps, sweep, q_set, norm_acc, comp_target, rng_obj, flags, c_box)
     except QueryBudgetExceededError:
         if plan.budget.on_budget_exceeded == "raise":
             raise
-        tr, z_fp, m_out, f_pin, pin, clip, diag = _run_stream_trajectory(
+        raw = _evaluate_fallback(
+            plan, maps, sweep, q_set, norm_acc, comp_target, rng_obj, flags, c_box
+        )
+    return _make_result(q_set, cond, *raw)
+
+
+prepare_queries, evaluate_queries = PrepareQueries, EvaluateQueries
+
+
+_SHOT_QUERIES = frozenset({"mass", "sample_measurements"})
+_ACCEPT_ALL = ("all", None)
+
+
+def _pack_shot_result(
+    cp: DirectPlan | SelectorPlan,
+    extract_data: bool,
+    zf: tuple[float, int],
+    ma: NDArray[np.bool_],
+    kf: _ScaledExpansion,
+    ef: dict[int, int],
+    dg: QueryDiagnostics,
+) -> QueryShotTrajectory:
+    sb = fault_selector_bits(cp, ef) if isinstance(cp, SelectorPlan) else None
+    ft, oe = (
+        extract_data_expansion(cp, kf.exp, sb)
+        if (extract_data and isinstance(cp, SelectorPlan) and sb is not None)
+        else (cp.final_tableau.copy(), kf.exp.copy())
+    )
+    if oe.chi > 0 and oe.norm_sq() > 0.0:
+        oe.weights = np.ascontiguousarray(oe.weights / math.sqrt(oe.norm_sq()))
+    return QueryShotTrajectory(ma, _ldexp(*zf), oe, ft, sb, dg)
+
+
+def _shot_fallback(
+    plan: PreparedQueryPlan,
+    maps: _RealizationMaps,
+    sweep: dict[int, int],
+    rng_obj: np.random.Generator,
+    extract_data: bool,
+    c_box: list[_EvalCtx],
+) -> QueryShotTrajectory:
+    """`STREAM` fallback of one shot after the tree path exceeded its budget."""
+    faults, meas, qmeas, paulis, resets = maps
+    tr, z_fp, m_out, f_pin, pin, clip, diag = _run_stream_trajectory(
+        plan,
+        faults,
+        meas,
+        qmeas,
+        paulis,
+        resets,
+        sweep,
+        rng_obj,
+        sample_mc_faults=True,
+        use_sampling=True,
+        extract_data=extract_data,
+        pctx=c_box[0] if c_box else None,
+    )
+    if tr is None or (z_fp[0] <= 0.0 and clip):
+        z_fp, _, _, _, _, m_arr, ket_f, eff_f, diag = _eval_via_tree(
+            plan,
+            f_pin,
+            meas,
+            qmeas,
+            paulis,
+            resets,
+            sweep,
+            _SHOT_QUERIES,
+            _ACCEPT_ALL,
+            None,
+            rng_obj,
+            sample_mc_faults=True,
+            is_mixed=False,
+            stream_only=True,
+            prev_diag=diag,
+            pin=pin,
+        )
+        return _pack_shot_result(plan.compiled_plan, extract_data, z_fp, m_arr, ket_f, eff_f, diag)
+    if z_fp[0] > 0.0:
+        return QueryShotTrajectory(
+            m_out, _ldexp(*z_fp), tr.expansion, tr.final_tableau, tr.selector_bits, diag
+        )
+    empty = _empty_se(plan.num_total_qubits, plan.atol)
+    return _pack_shot_result(plan.compiled_plan, extract_data, _FP_ZERO, m_out, empty, f_pin, diag)
+
+
+def _run_shot(
+    plan: PreparedQueryPlan,
+    maps: _RealizationMaps,
+    sweep: dict[int, int],
+    rng_obj: np.random.Generator,
+    extract_data: bool,
+) -> QueryShotTrajectory:
+    """One shot from already-normalised realization maps and sweep bits."""
+    c_box: list[_EvalCtx] = []
+    faults, meas, qmeas, paulis, resets = maps
+    try:
+        z_fp, _, _, _, _, m_arr, ket_f, eff_f, diag = _eval_via_tree(
             plan,
             faults,
             meas,
@@ -2129,111 +2660,19 @@ def EvaluateQueries(
             paulis,
             resets,
             sweep,
+            _SHOT_QUERIES,
+            _ACCEPT_ALL,
+            None,
             rng_obj,
-            sample_mc_faults=sample_mc_faults,
-            use_sampling=use_sampling,
-            extract_data=True,
-            pctx=c_box[0] if c_box else None,
-            skip=is_mixed,
+            sample_mc_faults=True,
+            is_mixed=False,
+            out_ctx=c_box,
         )
-        if tr is None or (z_fp[0] <= 0.0 and (clip or "prefix_probs" in q_set)):
-            z_fp, a_fp, b_fp, acc, p_probs, m_arr, _, _, diag = _eval_via_tree(
-                plan,
-                f_pin,
-                meas,
-                qmeas,
-                paulis,
-                resets,
-                sweep,
-                q_set,
-                norm_acc,
-                comp_target,
-                rng_obj,
-                sample_mc_faults=sample_mc_faults,
-                is_mixed=is_mixed,
-                stream_only=True,
-                prev_diag=diag,
-                pin=pin,
-            )
-            return pack(z_fp, a_fp, b_fp, acc, p_probs, None if is_mixed else m_arr, diag)
-        acc, f_ctx = (
-            _check_acc(norm_acc, m_out),
-            _EvalCtx(
-                plan.budget,
-                plan.atol,
-                len(plan._state["q_act"]),
-                faults,
-                meas,
-                sweep,
-                enforce_budget=False,
-                prev_diag=diag,
-            ),
-        )
-        b_fp = (
-            _fp_mul(
-                z_fp,
-                *_compute_partial_trace_fidelity_mass(
-                    tr.final_tableau,
-                    tr.expansion,
-                    0,
-                    comp_target,
-                    plan.output_qubits,
-                    f_ctx,
-                    plan._state["bcache"],
-                ),
-            )
-            if ("fidelity" in q_set and acc and z_fp[0] > 0.0 and comp_target is not None)
-            else _FP_ZERO
-        )
-        p_probs_fb: list[tuple[float, float]] | None = (
-            [(0.0, 0.0)] * plan.num_measurements if "prefix_probs" in q_set else None
-        )
-        bm = (
-            {m_i: (z0, z1, zin) for m_i, z0, z1, zin in tr.born_masses if m_i is not None}
-            if p_probs_fb is not None
-            else {}
-        )
-        for _, rec, aux in plan._state["dyn"] if p_probs_fb is not None else ():
-            if (
-                isinstance(rec, (MeasurementRecord, ResetRecord))
-                and rec.meas_index is not None
-                and sum(bm.get(rec.meas_index, (0.0, 0.0, 0.0))[:2]) > 0.0
-                and bm[rec.meas_index][2] > 0.0
-            ):
-                q0, fp = (
-                    (bm[rec.meas_index][1 if rec.invert_result else 0])
-                    / sum(bm[rec.meas_index][:2]),
-                    rec.flip_prob,
-                )
-                p_probs_fb[rec.meas_index] = (
-                    max(0.0, min(1.0, (1.0 - fp) * q0 + fp * (1.0 - q0))),
-                    max(0.0, min(1.0, (1.0 - fp) * (1.0 - q0) + fp * q0)),
-                )
-            elif isinstance(rec, (MPadRecord, HeraldedNoiseRecord)):
-                ph_r = (
-                    min(1.0, max(0.0, sum(rec.probs)))
-                    if isinstance(rec, HeraldedNoiseRecord)
-                    else 0.0
-                )
-                p_probs_fb[rec.meas_index] = (
-                    (
-                        (rec.flip_prob, 1.0 - rec.flip_prob)
-                        if rec.pad_bit
-                        else (1.0 - rec.flip_prob, rec.flip_prob)
-                    )
-                    if isinstance(rec, MPadRecord)
-                    else (
-                        (1.0 - float(paulis[aux] > 0), float(paulis[aux] > 0))
-                        if aux in paulis
-                        else (max(0.0, 1.0 - ph_r), ph_r)
-                    )
-                )
-        return pack(
-            z_fp, z_fp if acc else _FP_ZERO, b_fp, acc, p_probs_fb, m_out, f_ctx.diagnostics
-        )
-
-
-prepare_queries, evaluate_queries = PrepareQueries, EvaluateQueries
+        return _pack_shot_result(plan.compiled_plan, extract_data, z_fp, m_arr, ket_f, eff_f, diag)
+    except QueryBudgetExceededError:
+        if plan.budget.on_budget_exceeded == "raise":
+            raise
+        return _shot_fallback(plan, maps, sweep, rng_obj, extract_data, c_box)
 
 
 def run_query_shot(
@@ -2246,97 +2685,46 @@ def run_query_shot(
 ) -> QueryShotTrajectory:
     """Execute one causal shot via `plan`'s cached segment tree (or `STREAM` fallback)."""
     faults, meas, qmeas, paulis, resets, r_sweep = _unpack_realization(plan, realization)
-    sweep, cp = (_norm_sweep(sweep_bits) if sweep_bits is not None else r_sweep), plan.compiled_plan
-    rng_obj, c_box = (
-        (
-            rng
-            if isinstance(rng, np.random.Generator)
-            else np.random.default_rng(None if rng is None else coerce_strict_int(rng, "rng seed"))
-        ),
-        [],
+    sweep = _norm_sweep(sweep_bits) if sweep_bits is not None else r_sweep
+    rng_obj = _as_generator(rng)
+    return _run_shot(plan, (faults, meas, qmeas, paulis, resets), sweep, rng_obj, extract_data)
+
+
+def _is_seq(x: Any) -> bool:
+    return isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray, memoryview))
+
+
+def _batch_fault_seq(
+    fault_realizations: Any, b_sz: int
+) -> Sequence[Mapping[Any, Any] | None] | None:
+    """Per-shot realizations (a `Mapping`/`None` is broadcast), or None if the length is off."""
+    if fault_realizations is None or isinstance(fault_realizations, Mapping):
+        return [fault_realizations] * b_sz
+    if _is_seq(fault_realizations) and len(fault_realizations) == b_sz:
+        return fault_realizations
+    return None
+
+
+def _batch_sweep_rows(sweep_bits: Any, b_sz: int) -> tuple[Any, bool]:
+    """Per-shot sweep rows (or None if the shape is off) and whether they are already normalised."""
+    sw_1d = (
+        isinstance(sweep_bits, Mapping)
+        or (isinstance(sweep_bits, np.ndarray) and sweep_bits.ndim == 1)
+        or (
+            _is_seq(sweep_bits)
+            and (
+                len(sweep_bits) == 0 or isinstance(sweep_bits[0], (int, np.integer, bool, np.bool_))
+            )
+        )
     )
-
-    def _pack_shot(
-        zf: tuple[float, int],
-        ma: NDArray[np.bool_],
-        kf: _ScaledExpansion,
-        ef: dict[int, int],
-        dg: QueryDiagnostics,
-    ) -> QueryShotTrajectory:
-        sb = fault_selector_bits(cp, ef) if isinstance(cp, SelectorPlan) else None
-        ft, oe = (
-            extract_data_expansion(cp, kf.exp, sb)
-            if (extract_data and isinstance(cp, SelectorPlan) and sb is not None)
-            else (cp.final_tableau.copy(), kf.exp.copy())
-        )
-        if oe.chi > 0 and oe.norm_sq() > 0.0:
-            oe.weights = np.ascontiguousarray(oe.weights / math.sqrt(oe.norm_sq()))
-        return QueryShotTrajectory(ma, _ldexp(*zf), oe, ft, sb, dg)
-
-    try:
-        z_fp, _, _, _, _, m_arr, ket_f, eff_f, diag = _eval_via_tree(
-            plan,
-            faults,
-            meas,
-            qmeas,
-            paulis,
-            resets,
-            sweep,
-            frozenset({"mass", "sample_measurements"}),
-            ("all", None),
-            None,
-            rng_obj,
-            sample_mc_faults=True,
-            is_mixed=False,
-            out_ctx=c_box,
-        )
-        return _pack_shot(z_fp, m_arr, ket_f, eff_f, diag)
-    except QueryBudgetExceededError:
-        if plan.budget.on_budget_exceeded == "raise":
-            raise
-        tr, z_fp, m_out, f_pin, pin, clip, diag = _run_stream_trajectory(
-            plan,
-            faults,
-            meas,
-            qmeas,
-            paulis,
-            resets,
-            sweep,
-            rng_obj,
-            sample_mc_faults=True,
-            use_sampling=True,
-            extract_data=extract_data,
-            pctx=c_box[0] if c_box else None,
-        )
-        if tr is None or (z_fp[0] <= 0.0 and clip):
-            z_fp, _, _, _, _, m_arr, ket_f, eff_f, diag = _eval_via_tree(
-                plan,
-                f_pin,
-                meas,
-                qmeas,
-                paulis,
-                resets,
-                sweep,
-                frozenset({"mass", "sample_measurements"}),
-                ("all", None),
-                None,
-                rng_obj,
-                sample_mc_faults=True,
-                is_mixed=False,
-                stream_only=True,
-                prev_diag=diag,
-                pin=pin,
-            )
-            return _pack_shot(z_fp, m_arr, ket_f, eff_f, diag)
-        return (
-            QueryShotTrajectory(
-                m_out, _ldexp(*z_fp), tr.expansion, tr.final_tableau, tr.selector_bits, diag
-            )
-            if z_fp[0] > 0.0
-            else _pack_shot(
-                _FP_ZERO, m_out, _empty_se(plan.num_total_qubits, plan.atol), f_pin, diag
-            )
-        )
+    if sweep_bits is None:
+        return [None] * b_sz, True
+    if sw_1d:
+        return [_norm_sweep(sweep_bits)] * b_sz, True
+    is_2d = (
+        isinstance(sweep_bits, np.ndarray) and sweep_bits.ndim == 2 and sweep_bits.shape[0] == b_sz
+    ) or (_is_seq(sweep_bits) and len(sweep_bits) == b_sz)
+    return (sweep_bits if is_2d else None), False
 
 
 def run_query_batch(
@@ -2351,79 +2739,22 @@ def run_query_batch(
     """Execute `batch_size` shots reusing `plan`'s cached segment tree across the batch."""
     if not isinstance(plan, PreparedQueryPlan):
         raise TypeError(f"Expected PreparedQueryPlan, got {type(plan)!r}")
-    b_sz, is_seq = (
-        coerce_strict_int(batch_size, "batch_size"),
-        (
-            lambda x: (
-                isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray, memoryview))
-            )
-        ),
-    )
-    f_bcast = fault_realizations is None or isinstance(fault_realizations, Mapping)
-    f_seq = (
-        [fault_realizations] * b_sz
-        if f_bcast
-        else (
-            fault_realizations
-            if (is_seq(fault_realizations) and len(fault_realizations) == b_sz)
-            else None
-        )
-    )
-    sw_1d = (
-        isinstance(sweep_bits, Mapping)
-        or (isinstance(sweep_bits, np.ndarray) and sweep_bits.ndim == 1)
-        or (
-            is_seq(sweep_bits)
-            and (
-                len(sweep_bits) == 0 or isinstance(sweep_bits[0], (int, np.integer, bool, np.bool_))
-            )
-        )
-    )
-    s_raw = (
-        [None] * b_sz
-        if sweep_bits is None
-        else (
-            [_norm_sweep(sweep_bits)] * b_sz
-            if sw_1d
-            else (
-                sweep_bits
-                if (
-                    (
-                        isinstance(sweep_bits, np.ndarray)
-                        and sweep_bits.ndim == 2
-                        and sweep_bits.shape[0] == b_sz
-                    )
-                    or (is_seq(sweep_bits) and len(sweep_bits) == b_sz)
-                )
-                else None
-            )
-        )
-    )
+    b_sz = coerce_strict_int(batch_size, "batch_size")
+    f_seq = _batch_fault_seq(fault_realizations, b_sz)
+    s_raw, s_normalised = _batch_sweep_rows(sweep_bits, b_sz)
     if b_sz < 1 or f_seq is None or s_raw is None:
         raise ValueError(
             f"Invalid batch_size={b_sz}, fault_realizations, or sweep_bits for run_query_batch"
         )
-    s_seq, _ = (
-        (
-            s_raw
-            if (sweep_bits is None or sw_1d)
-            else [None if sr is None else _norm_sweep(sr) for sr in s_raw]
-        ),
-        [_unpack_realization(plan, r) for r in ((fault_realizations,) if f_bcast else f_seq)],
-    )
-    rng_obj, records, trajectories = (
-        (
-            rng
-            if isinstance(rng, np.random.Generator)
-            else np.random.default_rng(None if rng is None else coerce_strict_int(rng, "rng seed"))
-        ),
-        np.zeros((b_sz, plan.num_measurements), dtype=np.bool_),
-        [],
-    )
+    s_seq = s_raw if s_normalised else [None if sr is None else _norm_sweep(sr) for sr in s_raw]
+    unpacked = [_unpack_realization(plan, r) for r in f_seq]
+    rng_obj = _as_generator(rng)
+    records = np.zeros((b_sz, plan.num_measurements), dtype=np.bool_)
+    trajectories: list[QueryShotTrajectory] = []
     for s in range(b_sz):
-        traj = run_query_shot(
-            plan, realization=f_seq[s], sweep_bits=s_seq[s], rng=rng_obj, extract_data=extract_data
-        )
+        faults, meas, qmeas, paulis, resets, r_sweep = unpacked[s]
+        sweep = r_sweep if s_seq[s] is None else _norm_sweep(s_seq[s])
+        traj = _run_shot(plan, (faults, meas, qmeas, paulis, resets), sweep, rng_obj, extract_data)
         records[s] = traj.measurements
         trajectories.append(traj)
     return records, trajectories

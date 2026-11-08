@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import struct
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 import numpy as np
@@ -19,6 +20,11 @@ from stimside._magic.channels import (
     sample_categorical_branch, sample_heralded_pauli_branch,
     split_pauli_product_targets,
 )
+from stimside._magic.live_store import (
+    LiveExpansions, block_table, born_outcomes, engine_numerics_available, raise_born_failure,
+    raise_factor_failure, raise_split_failure,
+)
+from stimside._native.magic_engine import CLS_ACTIVE, CLS_DEAD, CLS_TRIVIAL
 from stimside._magic.gates import (
     CliffordFaultChannel, CompiledPauliAxis, canonical_clifford_gate_name_and_arity,
     canonical_gate_data, coerce_strict_int, extract_circuit_faults,
@@ -77,6 +83,11 @@ M2D_MODES: dict[str, Literal["auto", "magicside", "stim", "zero"]] = {
 }
 
 
+# Private switch (no public flag): True keeps the live per-shot expansions in the C++
+# MagicBatchEngine behind the `_live_exps` proxy; False keeps the reference Python list.
+_LIVE_STORE_ENGINE = False
+
+
 def resolve_budget(
     query_budget: QueryBudget | None, max_components: int | None, on_budget_exceeded: str | None
 ) -> tuple[QueryBudget | None, int | None, Literal["raise", "fallback"]]:
@@ -105,7 +116,17 @@ def _normalize_shot_realization(
         w = (max(coerce_strict_int(k, "sweep_bits key") for k in sw) + 1) if isinstance(sw, Mapping) and sw else (len(sw) if not isinstance(sw, (str, bytes, Mapping)) and hasattr(sw, "__len__") else 0)
         sw_m = normalize_choice_map(sw, (1,) * max(0, w), "sweep_bits", allow_bool_values=True) or {}
         sec["sweep_bits"] = np.array([bool(sw_m.get(i, 0)) for i in range(max(sw_m) + 1)], dtype=np.bool_) if sw_m else np.zeros(0, dtype=np.bool_)
-    return sec
+    # An empty section (`{"faults": {}}`, `{"paulis": []}`, `{"sweep_bits": ()}`) is the same as no
+    # section. A 0-d array is not "empty": it keeps its own "array must be 1D" error downstream.
+    # Arrays with a zero-length first axis (even 2-D `(0, 2)`, which used to be rejected) are
+    # dropped too: accepted.
+    return {k: v for k, v in sec.items() if not _is_empty_section(v)}
+
+
+def _is_empty_section(v: Any) -> bool:
+    if isinstance(v, np.ndarray):
+        return v.ndim > 0 and len(v) == 0
+    return isinstance(v, (Mapping, list, tuple)) and len(v) == 0
 
 
 def _normalize_stream_paulis(plan: DirectPlan | SelectorPlan, raw_p: Any) -> Any:
@@ -147,6 +168,54 @@ def _normalize_sweep_matrix(sweep_bits: Any, batch_size: int) -> NDArray[np.bool
     if arr.ndim == 2 and arr.shape[0] == batch_size:
         return arr.copy()
     raise ValueError(f"Invalid sweep_bits shape {arr.shape} for batch_size={batch_size}")
+
+
+def _state_key(e: ShotExpansion) -> bytes:
+    """Exact-state key: all `ShotExpansion` fields a block reads or passes through, log_mass too."""
+    assert e.ell_odd is not None
+    head = np.array([e.n_qubits, e.d, e.chi, e._is_canonical_merged], dtype=np.int64)
+    scalars = np.array([e.atol, e.log_mass], dtype=np.float64)
+    arrays = (e.weights, e.h_words, e.ell, e.A_words, e.a_union, e.Gamma, e.pivots, e.ell_odd)
+    return b"".join([head.tobytes(), scalars.tobytes(), *(a.tobytes() for a in arrays)])
+
+
+def _state_fingerprint(e: ShotExpansion) -> bytes:
+    """Cheap prefilter: a pure function of the state, built only from bytes `_state_key` contains.
+
+    The O(d)-sized arrays are included whole; of the chi-sized ones only ~9 strided weights and
+    the last h_words / ell row. Equal key => equal fingerprint, so it can only split a bucket.
+    """
+    assert e.ell_odd is not None
+    chi = e.chi
+    head = struct.pack("<4q2d", e.n_qubits, e.d, chi, e._is_canonical_merged, e.atol, e.log_mass)
+    parts = (
+        e.weights[:: max(1, chi // 8)], e.weights[-1:], e.h_words[-1], e.ell[-1],
+        e.A_words, e.a_union, e.Gamma, e.pivots, e.ell_odd,
+    )
+    return head + b"".join([a.tobytes() for a in parts])
+
+
+def _group_shots_by_state(exps: Sequence[ShotExpansion]) -> list[list[int]]:
+    """Indices of shots with chi > 0 grouped by bit-identical state, ordered by lowest member.
+
+    Shots are first bucketed by the cheap `_state_fingerprint`; the full byte-exact `_state_key`
+    is built only for shots sharing a bucket, and alone decides every merge.
+    """
+    buckets: dict[bytes, list[int]] = {}
+    for s, e in enumerate(exps):
+        if e.chi > 0:
+            buckets.setdefault(_state_fingerprint(e), []).append(s)
+    groups: list[list[int]] = []
+    for members in buckets.values():
+        if len(members) == 1:
+            groups.append(members)
+            continue
+        exact: dict[bytes, list[int]] = {}
+        for s in members:
+            exact.setdefault(_state_key(exps[s]), []).append(s)
+        groups.extend(exact.values())
+    groups.sort(key=lambda g: g[0])
+    return groups
 
 
 class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixin):
@@ -293,7 +362,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._finished_running_circuit = False
         self._live_ref_tab = ReferenceCHPTableau(self._eff_nq)
         self._live_frame_events: list[FrameEvent] = []
-        self._live_exps: list[ShotExpansion] = [ShotExpansion.zero(self._eff_nq, atol=self.atol) for _ in range(self.batch_size)]
+        self._live_exps: list[ShotExpansion] | LiveExpansions = self._fresh_live_exps()
         self._shot_tabs: list[ReferenceCHPTableau] | None = None
         self._active_plan: DirectPlan | SelectorPlan | None = None
         self._shot_sel_bits: list[NDArray[np.bool_] | None] | None = None
@@ -346,7 +415,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._live_frame_events = list(cp.frame_events)
         self._shot_tabs = tabs
         self._live_ref_tab = tabs[0].copy()
-        self._live_exps = exps
+        self._live_exps = exps  # compiled runs keep a plain list (SELECTOR shots carry extra qubits)
         for op in self._unrolled_ops:
             apply_coords_op(op, self.qubit_coords, self.qubit_tags, self.coords_shifts)
         self._circuit_time = len(self._unrolled_ops)
@@ -481,11 +550,31 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         mc_cap = self.max_components if self.on_budget_exceeded == "raise" else None
         for rec in recs:
             assert isinstance(rec, CompiledOpenBlockRecord)
-            for s in range(self.batch_size):
-                if self._live_exps[s].chi > 0:
-                    self._live_exps[s] = apply_compiled_block(self._live_exps[s], rec.block, check_unitary=True, atol=self.atol)
-                    if mc_cap is not None and self._live_exps[s].chi > mc_cap:
-                        raise QueryBudgetExceededError(f"Expansion exceeded max_components={mc_cap} (got chi={self._live_exps[s].chi})")
+            if self._apply_block_in_engine(rec.block, mc_cap):
+                continue
+            for members in _group_shots_by_state(self._live_exps):
+                out = apply_compiled_block(
+                    self._live_exps[members[0]], rec.block, check_unitary=True, atol=self.atol
+                )
+                for s in members[1:]:
+                    self._live_exps[s] = out.copy()  # never share one output object across shots
+                self._live_exps[members[0]] = out
+                if mc_cap is not None and out.chi > mc_cap:
+                    raise QueryBudgetExceededError(
+                        f"Expansion exceeded max_components={mc_cap} (got chi={out.chi})"
+                    )
+
+    def _apply_block_in_engine(self, block: Any, mc_cap: int | None) -> bool:
+        """One engine command for a block (grouping, fan-out and the `max_components` bound
+        included); False when the shots are a plain list or the engine must not run this block
+        (the per-group reference code then runs it)."""
+        store = self._live_exps
+        table = block_table(block, self._eff_nq) if isinstance(store, LiveExpansions) else None
+        if table is None:
+            return False
+        assert isinstance(store, LiveExpansions)
+        store.apply_block(table, mc_cap)
+        return True
 
     def _apply_pauli_mask(self, pauli: Literal["X", "Y", "Z"], mask: NDArray[np.bool_]) -> None:
         affected = np.flatnonzero(np.any(mask[: self._eff_nq], axis=1))
@@ -494,10 +583,42 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._flush_magic()
         for q_np in affected:
             ax = compile_pauli_product(self._live_ref_tab, [(int(q_np), pauli)])
-            for b_np in np.flatnonzero(mask[int(q_np)]):
-                b = int(b_np)
-                if self._live_exps[b].chi > 0:
-                    self._live_exps[b] = apply_pauli(self._live_exps[b], ax)
+            self._apply_axis_to_shots(ax, mask[int(q_np)])
+
+    def _fresh_live_exps(self) -> list[ShotExpansion] | LiveExpansions:
+        """`ShotExpansion.zero` for every shot: a list, or the (reused) engine-backed store."""
+        if not (_LIVE_STORE_ENGINE and engine_numerics_available()):
+            return [ShotExpansion.zero(self._eff_nq, atol=self.atol) for _ in range(self.batch_size)]
+        store = getattr(self, "_live_store", None)  # `clear()` reuses the simulator: reset, don't rebuild
+        if store is None:
+            store = self._live_store = LiveExpansions(self.batch_size, self._eff_nq, self.atol)
+        store.reset()
+        return store
+
+    def __copy__(self) -> MagicsideSimulator:
+        """Shallow copy (as the default), except that a native store is never shared: the copy
+        gets its own engine holding the same shots (freeing one must not reset the other)."""
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(self.__dict__)
+        store: LiveExpansions | None = self.__dict__.get("_live_store")
+        if store is not None:
+            in_use = self._live_exps is store  # else a compiled run left a list behind
+            new._live_store = store.copy() if in_use else LiveExpansions(
+                store.batch_size, store.n_qubits, store.atol
+            )
+            if in_use:
+                new._live_exps = new._live_store
+        return new
+
+    def _apply_axis_to_shots(self, ax: Any, mask: NDArray[np.bool_]) -> None:
+        """`apply_pauli(shot, ax)` on every shot in `mask` that has chi > 0, in shot order."""
+        if isinstance(self._live_exps, LiveExpansions):
+            self._live_exps.apply_pauli_mask(ax, mask)
+            return
+        for b_np in np.flatnonzero(mask):
+            b = int(b_np)
+            if self._live_exps[b].chi > 0:
+                self._live_exps[b] = apply_pauli(self._live_exps[b], ax)
 
     def apply_pauli(self, pauli: Literal["X", "Y", "Z"], mask: NDArray[np.bool_], p: float = 1.0) -> None:
         if p <= 0.0:
@@ -516,6 +637,19 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._live_exps[s], fac, inverse=inverse, check_unitary=True, atol=self.atol
         )
 
+    def _apply_factor_lists(
+        self, lists: Sequence[CompiledCliffordFactorList], which: NDArray[np.int32], inverse: bool
+    ) -> None:
+        """Factor list `lists[which[s]]` on every shot with `which[s] >= 0`, in shot order.
+
+        One engine command when the shots live in the engine, else the per-shot loop.
+        """
+        if isinstance(self._live_exps, LiveExpansions):
+            self._live_exps.inject_factor_lists(lists, which, inverse)
+            return
+        for s in np.flatnonzero(which >= 0):
+            self._apply_factor_list(int(s), lists[int(which[s])], inverse=inverse)
+
     def _forced_fault_branch(self, s: int, slot_idx: int) -> int | None:
         if self._norm_reals is None or slot_idx < 0:
             return None
@@ -526,12 +660,45 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._flush_magic()
         probs = [b.prob for b in ch.branches]
         facs = [compile_clifford_factors(self._live_ref_tab, b.gate_name, b.targets) for b in ch.branches]
+        engine = isinstance(self._live_exps, LiveExpansions)
+        which = np.full(self.batch_size, -1, dtype=np.int32)
         for s in range(self.batch_size):
             forced = self._forced_fault_branch(s, slot_idx)
             rng_s = self._shot_np_rngs[s] if self._shot_np_rngs is not None else self.np_rng
             c = sample_categorical_branch(probs, rng_s) if forced is None else forced
-            if c > 0:
+            if c > 0 and engine:
+                which[s] = c - 1  # all draws first, then one engine command
+            elif c > 0:
                 self._apply_factor_list(s, facs[c - 1])
+        if engine:
+            try:
+                self._apply_factor_lists(facs, which, False)
+            except Exception:
+                store = self._live_exps
+                if isinstance(store, LiveExpansions) and store.failed_shot is not None:
+                    self._undo_excess_fault_draws(slot_idx, store.failed_shot)  # list store drew
+                raise  # for shots 0..failed_shot only
+
+    def _undo_excess_fault_draws(self, slot_idx: int, failed_shot: int) -> None:
+        """Rewind the branch draws made for the shots after `failed_shot` (one `random()` each).
+
+        The engine path draws for every shot before its single command, the list store draws and
+        applies shot by shot, so after a caught failure the streams would differ. A `random()`
+        consumes exactly one 64-bit output, and PCG64's `advance` is exact except that it clears
+        the buffered 32-bit word, which `random()` never touches: that word is put back.
+        """
+        counts: dict[int, list[Any]] = {}
+        for s in range(failed_shot + 1, self.batch_size):
+            if self._forced_fault_branch(s, slot_idx) is None:
+                rng = self._shot_np_rngs[s] if self._shot_np_rngs is not None else self.np_rng
+                counts.setdefault(id(rng), [rng, 0])[1] += 1
+        for rng, n in counts.values():
+            bg = rng.bit_generator
+            buffered = bg.state
+            bg.advance(2**128 - n)
+            state = bg.state
+            state["has_uint32"], state["uinteger"] = buffered["has_uint32"], buffered["uinteger"]
+            bg.state = state
 
     def _next_step_meta(self, op: stim.CircuitInstruction) -> None:
         pass
@@ -691,7 +858,54 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             else int(self._shot_np_rngs[b].random() < p1)  # type: ignore[index]
         )
 
+    def _project_substep_engine(
+        self, store: LiveExpansions, rec: MeasurementRecord | ResetRecord
+    ) -> NDArray[np.bool_]:
+        """`_project_substep_batch` with the shots in the engine: the C++ classifies, kicks the
+        trivial shots of a reset and projects both outcomes of the others (`measure_split`); the
+        decisions that need Python (checks, the draw, the sync callback, the log of the masses) stay
+        here, in the reference's order; `measure_finish` commits the chosen branches."""
+        obs = rec.obs_axis
+        reset = None
+        if isinstance(rec, ResetRecord):
+            kick = rec.reset_kick_axis
+            reset = (kick.a_words, kick.b_words, kick.kappa, rec.reset_flip_ref)
+        res = store.measure_split(
+            (obs.a_words, obs.b_words, obs.kappa), rec.rot_axis is not None, reset
+        )
+        m_shots = np.zeros(self.batch_size, dtype=np.bool_)
+        self._log_branch_masses[res.cls == CLS_DEAD] = -math.inf
+        triv = res.cls == CLS_TRIVIAL
+        m_shots[triv] = res.bit[triv].astype(np.bool_)
+        raise_split_failure(res, self._eff_nq, self.atol)
+        if res.n_active == 0:
+            return m_shots
+        idx = np.flatnonzero(res.cls == CLS_ACTIVE)
+        shots = idx.tolist()
+        sampler = (
+            None
+            if self._tab_rngs is None
+            else lambda i, p1: (
+                0 if p1 <= K1_CANCEL_REL_TOL
+                else 1 if p1 >= 1.0 - K1_CANCEL_REL_TOL
+                else self._sample_sync_born_bit(shots[i], p1)
+            )
+        )
+        out, z0, z1, chosen = born_outcomes(res, self.atol, self.np_rng, sampler)
+        fin = store.measure_finish(out, chosen, res)
+        if fin.failure is not None and fin.phase == 1:  # nothing was committed or counted
+            raise_factor_failure(fin.failure, self._eff_nq, self.atol)
+        self._log_branch_masses[idx] += _log0(np.where(out, z1, z0) / (z0 + z1))
+        m_shots[idx] = out
+        if fin.failure is not None:  # a failing reset kick: the shots before it are committed
+            raise_factor_failure(fin.failure, self._eff_nq, self.atol)
+        return m_shots
+
     def _project_substep_batch(self, rec: MeasurementRecord | ResetRecord) -> NDArray[np.bool_]:
+        store = self._live_exps
+        axes = [rec.obs_axis] + ([rec.reset_kick_axis] if isinstance(rec, ResetRecord) else [])
+        if isinstance(store, LiveExpansions) and all(store.axis_is_encodable(a) for a in axes):
+            return self._project_substep_engine(store, rec)
         m_shots = np.zeros(self.batch_size, dtype=np.bool_)
         obs = rec.obs_axis
         idx: list[int] = []
@@ -830,11 +1044,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 if mask_g is not None:
                     cond = cond & mask_g
                 if np.any(cond):
-                    ax = compile_pauli_product(self._live_ref_tab, [(q_t, pch)])
-                    for s in np.flatnonzero(cond):
-                        si = int(s)
-                        if self._live_exps[si].chi > 0:
-                            self._live_exps[si] = apply_pauli(self._live_exps[si], ax)
+                    self._apply_axis_to_shots(compile_pauli_product(self._live_ref_tab, [(q_t, pch)]), cond)
             return
         qs = [int(t.qubit_value) for t in raw]
         for g_idx, off in enumerate(range(0, len(qs), arity)):
@@ -862,12 +1072,10 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._flush_magic()
         fac = compile_fac()
         if 2 * n_act <= self.batch_size:
-            for s in np.flatnonzero(mask_g):
-                self._apply_factor_list(int(s), fac, inverse=False)
+            self._apply_factor_lists([fac], np.where(mask_g, 0, -1).astype(np.int32), False)
         else:
             advance_ref()
-            for s in np.flatnonzero(~mask_g):
-                self._apply_factor_list(int(s), fac, inverse=True)
+            self._apply_factor_lists([fac], np.where(mask_g, -1, 0).astype(np.int32), True)
 
     def do_conditional_pauli_noise(self, op: stim.CircuitInstruction, condition_met_mask: NDArray[np.bool_] | None = None) -> None:
         cname = canonical_gate_data(op.name).name
@@ -945,12 +1153,107 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._apply_pauli_mask("X", xm)
         self._apply_pauli_mask("Z", zm)
 
+    def _engine_store(
+        self, shots: Sequence[int] | NDArray[np.int_], *axes: Any
+    ) -> LiveExpansions | None:
+        """The engine store when the shots live in it, every listed shot exists and every axis is
+        encodable, else None (the reference per-shot code then runs and raises or accepts)."""
+        store = self._live_exps
+        if not isinstance(store, LiveExpansions):
+            return None
+        if not all(store.axis_is_encodable(a) for a in axes):
+            return None
+        return store if len(shots) == 0 or int(shots[-1]) < self.batch_size else None
+
+    @staticmethod
+    def _int_array(a: Any) -> bool:
+        """A plain ndarray (no subclass, so no hook) of bool / integer kind: what the engine path
+        reads up front; anything else takes the reference loop, which reads shot by shot."""
+        return type(a) is np.ndarray and a.dtype.kind in "biu"
+
+    def _plain_bits(self, bits: Any) -> bool:
+        """A 1-d integer or bool array of one entry per shot: what the engine postselect reads
+        (anything else takes the reference loop, which raises or accepts as it always did)."""
+        return self._int_array(bits) and bits.shape == (self.batch_size,)
+
+    def _engine_error(self, fail: Any, oom_at: int | None, what: str) -> None:
+        """Raise what the per-shot reference raises for an engine failure (or out of memory)."""
+        if fail is not None:
+            raise_born_failure(fail, self._eff_nq, self.atol)
+        if oom_at is not None:
+            raise MemoryError(f"{what} ran out of memory at list entry {oom_at}")
+
+    def _postselect_engine(
+        self, store: LiveExpansions, obs: CompiledPauliAxis, shots: NDArray[np.intp],
+        desired_bits: NDArray[np.uint8],
+    ) -> None:
+        """`postselect_z_batch`'s loop as one engine command: each committed shot's branch mass
+        is updated (scalar `np.log`, as the reference), then the failure, if any, is raised."""
+        want = np.fromiter((int(desired_bits[int(b)]) & 1 for b in shots), np.uint8, len(shots))
+        res = store.postselect((obs.a_words, obs.b_words, obs.kappa), shots, want)
+        z01 = res.z01.tolist()
+        for i in np.flatnonzero(res.done).tolist():
+            z0, z1 = z01[i]
+            if z0 + z1 > 0.0:
+                self._log_branch_masses[int(shots[i])] += _log0((z1 if want[i] else z0) / (z0 + z1))
+        fail = res.failure
+        self._engine_error(fail, res.oom_at, "mbe_postselect")
+
+    def _unmatched_engine(
+        self, store: LiveExpansions, obs: CompiledPauliAxis, kick: CompiledPauliAxis,
+        shots: NDArray[np.intp], one_mask: NDArray[np.int64],
+    ) -> None:
+        """One qubit of `do_unmatched_noisy_reset_z` in the engine: one peek, the draws (here),
+        one apply. The reference peeks, draws and applies shot by shot, so when a shot fails the
+        draws made for the shots after it are taken back (the generator is restored and redrawn up
+        to the failing shot), and a failing peek applies the shots before it first."""
+        o, k = (obs.a_words, obs.b_words, obs.kappa), (kick.a_words, kick.b_words, kick.kappa)
+        if self._tab_rngs is not None:
+            return self._unmatched_sync(store, o, k, shots, one_mask)
+        p1, peek_fail = store.peek(o, shots)
+        n = len(shots) if peek_fail is None else peek_fail.shot
+        p1, lst = p1[:n], shots[:n]
+        hi = p1 >= 1.0 - 1e-12
+        draw = ~((p1 <= 1e-12) | hi)
+        bits = hi.astype(np.uint8)
+        state0 = self.np_rng.bit_generator.state
+        bits[draw] = self.np_rng.random(int(draw.sum())) < p1[draw]
+        res = store.unmatched_apply(o, k, lst, bits, draw, bits.astype(np.int64) != one_mask[:n])
+        failed_at = res.failure.shot if res.failure is not None else res.oom_at
+        if failed_at is not None:  # the reference had drawn only up to the failing shot
+            self.np_rng.bit_generator.state = state0
+            self.np_rng.random(int(draw[: failed_at + 1].sum()))
+        self._engine_error(res.failure, res.oom_at, "mbe_unmatched_apply")
+        self._engine_error(peek_fail, None, "mbe_peek")
+
+    def _unmatched_sync(
+        self, store: LiveExpansions, o: tuple[Any, Any, int], k: tuple[Any, Any, int],
+        shots: NDArray[np.intp], one_mask: NDArray[np.int64],
+    ) -> None:
+        """Sync mode: every shot has its own streams, so shot by shot as the reference does."""
+        for i, b in enumerate(shots.tolist()):
+            lst = shots[i : i + 1]
+            p1, peek_fail = store.peek(o, lst)
+            self._engine_error(peek_fail, None, "mbe_peek")
+            pb = float(p1[0])
+            pinned = pb <= 1e-12 or pb >= 1.0 - 1e-12
+            m_b = int(pb >= 1.0 - 1e-12) if pinned else self._sample_sync_born_bit(b, pb)
+            res = store.unmatched_apply(o, k, lst, [m_b], [not pinned], [m_b != int(one_mask[i])])
+            self._engine_error(res.failure, res.oom_at, "mbe_unmatched_apply")
+
     def peek_pauli_born_batch(self, targets: Sequence[int] | NDArray[np.int_], pauli: Literal["X", "Y", "Z"] = "Z") -> NDArray[np.float64]:
         self._flush_magic()
         t_list = [int(q) for q in targets]
         out = np.zeros((len(t_list), self.batch_size), dtype=np.float64)
         for row_i, q in enumerate(t_list):
             shared_obs = None if self._shot_tabs is not None else compile_pauli_product(self._live_ref_tab, [(q, pauli)])
+            store = None if shared_obs is None else self._engine_store((), shared_obs)
+            if store is not None and shared_obs is not None:
+                obs_t = (shared_obs.a_words, shared_obs.b_words, shared_obs.kappa)
+                p1, fail = store.peek(obs_t, np.arange(self.batch_size))
+                self._engine_error(fail, None, "mbe_peek")
+                out[row_i] = p1
+                continue
             for b in range(self.batch_size):
                 obs = shared_obs if shared_obs is not None else compile_pauli_product(self._shot_tabs[b], [(q, pauli)])  # type: ignore[index]
                 out[row_i, b] = self._obs_p1(self._live_exps[b], obs)
@@ -969,6 +1272,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             return
         self._flush_magic()
         obs = compile_pauli_product(self._live_ref_tab, [(int(q), pauli)])
+        store = self._engine_store(shots, obs)
+        if store is not None and self._plain_bits(desired_bits):
+            return self._postselect_engine(store, obs, shots, desired_bits)
         for b_np in shots:
             b = int(b_np)
             if self._live_exps[b].chi == 0:
@@ -980,6 +1286,12 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._log_branch_masses[b] += _log0((m_res.z1 if m_res.outcome else m_res.z0) / zin)
 
     def do_unmatched_noisy_reset_z(self, reset_zero_mask: NDArray[np.bool_], reset_one_mask: NDArray[np.bool_], pauli: Literal["X", "Y", "Z"] = "Z", order: Sequence[int] | None = None) -> None:
+        """Noisy reset: Born-sample Z, kick shots off their target; trace-preserving.
+
+        Unlike `postselect_z_batch`, this leaves the branch mass untouched (a reset is a
+        channel, not a postselection). A live `R` instruction, by contrast, does scale the mass
+        by the probability of its sampled outcome.
+        """
         comb = reset_zero_mask | reset_one_mask
         if not np.any(comb):
             return
@@ -992,6 +1304,14 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 continue
             obs = compile_pauli_product(self._live_ref_tab, [(int(q), pauli)])
             kick = compile_pauli_product(self._live_ref_tab, [(int(q), kick_p)])
+            store = self._engine_store(shots, obs, kick)
+            # A broadcast mask, or one that is not 2-D, is read shot by shot by the reference.
+            if store is not None and self._int_array(reset_one_mask) and (
+                reset_one_mask.shape == comb.shape and comb.ndim == 2
+            ):
+                one = np.asarray(reset_one_mask[q, shots]).astype(np.int64)
+                self._unmatched_engine(store, obs, kick, shots, one)
+                continue
             for b_np in shots:
                 b = int(b_np)
                 pb = self._obs_p1(self._live_exps[b], obs)

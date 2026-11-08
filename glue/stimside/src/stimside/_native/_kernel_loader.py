@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import platform
 import shlex
+import stat
 import subprocess
 import tempfile
 from types import ModuleType
@@ -34,6 +35,17 @@ def c_ptr(arr: Any, ptr_t: Any) -> Any:
 
 
 def c_w_ptr(w: Any) -> Any:
+    # No coercion here: a converted temporary would be freed before C++ reads it.
+    if (
+        w.dtype.char != "D"  # "D" is complex128
+        or not w.dtype.isnative
+        or w.ndim == 0
+        or not (w.flags.c_contiguous and w.flags.aligned)
+    ):
+        raise TypeError(
+            "weights must be a native-endian, aligned, C-contiguous complex128 array with at "
+            f"least one axis, got dtype {w.dtype}, shape {w.shape}"
+        )
     return c_ptr(w.view("float64"), f64_p)
 
 
@@ -41,7 +53,11 @@ def get_cpp_compile_and_link_args(
     include_march_native: bool = True,
 ) -> tuple[list[str], list[str]]:
     machine = (platform.machine() or platform.processor() or "").lower()
-    compile_args = ["-std=c++17", "-O3", "-fPIC", "-fno-strict-aliasing", "-g0"]
+    compile_args = [
+        "-std=c++17", "-O3", "-fPIC", "-fno-strict-aliasing",
+        "-ffp-contract=off",  # no FMA: keeps exact references and native/portable builds in step
+        "-g0",
+    ]
     if (
         include_march_native
         and os.environ.get("STIMSIDE_PORTABLE_BUILD") != "1"
@@ -52,6 +68,23 @@ def get_cpp_compile_and_link_args(
     ):
         compile_args.append("-march=native")
     return compile_args, ["-O3", "-shared"]
+
+
+def _source_mtime_ns(cpp_path: Path) -> int:
+    """Newest mtime among the translation unit and the headers beside it.
+
+    Only regular files that are not symlinks count: a link to a directory or to a procfs file
+    would report an mtime that the loader's own temp files keep moving, rebuilding every start.
+    """
+    mtimes = [cpp_path.stat().st_mtime_ns]
+    for hpp in cpp_path.parent.glob("*.hpp"):
+        try:
+            st = hpp.lstat()
+        except OSError:  # e.g. deleted just now
+            continue
+        if stat.S_ISREG(st.st_mode):
+            mtimes.append(st.st_mtime_ns)
+    return max(mtimes)
 
 
 def resolve_so(
@@ -76,7 +109,7 @@ def resolve_so(
             in_source_tree
             and cpp_path.exists()
             and os.access(here, os.W_OK)
-            and cpp_path.stat().st_mtime_ns > so_path.stat().st_mtime_ns
+            and _source_mtime_ns(cpp_path) > so_path.stat().st_mtime_ns
         )
     )
     if need_compile:
@@ -118,12 +151,12 @@ def resolve_so(
             if (
                 not force_recompile
                 and so_path.exists()
-                and (not in_source_tree or cpp_path.stat().st_mtime_ns <= so_path.stat().st_mtime_ns)
+                and (not in_source_tree or _source_mtime_ns(cpp_path) <= so_path.stat().st_mtime_ns)
             ):
                 return so_path
             for cmd in cmd_variants:
                 try:
-                    src_mtime_ns = cpp_path.stat().st_mtime_ns
+                    src_mtime_ns = _source_mtime_ns(cpp_path)
                     subprocess.run(cmd, check=True)
                     os.utime(tmp_so, ns=(src_mtime_ns, src_mtime_ns))
                     os.replace(tmp_so, so_path)
@@ -144,16 +177,20 @@ def resolve_so(
     return so_path
 
 
-def load_cdll(resolve: Callable[..., Path], sentinel: str | None = None) -> ctypes.CDLL:
-    """Load the resolved library; recompile once if loading fails or `sentinel` is not exported.
+def load_cdll(
+    resolve: Callable[..., Path], sentinel: str | Sequence[str] | None = None
+) -> ctypes.CDLL:
+    """Load the resolved library; recompile once if loading fails or a name is not exported.
 
-    Raises RuntimeError rather than return a rebuilt library that still lacks `sentinel`.
+    `sentinel` is one exported name or a sequence of them. Raises RuntimeError rather than
+    return a rebuilt library that still lacks one.
     """
+    names = (sentinel,) if isinstance(sentinel, str) else tuple(sentinel or ())
     first_err: OSError | None = None
     try:
         lib = ctypes.CDLL(str(resolve()))
-        if sentinel is not None:
-            getattr(lib, sentinel)
+        for name in names:
+            getattr(lib, name)
         return lib
     except AttributeError:
         # Else dlopen hands this stale library back for the rebuilt one (same path).
@@ -170,11 +207,12 @@ def load_cdll(resolve: Callable[..., Path], sentinel: str | None = None) -> ctyp
         # Keep the compiler error as the cause; still report the initial load error.
         raise RuntimeError(f"{exc} (initial load error: {first_err})") from exc
     lib = ctypes.CDLL(str(rebuilt_path))
-    if sentinel is not None and not hasattr(lib, sentinel):
-        # dlopen handed back the stale library: another handle keeps it loaded (or the source lacks it).
+    if missing := [name for name in names if not hasattr(lib, name)]:
+        # dlopen handed back the stale library: another handle keeps it loaded (or the source
+        # lacks it).
         raise RuntimeError(
-            f"{lib._name} does not export {sentinel} even after a rebuild: restart Python if an "
-            "older copy of it was loaded earlier in this process."
+            f"{lib._name} does not export {', '.join(missing)} even after a rebuild: restart "
+            "Python if an older copy of it was loaded earlier in this process."
         )
     return lib
 
@@ -199,7 +237,7 @@ def get_lib(
         if force_recompile
         else resolve_fn
     )
-    lib = load_cdll(resolver, sentinel)
+    lib = load_cdll(resolver, tuple(dict.fromkeys((sentinel, *(spec[0] for spec in specs)))))
     for fn_name, argtypes, restype in specs:
         fn = getattr(lib, fn_name)
         fn.argtypes = list(argtypes)

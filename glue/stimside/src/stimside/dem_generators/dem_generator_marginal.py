@@ -229,15 +229,18 @@ class MarginalLeakageDemGenerator:
 
     Pass an instance to the samplers as ``MarginalDecoder(dem_gen=...)`` (the
     ``dem_decoder`` of ``TablesideSampler``, ``CosetsideSampler``, or
-    ``FlipsideSampler``). Called with a circuit and its
+    ``MagicsideSampler``; ``FlipsideSampler`` rejects ``MarginalDecoder``, because
+    these DEMs model leaked qubits as frozen but ``FlipsideSimulator`` depolarizes
+    them). Called with a circuit and its
     ``(shots, measurements)`` measurement records, it returns one DEM per shot
     (a single DEM for 1D records), built from the ``MPAD[LEAKAGE_MEASUREMENT...]``
     flags of that shot.
 
     Args:
         unconditional_condition_on_U: must match the op handler's flag of the
-            same name (``LeakageUint8`` and ``LeakageUint8Coset`` default to
-            True). It decides whether untagged gates skip leaked qubits.
+            same name (``LeakageUint8Tableau``, ``LeakageUint8Coset`` and
+            ``LeakageUint8Magic`` default to True; ``LeakageUint8Flip`` has no such
+            flag). It decides whether untagged gates skip leaked qubits.
         decompose_errors: if True, decompose the DEM into matchable graphlike
             components (<=2 detectors per component) using Stim's native APIs.
         reweight_only: if True, produce only the DEM reweight update instead of

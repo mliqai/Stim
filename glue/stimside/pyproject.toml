@@ -47,3 +47,11 @@ testpaths = ["src"]
 norecursedirs = ["build", "dist", "python_build_stimside", "*.egg-info", ".benchmarks", ".git"]
 markers = ["slow: long-running test (> 10 s)"]
 
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.mypy]
+ignore_missing_imports = true

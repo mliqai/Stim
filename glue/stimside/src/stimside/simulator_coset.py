@@ -180,6 +180,10 @@ class CosetsideSimulator(
 
     @property
     def active_shots(self) -> dict[int, MRQFState]:
+        """Live active-shot dict; each read marks it as possibly mutated (re-pushed to C++).
+
+        Mutate through a fresh read: a reference held across a peek is not re-pushed.
+        """
         if self._use_cpp:
             if self._cpp_dirty:
                 self._sync_cpp_to_py()
@@ -188,6 +192,12 @@ class CosetsideSimulator(
 
     def _sync_cpp_to_py(self) -> None:
         if not self._cpp_dirty or self._cpp_eng is None or self._cpp_lib is None:
+            return
+        if self._py_dirty:
+            # Both flags are only ever set together by an interrupt between the two stores of
+            # `_engine_kernel_end`. The Python (pre-kernel) state wins, exactly as it does when
+            # a peek re-imports it, so the outcome does not depend on which is read first.
+            self._cpp_dirty = False
             return
         lib = self._cpp_lib
         out_idx = np.empty(self.batch_size, dtype=np.int32)
@@ -235,8 +245,11 @@ class CosetsideSimulator(
             st._refresh_views()
         self._cpp_dirty = False
 
-    def _sync_py_to_cpp(self, *, keep_py_dirty: bool = False) -> None:
-        if not self._py_dirty and (self._cpp_dirty or len(self._active_shots) == 0):
+    def _sync_py_to_cpp(self) -> None:
+        # Re-imports only when Python state is newer. `_py_dirty` is raised by every Python
+        # writer and cleared here, so a held MRQFState/dict reference mutated after a peek is
+        # not re-pushed unless `active_shots` is read again.
+        if not self._py_dirty:
             return
         lib = self._cpp_lib
         assert lib is not None and self._cpp_eng is not None
@@ -262,8 +275,23 @@ class CosetsideSimulator(
                 in_Gamma.ctypes.data_as(u8_p),
                 in_P.ctypes.data_as(i32_p),
             )
-        self._py_dirty = keep_py_dirty
+        self._py_dirty = False
         self._cpp_dirty = False
+
+    def _engine_kernel_begin(self) -> None:
+        # Call right before a C++ kernel that mutates the engine. An async KeyboardInterrupt after
+        # the kernel returns but before `_cpp_dirty` is set would leave both flags clean with the
+        # engine ahead of Python (`_sync_py_to_cpp` trusts the flags). Arming `_py_dirty` first
+        # makes such an interrupt roll the engine back to the (pre-kernel) Python state at the
+        # next peek. If the engine is already ahead (`_cpp_dirty`) the flags stay as they are.
+        if not self._cpp_dirty:
+            self._py_dirty = True
+
+    def _engine_kernel_end(self) -> None:
+        # Call right after the kernel returns: `_cpp_dirty` is raised BEFORE `_py_dirty` is
+        # cleared, so no interrupt can leave both flags clean.
+        self._cpp_dirty = True
+        self._py_dirty = False
 
     def _init_rngs(self) -> None:
         if self.sync_tableside_rng:
@@ -382,6 +410,10 @@ class CosetsideSimulator(
 
     def clear(self) -> None:
         """Reset the simulator state for a new batch without recompiling the reference circuit."""
+        if self._use_cpp:
+            # Raised first: an interrupt before `engine_clear` must re-import the cleared Python
+            # state at the next peek instead of leaving a stale engine behind clean flags.
+            self._py_dirty = True
         self._flip_simulator.clear()
         self._active_shots.clear()
         if self._cpp_eng is not None and self._cpp_lib is not None:
@@ -888,6 +920,7 @@ class CosetsideSimulator(
                 cm_c = np.ascontiguousarray(condition_met_mask, dtype=np.uint8)
                 xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
                 zs_c = np.ascontiguousarray(zs_base, dtype=np.uint8)
+                self._engine_kernel_begin()
                 lib.engine_batch_inject_general_clifford(
                     self._cpp_eng,
                     num_g,
@@ -905,7 +938,7 @@ class CosetsideSimulator(
                     z2z_w.ctypes.data_as(u64_p),
                     *self._cpp_out_args(),
                 )
-                self._cpp_dirty = True
+                self._engine_kernel_end()
                 self._flush_xz(self._any_x_c.value, self._any_z_c.value)
                 return
 
@@ -961,6 +994,11 @@ class CosetsideSimulator(
                 output_xs=True, output_zs=True
             )
             group_arr = np.array(group, dtype=np.intp)
+            # Raised BEFORE the per-shot writes (and once per group, because the next group's
+            # `condition_group_fn` may peek, which syncs and clears it): if a write raises
+            # midway the engine must still be re-imported, `_sync_py_to_cpp` trusts the flag.
+            if self._use_cpp:
+                self._py_dirty = True
             for b_idx_np in failed_shots:
                 b_idx = int(b_idx_np)
                 f_x_local = xs_base[group_arr, b_idx]
@@ -974,8 +1012,6 @@ class CosetsideSimulator(
                     xs_base=xs_base,
                     zs_base=zs_base,
                 )
-            if self._use_cpp:
-                self._py_dirty = True
         if self._use_cpp:
             self._py_dirty = True
 
@@ -1295,6 +1331,7 @@ class CosetsideSimulator(
         )
         xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
         x2z_w, z2z_w = step_meta.get_evict_words(self._n_words)
+        self._engine_kernel_begin()
         self._cpp_lib.engine_batch_det_meas_step(
             self._cpp_eng,
             num_sub,
@@ -1307,7 +1344,7 @@ class CosetsideSimulator(
             z2z_w.ctypes.data_as(u64_p),
             *self._cpp_out_args(),
         )
-        self._cpp_dirty = True
+        self._engine_kernel_end()
         any_x = int(self._any_x_c.value)
         any_z = int(self._any_z_c.value)
         # Epilogue of a deterministic batched step: record, reset-kick, flush and flip noise.
@@ -1332,6 +1369,7 @@ class CosetsideSimulator(
         if meta.q < 0:
             return np.zeros(self.batch_size, dtype=np.bool_)
         assert self._cpp_lib is not None and self._cpp_eng is not None
+        self._engine_kernel_begin()
         if not meta.is_random:
             m_shots = np.empty(self.batch_size, dtype=np.bool_)
             null_u64, null_i64 = ctypes.cast(0, u64_p), ctypes.cast(0, i64_p)
@@ -1355,7 +1393,7 @@ class CosetsideSimulator(
                 xs_c.ctypes.data_as(u8_p), m_shots.ctypes.data_as(u8_p),
                 *self._cpp_out_args(),
             )
-        self._cpp_dirty = True
+        self._engine_kernel_end()
         return m_shots
 
     def _eval_substep_py(
@@ -1513,6 +1551,7 @@ class CosetsideSimulator(
             self._any_x_c.value = 0
             self._any_z_c.value = 0
 
+            self._engine_kernel_begin()
             self._cpp_lib.engine_batch_unmatched_noisy_reset_z(
                 self._cpp_eng,
                 r0_c.ctypes.data_as(u8_p),
@@ -1524,7 +1563,7 @@ class CosetsideSimulator(
                 x2z_w.ctypes.data_as(u64_p),
                 *self._cpp_out_args(),
             )
-            self._cpp_dirty = True
+            self._engine_kernel_end()
             self._flush_xz(self._any_x_c.value, self._any_z_c.value)
             return
 
@@ -1546,6 +1585,11 @@ class CosetsideSimulator(
         any_x_kick = False
         any_z_kick = False
 
+        # Raised BEFORE the per-shot writes (X/Y only: Z never reaches Python with the engine):
+        # if one raises midway (e.g. a bad `order` index) the earlier shots are already
+        # projected in Python and the engine must be re-imported.
+        if pauli != "Z":
+            self._py_dirty = True
         for q_np in affected_qubits:
             q = int(q_np)
             shots_for_q = np.flatnonzero(combined_mask[q])
@@ -1602,8 +1646,6 @@ class CosetsideSimulator(
                         xs_base[q, b_idx] ^= True
                         any_x_kick = True
 
-        if pauli != "Z":
-            self._py_dirty = True
         self._flush_xz(any_x_kick, any_z_kick)
 
     def postselect_z_batch(
@@ -1633,6 +1675,10 @@ class CosetsideSimulator(
         aw, bw, kap = pauli_image(pauli, q, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa)
         _, sign_bool, rot = self._projection_words(aw, bw, kap)
 
+        # Raised BEFORE the per-shot writes: if one raises midway (short `desired_bits`,
+        # KeyboardInterrupt) the earlier shots are already projected in Python and the engine
+        # must be re-imported; `_sync_py_to_cpp` trusts this flag.
+        self._py_dirty = True
         for b_np in shots_for_q:
             b_idx = int(b_np)
             m = int(desired_bits[b_idx]) & 1
@@ -1652,7 +1698,6 @@ class CosetsideSimulator(
             any_x_kick |= kx
             any_z_kick |= kz
 
-        self._py_dirty = True
         self._flush_xz(any_x_kick, any_z_kick)
 
     def record_direct_measurements(self, outcomes_per_target: NDArray[np.bool_]) -> None:
@@ -1701,7 +1746,7 @@ class CosetsideSimulator(
         )
 
         if self._use_cpp and self._cpp_lib is not None and self._cpp_eng is not None:
-            self._sync_py_to_cpp(keep_py_dirty=self._py_dirty)
+            self._sync_py_to_cpp()
             xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
             zs_c = np.ascontiguousarray(zs_base, dtype=np.uint8)
             out = np.empty((len(targets_arr), self.batch_size), dtype=np.int8)

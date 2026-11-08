@@ -19,6 +19,7 @@ from stimside._magic.compile import (
     run_direct,
     run_selector,
 )
+from stimside._native import _kernel_loader as kl
 from stimside._native import magic_kernels as mk
 
 EXPECTED_SYMBOLS = (
@@ -31,6 +32,9 @@ EXPECTED_SYMBOLS = (
     "magic_branch_ccz",
     "magic_project_diagonal",
     "magic_contract_choi",
+    "magic_abi_v3",
+    "magic_measure_batch",
+    "magic_apply_quarter_turn_tol",
 )
 
 
@@ -625,3 +629,138 @@ def test_measure_expansions_batch_rejects_empty_mixed_width_and_chi0_batches() -
                   [_rand_shot(rng, 5, 2, "canon"), chi0], [chi0, _rand_shot(rng, 5, 2, "canon")]):
         with pytest.raises(ValueError, match="measure_expansions_batch"):
             pq.measure_expansions_batch(shots, obs, rng=rng)
+
+
+# complex64 weights (assigned after construction, so `__post_init__` never coerces them) must
+# not reach the kernels as-is: they read 2 * chi doubles, so a narrower dtype is read out of bounds.
+def _c64_shot() -> pq.ShotExpansion:
+    e = pq.apply_pauli_t(pq.ShotExpansion.zero(5), [1, 0, 0, 0, 0], [0] * 5, 0)  # chi 1 -> 2
+    return pq.apply_pauli_t(e, [0, 1, 0, 0, 0], [0] * 5, 0)
+
+
+def _with_weight_dtype(e: pq.ShotExpansion, dtype: type, scale: int = 0) -> pq.ShotExpansion:
+    e = e.copy()
+    # `scale` rounds to a dyadic grid, which complex64 and complex128 both represent exactly.
+    e.weights = (np.round(e.weights * scale) / scale if scale else e.weights).astype(dtype)
+    return e
+
+
+def test_apply_pauli_in_place_with_complex64_weights_matches_complex128() -> None:
+    args = ([1, 0, 0, 0, 0], [0, 1, 0, 0, 0], 1)
+    e = _with_weight_dtype(_c64_shot(), np.complex64)
+    w32 = e.weights
+    out = pq.apply_pauli(e, *args, in_place=True)
+    want = pq.apply_pauli(_with_weight_dtype(_c64_shot(), np.complex128), *args).weights
+    assert out is e and e.weights.dtype == np.complex128
+    np.testing.assert_allclose(e.weights, want, rtol=1e-6, atol=0)  # input rounded to complex64
+    assert w32.dtype == np.complex64  # the caller's own array is left alone
+
+
+def test_measure_expansions_batch_with_all_complex64_weights_is_bit_exact() -> None:
+    obs = ([0] * 5, [1, 0, 0, 0, 0], 0)
+
+    def run(dtype: type) -> tuple:
+        shots = [_with_weight_dtype(_c64_shot(), dtype, 16) for _ in range(2)]
+        return pq.measure_expansions_batch(shots, obs, rng=np.random.default_rng(1))
+
+    got, ref = run(np.complex64), run(np.complex128)
+    assert all(a.tobytes() == b.tobytes() for a, b in zip(got[:3], ref[:3]))
+    assert [p.weights.tobytes() for p in got[3]] == [p.weights.tobytes() for p in ref[3]]
+
+
+def test_apply_quarter_turn_in_place_and_contract_choi_with_complex64_weights() -> None:
+    ref = pq.apply_quarter_turn(_c64_shot(), [1, 0, 0, 0, 0], [0] * 5, 0)
+    e = _with_weight_dtype(_c64_shot(), np.complex64)
+    pq.apply_quarter_turn(e, [1, 0, 0, 0, 0], [0] * 5, 0, in_place=True, check_unitary=False)
+    np.testing.assert_allclose(e.norm_sq(), ref.norm_sq(), rtol=1e-6)
+    zero3, right = pq.ShotExpansion.zero(3), pq.ShotExpansion.zero(2)
+    left = _with_weight_dtype(zero3, np.complex64)
+    got = pq.contract_choi_expansions(left, right, 2, (0,), False)
+    want = pq.contract_choi_expansions(zero3, right, 2, (0,), False)
+    np.testing.assert_array_equal(got.weights, want.weights)
+
+
+def test_c_w_ptr_rejects_non_complex128_instead_of_reading_out_of_bounds() -> None:
+    for bad in (np.ones(4, np.complex64), np.ones(4, np.float64), np.ones(8, np.complex128)[::2]):
+        with pytest.raises(TypeError, match="complex128"):
+            kl.c_w_ptr(bad)
+    kl.c_w_ptr(np.ones(4, np.complex128))
+
+
+def _tiny_tail_shot() -> pq.ShotExpansion:
+    e = _c64_shot()  # chi 4; the last weight is 1e-7 relative, so only a loose cancel_tol drops it
+    e.weights = e.weights.copy()
+    e.weights[-1] *= 1e-6
+    return e
+
+
+def test_cancel_tol_reaches_quarter_turn_and_measure_batch_and_legacy_entry_keeps_1e13(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x_obs = ([0, 0, 1, 0, 0], [0] * 5, 0)  # a != 0, so the batch rotates through the quarter turn
+
+    def ranks() -> tuple[int, int]:
+        e = _tiny_tail_shot()
+        qt = pq.apply_quarter_turn(e, [1, 0, 0, 0, 0], [0] * 5, 0, check_unitary=False)
+        batch = pq.measure_expansions_batch(
+            [_tiny_tail_shot()] * 2, x_obs, rng=np.random.default_rng(1), keep_rotated_frame=True
+        )
+        return qt.chi, batch[3][0].chi
+
+    assert ranks() == (4, 4)
+    monkeypatch.setattr(pq, "K1_CANCEL_REL_TOL", 1e-3)
+    assert ranks() == (3, 3)
+
+    exp = _tiny_tail_shot()  # the legacy 23-argument symbol ignores the module constant
+    a, b = np.array([1], np.uint64), np.zeros(1, np.uint64)
+    out_chi, _, _bufs, out_ptrs = pq._alloc_cpp_geom_bufs(exp.chi, exp.n_words, exp.d + 1)
+    rc = mk.get_magic_kernels_lib().magic_apply_quarter_turn(
+        exp.chi, exp.d, exp.n_qubits, exp.n_words, *pq._cpp_shot_in_ptrs(exp),
+        pq._c_ptr(a, pq._c_u64_p), pq._c_ptr(b, pq._c_u64_p), ctypes.c_uint8(0), *out_ptrs,
+    )
+    assert rc == 0 and out_chi.value == 4
+
+
+def test_measure_batch_kernel_applies_the_passed_cancel_tol_to_its_quarter_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A 1e-4 relative tail survives the default 1e-13 but is cancelled at 1e-3. Cancelling it
+    # breaks unitarity, which the kernel's own quarter turn reports; a kernel that ignored
+    # `cancel_tol` there would keep the tail and fail later, at the Born-mass check.
+    e = _c64_shot()
+    e.weights = e.weights.copy()
+    e.weights[-1] *= 1e-4
+    obs = ([0, 0, 1, 0, 0], [0] * 5, 0)
+    pq.measure_expansions_batch([e], obs, rng=np.random.default_rng(1))
+    monkeypatch.setattr(pq, "K1_CANCEL_REL_TOL", 1e-3)
+    with pytest.raises(FloatingPointError, match="apply_quarter_turn failed while measuring"):
+        pq.measure_expansions_batch([e], obs, rng=np.random.default_rng(1))
+
+
+def test_magic_library_sentinel_is_abi_v3_and_the_legacy_v2_symbol_stays_exported() -> None:
+    lib = mk.get_magic_kernels_lib()
+    assert (lib.magic_abi_v3(), lib.magic_abi_v2()) == (3, 2)
+    assert mk.get_magic_measure_batch() is lib.magic_measure_batch
+
+
+def _unaligned_complex128() -> np.ndarray:
+    raw = np.zeros(4 * 16 + 1, np.uint8)
+    w = raw[1:].view(np.complex128)  # contiguous, native order, but 1 byte off alignment
+    assert w.dtype.char == "D" and w.flags.c_contiguous and not w.flags.aligned
+    return w
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        np.ones(4, ">c16"),
+        _unaligned_complex128(),
+        np.array(1 + 1j),
+    ],
+    ids=["big_endian", "unaligned", "zero_dim"],
+)
+def test_c_w_ptr_raises_type_error_for_byte_swapped_unaligned_and_zero_dim_arrays(
+    bad: np.ndarray,
+) -> None:
+    with pytest.raises(TypeError, match="complex128"):
+        kl.c_w_ptr(bad)

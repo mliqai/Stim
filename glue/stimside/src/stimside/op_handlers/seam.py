@@ -64,7 +64,8 @@ class BatchedLeakageSimulator(Protocol):
         reset_one_mask: NDArray[np.bool_],
         pauli: Literal["X", "Y", "Z"] = "Z",
         order: Sequence[int] | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Noisy reset of unmatched shots; trace-preserving (the branch mass stays unchanged)."""
 
     def apply_pauli(
         self, pauli: Literal["X", "Y", "Z"], mask: NDArray[np.bool_], p: float = 1.0

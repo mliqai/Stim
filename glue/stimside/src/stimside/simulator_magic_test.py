@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import multiprocessing
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 
@@ -703,7 +705,7 @@ def test_live_and_compiled_stream_engines_sample_the_same_distribution() -> None
 
     XOR parities plus means fix every pairwise correlation. At most 105 comparisons per circuit
     (168 in total), so a false failure is about 1e-4 family-wise. Each engine's 8192 shots are
-    4 fixed-seed chunks of 2048; the 48 chunks run on 8 processes (about 30 s wall).
+    4 fixed-seed chunks of 2048; the 48 chunks run on up to 8 spawned processes (about 30 s wall).
     """
     names = [
         "c01_clifford_noise_feedback",
@@ -716,7 +718,10 @@ def test_live_and_compiled_stream_engines_sample_the_same_distribution() -> None
     texts = [next(text for c, _, _, text in CORPUS if c == name) for name in names]
     jobs = [(t, 100 * c + 10 * comp + k, comp) for c, t in enumerate(texts)
             for comp in (False, True) for k in range(4)]
-    with ProcessPoolExecutor(8) as pool:
+    # Plumbing only: at most 8 workers and no more than the usable CPUs (2-4-core runners; 3.13+
+    # honours affinity), and spawn so children do not inherit the parent's locks / BLAS state.
+    workers = min(8, getattr(os, "process_cpu_count", os.cpu_count)() or 1)
+    with ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn")) as pool:
         res = list(pool.map(_engine_chunk, jobs))
     z = {n: _max_z(np.vstack(res[8 * c:8 * c + 4]), np.vstack(res[8 * c + 4:8 * c + 8]))
          for c, n in enumerate(names)}

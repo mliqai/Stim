@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Literal, Sequence, cast
+from typing import Literal, Sequence, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -32,12 +32,9 @@ from stimside.op_handlers.leakage_handlers.transition_effects import (
 from stimside.op_handlers.seam import BatchedLeakageSimulator
 from stimside.util.stim_workarounds import split_fused_instruction
 
-if TYPE_CHECKING:
-    from stimside.simulator_coset import CosetsideSimulator
-
 
 @dataclasses.dataclass
-class LeakageUint8Coset(OpHandler["CosetsideSimulator"]):
+class LeakageUint8Coset(OpHandler[BatchedLeakageSimulator]):
     """Batched uint8 leakage OpHandler for CosetsideSimulator reusing tableside tag parsers.
 
     Args:

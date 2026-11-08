@@ -16,17 +16,9 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
-from stimside._native._kernel_loader import (
-    c_ptr as _c_ptr,
-    c_w_ptr as _c_w_ptr,
-    f64_p as _c_f64_p,
-    i32_p as _c_i32_p,
-    i64_p as _c_i64_p,
-    u8_p as _c_u8_p,
-    u64_p as _c_u64_p,
-)
+from stimside._native import _kernel_loader as _kl
 from stimside._native.magic_kernels import get_magic_kernels_lib as _get_cpp_lib
-from stimside._native.magic_kernels import get_magic_measure_batch
+from stimside._native.magic_kernels import addr as _addr, get_magic_measure_batch, w_addr as _w_addr
 from stimside.util.bitwords import (
     coerce_pauli_words,
     first_set_bit_in_words,
@@ -63,6 +55,7 @@ OMEGA_ARR: NDArray[np.complex128] = np.array(OMEGA_POWERS, dtype=np.complex128)
 I_POWERS: tuple[complex, ...] = (1.0 + 0.0j, 0.0 + 1.0j, -1.0 + 0.0j, 0.0 - 1.0j)
 I_POWERS_ARR: NDArray[np.complex128] = np.array(I_POWERS, dtype=np.complex128)
 _INV_SQRT2, _PHASE4 = INV_SQRT2, I_POWERS_ARR
+_c_ptr, _c_u64_p = _kl.c_ptr, _kl.u64_p  # typed-pointer helpers: magic_kernels_test calls them
 
 __all__ = [
     "DEFAULT_ATOL", "K1_CANCEL_REL_TOL", "ImpossiblePostselectionError",
@@ -702,10 +695,11 @@ def _clone_shot_with_rows(
 
 def _cpp_shot_in_ptrs(exp: ShotExpansion, *, include_a_union: bool = False) -> tuple[Any, ...]:
     assert exp.ell_odd is not None
-    mid = (_c_ptr(exp.A_words, _c_u64_p), _c_ptr(exp.a_union, _c_u64_p)) if include_a_union else (_c_ptr(exp.A_words, _c_u64_p),)
+    exp.weights = np.ascontiguousarray(exp.weights, dtype=np.complex128)  # set after __post_init__
+    mid = (_addr(exp.A_words), _addr(exp.a_union)) if include_a_union else (_addr(exp.A_words),)
     return (
-        _c_w_ptr(exp.weights), _c_ptr(exp.h_words, _c_u64_p), _c_ptr(exp.ell, _c_u8_p),
-        *mid, _c_ptr(exp.Gamma, _c_u8_p), _c_ptr(exp.pivots, _c_i32_p), _c_ptr(exp.ell_odd, _c_u8_p),
+        _w_addr(exp.weights), _addr(exp.h_words), _addr(exp.ell),
+        *mid, _addr(exp.Gamma), _addr(exp.pivots), _addr(exp.ell_odd),
     )
 
 
@@ -714,7 +708,9 @@ def _alloc_cpp_row_bufs(cap: int, nw: int, d: int) -> tuple[Any, ...]:
     out_w = np.empty(cap, dtype=np.complex128)
     out_h = np.empty((cap, nw), dtype=np.uint64)
     out_ell = np.empty((cap, d), dtype=np.uint8)
-    ptrs = (ctypes.byref(out_chi), _c_w_ptr(out_w), _c_ptr(out_h, _c_u64_p), _c_ptr(out_ell, _c_u8_p), ctypes.byref(out_norm))
+    ptrs = (
+        ctypes.byref(out_chi), _w_addr(out_w), _addr(out_h), _addr(out_ell), ctypes.byref(out_norm)
+    )
     return out_chi, out_w, out_h, out_ell, ptrs
 
 
@@ -730,8 +726,8 @@ def _alloc_cpp_geom_bufs(chi: int, nw: int, d_cap: int) -> tuple[Any, ...]:
     bufs = (out_w, out_h, out_ell, out_A, out_G, out_piv, out_eo)
     ptrs = (
         ctypes.byref(out_chi), ctypes.byref(out_d),
-        _c_w_ptr(out_w), _c_ptr(out_h, _c_u64_p), _c_ptr(out_ell, _c_u8_p),
-        _c_ptr(out_A, _c_u64_p), _c_ptr(out_G, _c_u8_p), _c_ptr(out_piv, _c_i32_p), _c_ptr(out_eo, _c_u8_p),
+        _w_addr(out_w), _addr(out_h), _addr(out_ell),
+        _addr(out_A), _addr(out_G), _addr(out_piv), _addr(out_eo),
     )
     return out_chi, out_d, bufs, ptrs
 
@@ -768,13 +764,14 @@ def apply_pauli(
     exp = target if in_place else target.copy()
     if exp.chi == 0:
         return exp
+    exp.weights = np.ascontiguousarray(exp.weights, dtype=np.complex128)
     if not np.all(np.isfinite(exp.weights)):
         raise FloatingPointError("Non-finite weights in apply_pauli")
     _get_cpp_lib().magic_apply_pauli_batch(
-        exp.chi, exp.d, exp.n_words, _c_w_ptr(exp.weights),
-        _c_ptr(exp.h_words, _c_u64_p), _c_ptr(exp.ell, _c_u8_p),
-        _c_ptr(exp.A_words, _c_u64_p), _c_ptr(exp.a_union, _c_u64_p),
-        _c_ptr(a_w, _c_u64_p), _c_ptr(b_w, _c_u64_p), ctypes.c_uint8(kap),
+        exp.chi, exp.d, exp.n_words, _w_addr(exp.weights),
+        _addr(exp.h_words), _addr(exp.ell),
+        _addr(exp.A_words), _addr(exp.a_union),
+        _addr(a_w), _addr(b_w), ctypes.c_uint8(kap),
     )
     return exp
 
@@ -815,9 +812,10 @@ def apply_quarter_turn(
                 check_unitary_norm(pre_norm, 0.0, tol_e, "apply_quarter_turn")
             return exp
     out_chi, out_d, bufs, out_ptrs = _alloc_cpp_geom_bufs(exp.chi, exp.n_words, exp.d + 1)
-    rc = lib.magic_apply_quarter_turn(
+    rc = lib.magic_apply_quarter_turn_tol(
         exp.chi, exp.d, exp.n_qubits, exp.n_words, *_cpp_shot_in_ptrs(exp),
-        _c_ptr(a_w, _c_u64_p), _c_ptr(b_w, _c_u64_p), ctypes.c_uint8(kap), *out_ptrs,
+        _addr(a_w), _addr(b_w), ctypes.c_uint8(kap),
+        ctypes.c_double(K1_CANCEL_REL_TOL), *out_ptrs,
     )
     if rc != 0:
         raise FloatingPointError(f"magic_apply_quarter_turn returned error code {rc}")
@@ -978,7 +976,7 @@ def apply_pauli_t(
 
     def _cpp(lib: Any, head: tuple[Any, ...], out_ptrs: tuple[Any, ...], _bw: Any, ba: Any, bb: Any, bk: Any) -> None:
         lib.magic_branch_pauli_t(
-            *head, _c_ptr(ba[1], _c_u64_p), _c_ptr(bb[1], _c_u64_p),
+            *head, _addr(ba[1]), _addr(bb[1]),
             ctypes.c_uint8(int(bk[1])), ctypes.c_int(1 if is_dag else 0),
             ctypes.c_double(K1_CANCEL_REL_TOL), *out_ptrs,
         )
@@ -1048,7 +1046,7 @@ def apply_ccz(
 
     def _cpp(lib: Any, head: tuple[Any, ...], out_ptrs: tuple[Any, ...], bw: Any, ba: Any, bb: Any, bk: Any) -> None:
         lib.magic_branch_ccz(
-            *head, _c_w_ptr(bw), _c_ptr(ba, _c_u64_p), _c_ptr(bb, _c_u64_p), _c_ptr(bk, _c_u8_p),
+            *head, _w_addr(bw), _addr(ba), _addr(bb), _addr(bk),
             ctypes.c_double(K1_CANCEL_REL_TOL), *out_ptrs,
         )
 
@@ -1221,7 +1219,7 @@ def project_diagonal(
     out_z = ctypes.c_double(0.0)
     _get_cpp_lib().magic_project_diagonal(
         exp.chi, exp.d, exp.n_words, *_cpp_shot_in_ptrs(exp),
-        _c_ptr(b_w, _c_u64_p), ctypes.c_uint8(sig << 1), ctypes.c_uint8(m),
+        _addr(b_w), ctypes.c_uint8(sig << 1), ctypes.c_uint8(m),
         ctypes.c_double(K1_CANCEL_REL_TOL), *out_ptrs, ctypes.byref(out_z),
     )
     _assign_cpp_geom_shot(exp, int(out_chi.value), int(out_d.value), bufs)
@@ -1271,7 +1269,7 @@ def contract_choi_expansions(
         _get_cpp_lib().magic_contract_choi(
             left.chi, left.d, left.n_words, *_cpp_shot_in_ptrs(left),
             right.chi, right.d, right.n_words, *_cpp_shot_in_ptrs(right),
-            n_op, _c_ptr(q_arr, _c_i32_p), m, int(bool(right_is_choi)),
+            n_op, _addr(q_arr), m, int(bool(right_is_choi)),
             ctypes.c_double(K1_CANCEL_REL_TOL), *out_ptrs,
         )
     )
@@ -1442,21 +1440,19 @@ def _measure_batch_kernel(
         np.empty(n_cap, np.int32), np.empty(n_cap, np.uint8), np.empty((n, nw), np.uint64),
     )
     ins: tuple[NDArray[Any], ...] = (chi, d, canon, z, w, *cat)
-    in_t = (_c_i64_p, _c_i64_p, _c_u8_p, _c_f64_p, None, _c_u64_p, _c_u8_p, _c_u64_p, _c_u8_p,
-            _c_i32_p, _c_u8_p)
-    out_t = (_c_f64_p, _c_i64_p, None, _c_u64_p, _c_u8_p, _c_u64_p, _c_u8_p, _c_i32_p, _c_u8_p,
-             _c_u64_p)
     ra, rb, rk = rot if rot is not None else (b_diag, b_diag, 0)
     fn = get_magic_measure_batch()
+    # Raw addresses keep nothing alive: `run` must itself hold every array it points into (an
+    # address into a freed array is a use-after-free in C++).
+    alive = (ins, outs, ra, rb, b_diag)
+    in_a = [_w_addr(a) if i == 4 else _addr(a) for i, a in enumerate(ins)]
+    out_a = [_w_addr(a) if i == 2 else _addr(a) for i, a in enumerate(outs)]
+    ra_a, rb_a, bd_a = _addr(ra), _addr(rb), _addr(b_diag)
 
-    def ptrs(arrs: tuple[NDArray[Any], ...], types: tuple[Any, ...]) -> list[Any]:
-        return [_c_w_ptr(a) if t is None else _c_ptr(a, t) for a, t in zip(arrs, types)]
-
-    def run(outcome: NDArray[np.uint8] | None) -> None:  # closes over the arrays it points into
+    def run(outcome: NDArray[np.uint8] | None, _keep: Any = alive) -> None:
         s = fn(
-            n, n_q, nw, *ptrs(ins, in_t), int(rot is not None), _c_ptr(ra, _c_u64_p),
-            _c_ptr(rb, _c_u64_p), rk, _c_ptr(b_diag, _c_u64_p), sig << 1, K1_CANCEL_REL_TOL, atol,
-            None if outcome is None else _c_ptr(outcome, _c_u8_p), *ptrs(outs, out_t),
+            n, n_q, nw, *in_a, int(rot is not None), ra_a, rb_a, rk, bd_a, sig << 1,
+            K1_CANCEL_REL_TOL, atol, None if outcome is None else _addr(outcome), *out_a,
         )
         if s >= 0:
             raise FloatingPointError(f"apply_quarter_turn failed while measuring shot {s}")
@@ -1494,7 +1490,7 @@ def measure_expansions_batch(
     chi = np.fromiter((e.chi for e in exps), np.int64, len(exps))
     if np.any(chi == 0):
         raise ValueError("measure_expansions_batch needs chi > 0 for every shot")
-    w = np.concatenate([e.weights for e in exps])
+    w = np.concatenate([e.weights for e in exps], dtype=np.complex128)
     z = (w.real * w.real + w.imag * w.imag)[np.cumsum(chi) - chi]  # norm_sq() when chi == 1
     for i in np.flatnonzero(chi > 1).tolist():
         z[i] = exps[i].norm_sq()

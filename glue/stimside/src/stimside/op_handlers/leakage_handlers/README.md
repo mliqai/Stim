@@ -8,7 +8,8 @@ and use the tracked state to add Pauli noise to the simulator
 Leakage tags start with `LEAKAGE` or `CONDITIONED_ON`, to make them easy to notice and to not waste time
 parsing a tag you don't care about. The four engine-specific handlers are exported at the `stimside`
 package root as `LeakageUint8Flip`, `LeakageUint8Tableau`, `LeakageUint8Coset`, and `LeakageUint8Magic`
-(with `LeakageUint8` kept as the legacy class name inside `leakage_uint8_flip` and `leakage_uint8_tableau`).
+(the older names `LeakageUint8` and `CompiledLeakageUint8` remain only as aliases of the `Flip` and `Tableau`
+classes inside the `leakage_uint8_flip` and `leakage_uint8_tableau` submodules, and are not exported at the package root).
 
 The leakage tags follow the general form:
 

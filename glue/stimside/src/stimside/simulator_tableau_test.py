@@ -920,7 +920,8 @@ def test_subclassed_compiled_leakage_uint8_is_not_bypassed_by_fast_path(sync: bo
 
 
 def test_subclassed_handler_routes_zero_one_keys_per_shot_in_multibatch_run() -> None:
-    # A subclass takes the slow path; with 0/1 keys at batch_size > 1, run() must still route per shot.
+    # A field-only subclass keeps the precompiled path (WP-09); with 0/1 keys at batch_size > 1,
+    # run() must still route per shot (the generic path: simulator_tableau_routing_test.py).
     import dataclasses
     from stimside.op_handlers.leakage_handlers.leakage_uint8_tableau import (
         CompiledLeakageUint8,
