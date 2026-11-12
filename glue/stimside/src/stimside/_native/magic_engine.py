@@ -62,7 +62,6 @@ from typing import Any, NamedTuple
 import numpy as np
 
 from stimside._native._kernel_loader import AbiSpec, get_lib, resolve_so
-from stimside._native.magic_kernels import addr as _kernels_addr
 from stimside._native.magic_kernels import w_addr
 
 _LIB_INSTANCE: ctypes.CDLL | None = None
@@ -275,9 +274,10 @@ _SPLIT_TOKENS = itertools.count(1)  # one per `measure_split`, across all engine
 def addr(arr: Any) -> int:
     """`magic_kernels.addr`, refusing buffers the C++ must not load through (it reads uint64,
     int32 and double directly: an unaligned or strided buffer is undefined behaviour)."""
-    if not (arr.flags.c_contiguous and arr.flags.aligned):
+    flags = arr.flags
+    if not (flags.c_contiguous and flags.aligned):
         raise TypeError("native buffers must be aligned and C-contiguous")
-    return _kernels_addr(arr)
+    return int(arr.ctypes.data) if arr.size > 0 else 0  # = `_kernels_addr(arr)`, inlined
 
 
 def as_integer(v: Any, what: str) -> int:
@@ -322,6 +322,8 @@ def _as(arr: Any, dtype: Any, shape: tuple[int, ...], what: str) -> Any:
 
 
 _I32_MIN, _I32_MAX = -(2**31), 2**31 - 1
+_FITS_I32 = frozenset(np.dtype(t) for t in (np.int8, np.int16, np.int32, np.uint8, np.uint16))
+_NO_KICK = np.zeros(0, np.uint64)  # empty, so `addr` gives NULL; never written
 
 
 def _int32_value(v: Any, what: str) -> int:
@@ -343,8 +345,13 @@ def _as_i32(arr: Any, shape: tuple[int, ...], what: str) -> Any:
     out = np.array(arr, order="C", copy=True)  # read the caller's data once; check this copy
     if out.size and out.dtype.kind not in "iu":
         raise TypeError(f"{what} must be an integer array, got dtype {out.dtype}")
-    if out.size and (int(out.min()) < _I32_MIN or int(out.max()) > _I32_MAX):
+    fits = out.dtype in _FITS_I32  # every value of these dtypes fits: no range scan
+    if out.size and not fits and (int(out.min()) < _I32_MIN or int(out.max()) > _I32_MAX):
         raise ValueError(f"{what} must fit an int32")
+    if out.dtype == np.int32 and out.flags.aligned:  # `out` is already a private copy
+        if out.shape != shape:
+            raise ValueError(f"{what} must have shape {shape}, got {out.shape}")
+        return out
     return _as(out, np.int32, shape, what)
 
 
@@ -352,11 +359,67 @@ def _list_indices(shot_list: Any, n_lists: int, batch: int) -> Any:
     """`shot_list` as a private int32 array: every value below 0 means "skip" (as the reference's
     `which >= 0`), every value from `n_lists` up becomes `n_lists` (the native refusal), so a
     wide integer is never wrapped into a valid list index by the int32 conversion."""
+    if type(shot_list) is np.ndarray and shot_list.dtype == np.int32:
+        own = _as(shot_list, np.int32, (batch,), "shot_list")  # int32 needs no narrowing
+        np.clip(own, -1, n_lists, out=own)
+        return own
     wide = _as(shot_list, np.int64, (batch,), "shot_list")
     return np.clip(wide, -1, n_lists).astype(np.int32)
 
 
 _FORK_OWNERS: weakref.WeakSet[Any] = weakref.WeakSet()  # objects a forked child must renew
+
+
+def _owned_columns(
+    table: FactorTable, nw: int
+) -> tuple[int, int, tuple[Any, ...], tuple[Any, ...]]:
+    """Private, checked copies of a factor table's columns and axes (the C++ reads only these)."""
+    n_lists = int(table.has_p0.shape[0])
+    t = (
+        _as(table.has_p0, np.uint8, (n_lists,), "has_p0"),
+        _as_i32(table.n_r, (n_lists,), "n_r"),
+        _as_i32(table.v_fwd, (n_lists,), "v_fwd"),
+        _as_i32(table.v_inv, (n_lists,), "v_inv"),
+        _as_i32(table.axis_start, (n_lists,), "axis_start"),
+    )
+    n_axes = int(table.axes_kappa.shape[0])
+    axes = (
+        _as(table.axes_a, np.uint64, (n_axes, nw), "axes_a"),
+        _as(table.axes_b, np.uint64, (n_axes, nw), "axes_b"),
+        _as(table.axes_kappa, np.uint8, (n_axes,), "axes_kappa"),
+    )
+    return n_lists, n_axes, t, axes
+
+
+_ENGINE_SEAL = object()  # module-private: only `own_factor_table` can make an OwnedFactorTable
+
+
+class OwnedFactorTable(NamedTuple):
+    """A factor table held by stimside alone: private copies made once by `own_factor_table`,
+    read-only, never handed out. `inject_cliffords` uses it without copying it again (glue cut
+    (b)); no caller array is ever behind it, so no caller can change it while the GIL is released.
+    """
+
+    cols: tuple[Any, ...]
+    axes: tuple[Any, ...]
+    n_words: int
+    seal: object
+
+
+def _immutable(arr: Any) -> Any:
+    """A copy of `arr` over a `bytes` buffer: numpy refuses to make it writable again (unlike
+    an array that owns its data, whose `writeable` flag anyone can turn back on)."""
+    out = np.frombuffer(arr.tobytes(), dtype=arr.dtype).reshape(arr.shape)
+    assert out.flags.c_contiguous and out.flags.aligned and not out.flags.writeable
+    return out
+
+
+def own_factor_table(table: FactorTable, nw: int) -> OwnedFactorTable:
+    """Copy and check `table` once (as `inject_cliffords` would), into immutable buffers."""
+    _, _, cols, axes = _owned_columns(table, nw)
+    return OwnedFactorTable(
+        tuple(_immutable(a) for a in cols), tuple(_immutable(a) for a in axes), nw, _ENGINE_SEAL
+    )
 
 
 def track_locks_for_fork(owner: Any) -> None:
@@ -564,34 +627,35 @@ class MagicBatchEngine:
             raise RuntimeError("mbe_apply_pauli_mask: invalid engine handle")
 
     def inject_cliffords(
-        self, table: FactorTable, shot_list: Any, inverse: bool
+        self, table: FactorTable | OwnedFactorTable, shot_list: Any, inverse: bool
     ) -> FactorFailure | None:
         """Apply factor list `shot_list[s]` (-1: none) to every shot, in shot order.
 
         What `apply_clifford_factors(..., check_unitary=True)` does per shot, committed shot by
         shot: on a failure the shots before it are updated, it and the later ones are not, and
         the failure is returned (the caller raises the reference exception). None on success.
+        An `OwnedFactorTable` (built by `own_factor_table`) is used as is; any other table is
+        copied first.
         """
-        nw, n_lists = self.n_words, int(table.has_p0.shape[0])
-        t = (
-            _as(table.has_p0, np.uint8, (n_lists,), "has_p0"),
-            _as_i32(table.n_r, (n_lists,), "n_r"),
-            _as_i32(table.v_fwd, (n_lists,), "v_fwd"),
-            _as_i32(table.v_inv, (n_lists,), "v_inv"),
-            _as_i32(table.axis_start, (n_lists,), "axis_start"),
-        )
-        n_axes = int(table.axes_kappa.shape[0])
-        axes = (
-            _as(table.axes_a, np.uint64, (n_axes, nw), "axes_a"),
-            _as(table.axes_b, np.uint64, (n_axes, nw), "axes_b"),
-            _as(table.axes_kappa, np.uint8, (n_axes,), "axes_kappa"),
-        )
+        nw = self.n_words
+        if isinstance(table, OwnedFactorTable):
+            if type(table) is not OwnedFactorTable or table.seal is not _ENGINE_SEAL or (
+                table.n_words != nw
+            ):
+                raise TypeError("an OwnedFactorTable comes only from own_factor_table(.., n_words)")
+            t, axes = table.cols, table.axes
+            n_lists, n_axes = int(t[0].shape[0]), int(axes[2].shape[0])
+        else:
+            n_lists, n_axes, t, axes = _owned_columns(table, nw)
         shots = _list_indices(shot_list, n_lists, self.batch_size)
         err, errd = np.zeros(4, dtype=np.int64), np.zeros(2, dtype=np.float64)
+        t0, t1, t2, t3, t4 = t
+        a0, a1, a2 = axes
         with self._section():
             bad = self._lib.mbe_inject_cliffords(
-                self._h(), n_lists, n_axes, *(addr(x) for x in t), *(addr(x) for x in axes),
-                addr(shots), int(bool(inverse)), addr(err), addr(errd),
+                self._h(), n_lists, n_axes, addr(t0), addr(t1), addr(t2), addr(t3), addr(t4),
+                addr(a0), addr(a1), addr(a2), addr(shots), int(bool(inverse)), addr(err),
+                addr(errd),
             )
         if bad == -1:
             return None
@@ -679,7 +743,7 @@ class MagicBatchEngine:
         """
         nw, batch = self.n_words, self.batch_size
         a_w, b_w = (_as(x, np.uint64, (nw,), n) for x, n in ((obs[0], "a"), (obs[1], "b")))
-        k_a, k_b = (np.zeros(nw, np.uint64), np.zeros(nw, np.uint64))
+        k_a = k_b = _NO_KICK  # address 0: read only for a reset (the engine accepts NULL otherwise)
         k_kap, flip_ref = 0, False
         if reset is not None:
             k_a = _as(reset[0], np.uint64, (nw,), "kick a")

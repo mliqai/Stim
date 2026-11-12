@@ -24,7 +24,7 @@ from stimside._magic.channels import (
 )
 from stimside._magic.live_store import (
     LiveExpansions, block_table, born_outcomes, engine_numerics_available, raise_born_failure,
-    raise_factor_failure, raise_split_failure,
+    raise_factor_failure, raise_split_failure, register_own_list,
 )
 from stimside._native.magic_engine import CLS_ACTIVE, CLS_DEAD, CLS_TRIVIAL
 from stimside._magic.gates import (
@@ -224,6 +224,11 @@ class _RefMemo:
         self.entries.move_to_end(key)
         return item[0]
 
+    def get_quiet(self, key: Any) -> Any | None:
+        """The stored value, without counting a hit/miss or touching the LRU order."""
+        item = self.entries.get(key)
+        return None if item is None else item[0]
+
     def put(self, key: Any, val: Any, nbytes: int) -> None:
         size = max(1, int(nbytes))
         if self.max_entries <= 0 or size > self.max_bytes:
@@ -242,6 +247,24 @@ class _RefMemo:
 
 
 _SIM_MEMOS: weakref.WeakKeyDictionary[MagicsideSimulator, _RefMemo] = weakref.WeakKeyDictionary()
+
+
+def _categorical_batch(probs: Sequence[float], rng: np.random.Generator, n: int) -> NDArray[Any]:
+    """`n` calls of `sample_categorical_branch(probs, rng)` as one draw (int32 results).
+
+    `rng.random(n)` takes the same `n` doubles from the stream as `n` scalar `random()` calls,
+    and each result is the first branch whose running sum (accumulated in the same order, as
+    Python floats) exceeds the draw, else 0: bit-identical results and final rng state.
+    """
+    u = rng.random(n)
+    out = np.zeros(n, dtype=np.int32)
+    acc, sums = 0.0, []
+    for p in probs:
+        acc += float(p)
+        sums.append(acc)
+    for idx in range(len(sums) - 1, -1, -1):  # the lowest matching branch is written last
+        out[u < sums[idx]] = idx + 1
+    return out
 
 
 def resolve_budget(
@@ -848,6 +871,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             return hit
         fac = compile_clifford_factors(tab, gate_name, t_tup)
         memo.put(key, fac, _value_nbytes(fac) + _MEMO_ENTRY_OVERHEAD)
+        if memo.get_quiet(key) is fac:  # stored, so frozen: let the engine store trust it
+            register_own_list(fac)
         return fac
 
     def _do_unitary_ref(self, canon: str, grp: tuple[int, ...]) -> None:
@@ -1091,15 +1116,21 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         probs = [b.prob for b in ch.branches]
         facs = [self._compile_factors(b.gate_name, b.targets) for b in ch.branches]
         engine = isinstance(self._live_exps, LiveExpansions)
-        which = np.full(self.batch_size, -1, dtype=np.int32)
-        for s in range(self.batch_size):
-            forced = self._forced_fault_branch(s, slot_idx)
-            rng_s = self._shot_np_rngs[s] if self._shot_np_rngs is not None else self.np_rng
-            c = sample_categorical_branch(probs, rng_s) if forced is None else forced
-            if c > 0 and engine:
-                which[s] = c - 1  # all draws first, then one engine command
-            elif c > 0:
-                self._apply_factor_list(s, facs[c - 1])
+        forced_any = any(
+            self._forced_fault_branch(s, slot_idx) is not None for s in range(self.batch_size)
+        )
+        if engine and self._shot_np_rngs is None and not forced_any:
+            which = _categorical_batch(probs, self.np_rng, self.batch_size) - 1
+        else:
+            which = np.full(self.batch_size, -1, dtype=np.int32)
+            for s in range(self.batch_size):
+                forced = self._forced_fault_branch(s, slot_idx)
+                rng_s = self._shot_np_rngs[s] if self._shot_np_rngs is not None else self.np_rng
+                c = sample_categorical_branch(probs, rng_s) if forced is None else forced
+                if c > 0 and engine:
+                    which[s] = c - 1  # all draws first, then one engine command
+                elif c > 0:
+                    self._apply_factor_list(s, facs[c - 1])
         if engine:
             try:
                 self._apply_factor_lists(facs, which, False)
@@ -1642,7 +1673,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     ) -> None:
         """`postselect_z_batch`'s loop as one engine command: each committed shot's branch mass
         is updated (scalar `np.log`, as the reference), then the failure, if any, is raised."""
-        want = np.fromiter((int(desired_bits[int(b)]) & 1 for b in shots), np.uint8, len(shots))
+        # `desired_bits` is a plain bool/integer array (`_plain_bits`): the low bit, vectorized
+        want = (desired_bits[shots] & desired_bits.dtype.type(1)).astype(np.uint8)
         res = store.postselect((obs.a_words, obs.b_words, obs.kappa), shots, want)
         z01 = res.z01.tolist()
         for i in np.flatnonzero(res.done).tolist():

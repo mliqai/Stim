@@ -13,8 +13,10 @@ against lists, and it cannot be pickled. `copy()` makes an independent store wit
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import threading
+import weakref
 from collections.abc import Callable, Sequence
 from typing import Any, overload
 
@@ -40,12 +42,14 @@ from stimside._native.magic_engine import (
     FactorTable,
     FinishResult,
     MagicBatchEngine,
+    OwnedFactorTable,
     PostselectResult,
     ShotArrays,
     SplitResult,
     UnmatchedResult,
     as_integer,
     numerics_match_numpy,
+    own_factor_table,
     track_locks_for_fork,
 )
 
@@ -126,6 +130,29 @@ def factor_table(lists: Sequence[CompiledCliffordFactorList], n_words: int) -> F
             f"factor lists need uint64 word arrays of shape ({n_words},), integer v and kappa"
         )
     return _encode_lists(lists, n_words)
+
+
+_TABLE_CACHE_MAX = 4096  # owned factor tables kept per store (each holds its lists alive)
+# Factor lists the simulator built and froze itself (`simulator_magic`'s E1 memo registers each
+# one when it stores it). Weak: an entry lives only as long as its list, so a reused id never
+# matches a dead list.
+_OWN_LISTS: weakref.WeakValueDictionary[int, CompiledCliffordFactorList] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def register_own_list(fac: CompiledCliffordFactorList) -> None:
+    """Mark `fac` (frozen by the simulator, never handed to callers to build) as trusted."""
+    _OWN_LISTS[id(fac)] = fac
+
+
+def _frozen_key(lists: Sequence[CompiledCliffordFactorList]) -> tuple[Any, ...] | None:
+    """An identity key when every list is one the simulator registered (`register_own_list`),
+    else None. Registration, not a read-only flag, is the test: a caller can make an `owndata`
+    array writable again. The engine still never reads these arrays: `own_factor_table` copies
+    them once, so this choice affects only which lists skip re-encoding, never memory safety."""
+    key = tuple(id(fac) for fac in lists)
+    return key if all(_OWN_LISTS.get(k) is fac for k, fac in zip(key, lists)) else None
 
 
 def _encode_lists(lists: Sequence[CompiledCliffordFactorList], n_words: int) -> FactorTable:
@@ -354,6 +381,8 @@ class LiveExpansions(Sequence[ShotExpansion]):
         self.atol = validate_atol(atol)
         # Shot at which the last `inject_factor_lists` raised, else None (see that method).
         self.failed_shot: int | None = None
+        # Owned tables of the simulator's own (frozen) factor lists, keyed by axis identity.
+        self._tables: collections.OrderedDict[Any, Any] = collections.OrderedDict()
         self._engine: MagicBatchEngine | None = None
         # Guards creating/dropping the engine, not engine calls. Re-entrant, with `_creating`
         # refusing a same-thread re-entry into the creation, so a finalizer or signal handler
@@ -449,13 +478,41 @@ class LiveExpansions(Sequence[ShotExpansion]):
         """
         self.failed_shot = None
         eng = self.engine
-        if not well_formed_lists(lists, eng.n_words):
-            self._inject_per_shot(lists, shot_list, inverse)
-            return
-        fail = eng.inject_cliffords(_encode_lists(lists, eng.n_words), shot_list, inverse)
+        table: FactorTable | OwnedFactorTable | None = self._trusted_table(lists, eng.n_words)
+        if table is None:
+            if not well_formed_lists(lists, eng.n_words):
+                self._inject_per_shot(lists, shot_list, inverse)
+                return
+            table = _encode_lists(lists, eng.n_words)
+        fail = eng.inject_cliffords(table, shot_list, inverse)
         if fail is not None:
             self.failed_shot = fail.shot
             raise_factor_failure(fail, self.n_qubits, self.atol)
+
+    def _trusted_table(
+        self, lists: Sequence[CompiledCliffordFactorList], nw: int
+    ) -> OwnedFactorTable | None:
+        """The owned table of `lists` when every list is one the simulator registered (its own
+        frozen E1-memo objects), cached by identity (glue cut (a)); else None.
+
+        A cached entry holds its lists, so their ids cannot be reused while it lives; frozen
+        dataclasses over frozen arrays make the encoding a function of those ids.
+        """
+        key = _frozen_key(lists)
+        if key is None:
+            return None
+        cache = self._tables
+        hit = cache.get(key)
+        if hit is not None:
+            cache.move_to_end(key)
+            return hit[0]
+        if not well_formed_lists(lists, nw):
+            return None
+        owned = own_factor_table(_encode_lists(lists, nw), nw)
+        cache[key] = (owned, tuple(lists))
+        if len(cache) > _TABLE_CACHE_MAX:
+            cache.popitem(last=False)
+        return owned
 
     def _inject_per_shot(
         self, lists: Sequence[CompiledCliffordFactorList], shot_list: Any, inverse: bool

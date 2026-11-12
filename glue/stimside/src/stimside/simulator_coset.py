@@ -107,6 +107,96 @@ def _check_qubit_counts(
         )
 
 
+def _owned_block(
+    x: Any, dtype: Any, block: tuple[int, ...], what: str, exact_cols: bool = False
+) -> NDArray[Any]:
+    """A private C-contiguous copy of the leading `block` of array `x`, which must be `dtype`.
+
+    `x` is copied before it is checked, so the checks and the returned block see one buffer that
+    no caller can resize or rewrite. `exact_cols` also requires the last axis to equal block's.
+    """
+    a = np.array(x, copy=True)
+    bad = a.dtype != dtype or a.ndim != len(block) or any(s < k for s, k in zip(a.shape, block))
+    if bad or (exact_cols and a.shape[-1] != block[-1]):
+        raise ValueError(
+            f"{what} must be a {np.dtype(dtype).name} array of at least {block}, got "
+            f"{a.dtype} {a.shape}"
+        )
+    return np.ascontiguousarray(a[tuple(slice(0, k) for k in block)])
+
+
+def _owned_shot_import(
+    b: Any, st: Any, n_q: int, n_w: int, batch: int
+) -> tuple[int, int, tuple[NDArray[Any], ...]]:
+    """Check one `active_shots` entry; return its index, rank and private copies of its buffers.
+
+    `engine_import_shot` trusts the shot index, the rank `d` and every buffer length, so an
+    out-of-range key or a short buffer in the public mutable dict is an out-of-bounds access in
+    C++ (R3-F7). Raises ValueError for any entry that does not fit the engine.
+    """
+    bi, d = int(b), int(st._d)
+    if not 0 <= bi < batch:
+        raise ValueError(f"active_shots key {b!r} is out of range for batch_size={batch}")
+    if not 0 <= d <= n_q:
+        raise ValueError(f"active_shots[{bi}] has rank d={d}, expected 0 <= d <= {n_q}")
+    m, what = max(1, d), f"active_shots[{bi}]"
+    p_arr = np.array(st.P if d else [], dtype=np.int64, copy=True)
+    if p_arr.shape != (d,) or bool(np.any((p_arr < 0) | (p_arr >= n_q))):
+        raise ValueError(f"{what}.P must hold d={d} qubit indices in [0, {n_q})")
+    bufs = (
+        _owned_block(st.h_words, np.uint64, (n_w,), f"{what}.h_words"),
+        _owned_block(st.a_union, np.uint64, (n_w,), f"{what}.a_union"),
+        _owned_block(st._A_buf, np.uint64, (m, n_w), f"{what}._A_buf", exact_cols=True),
+        _owned_block(st._ell_buf, np.uint8, (m,), f"{what}._ell_buf"),
+        _owned_block(st._Gamma_buf, np.uint8, (m, m), f"{what}._Gamma_buf"),
+        p_arr.astype(np.int32) if d else np.array([-1], dtype=np.int32),
+    )
+    return bi, d, bufs
+
+
+def _copy_export_into(st: MRQFState, d: int, out: tuple[NDArray[Any], ...]) -> None:
+    h, au, a_mat, ell, gamma, p = out
+    st._ensure_capacity(max(1, d))
+    st.h_words[...] = h
+    st.a_union[...] = au
+    st._A_buf[:d] = a_mat[:d]
+    st._ell_buf[:d] = ell[:d]
+    st._Gamma_buf[:d, :d] = gamma[:d, :d]
+    st._d = d
+    st.P = [int(x) for x in p[:d]]
+    st._refresh_views()
+
+
+def _reusable(st: Any, n_w: int) -> bool:
+    """`st` is an MRQFState whose buffers have the layout `MRQFState` itself allocates."""
+    if not isinstance(st, MRQFState):
+        return False
+    cap = st._cap
+    want = (
+        (st.h_words, np.uint64, (n_w,)), (st.a_union, np.uint64, (n_w,)),
+        (st._A_buf, np.uint64, (cap, n_w)), (st._ell_buf, np.uint8, (cap,)),
+        (st._Gamma_buf, np.uint8, (cap, cap)),
+    )
+    return all(
+        type(a) is np.ndarray and a.dtype == dt and a.shape == shp and a.flags.writeable
+        for a, dt, shp in want
+    )
+
+
+def _install_export(
+    st: Any, d: int, n_q: int, n_w: int, out: tuple[NDArray[Any], ...]
+) -> MRQFState:
+    """Copy one exported shot `(h, a_union, A, ell, Gamma, P)` into `st`; return the state used.
+
+    The export writes only into fresh buffers (R3-F7: a held `active_shots` reference can swap
+    short buffers into `st`). A `st` whose buffers do not have MRQFState's own layout is replaced.
+    """
+    if not _reusable(st, n_w):
+        st = MRQFState(n_q, n_w, _init_cap=max(16, d))
+    _copy_export_into(st, d, out)
+    return st
+
+
 def _is_mixed_two_qubit(op: stim.CircuitInstruction) -> bool:
     """A two-qubit gate with a record or sweep target (`CX rec[-1] 1`)."""
     return stim.gate_data(op.name).is_two_qubit_gate and any(
@@ -289,33 +379,24 @@ class CosetsideSimulator(
         for i in range(n_act):
             b = int(out_idx[i])
             d = int(out_d[i])
-            st = self._active_shots.get(b)
-            if st is None:
-                st = MRQFState(
-                    self._init_num_qubits, self._n_words, _init_cap=max(16, d)
-                )
-                self._active_shots[b] = st
-            else:
-                st._ensure_capacity(max(1, d))
-            st._d = d
-            out_P = np.empty(max(1, d), dtype=np.int32)
-            out_Gamma = np.empty((max(1, d), max(1, d)), dtype=np.uint8)
+            m = max(1, d)
+            out = (
+                np.empty(self._n_words, dtype=np.uint64),
+                np.empty(self._n_words, dtype=np.uint64),
+                np.empty((m, self._n_words), dtype=np.uint64),
+                np.empty(m, dtype=np.uint8),
+                np.empty((m, m), dtype=np.uint8),
+                np.empty(m, dtype=np.int32),
+            )
             lib.engine_export_shot(
                 self._cpp_eng,
                 b,
-                st.h_words.ctypes.data_as(u64_p),
-                st.a_union.ctypes.data_as(u64_p),
-                st._A_buf.ctypes.data_as(u64_p),
-                st._ell_buf.ctypes.data_as(u8_p),
-                out_Gamma.ctypes.data_as(u8_p),
-                out_P.ctypes.data_as(i32_p),
+                *(a.ctypes.data_as(u8_p if a.dtype == np.uint8 else u64_p) for a in out[:5]),
+                out[5].ctypes.data_as(i32_p),
             )
-            if d > 0:
-                st._Gamma_buf[:d, :d] = out_Gamma[:d, :d]
-                st.P = [int(x) for x in out_P[:d]]
-            else:
-                st.P = []
-            st._refresh_views()
+            self._active_shots[b] = _install_export(
+                self._active_shots.get(b), d, self._init_num_qubits, self._n_words, out
+            )
         self._cpp_dirty = False
 
     def _sync_py_to_cpp(self) -> None:
@@ -326,27 +407,24 @@ class CosetsideSimulator(
             return
         lib = self._cpp_lib
         assert lib is not None and self._cpp_eng is not None
+        # Check and copy every entry first (R3-F7), so a bad entry raises before the engine is
+        # cleared: the rejected call changes nothing and the C++ shots stay as they were.
+        shots = [
+            _owned_shot_import(b, st, self._init_num_qubits, self._n_words, self._init_batch_size)
+            for b, st in list(self._active_shots.items())
+        ]
         lib.engine_clear(self._cpp_eng)
-        for b, st in self._active_shots.items():
-            d = st._d
-            in_A = np.ascontiguousarray(st._A_buf[: max(1, d)], dtype=np.uint64)
-            in_ell = np.ascontiguousarray(st._ell_buf[: max(1, d)], dtype=np.uint8)
-            in_Gamma = np.ascontiguousarray(
-                st._Gamma_buf[: max(1, d), : max(1, d)], dtype=np.uint8
-            )
-            in_P = np.ascontiguousarray(
-                st.P if d > 0 else [-1], dtype=np.int32
-            )
+        for bi, d, (h, au, a_mat, ell, gamma, p) in shots:
             lib.engine_import_shot(
                 self._cpp_eng,
-                int(b),
-                int(d),
-                st.h_words.ctypes.data_as(u64_p),
-                st.a_union.ctypes.data_as(u64_p),
-                in_A.ctypes.data_as(u64_p),
-                in_ell.ctypes.data_as(u8_p),
-                in_Gamma.ctypes.data_as(u8_p),
-                in_P.ctypes.data_as(i32_p),
+                bi,
+                d,
+                h.ctypes.data_as(u64_p),
+                au.ctypes.data_as(u64_p),
+                a_mat.ctypes.data_as(u64_p),
+                ell.ctypes.data_as(u8_p),
+                gamma.ctypes.data_as(u8_p),
+                p.ctypes.data_as(i32_p),
             )
         self._py_dirty = False
         self._cpp_dirty = False
