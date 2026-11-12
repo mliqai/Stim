@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import math
 import struct
+import weakref
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 import numpy as np
@@ -62,7 +64,7 @@ from stimside.util.circuit import (
     unroll_circuit,
 )
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
-from stimside.util.reference_chp import ReferenceCHPTableau
+from stimside.util.reference_chp import PackedSymplecticTables, ReferenceCHPTableau
 from stimside.util.seeding import derived_seed
 from stimside.util.sync_rng import (
     apply_sync_meas_flips,
@@ -86,6 +88,160 @@ M2D_MODES: dict[str, Literal["auto", "magicside", "stim", "zero"]] = {
 # Private switch (no public flag): True keeps the live per-shot expansions in the C++
 # MagicBatchEngine behind the `_live_exps` proxy; False keeps the reference Python list.
 _LIVE_STORE_ENGINE = False
+
+# Private E1 reference-tableau memo controls (per-instance bounded LRU; off for compiled engines).
+_REF_MEMO_ENABLED = True
+_REF_MEMO_VERIFY = False
+_REF_MEMO_MAX_ENTRIES = 8192
+_REF_MEMO_MAX_BYTES = 32 * 1024 * 1024
+_MEMO_ENTRY_OVERHEAD = 128
+
+
+def _freeze_value(val: Any) -> None:
+    if isinstance(val, np.ndarray):
+        val.flags.writeable = False
+    elif isinstance(val, (tuple, list)):
+        for item in val:
+            _freeze_value(item)
+    elif dataclasses.is_dataclass(val):
+        for f in dataclasses.fields(val):
+            _freeze_value(getattr(val, f.name))
+
+
+def _packed_nbytes(packed: PackedSymplecticTables) -> int:
+    return sum(int(arr.nbytes) for arr in packed)
+
+
+def _value_nbytes(val: Any) -> int:
+    if val is None or isinstance(val, (int, float, bool, str)):
+        return 0
+    if isinstance(val, np.ndarray):
+        return int(val.nbytes)
+    if isinstance(val, (tuple, list)):
+        return sum(_value_nbytes(x) for x in val)
+    if dataclasses.is_dataclass(val):
+        return sum(_value_nbytes(getattr(val, f.name)) for f in dataclasses.fields(val))
+    return 0
+
+
+def _tab_equal(tab: ReferenceCHPTableau, packed: PackedSymplecticTables) -> bool:
+    pairs: tuple[tuple[NDArray[Any], NDArray[Any]], ...] = (
+        (tab.x2x, packed[0]), (tab.x2z, packed[1]), (tab.z2x, packed[2]),
+        (tab.z2z, packed[3]), (tab.x_kap, packed[4]), (tab.z_kap, packed[5]),
+    )
+    return all(
+        a.shape == b.shape and a.dtype == b.dtype and a.tobytes() == b.tobytes()
+        for a, b in pairs
+    )
+
+
+def _memo_val_equal(a: Any, b: Any) -> bool:
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, np.ndarray):
+        return a.dtype == b.dtype and a.shape == b.shape and a.tobytes() == b.tobytes()
+    if isinstance(a, (tuple, list)):
+        return len(a) == len(b) and all(_memo_val_equal(x, y) for x, y in zip(a, b))
+    if dataclasses.is_dataclass(a):
+        return all(
+            _memo_val_equal(getattr(a, f.name), getattr(b, f.name))
+            for f in dataclasses.fields(a)
+        )
+    return bool(a == b)
+
+
+class _TrackedRefTableau(ReferenceCHPTableau):
+    """Reference tableau carrying a memo sid; direct external mutations drop the sid."""
+
+    _sid: int | None = None
+    _memo_ref: _RefMemo | None = None
+    _in_memo: bool = False
+
+    def do_unitary(self, gate_name: str, targets: Sequence[int]) -> None:
+        if not self._in_memo:
+            self._sid = None
+        super().do_unitary(gate_name, targets)
+
+    def do_spp(
+        self, terms: Sequence[tuple[int, str]], *, negate: bool = False, dag: bool = False
+    ) -> None:
+        if not self._in_memo:
+            self._sid = None
+        super().do_spp(terms, negate=negate, dag=dag)
+
+    def apply_right_rot(
+        self, rot_a: NDArray[np.uint64], rot_b: NDArray[np.uint64], fac_kap: int
+    ) -> None:
+        if not self._in_memo:
+            self._sid = None
+        super().apply_right_rot(rot_a, rot_b, fac_kap)
+
+    def measure_z(
+        self, q: int, *, is_reset: bool = False, m_ref_override: int = 0
+    ) -> Any:
+        if not self._in_memo:
+            self._sid = None
+        return super().measure_z(q, is_reset=is_reset, m_ref_override=m_ref_override)
+
+
+class _RefMemo:
+    """Per-simulator bounded LRU memo keyed by hash-consed reference-tableau sid history."""
+
+    def __init__(self, max_entries: int, max_bytes: int) -> None:
+        self.max_entries = max(0, int(max_entries))
+        self.max_bytes = max(0, int(max_bytes))
+        self.max_trie = max(self.max_entries * 4, 32768)
+        self.entries: collections.OrderedDict[Any, tuple[Any, int]] = collections.OrderedDict()
+        self._trie: collections.OrderedDict[tuple[int, Any], int] = collections.OrderedDict()
+        self._next_sid = 0
+        self.total_bytes = 0
+        self.hits = 0
+        self.misses = 0
+
+    def root_sid(self, n_qubits: int) -> int:
+        return self.child(0, ("root", int(n_qubits)))
+
+    def child(self, sid: int, step: Any) -> int:
+        edge = (sid, step)
+        nxt = self._trie.get(edge)
+        if nxt is not None:
+            self._trie.move_to_end(edge)
+            return nxt
+        self._next_sid += 1
+        nxt = self._next_sid
+        if self.max_trie > 0:
+            if len(self._trie) >= self.max_trie:
+                self._trie.popitem(last=False)
+            self._trie[edge] = nxt
+        return nxt
+
+    def get(self, key: Any) -> Any | None:
+        item = self.entries.get(key)
+        if item is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        self.entries.move_to_end(key)
+        return item[0]
+
+    def put(self, key: Any, val: Any, nbytes: int) -> None:
+        size = max(1, int(nbytes))
+        if self.max_entries <= 0 or size > self.max_bytes:
+            return
+        _freeze_value(val)
+        old = self.entries.pop(key, None)
+        if old is not None:
+            self.total_bytes -= old[1]
+        while self.entries and (
+            len(self.entries) >= self.max_entries or self.total_bytes + size > self.max_bytes
+        ):
+            _, (_, evicted_bytes) = self.entries.popitem(last=False)
+            self.total_bytes -= evicted_bytes
+        self.entries[key] = (val, size)
+        self.total_bytes += size
+
+
+_SIM_MEMOS: weakref.WeakKeyDictionary[MagicsideSimulator, _RefMemo] = weakref.WeakKeyDictionary()
 
 
 def resolve_budget(
@@ -360,7 +516,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._circuit_time = 0
         self._used_interactively = False
         self._finished_running_circuit = False
-        self._live_ref_tab = ReferenceCHPTableau(self._eff_nq)
+        self._live_ref_tab: ReferenceCHPTableau = (
+            self._new_ref_tab() if _REF_MEMO_ENABLED else ReferenceCHPTableau(self._eff_nq)
+        )
         self._live_frame_events: list[FrameEvent] = []
         self._live_exps: list[ShotExpansion] | LiveExpansions = self._fresh_live_exps()
         self._shot_tabs: list[ReferenceCHPTableau] | None = None
@@ -415,7 +573,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._live_frame_events = list(cp.frame_events)
         self._shot_tabs = tabs
         self._live_ref_tab = tabs[0].copy()
-        self._live_exps = exps  # compiled runs keep a plain list (SELECTOR shots carry extra qubits)
+        # compiled runs keep a plain list (SELECTOR shots carry extra qubits)
+        self._live_exps = exps
         for op in self._unrolled_ops:
             apply_coords_op(op, self.qubit_coords, self.qubit_tags, self.coords_shifts)
         self._circuit_time = len(self._unrolled_ops)
@@ -582,14 +741,17 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             return
         self._flush_magic()
         for q_np in affected:
-            ax = compile_pauli_product(self._live_ref_tab, [(int(q_np), pauli)])
+            ax = self._compile_axis([(int(q_np), pauli)])
             self._apply_axis_to_shots(ax, mask[int(q_np)])
 
     def _fresh_live_exps(self) -> list[ShotExpansion] | LiveExpansions:
         """`ShotExpansion.zero` for every shot: a list, or the (reused) engine-backed store."""
         if not (_LIVE_STORE_ENGINE and engine_numerics_available()):
-            return [ShotExpansion.zero(self._eff_nq, atol=self.atol) for _ in range(self.batch_size)]
-        store = getattr(self, "_live_store", None)  # `clear()` reuses the simulator: reset, don't rebuild
+            return [
+                ShotExpansion.zero(self._eff_nq, atol=self.atol) for _ in range(self.batch_size)
+            ]
+        # `clear()` reuses the simulator: reset, don't rebuild
+        store = getattr(self, "_live_store", None)
         if store is None:
             store = self._live_store = LiveExpansions(self.batch_size, self._eff_nq, self.atol)
         store.reset()
@@ -608,7 +770,275 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             )
             if in_use:
                 new._live_exps = new._live_store
+                new._live_ref_tab = self._live_ref_tab.copy()
         return new
+
+    @property
+    def _ref_memo(self) -> _RefMemo:
+        memo = _SIM_MEMOS.get(self)
+        if memo is None:
+            memo = _RefMemo(_REF_MEMO_MAX_ENTRIES, _REF_MEMO_MAX_BYTES)
+            _SIM_MEMOS[self] = memo
+        return memo
+
+    def _new_ref_tab(self) -> _TrackedRefTableau:
+        memo = self._ref_memo
+        tab = _TrackedRefTableau(self._eff_nq)
+        tab._sid = memo.root_sid(self._eff_nq)
+        tab._memo_ref = memo
+        return tab
+
+    def _memo_tab(self) -> tuple[_RefMemo, _TrackedRefTableau, int] | None:
+        if not _REF_MEMO_ENABLED:
+            return None
+        tab = self._live_ref_tab
+        if not isinstance(tab, _TrackedRefTableau):
+            return None
+        memo = self._ref_memo
+        sid = tab._sid
+        if sid is None or tab._memo_ref is not memo:
+            return None
+        return memo, tab, sid
+
+    def _restore_tracked_tab(
+        self, memo: _RefMemo, next_sid: int, packed: PackedSymplecticTables
+    ) -> None:
+        tab = _TrackedRefTableau.from_packed(self._eff_nq, packed)
+        assert isinstance(tab, _TrackedRefTableau)
+        tab._sid = next_sid
+        tab._memo_ref = memo
+        self._live_ref_tab = tab
+
+    def _compile_axis(
+        self, terms: Sequence[tuple[int, str]], *, negate: bool = False
+    ) -> CompiledPauliAxis:
+        terms_t = tuple((int(q), p) for q, p in terms)
+        neg = bool(negate)
+        info = self._memo_tab()
+        if info is None:
+            return compile_pauli_product(self._live_ref_tab, terms_t, negate=neg)
+        memo, tab, sid = info
+        key = ("axis", sid, terms_t, neg)
+        hit = memo.get(key)
+        if hit is not None:
+            assert isinstance(hit, CompiledPauliAxis)
+            if _REF_MEMO_VERIFY:
+                live = compile_pauli_product(tab, terms_t, negate=neg)
+                assert _memo_val_equal(live, hit), "E1 axis memo mismatch"
+            return hit
+        ax = compile_pauli_product(tab, terms_t, negate=neg)
+        memo.put(key, ax, _value_nbytes(ax) + _MEMO_ENTRY_OVERHEAD)
+        return ax
+
+    def _compile_factors(
+        self, gate_name: str, targets: Sequence[int]
+    ) -> CompiledCliffordFactorList:
+        t_tup = tuple(int(q) for q in targets)
+        info = self._memo_tab()
+        if info is None:
+            return compile_clifford_factors(self._live_ref_tab, gate_name, t_tup)
+        memo, tab, sid = info
+        key = ("fac", sid, gate_name, t_tup)
+        hit = memo.get(key)
+        if hit is not None:
+            assert isinstance(hit, CompiledCliffordFactorList)
+            if _REF_MEMO_VERIFY:
+                live = compile_clifford_factors(tab, gate_name, t_tup)
+                assert _memo_val_equal(live, hit), "E1 factor memo mismatch"
+            return hit
+        fac = compile_clifford_factors(tab, gate_name, t_tup)
+        memo.put(key, fac, _value_nbytes(fac) + _MEMO_ENTRY_OVERHEAD)
+        return fac
+
+    def _do_unitary_ref(self, canon: str, grp: tuple[int, ...]) -> None:
+        info = self._memo_tab()
+        if info is None:
+            self._live_ref_tab.do_unitary(canon, grp)
+            self._live_frame_events.append(LeftUnitaryEvent(canon, grp))
+            return
+        memo, tab, sid = info
+        key = ("u", sid, canon, grp)
+        hit = memo.get(key)
+        if hit is not None:
+            next_sid, packed, ev = hit
+            if _REF_MEMO_VERIFY:
+                chk = tab.copy()
+                chk.do_unitary(canon, grp)
+                assert _tab_equal(chk, packed), "E1 unitary memo mismatch"
+            self._restore_tracked_tab(memo, next_sid, packed)
+            self._live_frame_events.append(ev)
+            return
+        tab._in_memo = True
+        try:
+            tab.do_unitary(canon, grp)
+        except Exception:
+            tab._sid = None
+            raise
+        finally:
+            tab._in_memo = False
+        ev = LeftUnitaryEvent(canon, grp)
+        self._live_frame_events.append(ev)
+        next_sid = memo.child(sid, ("u", canon, grp))
+        packed = tab.snapshot_packed()
+        tab._sid = next_sid
+        memo.put(key, (next_sid, packed, ev), _packed_nbytes(packed) + _MEMO_ENTRY_OVERHEAD)
+
+    def _do_spp_ref(
+        self, terms: Sequence[tuple[int, str]], negate: bool, dag: bool
+    ) -> None:
+        terms_t = tuple((int(q), p) for q, p in terms)
+        neg, is_dag = bool(negate), bool(dag)
+        info = self._memo_tab()
+        if info is None:
+            self._live_ref_tab.do_spp(terms_t, negate=neg, dag=is_dag)
+            self._live_frame_events.append(LeftSppEvent(terms_t, neg, is_dag))
+            return
+        memo, tab, sid = info
+        key = ("spp", sid, terms_t, neg, is_dag)
+        hit = memo.get(key)
+        if hit is not None:
+            next_sid, packed, ev = hit
+            if _REF_MEMO_VERIFY:
+                chk = tab.copy()
+                chk.do_spp(terms_t, negate=neg, dag=is_dag)
+                assert _tab_equal(chk, packed), "E1 spp memo mismatch"
+            self._restore_tracked_tab(memo, next_sid, packed)
+            self._live_frame_events.append(ev)
+            return
+        tab._in_memo = True
+        try:
+            tab.do_spp(terms_t, negate=neg, dag=is_dag)
+        except Exception:
+            tab._sid = None
+            raise
+        finally:
+            tab._in_memo = False
+        ev = LeftSppEvent(terms_t, neg, is_dag)
+        self._live_frame_events.append(ev)
+        next_sid = memo.child(sid, ("spp", terms_t, neg, is_dag))
+        packed = tab.snapshot_packed()
+        tab._sid = next_sid
+        memo.put(key, (next_sid, packed, ev), _packed_nbytes(packed) + _MEMO_ENTRY_OVERHEAD)
+
+    def _compile_meas_ref(
+        self,
+        terms: Sequence[tuple[int, str]],
+        *,
+        invert_result: bool,
+        flip_prob: float,
+        meas_index: int,
+    ) -> MeasurementRecord:
+        terms_t = tuple((int(q), p) for q, p in terms)
+        inv, fp, mi = bool(invert_result), float(flip_prob), int(meas_index)
+        info = self._memo_tab()
+        if info is None:
+            return compile_pauli_measurement_c15(
+                self._live_ref_tab, terms_t, invert_result=inv, flip_prob=fp, meas_index=mi,
+                frame_events=self._live_frame_events,
+            )
+        memo, tab, sid = info
+        key = ("meas", sid, terms_t, inv, fp, mi)
+        hit = memo.get(key)
+        if hit is not None:
+            rec, next_sid, packed, delta = hit
+            if _REF_MEMO_VERIFY:
+                chk = tab.copy()
+                chk_ev: list[FrameEvent] = []
+                live = compile_pauli_measurement_c15(
+                    chk, terms_t, invert_result=inv, flip_prob=fp, meas_index=mi,
+                    frame_events=chk_ev,
+                )
+                assert _memo_val_equal(live, rec), "E1 meas rec mismatch"
+                assert _memo_val_equal(tuple(chk_ev), delta), "E1 meas events mismatch"
+                want = tab.snapshot_packed() if packed is None else packed
+                assert _tab_equal(chk, want), "E1 meas tab mismatch"
+            if packed is not None:
+                self._restore_tracked_tab(memo, next_sid, packed)
+            self._live_frame_events.extend(delta)
+            assert isinstance(rec, MeasurementRecord)
+            return rec
+        n0 = len(self._live_frame_events)
+        tab._in_memo = True
+        try:
+            rec = compile_pauli_measurement_c15(
+                tab, terms_t, invert_result=inv, flip_prob=fp, meas_index=mi,
+                frame_events=self._live_frame_events,
+            )
+        except Exception:
+            tab._sid = None
+            raise
+        finally:
+            tab._in_memo = False
+        delta = tuple(self._live_frame_events[n0:])
+        if delta:
+            next_sid = memo.child(sid, ("meas", terms_t))
+            packed_out: PackedSymplecticTables | None = tab.snapshot_packed()
+            tab._sid = next_sid
+        else:
+            next_sid, packed_out = sid, None
+        nbytes = _value_nbytes(rec) + (_packed_nbytes(packed_out) if packed_out else 0)
+        memo.put(key, (rec, next_sid, packed_out, delta), nbytes + _MEMO_ENTRY_OVERHEAD)
+        return rec
+
+    def _compile_reset_ref(
+        self,
+        q: int,
+        basis: Literal["Z", "X", "Y"],
+        *,
+        meas_index: int | None,
+        invert_result: bool,
+        flip_prob: float,
+    ) -> ResetRecord:
+        qi, inv, fp = int(q), bool(invert_result), float(flip_prob)
+        info = self._memo_tab()
+        if info is None:
+            return compile_reset_c15(
+                self._live_ref_tab, qi, basis, meas_index=meas_index, invert_result=inv,
+                flip_prob=fp, frame_events=self._live_frame_events,
+            )
+        memo, tab, sid = info
+        key = ("reset", sid, qi, basis, meas_index, inv, fp)
+        hit = memo.get(key)
+        if hit is not None:
+            rec, next_sid, packed, delta = hit
+            if _REF_MEMO_VERIFY:
+                chk = tab.copy()
+                chk_ev: list[FrameEvent] = []
+                live = compile_reset_c15(
+                    chk, qi, basis, meas_index=meas_index, invert_result=inv, flip_prob=fp,
+                    frame_events=chk_ev,
+                )
+                assert _memo_val_equal(live, rec), "E1 reset rec mismatch"
+                assert _memo_val_equal(tuple(chk_ev), delta), "E1 reset events mismatch"
+                want = tab.snapshot_packed() if packed is None else packed
+                assert _tab_equal(chk, want), "E1 reset tab mismatch"
+            if packed is not None:
+                self._restore_tracked_tab(memo, next_sid, packed)
+            self._live_frame_events.extend(delta)
+            assert isinstance(rec, ResetRecord)
+            return rec
+        n0 = len(self._live_frame_events)
+        tab._in_memo = True
+        try:
+            rec = compile_reset_c15(
+                tab, qi, basis, meas_index=meas_index, invert_result=inv, flip_prob=fp,
+                frame_events=self._live_frame_events,
+            )
+        except Exception:
+            tab._sid = None
+            raise
+        finally:
+            tab._in_memo = False
+        delta = tuple(self._live_frame_events[n0:])
+        if delta:
+            next_sid = memo.child(sid, ("reset", qi, basis))
+            packed_out: PackedSymplecticTables | None = tab.snapshot_packed()
+            tab._sid = next_sid
+        else:
+            next_sid, packed_out = sid, None
+        nbytes = _value_nbytes(rec) + (_packed_nbytes(packed_out) if packed_out else 0)
+        memo.put(key, (rec, next_sid, packed_out, delta), nbytes + _MEMO_ENTRY_OVERHEAD)
+        return rec
 
     def _apply_axis_to_shots(self, ax: Any, mask: NDArray[np.bool_]) -> None:
         """`apply_pauli(shot, ax)` on every shot in `mask` that has chi > 0, in shot order."""
@@ -659,7 +1089,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def _fire_fault_channel_live(self, slot_idx: int, ch: CliffordFaultChannel) -> None:
         self._flush_magic()
         probs = [b.prob for b in ch.branches]
-        facs = [compile_clifford_factors(self._live_ref_tab, b.gate_name, b.targets) for b in ch.branches]
+        facs = [self._compile_factors(b.gate_name, b.targets) for b in ch.branches]
         engine = isinstance(self._live_exps, LiveExpansions)
         which = np.full(self.batch_size, -1, dtype=np.int32)
         for s in range(self.batch_size):
@@ -747,10 +1177,28 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             for slot_idx, ch in self._prog_faults[n]:
                 self._fire_fault_channel_live(slot_idx, ch)
 
-    def _emit_magic_op(self, op: stim.CircuitInstruction, qs: Sequence[int] | None = None) -> None:
-        emit_magic_terms(
-            op.tag, validate_magic_op(op) if qs is None else qs, self._live_ref_tab, self._pending_magic
-        )
+    def _emit_magic_op(
+        self, op: stim.CircuitInstruction, qs: Sequence[int] | None = None
+    ) -> None:
+        resolved = tuple(validate_magic_op(op)) if qs is None else tuple(int(q) for q in qs)
+        info = self._memo_tab()
+        if info is None:
+            emit_magic_terms(op.tag, resolved, self._live_ref_tab, self._pending_magic)
+            return
+        memo, tab, sid = info
+        key = ("magic", sid, op.tag, resolved)
+        hit = memo.get(key)
+        if hit is not None:
+            if _REF_MEMO_VERIFY:
+                chk: list[MagicTermRecord] = []
+                emit_magic_terms(op.tag, resolved, tab, chk)
+                assert _memo_val_equal(tuple(chk), hit), "E1 magic emit mismatch"
+            self._pending_magic.extend(hit)
+            return
+        n0 = len(self._pending_magic)
+        emit_magic_terms(op.tag, resolved, tab, self._pending_magic)
+        delta = tuple(self._pending_magic[n0:])
+        memo.put(key, delta, _value_nbytes(delta) + _MEMO_ENTRY_OVERHEAD)
 
     emit_magic_op = _emit_magic_op
 
@@ -975,9 +1423,15 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 seg_len = 0
                 seen.clear()
             rec: MeasurementRecord | ResetRecord = (
-                compile_reset_c15(self._live_ref_tab, payload[0], payload[1], meas_index=0 if gd.produces_measurements else None, invert_result=inv, flip_prob=0.0, frame_events=self._live_frame_events)
+                self._compile_reset_ref(
+                    payload[0], payload[1],
+                    meas_index=0 if gd.produces_measurements else None,
+                    invert_result=inv, flip_prob=0.0,
+                )
                 if gd.is_reset
-                else compile_pauli_measurement_c15(self._live_ref_tab, payload, invert_result=inv, flip_prob=0.0, meas_index=0, frame_events=self._live_frame_events)
+                else self._compile_meas_ref(
+                    payload, invert_result=inv, flip_prob=0.0, meas_index=0
+                )
             )
             m_shots = self._project_substep_batch(rec)
             if gd.produces_measurements:
@@ -1016,12 +1470,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             for g_idx, (grp, inv) in enumerate(split_pauli_product_targets(op)):
                 self._apply_conditional_ref_step(
                     mask_at(g_idx),
-                    lambda g=grp, iv=inv: (
-                        self._live_ref_tab.do_spp(g, negate=iv, dag=dag),
-                        self._live_frame_events.append(LeftSppEvent(tuple(g), iv, dag)),
-                    ),
+                    lambda g=grp, iv=inv: self._do_spp_ref(g, iv, dag),
                     lambda g=grp, iv=inv: CompiledCliffordFactorList(
-                        7 if dag else 1, None, (compile_pauli_product(self._live_ref_tab, g, negate=iv ^ (not dag)),)
+                        7 if dag else 1, None, (self._compile_axis(g, negate=iv ^ (not dag)),)
                     ),
                 )
             return
@@ -1044,23 +1495,25 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 if mask_g is not None:
                     cond = cond & mask_g
                 if np.any(cond):
-                    self._apply_axis_to_shots(compile_pauli_product(self._live_ref_tab, [(q_t, pch)]), cond)
+                    self._apply_axis_to_shots(self._compile_axis([(q_t, pch)]), cond)
             return
         qs = [int(t.qubit_value) for t in raw]
         for g_idx, off in enumerate(range(0, len(qs), arity)):
             self._apply_unitary_group(canon, tuple(qs[off : off + arity]), mask_at(g_idx))
 
-    def _apply_unitary_group(self, canon: str, grp: tuple[int, ...], mask_g: NDArray[np.bool_] | None) -> None:
+    def _apply_unitary_group(
+        self, canon: str, grp: tuple[int, ...], mask_g: NDArray[np.bool_] | None
+    ) -> None:
         self._apply_conditional_ref_step(
             mask_g,
-            lambda: (self._live_ref_tab.do_unitary(canon, grp), self._live_frame_events.append(LeftUnitaryEvent(canon, grp))),
-            lambda: compile_clifford_factors(self._live_ref_tab, canon, grp),
+            lambda: self._do_unitary_ref(canon, grp),
+            lambda: self._compile_factors(canon, grp),
         )
 
     def _apply_conditional_ref_step(
         self,
         mask_g: NDArray[np.bool_] | None,
-        advance_ref: Callable[[], object],
+        advance_ref: Callable[[], None],
         compile_fac: Callable[[], CompiledCliffordFactorList],
     ) -> None:
         if mask_g is None or np.all(mask_g):
@@ -1246,7 +1699,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         t_list = [int(q) for q in targets]
         out = np.zeros((len(t_list), self.batch_size), dtype=np.float64)
         for row_i, q in enumerate(t_list):
-            shared_obs = None if self._shot_tabs is not None else compile_pauli_product(self._live_ref_tab, [(q, pauli)])
+            shared_obs = (
+                None if self._shot_tabs is not None else self._compile_axis([(q, pauli)])
+            )
             store = None if shared_obs is None else self._engine_store((), shared_obs)
             if store is not None and shared_obs is not None:
                 obs_t = (shared_obs.a_words, shared_obs.b_words, shared_obs.kappa)
@@ -1271,7 +1726,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if len(shots) == 0:
             return
         self._flush_magic()
-        obs = compile_pauli_product(self._live_ref_tab, [(int(q), pauli)])
+        obs = self._compile_axis([(int(q), pauli)])
         store = self._engine_store(shots, obs)
         if store is not None and self._plain_bits(desired_bits):
             return self._postselect_engine(store, obs, shots, desired_bits)
@@ -1302,8 +1757,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             shots = np.flatnonzero(comb[q])
             if len(shots) == 0:
                 continue
-            obs = compile_pauli_product(self._live_ref_tab, [(int(q), pauli)])
-            kick = compile_pauli_product(self._live_ref_tab, [(int(q), kick_p)])
+            obs = self._compile_axis([(int(q), pauli)])
+            kick = self._compile_axis([(int(q), kick_p)])
             store = self._engine_store(shots, obs, kick)
             # A broadcast mask, or one that is not 2-D, is read shot by shot by the reference.
             if store is not None and self._int_array(reset_one_mask) and (

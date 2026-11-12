@@ -357,7 +357,7 @@ class Analysis:
             group_probs,
             group_reweights,
         ) = process_shots_cpp(
-            raised=np.ascontiguousarray(raised, dtype=np.uint8),
+            raised=raised,
             pred_offsets=self.pred_offsets,
             pred_flags=self.pred_flags,
             flag_env_offsets=self.flag_env_offsets,

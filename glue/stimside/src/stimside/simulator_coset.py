@@ -32,7 +32,12 @@ from stimside.util.circuit import (
     unroll_circuit,
 )
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
-from stimside.util.reference_chp import PackedSymplecticTables, pauli_image, pauli_image_batch
+from stimside.util.reference_chp import (
+    PackedSymplecticTables,
+    ReferenceCHPTableau,
+    pauli_image,
+    pauli_image_batch,
+)
 from stimside.util.seeding import derived_seed
 from stimside.util.stim_workarounds import broadcast_pauli_errors
 from stimside.util.sync_rng import (
@@ -49,6 +54,81 @@ from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
 # Pauli applied to the qubit of a record-controlled 2Q gate (stim only parses these with rec[] controls).
 _REC_FIRST_PAULI = {"CX": "X", "CNOT": "X", "ZCX": "X", "CY": "Y", "ZCY": "Y"}
 _REC_SECOND_PAULI = {"XCZ": "X", "YCZ": "Y"}
+
+
+def _own_mask(mask: Any) -> NDArray[Any]:
+    """The caller's `mask` as a private, C-ordered, plain `np.ndarray` copy (dtype unchanged).
+
+    Nobody else holds a reference to the copy, so no signal handler, thread, or `__bool__` /
+    `__setstate__` hook of the caller can change its shape, dtype or size afterwards. The one
+    `np.asarray` runs the caller's `__array__` once and drops an ndarray subclass (its `shape`
+    and `__getitem__` never run). For a C-contiguous uint8 mask `np.ascontiguousarray` returns
+    its argument itself, so without this copy the kernel would read the caller's own buffer.
+    """
+    return np.array(np.asarray(mask), order="C", copy=True)
+
+
+def _check_mask_shape(
+    name: str, shape: tuple[int, ...], rows: int, cols: int, rows_are: str
+) -> None:
+    """Raise ValueError unless a mask of this `shape` is (rows, cols).
+
+    The C++ kernels read rows * cols mask bytes from the buffer they are given, so a smaller
+    array is an out-of-bounds read there. Callers pass the shape of the `_own_mask` copy and hand
+    that same copy on: `np.ascontiguousarray(copy, dtype=np.uint8)` keeps its shape, so the shape
+    alone fixes the number of bytes the kernel reads.
+    """
+    if shape != (rows, cols):
+        raise ValueError(
+            f"{name} has shape {shape}, expected ({rows}, {cols}): one row per {rows_are} "
+            "and one column per shot (batch_size)"
+        )
+
+
+def _check_qubit_counts(
+    circuit: stim.Circuit, compiled_ref: CompiledReferenceCircuit | None, handler: Any
+) -> None:
+    """Raise ValueError unless `compiled_ref` and `handler` were compiled for `circuit`'s qubits.
+
+    The engine and its kernels are sized by the circuit: a reference (packed words, tables) or a
+    handler (scratch masks) of another size is read past its end. A handler without an integer
+    `num_qubits` attribute is not checked.
+    """
+    n = circuit.num_qubits
+    if compiled_ref is not None and compiled_ref.num_qubits != n:
+        raise ValueError(
+            f"compiled_ref was compiled for {compiled_ref.num_qubits} qubits, but the circuit "
+            f"has {n}"
+        )
+    handler_n = getattr(handler, "num_qubits", None)
+    if isinstance(handler_n, (int, np.integer)) and handler_n != n:
+        raise ValueError(
+            f"compiled_op_handler was compiled for {handler_n} qubits, but the circuit has {n}"
+        )
+
+
+def _is_mixed_two_qubit(op: stim.CircuitInstruction) -> bool:
+    """A two-qubit gate with a record or sweep target (`CX rec[-1] 1`)."""
+    return stim.gate_data(op.name).is_two_qubit_gate and any(
+        t.qubit_value is None for t in op.targets_copy()
+    )
+
+
+def _count_all_quantum_groups(op: stim.CircuitInstruction) -> int:
+    """Groups of a two-qubit `op` with two qubit targets: those its reference step keeps."""
+    groups = op.target_groups()
+    return sum(g[0].qubit_value is not None and g[1].qubit_value is not None for g in groups)
+
+
+def _compiled_unitary_rows(op: stim.CircuitInstruction) -> int | None:
+    """`len(step.target_groups)` of the UnitaryStepMeta that `CompiledReferenceCircuit.
+    compile_and_append_instruction(op)` builds for `op`; None if it builds another kind of step
+    (or raises). Mirrors that method, so a mask can be checked before the step is appended."""
+    if not stim.gate_data(op.name).is_unitary or op.name in ("SPP", "SPP_DAG"):
+        return None
+    if _is_mixed_two_qubit(op):
+        return _count_all_quantum_groups(op) or None  # no record-free group: a no-op step
+    return len(op.target_groups())
 
 
 class CosetsideSimulator(
@@ -81,28 +161,49 @@ class CosetsideSimulator(
     ) -> None:
         """record_leakage_events: record every leakage-state change of each shot
         (``get_leakage_events()``, see ``stimside.util.leakage_events``)."""
-        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, (int, np.integer))
+            or int(batch_size) <= 0
+        ):
             raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
         batch_size = int(batch_size)
+        _check_qubit_counts(circuit, compiled_ref, compiled_op_handler)  # before engine_create
         self.circuit = circuit
-        self.num_qubits = circuit.num_qubits
+        n_q = int(circuit.num_qubits)
+        self.num_qubits = n_q
+        self._init_num_qubits = n_q
         self.seed = seed
         self.batch_size = batch_size
+        self._init_batch_size = batch_size
         self.record_unleaked_to_leaked = bool(record_unleaked_to_leaked)
         self._unleaked_to_leaked_events: list[list[int]] = (
-            [[] for _ in range(batch_size)]
-            if self.record_unleaked_to_leaked
-            else []
+            [[] for _ in range(batch_size)] if self.record_unleaked_to_leaked else []
         )
         self.record_leakage_events = bool(record_leakage_events)
         self._leakage_events: list[list[LeakageEvent]] = (
             [[] for _ in range(batch_size)] if self.record_leakage_events else []
         )
         self.sync_tableside_rng = bool(sync_tableside_rng)
-        self._n_words = max(1, (self.num_qubits + 63) // 64)
+        self._n_words = max(1, (n_q + 63) // 64)
         self._batches_completed = 0
-        self._tab_scratch_q = self.num_qubits
+        self._tab_scratch_q = n_q
+        self._init_cpp_and_rng_state(n_q, batch_size)
+        self._flip_simulator = stim.FlipSimulator(
+            batch_size=batch_size,
+            disable_stabilizer_randomization=True,
+            num_qubits=n_q,
+            seed=self.seed,
+        )
+        self._compiled_ref = (
+            compiled_ref if compiled_ref is not None else CompiledReferenceCircuit(circuit)
+        )
+        self._compiled_m2d_converter = circuit.compile_m2d_converter()
+        self._compiled_op_handler = compiled_op_handler
+        self.compiled_op_handler = compiled_op_handler
+        self._init_runtime_buffers(n_q, batch_size)
 
+    def _init_cpp_and_rng_state(self, n_q: int, batch_size: int) -> None:
         self._shot_np_rngs: list[np.random.Generator] | None = None
         self._tab_rngs: list[stim.TableauSimulator] | None = None
         self._tab_rngs_x: list[stim.TableauSimulator] | None = None
@@ -114,61 +215,33 @@ class CosetsideSimulator(
         self._any_x_c = ctypes.c_int(0)
         self._any_z_c = ctypes.c_int(0)
         self._init_rngs()
-
         self._use_cpp = self._tab_rngs is None
         if self._use_cpp:
             self._cpp_lib = get_coset_kernels_lib()
             self._cpp_eng = self._cpp_lib.engine_create(
-                self.num_qubits,
-                self.batch_size,
-                self._shot_tiebreak_rng.ctypes.data_as(u64_p),
+                n_q, batch_size, self._shot_tiebreak_rng.ctypes.data_as(u64_p)
             )
 
-        self._flip_simulator = stim.FlipSimulator(
-            batch_size=self.batch_size,
-            disable_stabilizer_randomization=True,
-            num_qubits=self.num_qubits,
-            seed=self.seed,
-        )
-
-        self._compiled_ref = (
-            compiled_ref
-            if compiled_ref is not None
-            else CompiledReferenceCircuit(circuit)
-        )
-        self._compiled_m2d_converter = circuit.compile_m2d_converter()
-        self._compiled_op_handler = compiled_op_handler
-        self.compiled_op_handler = compiled_op_handler
-
+    def _init_runtime_buffers(self, n_q: int, batch_size: int) -> None:
         self.qubit_coords: dict[int, list[float]] = {}
         self.qubit_tags: dict[int, str] = {}
         self.coords_shifts: list[float] = []
-
         self._active_shots: dict[int, MRQFState] = {}
         self._measurement_columns: list[NDArray[np.bool_]] = []
-        self._scratch_mask = np.zeros(
-            (self.num_qubits, self.batch_size), dtype=np.bool_
-        )
-        self._scratch_x_mask = np.zeros(
-            (self.num_qubits, self.batch_size), dtype=np.bool_
-        )
-        self._scratch_z_mask = np.zeros(
-            (self.num_qubits, self.batch_size), dtype=np.bool_
-        )
+        self._scratch_mask = np.zeros((n_q, batch_size), dtype=np.bool_)
+        self._scratch_x_mask = np.zeros((n_q, batch_size), dtype=np.bool_)
+        self._scratch_z_mask = np.zeros((n_q, batch_size), dtype=np.bool_)
         self._cpp_m_buf: NDArray[np.bool_] = np.empty(0, dtype=np.bool_)
-        self._correlated_error_occurred: NDArray[np.bool_] = np.zeros(
-            self.batch_size, dtype=np.bool_
-        )
-
+        self._correlated_error_occurred: NDArray[np.bool_] = np.zeros(batch_size, dtype=np.bool_)
         self._circuit_time = 0
         self._step_cursor = 0
         self._used_interactively = False
         self._unrolled_ops: list[stim.CircuitInstruction] | None = None  # set by interactive_do
         self._finished_running_circuit = False
-
         self._final_measurement_records: NDArray[np.bool_] | None = None
         self._detector_flips: NDArray[np.bool_] | None = None
         self._observable_flips: NDArray[np.bool_] | None = None
+        self._override_packed_words: PackedSymplecticTables | None = None
 
     def __del__(self) -> None:
         if getattr(self, "_cpp_eng", None) is not None and getattr(self, "_cpp_lib", None) is not None:
@@ -200,8 +273,8 @@ class CosetsideSimulator(
             self._cpp_dirty = False
             return
         lib = self._cpp_lib
-        out_idx = np.empty(self.batch_size, dtype=np.int32)
-        out_d = np.empty(self.batch_size, dtype=np.int32)
+        out_idx = np.empty(self._init_batch_size, dtype=np.int32)
+        out_d = np.empty(self._init_batch_size, dtype=np.int32)
         n_act = int(
             lib.engine_get_active_shot_indices(
                 self._cpp_eng,
@@ -219,7 +292,7 @@ class CosetsideSimulator(
             st = self._active_shots.get(b)
             if st is None:
                 st = MRQFState(
-                    self.num_qubits, self._n_words, _init_cap=max(16, d)
+                    self._init_num_qubits, self._n_words, _init_cap=max(16, d)
                 )
                 self._active_shots[b] = st
             else:
@@ -301,7 +374,7 @@ class CosetsideSimulator(
                 self._tab_rngs,
                 self._tab_rngs_x,
             ) = build_sync_rngs(
-                self.seed, self._batches_completed, self.batch_size, self.num_qubits
+                self.seed, self._batches_completed, self._init_batch_size, self._init_num_qubits
             )
             self.np_rng = self._shot_np_rngs[0]
         else:
@@ -320,7 +393,7 @@ class CosetsideSimulator(
             if base_seed is None
             else int(base_seed)
         )
-        b_arange = np.arange(self.batch_size, dtype=np.uint64)
+        b_arange = np.arange(self._init_batch_size, dtype=np.uint64)
         base_hash = np.uint64(
             ((tie_seed + 1) * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
         )
@@ -328,7 +401,10 @@ class CosetsideSimulator(
             base_hash ^ (b_arange * np.uint64(0xBF58476D1CE4E5B9)),
             dtype=np.uint64,
         )
-        if getattr(self, "_cpp_eng", None) is not None and getattr(self, "_cpp_lib", None) is not None:
+        if (
+            getattr(self, "_cpp_eng", None) is not None
+            and getattr(self, "_cpp_lib", None) is not None
+        ):
             self._cpp_lib.engine_set_rng_states(
                 self._cpp_eng, self._shot_tiebreak_rng.ctypes.data_as(u64_p)
             )
@@ -432,10 +508,10 @@ class CosetsideSimulator(
 
         if self.record_unleaked_to_leaked:
             self._unleaked_to_leaked_events = [
-                [] for _ in range(self.batch_size)
+                [] for _ in range(self._init_batch_size)
             ]
         if self.record_leakage_events:
-            self._leakage_events = [[] for _ in range(self.batch_size)]
+            self._leakage_events = [[] for _ in range(self._init_batch_size)]
 
         self._circuit_time = 0
         self._step_cursor = 0
@@ -508,25 +584,32 @@ class CosetsideSimulator(
             self._n_words
         )
 
+    def _replays(self, step: StepMeta, op: stim.CircuitInstruction) -> bool:
+        """Whether `op` may be run against `step`, the reference step at the cursor.
+
+        interactive_do checked the full op against the circuit; this guards the steps earlier
+        interactive runs appended past its end (kept by clear()). A step only depends on the
+        op's name and targets, so tags (which op handlers remove) and arguments aren't compared.
+        """
+        return not self._used_interactively or (
+            step.op.name == op.name and op.targets_copy() == step.op.targets_copy()
+        )
+
     def _next_step_meta(self, op: stim.CircuitInstruction) -> StepMeta:
-        if self._step_cursor < len(self._compiled_ref.steps):
-            step = self._compiled_ref.steps[self._step_cursor]
-            # interactive_do checked the full op against the circuit; this guards the steps earlier
-            # interactive runs appended past its end (kept by clear()). A step only depends on the
-            # op's name and targets, so tags (which op handlers remove) and arguments aren't compared.
-            if not self._used_interactively or (
-                step.op.name == op.name
-                and op.targets_copy() == step.op.targets_copy()
-            ):
-                self._step_cursor += 1
+        while self._step_cursor < len(self._compiled_ref.steps):
+            cursor = self._step_cursor
+            step = self._compiled_ref.steps[cursor]
+            if not self._replays(step, op):
+                # The live reference is at the end of the tape, not here: appending is wrong.
+                raise ValueError(
+                    f"interactive_do: `{op}` doesn't match `{step.op}`, operation {cursor} of "
+                    "the reference the CosetsideSimulator compiled from its circuit (plus any "
+                    "operations earlier interactive runs appended after it). interactive_do can "
+                    "only replay that reference in order, then continue past its end."
+                )
+            if self._step_cursor == cursor:
+                self._step_cursor = cursor + 1
                 return step
-            # The live reference is at the end of the tape, not at this step: appending here is wrong.
-            raise ValueError(
-                f"interactive_do: `{op}` doesn't match `{step.op}`, operation {self._step_cursor} of "
-                "the reference the CosetsideSimulator compiled from its circuit (plus any operations "
-                "earlier interactive runs appended after it). interactive_do can only replay that "
-                "reference in order, then continue past its end."
-            )
         step = self._compiled_ref.compile_and_append_instruction(op)
         self._step_cursor = len(self._compiled_ref.steps)
         return step
@@ -571,7 +654,7 @@ class CosetsideSimulator(
                     self._unrolled_ops,
                     self._circuit_time,
                     "CosetsideSimulator",
-                    num_qubits=self.num_qubits,
+                    num_qubits=self._init_num_qubits,
                 )
             self._do_instruction(this)
         else:
@@ -598,7 +681,7 @@ class CosetsideSimulator(
             for gt in raw_targets:
                 bit_val = bool(gt.value) ^ bool(gt.is_inverted_result_target)
                 self._measurement_columns.append(
-                    np.full(self.batch_size, bit_val, dtype=np.bool_)
+                    np.full(self._init_batch_size, bit_val, dtype=np.bool_)
                 )
             if len(raw_targets) > 0:
                 self._apply_measurement_flip_noise(
@@ -659,12 +742,12 @@ class CosetsideSimulator(
         cz = cy + (args[3] if len(args) > 3 else 0.0)
         for gt, q in zip(raw_targets, qs):
             if is_erase:
-                hk = self.np_rng.random(self.batch_size) < p_erase
-                pi = self.np_rng.integers(0, 4, size=self.batch_size)
+                hk = self.np_rng.random(self._init_batch_size) < p_erase
+                pi = self.np_rng.integers(0, 4, size=self._init_batch_size)
                 xk = hk & ((pi == 1) | (pi == 2))
                 zk = hk & ((pi == 2) | (pi == 3))
             else:
-                u = self.np_rng.random(self.batch_size)
+                u = self.np_rng.random(self._init_batch_size)
                 hk = u < cz
                 xk = (u >= ci) & (u < cy)
                 zk = (u >= cx) & (u < cz)
@@ -720,7 +803,7 @@ class CosetsideSimulator(
     def _broadcast_pair_flips(self, targets, x1, z1, x2, z2) -> None:
         """Pair variant: targets are flattened (q1, q2) pairs; row g of x1/z1 (x2/z2) acts on pair g's q1 (q2)."""
         for pauli, f1, f2 in (("X", x1, x2), ("Z", z1, z2)):
-            flips = np.stack([f1, f2], axis=1).reshape(-1, self.batch_size)
+            flips = np.stack([f1, f2], axis=1).reshape(-1, self._init_batch_size)
             self._broadcast_flips(pauli, targets, flips)
 
     def _evict_healed_shots(
@@ -804,7 +887,7 @@ class CosetsideSimulator(
         """Inject E = U_t^dagger on shot b_idx via P1, P2, or PCP."""
         mrqf = self._active_shots.get(b_idx)
         if mrqf is None:
-            mrqf = MRQFState(self.num_qubits, self._n_words)
+            mrqf = MRQFState(self._init_num_qubits, self._n_words)
             self._active_shots[b_idx] = mrqf
 
         f_kinds, f_lx1, f_lz1, f_a1, f_b1, f_k1, f_lx2, f_lz2, f_a2, f_b2, f_k2 = f_arrs
@@ -839,138 +922,222 @@ class CosetsideSimulator(
             else:
                 mrqf.p2_apply_quarter_turn(a1, b1, kappa_shot)
 
-    def do_conditional_clifford(
+    def _dcc_expected_mask_shapes(
+        self, op: stim.CircuitInstruction, shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], str, str, bool]:
+        cols = self._init_batch_size
+        if _is_mixed_two_qubit(op):
+            _check_mask_shape(
+                "condition_met_mask", shape, len(op.target_groups()), cols, f"{op.name} group"
+            )
+            return (
+                (_count_all_quantum_groups(op), cols),
+                "condition_met_mask restricted to the record-free groups",
+                "step group",
+                True,
+            )
+        return shape, "condition_met_mask", f"{op.name} group", False
+
+    def _check_dcc_mask(
         self,
         op: stim.CircuitInstruction,
-        condition_met_mask: NDArray[np.bool_] | None = None,
-        *,
-        condition_group_fn: Any = None,
+        shape: tuple[int, ...],
+        has_group_fn: bool,
+        eff: tuple[tuple[int, ...], str, str, bool] | None = None,
     ) -> None:
-        """Execute a conditional Clifford op by running Phase 2 and injecting E = U_t^dagger where ~condition_met_mask."""
-        packed_words_before = self._current_packed_words()
-        step_meta = self._next_step_meta(op)
-        name = op.name
-        gd = stim.gate_data(name)
-        if gd.is_two_qubit_gate:
-            raw_t = op.targets_copy()
-            if any(t.qubit_value is None for t in raw_t):
-                target_groups = op.target_groups()
-                quant_indices: list[int] = []
-                for g_idx, (t0, t1) in enumerate(target_groups):
-                    if t0.qubit_value is not None and t1.qubit_value is not None:
-                        quant_indices.append(g_idx)
-                        continue
-                    rec, tq, paulis = (
-                        (t0, t1, _REC_FIRST_PAULI)
-                        if t0.is_measurement_record_target
-                        else (t1, t0, _REC_SECOND_PAULI)
-                    )
-                    if rec.is_measurement_record_target and tq.qubit_value is not None:
-                        active = self._measurement_columns[rec.value]
-                        if condition_met_mask is not None:
-                            active = active & condition_met_mask[g_idx]
-                        pauli = paulis.get(name, "Z")
-                        self._broadcast_flips(pauli, [tq.qubit_value], active[None, :])
-                if not isinstance(step_meta, UnitaryStepMeta):
-                    return
-                assert step_meta.quantum_op is not None
-                op = step_meta.quantum_op
-                if condition_met_mask is not None:
-                    condition_met_mask = condition_met_mask[quant_indices, :]
+        """Raise ValueError if a `condition_met_mask` of this `shape` does not fit `op`."""
+        steps, cols = self._compiled_ref.steps, self._init_batch_size
+        rows: int | None = None
+        if self._step_cursor >= len(steps):
+            rows = _compiled_unitary_rows(op)
+        else:
+            step = steps[self._step_cursor]
+            if isinstance(step, UnitaryStepMeta) and self._replays(step, op):
+                rows = len(step.target_groups)
+        eff_shape, name, rows_are, _ = (
+            eff if eff is not None else self._dcc_expected_mask_shapes(op, shape)
+        )
+        if rows is not None and not has_group_fn:
+            _check_mask_shape(name, eff_shape, rows, cols, rows_are)
 
-        if not isinstance(step_meta, UnitaryStepMeta):
-            return
-
-        if condition_group_fn is None and (
-            condition_met_mask is None or np.all(condition_met_mask)
-        ):
-            self._apply_unitary_to_frames(op)
-            return
-
-        if name in ("I", "II", "I_ERROR", "II_ERROR"):
-            if condition_group_fn is not None:
-                self._override_packed_words = packed_words_before
-                try:
-                    for g_idx in range(len(step_meta.target_groups)):
-                        condition_group_fn(g_idx)
-                finally:
-                    self._override_packed_words = None
-            return
-
-        if condition_group_fn is None and name in ("X", "Y", "Z"):
-            self._apply_unitary_to_frames(op)
-            qubits = [group[0] for group in step_meta.target_groups]
-            self._broadcast_flips(name, qubits, ~condition_met_mask)
-            return
-
-        if condition_group_fn is None and step_meta.are_groups_disjoint:
-            if self._use_cpp and self._cpp_lib is not None and self._cpp_eng is not None:
-                self._sync_py_to_cpp()
-                self._apply_unitary_to_frames(op)
-                lib = self._cpp_lib
-                num_g, arity, n_fac, t_groups, f_arrs = step_meta.get_cpp_cocycle_arrays(
-                    self._n_words
-                )
-                xs_base, zs_base, _, _, _ = self._flip_simulator.to_numpy(
-                    output_xs=True, output_zs=True
-                )
-                x2z_w, z2z_w = step_meta.get_evict_words(self._n_words)
-                self._scratch_x_mask.fill(False)
-                self._scratch_z_mask.fill(False)
-                cm_c = np.ascontiguousarray(condition_met_mask, dtype=np.uint8)
-                xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
-                zs_c = np.ascontiguousarray(zs_base, dtype=np.uint8)
-                self._engine_kernel_begin()
-                lib.engine_batch_inject_general_clifford(
-                    self._cpp_eng,
-                    num_g,
-                    arity,
-                    n_fac,
-                    t_groups.ctypes.data_as(i64_p),
-                    cm_c.ctypes.data_as(u8_p),
-                    xs_c.ctypes.data_as(u8_p),
-                    zs_c.ctypes.data_as(u8_p),
-                    *(
-                        a.ctypes.data_as(u64_p if a.dtype == np.uint64 else u8_p)
-                        for a in f_arrs
-                    ),
-                    x2z_w.ctypes.data_as(u64_p),
-                    z2z_w.ctypes.data_as(u64_p),
-                    *self._cpp_out_args(),
-                )
-                self._engine_kernel_end()
-                self._flush_xz(self._any_x_c.value, self._any_z_c.value)
-                return
-
-            self._apply_unitary_to_frames(op)
-            xs_base, zs_base, _, _, _ = self._flip_simulator.to_numpy(
-                output_xs=True, output_zs=True
+    def _rollback_dcc_step(self, step_meta: StepMeta, steps_len_before: int) -> None:
+        steps = self._compiled_ref.steps
+        if len(steps) > steps_len_before and steps[-1] is step_meta:
+            steps.pop()
+            prev = (
+                steps[-1]._get_packed_words(self._n_words)
+                if steps
+                else self._compiled_ref._initial_packed_words
             )
-            failed_g_indices = np.flatnonzero(~np.all(condition_met_mask, axis=1))
-            if len(failed_g_indices) > 0:
-                _, _, n_fac, _, f_arrs = step_meta.get_cpp_cocycle_arrays(self._n_words)
-                for g_idx_np in failed_g_indices:
-                    g_idx = int(g_idx_np)
-                    group = step_meta.target_groups[g_idx]
-                    failed_shots = np.flatnonzero(~condition_met_mask[g_idx])
-                    group_arr = np.array(group, dtype=np.intp)
-                    for b_idx_np in failed_shots:
-                        b_idx = int(b_idx_np)
-                        f_x_local = xs_base[group_arr, b_idx]
-                        f_z_local = zs_base[group_arr, b_idx]
-                        self._inject_inverse_cocycle_on_shot(
-                            b_idx, f_arrs, g_idx, n_fac, f_x_local, f_z_local
-                        )
-            if self._active_shots and any(
-                m.d == 0 for m in self._active_shots.values()
-            ):
-                self._evict_healed_shots(
-                    step_meta,
-                    xs_base=xs_base,
-                    zs_base=zs_base,
-                )
-            return
+            self._compiled_ref._last_packed_snapshot = prev
+            self._compiled_ref.ref_chp = ReferenceCHPTableau.from_packed(
+                self._compiled_ref.num_qubits, prev
+            )
+            self._step_cursor = len(steps)
+        elif self._step_cursor > 0 and steps[self._step_cursor - 1] is step_meta:
+            self._step_cursor -= 1
 
+    def _resolve_dcc_step(
+        self,
+        op: stim.CircuitInstruction,
+        eff: tuple[tuple[int, ...], str, str, bool] | None,
+        has_group_fn: bool,
+        cursor_at_check: int,
+    ) -> tuple[StepMeta, PackedSymplecticTables, int]:
+        if eff is not None and not has_group_fn and self._step_cursor != cursor_at_check:
+            self._check_dcc_step_candidate(op, eff)
+        packed_words_before = self._current_packed_words()
+        steps = self._compiled_ref.steps
+        steps_len_before = len(steps)
+        step_meta = self._next_step_meta(op)
+        if eff is not None and not has_group_fn and isinstance(step_meta, UnitaryStepMeta):
+            try:
+                eff_shape, name, rows_are, _ = eff
+                _check_mask_shape(
+                    name, eff_shape, len(step_meta.target_groups), self._init_batch_size, rows_are
+                )
+            except ValueError:
+                self._rollback_dcc_step(step_meta, steps_len_before)
+                raise
+        if (
+            self._step_cursor != cursor_at_check + 1
+            and self._step_cursor > 0
+            and self._compiled_ref.steps[self._step_cursor - 1] is step_meta
+            and getattr(self, "_override_packed_words", None) is None
+        ):
+            idx = self._step_cursor - 1
+            packed_words_before = (
+                self._compiled_ref._initial_packed_words
+                if idx == 0
+                else self._compiled_ref.steps[idx - 1]._get_packed_words(self._n_words)
+            )
+        return step_meta, packed_words_before, steps_len_before
+
+    def _check_dcc_step_candidate(
+        self, op: stim.CircuitInstruction, eff: tuple[tuple[int, ...], str, str, bool]
+    ) -> None:
+        steps, cols = self._compiled_ref.steps, self._init_batch_size
+        rows: int | None = None
+        if self._step_cursor >= len(steps):
+            rows = _compiled_unitary_rows(op)
+        else:
+            step = steps[self._step_cursor]
+            if isinstance(step, UnitaryStepMeta) and self._replays(step, op):
+                rows = len(step.target_groups)
+        if rows is not None:
+            eff_shape, name, rows_are, _ = eff
+            _check_mask_shape(name, eff_shape, rows, cols, rows_are)
+
+    def _dcc_apply_mixed_record(
+        self,
+        op: stim.CircuitInstruction,
+        mask: NDArray[Any] | None,
+        is_mixed: bool | None = None,
+    ) -> tuple[list[int] | None, NDArray[Any] | None]:
+        if is_mixed is False:
+            return None, mask
+        if is_mixed is None and not _is_mixed_two_qubit(op):
+            return None, mask
+        name = op.name
+        quant_indices: list[int] = []
+        for g_idx, (t0, t1) in enumerate(op.target_groups()):
+            if t0.qubit_value is not None and t1.qubit_value is not None:
+                quant_indices.append(g_idx)
+                continue
+            rec, tq, paulis = (
+                (t0, t1, _REC_FIRST_PAULI)
+                if t0.is_measurement_record_target
+                else (t1, t0, _REC_SECOND_PAULI)
+            )
+            if rec.is_measurement_record_target and tq.qubit_value is not None:
+                active = self._measurement_columns[rec.value]
+                if mask is not None:
+                    active = active & mask[g_idx]
+                self._broadcast_flips(paulis.get(name, "Z"), [tq.qubit_value], active[None, :])
+        return quant_indices, (mask[quant_indices, :] if mask is not None else None)
+
+    def _dcc_disjoint_cpp(
+        self,
+        op: stim.CircuitInstruction,
+        step_meta: UnitaryStepMeta,
+        mask: NDArray[Any],
+        steps_len_before: int,
+        can_rollback: bool,
+    ) -> None:
+        lib = self._cpp_lib
+        assert lib is not None and self._cpp_eng is not None
+        num_g, arity, n_fac, t_groups, f_arrs = step_meta.get_cpp_cocycle_arrays(self._n_words)
+        try:
+            cm_c = np.ascontiguousarray(mask, dtype=np.uint8)
+            _check_mask_shape(
+                "condition_met_mask", cm_c.shape, num_g, self._init_batch_size, "step group"
+            )
+        except Exception:
+            if can_rollback:
+                self._rollback_dcc_step(step_meta, steps_len_before)
+            raise
+        self._sync_py_to_cpp()
+        self._apply_unitary_to_frames(op)
+        xs_base, zs_base, _, _, _ = self._flip_simulator.to_numpy(output_xs=True, output_zs=True)
+        x2z_w, z2z_w = step_meta.get_evict_words(self._n_words)
+        self._scratch_x_mask.fill(False)
+        self._scratch_z_mask.fill(False)
+        xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
+        zs_c = np.ascontiguousarray(zs_base, dtype=np.uint8)
+        _check_mask_shape(
+            "condition_met_mask", cm_c.shape, num_g, self._init_batch_size, "step group"
+        )
+        self._engine_kernel_begin()
+        lib.engine_batch_inject_general_clifford(
+            self._cpp_eng,
+            num_g,
+            arity,
+            n_fac,
+            t_groups.ctypes.data_as(i64_p),
+            cm_c.ctypes.data_as(u8_p),
+            xs_c.ctypes.data_as(u8_p),
+            zs_c.ctypes.data_as(u8_p),
+            *(a.ctypes.data_as(u64_p if a.dtype == np.uint64 else u8_p) for a in f_arrs),
+            x2z_w.ctypes.data_as(u64_p),
+            z2z_w.ctypes.data_as(u64_p),
+            *self._cpp_out_args(),
+        )
+        self._engine_kernel_end()
+        self._flush_xz(self._any_x_c.value, self._any_z_c.value)
+
+    def _dcc_disjoint_py(
+        self,
+        op: stim.CircuitInstruction,
+        step_meta: UnitaryStepMeta,
+        mask: NDArray[Any],
+    ) -> None:
+        self._apply_unitary_to_frames(op)
+        xs_base, zs_base, _, _, _ = self._flip_simulator.to_numpy(output_xs=True, output_zs=True)
+        failed_g_indices = np.flatnonzero(~np.all(mask, axis=1))
+        if len(failed_g_indices) > 0:
+            _, _, n_fac, _, f_arrs = step_meta.get_cpp_cocycle_arrays(self._n_words)
+            for g_idx_np in failed_g_indices:
+                g_idx = int(g_idx_np)
+                group = step_meta.target_groups[g_idx]
+                failed_shots = np.flatnonzero(~mask[g_idx])
+                group_arr = np.array(group, dtype=np.intp)
+                for b_idx_np in failed_shots:
+                    b_idx = int(b_idx_np)
+                    f_x_local = xs_base[group_arr, b_idx]
+                    f_z_local = zs_base[group_arr, b_idx]
+                    self._inject_inverse_cocycle_on_shot(
+                        b_idx, f_arrs, g_idx, n_fac, f_x_local, f_z_local
+                    )
+        if self._active_shots and any(m.d == 0 for m in self._active_shots.values()):
+            self._evict_healed_shots(step_meta, xs_base=xs_base, zs_base=zs_base)
+
+    def _dcc_sequential_py(
+        self,
+        step_meta: UnitaryStepMeta,
+        packed_words_before: PackedSymplecticTables,
+        mask: NDArray[Any] | None,
+        condition_group_fn: Any,
+    ) -> None:
         if self._use_cpp and self._cpp_dirty:
             self._sync_cpp_to_py()
         group_pws = step_meta.ensure_group_packed_words(packed_words_before)
@@ -985,7 +1152,8 @@ class CosetsideSimulator(
                 finally:
                     self._override_packed_words = None
             else:
-                cm_row = condition_met_mask[g_idx]
+                assert mask is not None
+                cm_row = mask[g_idx]
             self._apply_unitary_to_frames(step_meta.group_ops[g_idx])
             failed_shots = np.where(~cm_row)[0]
             if len(failed_shots) == 0:
@@ -994,9 +1162,6 @@ class CosetsideSimulator(
                 output_xs=True, output_zs=True
             )
             group_arr = np.array(group, dtype=np.intp)
-            # Raised BEFORE the per-shot writes (and once per group, because the next group's
-            # `condition_group_fn` may peek, which syncs and clears it): if a write raises
-            # midway the engine must still be re-imported, `_sync_py_to_cpp` trusts the flag.
             if self._use_cpp:
                 self._py_dirty = True
             for b_idx_np in failed_shots:
@@ -1014,6 +1179,72 @@ class CosetsideSimulator(
                 )
         if self._use_cpp:
             self._py_dirty = True
+
+    def do_conditional_clifford(
+        self,
+        op: stim.CircuitInstruction,
+        condition_met_mask: NDArray[np.bool_] | None = None,
+        *,
+        condition_group_fn: Any = None,
+    ) -> None:
+        """Execute a conditional Clifford op by running Phase 2 and injecting E = U_t^dagger
+        where ~condition_met_mask.
+
+        A mask of the wrong shape raises ValueError atomically before anything changes.
+        """
+        mask: NDArray[Any] | None = (
+            _own_mask(condition_met_mask) if condition_met_mask is not None else None
+        )
+        eff = self._dcc_expected_mask_shapes(op, mask.shape) if mask is not None else None
+        cursor_at_check = self._step_cursor
+        if mask is not None:
+            self._check_dcc_mask(op, mask.shape, condition_group_fn is not None, eff)
+        step_meta, packed_words_before, steps_len_before = self._resolve_dcc_step(
+            op, eff, condition_group_fn is not None, cursor_at_check
+        )
+        name = op.name
+        quant_indices, mask = self._dcc_apply_mixed_record(
+            op, mask, eff[3] if eff is not None else None
+        )
+        if not isinstance(step_meta, UnitaryStepMeta):
+            return
+        if quant_indices is not None:
+            assert step_meta.quantum_op is not None
+            op = step_meta.quantum_op
+        try:
+            all_met = condition_group_fn is None and (mask is None or bool(np.all(mask)))
+        except Exception:
+            if quant_indices is None:
+                self._rollback_dcc_step(step_meta, steps_len_before)
+            raise
+        if all_met:
+            self._apply_unitary_to_frames(op)
+            return
+        if name in ("I", "II", "I_ERROR", "II_ERROR"):
+            if condition_group_fn is not None:
+                self._override_packed_words = packed_words_before
+                try:
+                    for g_idx in range(len(step_meta.target_groups)):
+                        condition_group_fn(g_idx)
+                finally:
+                    self._override_packed_words = None
+            return
+        if condition_group_fn is None and name in ("X", "Y", "Z"):
+            assert mask is not None
+            self._apply_unitary_to_frames(op)
+            qubits = [group[0] for group in step_meta.target_groups]
+            self._broadcast_flips(name, qubits, ~mask)
+            return
+        if condition_group_fn is None and step_meta.are_groups_disjoint:
+            assert mask is not None
+            if self._use_cpp and self._cpp_lib is not None and self._cpp_eng is not None:
+                self._dcc_disjoint_cpp(
+                    op, step_meta, mask, steps_len_before, quant_indices is None
+                )
+            else:
+                self._dcc_disjoint_py(op, step_meta, mask)
+            return
+        self._dcc_sequential_py(step_meta, packed_words_before, mask, condition_group_fn)
 
     def apply_pauli(
         self, pauli: Literal["X", "Y", "Z"], mask: NDArray[np.bool_], p: float = 1.0
@@ -1322,10 +1553,10 @@ class CosetsideSimulator(
         assert self._cpp_lib is not None and self._cpp_eng is not None
         num_sub = len(step_meta.substeps)
         q_arr, m_ref_arr, b_sub_words = step_meta.get_det_batch_arrays()
-        needed = num_sub * self.batch_size
+        needed = num_sub * self._init_batch_size
         if self._cpp_m_buf.size < needed:
             self._cpp_m_buf = np.empty(needed, dtype=np.bool_)
-        m_mat = self._cpp_m_buf[:needed].reshape(num_sub, self.batch_size)
+        m_mat = self._cpp_m_buf[:needed].reshape(num_sub, self._init_batch_size)
         xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
             output_xs=True, output_zs=False
         )
@@ -1367,11 +1598,11 @@ class CosetsideSimulator(
         self, meta: Any, xs_c: NDArray[np.uint8]
     ) -> NDArray[np.bool_]:
         if meta.q < 0:
-            return np.zeros(self.batch_size, dtype=np.bool_)
+            return np.zeros(self._init_batch_size, dtype=np.bool_)
         assert self._cpp_lib is not None and self._cpp_eng is not None
         self._engine_kernel_begin()
         if not meta.is_random:
-            m_shots = np.empty(self.batch_size, dtype=np.bool_)
+            m_shots = np.empty(self._init_batch_size, dtype=np.bool_)
             null_u64, null_i64 = ctypes.cast(0, u64_p), ctypes.cast(0, i64_p)
             self._cpp_lib.engine_batch_mixed_substep(
                 self._cpp_eng, 0, meta.q, int(meta.m_ref), 0,
@@ -1381,7 +1612,7 @@ class CosetsideSimulator(
                 *self._cpp_out_args(),
             )
         else:
-            m_shots = self.np_rng.integers(0, 2, size=self.batch_size, dtype=np.bool_)
+            m_shots = self.np_rng.integers(0, 2, size=self._init_batch_size, dtype=np.bool_)
             self._cpp_lib.engine_batch_mixed_substep(
                 self._cpp_eng, 1, meta.q, int(meta.m_ref), meta.p,
                 meta.a_words.ctypes.data_as(u64_p),
@@ -1400,7 +1631,7 @@ class CosetsideSimulator(
         self, meta: Any, xs_base: NDArray[np.bool_]
     ) -> NDArray[np.bool_]:
         if meta.q < 0:
-            return np.zeros(self.batch_size, dtype=np.bool_)
+            return np.zeros(self._init_batch_size, dtype=np.bool_)
         f_q_shots = xs_base[meta.q, :].copy()
         m_ref = meta.m_ref
         if not meta.is_random:
@@ -1422,9 +1653,9 @@ class CosetsideSimulator(
         p = meta.p
         p_word, p_bit = p >> 6, p & 63
         p_mask = np.uint64(1 << p_bit)
-        m_shots = np.zeros(self.batch_size, dtype=np.bool_)
-        delta_shots = np.zeros(self.batch_size, dtype=np.bool_)
-        for b_idx in range(self.batch_size):
+        m_shots = np.zeros(self._init_batch_size, dtype=np.bool_)
+        delta_shots = np.zeros(self._init_batch_size, dtype=np.bool_)
+        for b_idx in range(self._init_batch_size):
             mrqf = self._active_shots.get(b_idx)
             if mrqf is not None:
                 if not bool(mrqf.a_union[p_word] & p_mask):
@@ -1477,7 +1708,7 @@ class CosetsideSimulator(
                 )
             else:
                 flips_2d = (
-                    self.np_rng.random((num_m, self.batch_size)) < p_meas_err
+                    self.np_rng.random((num_m, self._init_batch_size)) < p_meas_err
                 )
                 for k_idx in range(num_m):
                     self._measurement_columns[-num_m + k_idx] ^= flips_2d[
@@ -1520,6 +1751,101 @@ class CosetsideSimulator(
             )
         return False, False
 
+    def _reset_z_cpp(
+        self,
+        reset_zero_mask: NDArray[Any],
+        reset_one_mask: NDArray[Any],
+        z2x_w: NDArray[np.uint64],
+        z2z_w: NDArray[np.uint64],
+        z_kappa: NDArray[np.uint8],
+        x2z_w: NDArray[np.uint64],
+    ) -> None:
+        assert self._cpp_lib is not None and self._cpp_eng is not None
+        r0_c = np.ascontiguousarray(reset_zero_mask, dtype=np.uint8)
+        r1_c = np.ascontiguousarray(reset_one_mask, dtype=np.uint8)
+        n_q, n_b = self._init_num_qubits, self._init_batch_size
+        _check_mask_shape("reset_zero_mask", r0_c.shape, n_q, n_b, "qubit")
+        _check_mask_shape("reset_one_mask", r1_c.shape, n_q, n_b, "qubit")
+        self._sync_py_to_cpp()
+        xs_base, _, _, _, _ = self._flip_simulator.to_numpy(output_xs=True, output_zs=False)
+        xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
+        self._scratch_x_mask.fill(False)
+        self._scratch_z_mask.fill(False)
+        self._any_x_c.value = 0
+        self._any_z_c.value = 0
+        self._engine_kernel_begin()
+        self._cpp_lib.engine_batch_unmatched_noisy_reset_z(
+            self._cpp_eng,
+            r0_c.ctypes.data_as(u8_p),
+            r1_c.ctypes.data_as(u8_p),
+            xs_c.ctypes.data_as(u8_p),
+            z2x_w.ctypes.data_as(u64_p),
+            z2z_w.ctypes.data_as(u64_p),
+            z_kappa.ctypes.data_as(u8_p),
+            x2z_w.ctypes.data_as(u64_p),
+            *self._cpp_out_args(),
+        )
+        self._engine_kernel_end()
+        self._flush_xz(self._any_x_c.value, self._any_z_c.value)
+
+    def _reset_py_qubit(
+        self,
+        q: int,
+        shots_for_q: NDArray[np.intp],
+        reset_one_mask: NDArray[Any],
+        pauli: Literal["X", "Y", "Z"],
+        xs_base: NDArray[np.bool_],
+        zs_base: NDArray[np.bool_] | None,
+        packed_words: PackedSymplecticTables,
+    ) -> tuple[bool, bool]:
+        x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa = packed_words
+        aw, bw, kap = pauli_image(pauli, q, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa)
+        a_is_zero, sign_bool, rot = self._projection_words(aw, bw, kap)
+        ref_exp = -1 if sign_bool else 1
+        any_x_kick = False
+        any_z_kick = False
+        for b_np in shots_for_q:
+            b_idx = int(b_np)
+            target_state = 1 if reset_one_mask[q, b_idx] else 0
+            if pauli == "Z":
+                f_q = int(xs_base[q, b_idx])
+            elif pauli == "X":
+                assert zs_base is not None
+                f_q = int(zs_base[q, b_idx])
+            else:
+                assert zs_base is not None
+                f_q = int(xs_base[q, b_idx] ^ zs_base[q, b_idx])
+            mrqf = self._active_shots.get(b_idx)
+            if mrqf is not None and (mrqf.d > 0 or _words_any_nonzero(mrqf.h_words)):
+                mu = mrqf.q1_pauli_expectation(aw, bw, kap)
+                z_exp = -mu if f_q else mu
+            else:
+                z_exp = (-ref_exp if f_q else ref_exp) if a_is_zero else 0
+            if z_exp in (1, -1):
+                need_flip = (target_state == 1) if z_exp == 1 else (target_state == 0)
+            else:
+                m = int(self._draw_tab_rng_bit(b_idx))
+                if mrqf is None:
+                    mrqf = MRQFState(self._init_num_qubits, self._n_words)
+                    self._active_shots[b_idx] = mrqf
+                kx, kz = self._project_and_retire(
+                    mrqf, aw, bw, sign_bool, rot, f_q, m, x2z_w, z2z_w, xs_base, zs_base
+                )
+                any_x_kick |= kx
+                any_z_kick |= kz
+                need_flip = m != target_state
+            if need_flip:
+                if pauli == "X":
+                    self._scratch_z_mask[q, b_idx] ^= True
+                    if zs_base is not None:
+                        zs_base[q, b_idx] ^= True
+                    any_z_kick = True
+                else:
+                    self._scratch_x_mask[q, b_idx] ^= True
+                    xs_base[q, b_idx] ^= True
+                    any_x_kick = True
+        return any_x_kick, any_z_kick
+
     def do_unmatched_noisy_reset_z(
         self,
         reset_zero_mask: NDArray[np.bool_],
@@ -1527,56 +1853,36 @@ class CosetsideSimulator(
         pauli: Literal["X", "Y", "Z"] = "Z",
         order: Sequence[int] | None = None,
     ) -> None:
-        """Reset noisy qubits to +1 (reset_zero_mask) or -1 (reset_one_mask) eigenstate of `pauli` without altering the reference tableau."""
-        if not (np.any(reset_zero_mask) or np.any(reset_one_mask)):
+        """Reset noisy qubits to +1 (reset_zero_mask) or -1 (reset_one_mask) eigenstate of
+        `pauli` without altering the reference tableau.
+
+        A mask that is not (num_qubits, batch_size) raises ValueError before anything changes.
+        """
+        r0 = _own_mask(reset_zero_mask)
+        r1 = _own_mask(reset_one_mask)
+        n_q, n_b = self._init_num_qubits, self._init_batch_size
+        _check_mask_shape("reset_zero_mask", r0.shape, n_q, n_b, "qubit")
+        _check_mask_shape("reset_one_mask", r1.shape, n_q, n_b, "qubit")
+        if not (np.any(r0) or np.any(r1)):
             return
-
-        x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa = self._current_packed_words()
-
+        packed_words = self._current_packed_words()
         if (
             pauli == "Z"
             and self._use_cpp
             and self._cpp_lib is not None
             and self._cpp_eng is not None
         ):
-            self._sync_py_to_cpp()
-            xs_base, _, _, _, _ = self._flip_simulator.to_numpy(
-                output_xs=True, output_zs=False
-            )
-            xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
-            r0_c = np.ascontiguousarray(reset_zero_mask, dtype=np.uint8)
-            r1_c = np.ascontiguousarray(reset_one_mask, dtype=np.uint8)
-            self._scratch_x_mask.fill(False)
-            self._scratch_z_mask.fill(False)
-            self._any_x_c.value = 0
-            self._any_z_c.value = 0
-
-            self._engine_kernel_begin()
-            self._cpp_lib.engine_batch_unmatched_noisy_reset_z(
-                self._cpp_eng,
-                r0_c.ctypes.data_as(u8_p),
-                r1_c.ctypes.data_as(u8_p),
-                xs_c.ctypes.data_as(u8_p),
-                z2x_w.ctypes.data_as(u64_p),
-                z2z_w.ctypes.data_as(u64_p),
-                z_kappa.ctypes.data_as(u8_p),
-                x2z_w.ctypes.data_as(u64_p),
-                *self._cpp_out_args(),
-            )
-            self._engine_kernel_end()
-            self._flush_xz(self._any_x_c.value, self._any_z_c.value)
+            _, x2z_w, z2x_w, z2z_w, _, z_kappa = packed_words
+            self._reset_z_cpp(r0, r1, z2x_w, z2z_w, z_kappa, x2z_w)
             return
-
         if self._use_cpp and self._cpp_dirty:
             self._sync_cpp_to_py()
-
-        combined_mask = reset_zero_mask | reset_one_mask
+        combined_mask = r0 | r1
         affected_qubits = np.flatnonzero(np.any(combined_mask, axis=1))
         if order is not None:
             affected_qubits = np.array(list(dict.fromkeys(order)), dtype=np.intp)
         if len(affected_qubits) == 0:
             return
-
         xs_base, zs_base, _, _, _ = self._flip_simulator.to_numpy(
             output_xs=True, output_zs=(pauli != "Z")
         )
@@ -1584,10 +1890,6 @@ class CosetsideSimulator(
         self._scratch_z_mask.fill(False)
         any_x_kick = False
         any_z_kick = False
-
-        # Raised BEFORE the per-shot writes (X/Y only: Z never reaches Python with the engine):
-        # if one raises midway (e.g. a bad `order` index) the earlier shots are already
-        # projected in Python and the engine must be re-imported.
         if pauli != "Z":
             self._py_dirty = True
         for q_np in affected_qubits:
@@ -1595,57 +1897,11 @@ class CosetsideSimulator(
             shots_for_q = np.flatnonzero(combined_mask[q])
             if len(shots_for_q) == 0:
                 continue
-
-            aw, bw, kap = pauli_image(pauli, q, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa)
-            a_is_zero, sign_bool, rot = self._projection_words(aw, bw, kap)
-            ref_exp = -1 if sign_bool else 1
-
-            for b_np in shots_for_q:
-                b_idx = int(b_np)
-                target_state = 1 if reset_one_mask[q, b_idx] else 0
-                if pauli == "Z":
-                    f_q = int(xs_base[q, b_idx])
-                elif pauli == "X":
-                    f_q = int(zs_base[q, b_idx])
-                else:
-                    f_q = int(xs_base[q, b_idx] ^ zs_base[q, b_idx])
-                mrqf = self._active_shots.get(b_idx)
-                if mrqf is not None and (
-                    mrqf.d > 0 or _words_any_nonzero(mrqf.h_words)
-                ):
-                    mu = mrqf.q1_pauli_expectation(aw, bw, kap)
-                    z_exp = -mu if f_q else mu
-                else:
-                    z_exp = (-ref_exp if f_q else ref_exp) if a_is_zero else 0
-
-                need_flip = False
-                if z_exp == 1:
-                    need_flip = target_state == 1
-                elif z_exp == -1:
-                    need_flip = target_state == 0
-                else:
-                    m = int(self._draw_tab_rng_bit(b_idx))
-                    if mrqf is None:
-                        mrqf = MRQFState(self.num_qubits, self._n_words)
-                        self._active_shots[b_idx] = mrqf
-                    kx, kz = self._project_and_retire(
-                        mrqf, aw, bw, sign_bool, rot, f_q, m, x2z_w, z2z_w, xs_base, zs_base
-                    )
-                    any_x_kick |= kx
-                    any_z_kick |= kz
-                    need_flip = m != target_state
-
-                if need_flip:
-                    if pauli == "X":
-                        self._scratch_z_mask[q, b_idx] ^= True
-                        if zs_base is not None:
-                            zs_base[q, b_idx] ^= True
-                        any_z_kick = True
-                    else:
-                        self._scratch_x_mask[q, b_idx] ^= True
-                        xs_base[q, b_idx] ^= True
-                        any_x_kick = True
-
+            kx, kz = self._reset_py_qubit(
+                q, shots_for_q, r1, pauli, xs_base, zs_base, packed_words
+            )
+            any_x_kick |= kx
+            any_z_kick |= kz
         self._flush_xz(any_x_kick, any_z_kick)
 
     def postselect_z_batch(
@@ -1690,7 +1946,7 @@ class CosetsideSimulator(
                 f_q = int(xs_base[q, b_idx] ^ zs_base[q, b_idx])
             mrqf = self._active_shots.get(b_idx)
             if mrqf is None:
-                mrqf = MRQFState(self.num_qubits, self._n_words)
+                mrqf = MRQFState(self._init_num_qubits, self._n_words)
                 self._active_shots[b_idx] = mrqf
             kx, kz = self._project_and_retire(
                 mrqf, aw, bw, sign_bool, rot, f_q, m, x2z_w, z2z_w, xs_base, zs_base
@@ -1719,41 +1975,87 @@ class CosetsideSimulator(
         """Return exact single-qubit Born probabilities ``P(-1)`` of shape ``(len(targets), batch_size)``."""
         return (1.0 - self.peek_pauli_batch(targets, pauli).astype(np.float64)) * 0.5
 
-    def peek_pauli_batch(
-        self,
-        targets: Sequence[int] | NDArray[np.int_],
-        pauli: Literal["X", "Y", "Z"] = "Z",
-    ) -> NDArray[np.int8]:
-        """Return exact single-qubit Pauli expectations (+1, -1, or 0) of shape (len(targets), batch_size) via Q1."""
-        if pauli not in ("X", "Y", "Z"):
-            raise ValueError(f"Unrecognised Pauli: {pauli}")
+    def _own_peek_targets(self, targets: Any) -> NDArray[np.int64]:
         targets_in = np.asarray(targets)
         if targets_in.ndim != 1 or (
             targets_in.size and not np.issubdtype(targets_in.dtype, np.integer)
         ):
             raise ValueError("peek targets must be a 1-D sequence of integer qubit indices")
-        targets_arr = np.ascontiguousarray(targets_in, dtype=np.int64)
-        if len(targets_arr) == 0:
-            return np.zeros((0, self.batch_size), dtype=np.int8)
-        if targets_arr.min() < 0 or targets_arr.max() >= self.num_qubits:
-            raise ValueError(f"peek target out of range [0, {self.num_qubits})")
+        targets_own = np.array(targets_in, order="C", copy=True)
+        if targets_own.ndim != 1 or (
+            targets_own.size and not np.issubdtype(targets_own.dtype, np.integer)
+        ):
+            raise ValueError("peek targets must be a 1-D sequence of integer qubit indices")
+        if targets_own.size > 0 and (
+            int(targets_own.min()) < 0 or int(targets_own.max()) >= self._init_num_qubits
+        ):
+            raise ValueError(f"peek target out of range [0, {self._init_num_qubits})")
+        return np.ascontiguousarray(targets_own, dtype=np.int64)
 
-        x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa = (
-            self._current_packed_words()
+    def _peek_pauli_batch_py(
+        self,
+        targets_arr: NDArray[np.int64],
+        pauli: Literal["X", "Y", "Z"],
+        xs_base: NDArray[np.bool_],
+        zs_base: NDArray[np.bool_],
+        packed_words: PackedSymplecticTables,
+    ) -> NDArray[np.int8]:
+        x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa = packed_words
+        f_comm_mat = (
+            xs_base[targets_arr, :]
+            if pauli == "Z"
+            else zs_base[targets_arr, :]
+            if pauli == "X"
+            else (xs_base[targets_arr, :] ^ zs_base[targets_arr, :])
         )
-        xs_base, zs_base, _, _, _ = self._flip_simulator.to_numpy(
-            output_xs=True, output_zs=True
+        a_words_all, b_words_all, kappas = pauli_image_batch(
+            pauli, targets_arr, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa
         )
+        a_is_zero = ~np.any(a_words_all != 0, axis=1)
+        signs_bool = (kappas & 3) == 2
+        ref_exp = np.where(signs_bool, -1, 1).astype(np.int8)
+        out = np.where(
+            a_is_zero[:, None],
+            np.where(f_comm_mat, -ref_exp[:, None], ref_exp[:, None]),
+            np.int8(0),
+        )
+        if self._active_shots:
+            for idx_t in range(len(targets_arr)):
+                aw = a_words_all[idx_t]
+                bw = b_words_all[idx_t]
+                kap = int(kappas[idx_t])
+                f_c_row = f_comm_mat[idx_t]
+                for b_idx, mrqf in self._active_shots.items():
+                    mu = mrqf.q1_pauli_expectation(aw, bw, kap)
+                    out[idx_t, b_idx] = -mu if f_c_row[b_idx] else mu
+        return out
 
+    def peek_pauli_batch(
+        self,
+        targets: Sequence[int] | NDArray[np.int_],
+        pauli: Literal["X", "Y", "Z"] = "Z",
+    ) -> NDArray[np.int8]:
+        """Return exact single-qubit Pauli expectations (+1, -1, or 0) of shape
+        (len(targets), batch_size) via Q1.
+        """
+        if pauli not in ("X", "Y", "Z"):
+            raise ValueError(f"Unrecognised Pauli: {pauli}")
+        targets_arr = self._own_peek_targets(targets)
+        n_targets = int(targets_arr.shape[0])
+        if n_targets == 0:
+            return np.zeros((0, self._init_batch_size), dtype=np.int8)
+        packed_words = self._current_packed_words()
+        xs_base, zs_base, _, _, _ = self._flip_simulator.to_numpy(output_xs=True, output_zs=True)
         if self._use_cpp and self._cpp_lib is not None and self._cpp_eng is not None:
             self._sync_py_to_cpp()
             xs_c = np.ascontiguousarray(xs_base, dtype=np.uint8)
             zs_c = np.ascontiguousarray(zs_base, dtype=np.uint8)
-            out = np.empty((len(targets_arr), self.batch_size), dtype=np.int8)
+            out = np.empty((n_targets, self._init_batch_size), dtype=np.int8)
+            x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa = packed_words
             p_kind = 2 if pauli == "Z" else (0 if pauli == "X" else 1)
             self._cpp_lib.engine_peek_pauli_batch(
                 self._cpp_eng,
-                len(targets_arr),
+                n_targets,
                 targets_arr.ctypes.data_as(i64_p),
                 p_kind,
                 xs_c.ctypes.data_as(u8_p),
@@ -1767,55 +2069,23 @@ class CosetsideSimulator(
                 out.ctypes.data_as(i8_p),
             )
             return out
-
-        f_comm_mat = (
-            xs_base[targets_arr, :]
-            if pauli == "Z"
-            else zs_base[targets_arr, :]
-            if pauli == "X"
-            else (xs_base[targets_arr, :] ^ zs_base[targets_arr, :])
-        )
-        a_words_all, b_words_all, kappas = pauli_image_batch(
-            pauli, targets_arr, x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa
-        )
-
-        a_is_zero = ~np.any(a_words_all != 0, axis=1)
-        signs_bool = (kappas & 3) == 2
-        ref_exp = np.where(signs_bool, -1, 1).astype(np.int8)
-        out = np.where(
-            a_is_zero[:, None],
-            np.where(f_comm_mat, -ref_exp[:, None], ref_exp[:, None]),
-            np.int8(0),
-        )
-
-        if self._active_shots:
-            num_t = len(targets_arr)
-            for idx_t in range(num_t):
-                aw = a_words_all[idx_t]
-                bw = b_words_all[idx_t]
-                kap = int(kappas[idx_t])
-                f_c_row = f_comm_mat[idx_t]
-                for b_idx, mrqf in self._active_shots.items():
-                    mu = mrqf.q1_pauli_expectation(aw, bw, kap)
-                    out[idx_t, b_idx] = -mu if f_c_row[b_idx] else mu
-
-        return out
+        return self._peek_pauli_batch_py(targets_arr, pauli, xs_base, zs_base, packed_words)
 
     def peek_z(self, target: int) -> int | NDArray[np.int8]:
         res = self.peek_pauli_batch([target], "Z")[0]
-        if self.batch_size == 1 or np.all(res == res[0]):
+        if self._init_batch_size == 1 or np.all(res == res[0]):
             return int(res[0])
         return res
 
     def peek_x(self, target: int) -> int | NDArray[np.int8]:
         res = self.peek_pauli_batch([target], "X")[0]
-        if self.batch_size == 1 or np.all(res == res[0]):
+        if self._init_batch_size == 1 or np.all(res == res[0]):
             return int(res[0])
         return res
 
     def peek_y(self, target: int) -> int | NDArray[np.int8]:
         res = self.peek_pauli_batch([target], "Y")[0]
-        if self.batch_size == 1 or np.all(res == res[0]):
+        if self._init_batch_size == 1 or np.all(res == res[0]):
             return int(res[0])
         return res
 
@@ -1824,7 +2094,7 @@ class CosetsideSimulator(
     ) -> list[int] | NDArray[np.int8]:
         targets_list = list(targets)
         batch_res = self.peek_pauli_batch(targets_list, pauli)
-        if self.batch_size == 1:
+        if self._init_batch_size == 1:
             return [int(x) for x in batch_res[:, 0]]
         return batch_res
 
@@ -1836,13 +2106,13 @@ class CosetsideSimulator(
         if len(self._measurement_columns) == 0:
             return np.zeros((0,), dtype=np.bool_)
         records = np.column_stack(self._measurement_columns)
-        return records[0] if self.batch_size == 1 else records
+        return records[0] if self._init_batch_size == 1 else records
 
     def get_final_measurement_records(self) -> NDArray[np.bool_]:
         if not self._finished_running_circuit:
             raise RuntimeError("The circuit has not been fully run yet.")
         if self._final_measurement_records is None:
             self._final_measurement_records = stack_measurement_columns(
-                self._measurement_columns, self.batch_size
+                self._measurement_columns, self._init_batch_size
             )
         return self._final_measurement_records.copy()

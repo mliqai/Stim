@@ -328,8 +328,20 @@ def build_envelopes_cpp(
         lib.marginal_free_envelope_result(res_ptr)
 
 
+def _own_raised_matrix(raised: NDArray[np.uint8] | NDArray[np.bool_]) -> NDArray[np.uint8]:
+    raised_in = np.asarray(raised)
+    if raised_in.ndim != 2:
+        raise ValueError(f"Expected 2-D raised matrix, got shape {raised_in.shape}.")
+    if raised_in.shape[0] > 0x7FFFFFFF or raised_in.shape[1] > 0x7FFFFFFF:
+        raise ValueError(f"Expected raised shape within int32 bounds, got {raised_in.shape}.")
+    raised_c = np.array(raised_in, dtype=np.uint8, order="C", copy=True)
+    if raised_c.ndim != 2:
+        raise ValueError(f"Expected 2-D raised matrix, got shape {raised_c.shape}.")
+    return raised_c
+
+
 def process_shots_cpp(
-    raised: NDArray[np.uint8],
+    raised: NDArray[np.uint8] | NDArray[np.bool_],
     pred_offsets: NDArray[np.int32],
     pred_flags: NDArray[np.int32],
     flag_env_offsets: NDArray[np.int32],
@@ -350,8 +362,10 @@ def process_shots_cpp(
     NDArray[np.float64] | None,
 ]:
     lib = get_marginal_dem_kernels_lib()
-    raised_c = np.ascontiguousarray(raised, dtype=np.uint8)
+    raised_c = _own_raised_matrix(raised)
     num_shots, num_flags = raised_c.shape
+    if num_shots > 0x7FFFFFFF or num_flags > 0x7FFFFFFF:
+        raise ValueError(f"Expected raised shape within int32 bounds, got {raised_c.shape}.")
     if num_flags + 1 != pred_offsets.size or num_flags + 1 != flag_env_offsets.size:
         raise ValueError(
             f"Expected raised with {pred_offsets.size - 1} flag columns, got {num_flags}."
