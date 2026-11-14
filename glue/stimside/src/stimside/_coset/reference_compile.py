@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -399,217 +399,232 @@ class CompiledReferenceCircuit:
         elif isinstance(block, stim.CircuitInstruction):
             if block.name in ("QUBIT_COORDS", "SHIFT_COORDS"):
                 return
-            self.compile_and_append_instruction(block)
+            step, next_snap = self._compile_on(
+                block, self.ref_chp, self._last_packed_snapshot
+            )
+            self._last_packed_snapshot = next_snap
+            self.steps.append(step)
 
-    def _append_noop(self, op: stim.CircuitInstruction) -> NoopStepMeta:
-        step = NoopStepMeta(
-            kind="noop",
-            op=op,
-            _packed_words=self._last_packed_snapshot,
-            num_qubits=self.num_qubits,
+    def _make_noop(
+        self, op: stim.CircuitInstruction, snap: PackedSymplecticTables
+    ) -> NoopStepMeta:
+        return NoopStepMeta(
+            kind="noop", op=op, _packed_words=snap, num_qubits=self.num_qubits
         )
+
+    def _run_meas_substep(
+        self,
+        chp: ReferenceCHPTableau,
+        q_sub: int,
+        invert_res: bool,
+        pre_ops: list[stim.CircuitInstruction],
+        post_ops: list[stim.CircuitInstruction],
+        is_reset: bool = False,
+    ) -> MeasSubStepMeta:
+        for p_op in pre_ops:
+            chp.do_unitary(p_op.name, [t.qubit_value for t in p_op.targets_copy()])
+        meta = chp.measure_z(q_sub, is_reset=is_reset, m_ref_override=0)
+        for p_op in post_ops:
+            chp.do_unitary(p_op.name, [t.qubit_value for t in p_op.targets_copy()])
+        return MeasSubStepMeta(
+            q=q_sub,
+            invert_result=invert_res,
+            pre_ops=pre_ops,
+            post_ops=post_ops,
+            meta=meta,
+        )
+
+    def _compile_mpp_term(
+        self, term: list[stim.GateTarget], chp: ReferenceCHPTableau
+    ) -> MeasSubStepMeta:
+        invert_res = False
+        term_qubits: list[int] = []
+        for gt in term:
+            term_qubits.append(gt.qubit_value)
+            if gt.is_inverted_result_target:
+                invert_res = not invert_res
+        raw_pairs = [
+            (
+                gt.qubit_value,
+                "X" if gt.is_x_target else ("Y" if gt.is_y_target else "Z"),
+            )
+            for gt in term
+        ]
+        if len(set(term_qubits)) < len(term_qubits):
+            norm_pairs, neg = reduce_hermitian_pauli_product(self.num_qubits, raw_pairs)
+            invert_res = invert_res ^ neg
+            if not norm_pairs:
+                return MeasSubStepMeta(
+                    q=-1,
+                    invert_result=invert_res,
+                    pre_ops=[],
+                    post_ops=[],
+                    meta=DetMeasMeta(
+                        is_random=False,
+                        q=-1,
+                        m_ref=0,
+                        beta_Z_words=np.zeros(self.n_words, dtype=np.uint64),
+                    ),
+                )
+        else:
+            norm_pairs = raw_pairs
+        pre_ops: list[stim.CircuitInstruction] = []
+        post_ops: list[stim.CircuitInstruction] = []
+        for q_r, pch in norm_pairs:
+            if pch in ("X", "Y"):
+                b_op = stim.CircuitInstruction("H" if pch == "X" else "H_YZ", [q_r])
+                pre_ops.append(b_op)
+                post_ops.insert(0, b_op)
+        q0 = norm_pairs[0][0]
+        cx_ops = [stim.CircuitInstruction("CX", [q_r, q0]) for q_r, _ in norm_pairs[1:]]
+        pre_ops.extend(cx_ops)
+        post_ops = list(reversed(cx_ops)) + post_ops
+        return self._run_meas_substep(chp, q0, invert_res, pre_ops, post_ops)
+
+    def _compile_meas_step(
+        self,
+        op: stim.CircuitInstruction,
+        gd: Any,
+        chp: ReferenceCHPTableau,
+        last_snap: PackedSymplecticTables,
+    ) -> tuple[MeasStepMeta, PackedSymplecticTables]:
+        name = op.name
+        substeps: list[MeasSubStepMeta] = []
+        raw_targets = op.targets_copy()
+        if name == "MPP":
+            idx = 0
+            while idx < len(raw_targets):
+                term = [raw_targets[idx]]
+                idx += 1
+                while idx < len(raw_targets) and raw_targets[idx].is_combiner:
+                    term.append(raw_targets[idx + 1])
+                    idx += 2
+                substeps.append(self._compile_mpp_term(term, chp))
+        elif name in ("MXX", "MYY", "MZZ"):
+            basis_pair = name[-1]
+            for i in range(0, len(raw_targets), 2):
+                gt0, gt1 = raw_targets[i], raw_targets[i + 1]
+                q0, q1 = gt0.qubit_value, gt1.qubit_value
+                inv = bool(gt0.is_inverted_result_target ^ gt1.is_inverted_result_target)
+                pre_ops: list[stim.CircuitInstruction] = []
+                post_ops: list[stim.CircuitInstruction] = []
+                if basis_pair in ("X", "Y"):
+                    g = "H" if basis_pair == "X" else "H_YZ"
+                    b_op = stim.CircuitInstruction(g, [q0, q1])
+                    pre_ops.append(b_op)
+                    post_ops.append(b_op)
+                cx_op = stim.CircuitInstruction("CX", [q1, q0])
+                pre_ops.append(cx_op)
+                post_ops.insert(0, cx_op)
+                substeps.append(self._run_meas_substep(chp, q0, inv, pre_ops, post_ops))
+        else:
+            bg = "H" if name.endswith("X") else ("H_YZ" if name.endswith("Y") else None)
+            for gt in raw_targets:
+                q = gt.qubit_value
+                ops = [stim.CircuitInstruction(bg, [q])] if bg else []
+                substeps.append(
+                    self._run_meas_substep(
+                        chp, q, bool(gt.is_inverted_result_target),
+                        list(ops), list(ops), is_reset=gd.is_reset,
+                    )
+                )
+        snap = chp.snapshot_packed() if chp._inv_dirty else last_snap
+        chp._inv_dirty = False
+        return MeasStepMeta(
+            kind="meas", op=op, gate_name=name,
+            produces_measurements=gd.produces_measurements, is_reset=gd.is_reset,
+            substeps=substeps, _packed_words=snap, num_qubits=self.num_qubits,
+        ), snap
+
+    def _compile_unitary_step(
+        self,
+        op: stim.CircuitInstruction,
+        gd: Any,
+        chp: ReferenceCHPTableau,
+        last_snap: PackedSymplecticTables,
+    ) -> tuple[UnitaryStepMeta | NoopStepMeta, PackedSymplecticTables]:
+        name = op.name
+        if name in ("SPP", "SPP_DAG"):
+            raise NotImplementedError(
+                f"CosetsideSimulator does not support {name} (Pauli product rotations). "
+                "Rewrite them with single- and two-qubit Clifford gates, or use "
+                "TablesideSimulator or FlipsideSimulator."
+            )
+        raw_t = op.targets_copy()
+        if gd.is_two_qubit_gate and any(t.qubit_value is None for t in raw_t):
+            quantum_targets: list[int] = []
+            for i in range(0, len(raw_t), 2):
+                q0, q1 = raw_t[i].qubit_value, raw_t[i + 1].qubit_value
+                if q0 is not None and q1 is not None:
+                    quantum_targets.extend([q0, q1])
+            if not quantum_targets:
+                return self._make_noop(op, last_snap), last_snap
+            targets = quantum_targets
+            quantum_op = stim.CircuitInstruction(name, quantum_targets, op.gate_args_copy())
+        else:
+            targets = [t.qubit_value for t in raw_t]
+            quantum_op = op
+        arity = 2 if gd.is_two_qubit_gate else 1
+        groups = [tuple(targets[i : i + arity]) for i in range(0, len(targets), arity)]
+        is_disjoint = len(set(targets)) == len(targets)
+        if is_disjoint:
+            chp.do_unitary(name, targets)
+            packed_after = chp.snapshot_packed() if chp._inv_dirty else last_snap
+            chp._inv_dirty = False
+            group_packed_words: list[PackedSymplecticTables] | None = None
+        else:
+            group_packed_words = []
+            for grp in groups:
+                chp.do_unitary(name, grp)
+                group_packed_words.append(chp.snapshot_packed())
+            packed_after = group_packed_words[-1]
+            chp._inv_dirty = False
+        return UnitaryStepMeta(
+            kind="unitary", op=op, gate_name=name, num_qubits=self.num_qubits,
+            target_groups=groups, quantum_op=quantum_op,
+            _group_packed_words=group_packed_words, _packed_words=packed_after,
+            are_groups_disjoint=is_disjoint,
+        ), packed_after
+
+    def _compile_on(
+        self,
+        op: stim.CircuitInstruction,
+        chp: ReferenceCHPTableau,
+        last_snap: PackedSymplecticTables,
+    ) -> tuple[StepMeta, PackedSymplecticTables]:
+        name = op.name
+        gd = stim.gate_data(name)
+        if gd.is_reset or gd.produces_measurements:
+            if name in ("MPAD", "HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
+                return self._make_noop(op, last_snap), last_snap
+            return self._compile_meas_step(op, gd, chp, last_snap)
+        if gd.is_unitary:
+            return self._compile_unitary_step(op, gd, chp, last_snap)
+        return self._make_noop(op, last_snap), last_snap
+
+    def compile_instruction(
+        self, op: stim.CircuitInstruction
+    ) -> tuple[StepMeta, ReferenceCHPTableau, PackedSymplecticTables]:
+        """Compile `op` against a copy of `ref_chp` without mutating the reference tape."""
+        tmp_chp = self.ref_chp.copy()
+        step, next_snap = self._compile_on(op, tmp_chp, self._last_packed_snapshot)
+        return step, tmp_chp, next_snap
+
+    def append_compiled_step(
+        self,
+        step: StepMeta,
+        next_chp: ReferenceCHPTableau,
+        next_snap: PackedSymplecticTables,
+    ) -> StepMeta:
+        """Commit a pre-compiled step and its resulting tableau/snapshot onto the tape."""
+        self.ref_chp = next_chp
+        self._last_packed_snapshot = next_snap
         self.steps.append(step)
         return step
 
     def compile_and_append_instruction(
         self, op: stim.CircuitInstruction
     ) -> StepMeta:
-        """Compile a single non-coordinate instruction and advance the live ReferenceCHPTableau."""
-        name = op.name
-        gd = stim.gate_data(name)
-
-        if gd.is_reset or gd.produces_measurements:
-            if name in ("MPAD", "HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
-                return self._append_noop(op)
-
-            substeps: list[MeasSubStepMeta] = []
-            raw_targets = op.targets_copy()
-
-            def _add_substep(
-                q_sub: int,
-                invert_res: bool,
-                pre_ops: list[stim.CircuitInstruction],
-                post_ops: list[stim.CircuitInstruction],
-                is_reset: bool = False,
-            ) -> None:
-                for p_op in pre_ops:
-                    self.ref_chp.do_unitary(
-                        p_op.name, [t.qubit_value for t in p_op.targets_copy()]
-                    )
-                meta = self.ref_chp.measure_z(
-                    q_sub, is_reset=is_reset, m_ref_override=0
-                )
-                for p_op in post_ops:
-                    self.ref_chp.do_unitary(
-                        p_op.name, [t.qubit_value for t in p_op.targets_copy()]
-                    )
-                substeps.append(
-                    MeasSubStepMeta(
-                        q=q_sub,
-                        invert_result=invert_res,
-                        pre_ops=pre_ops,
-                        post_ops=post_ops,
-                        meta=meta,
-                    )
-                )
-
-            if name == "MPP":
-                idx = 0
-                product_terms: list[list[stim.GateTarget]] = []
-                while idx < len(raw_targets):
-                    term = [raw_targets[idx]]
-                    idx += 1
-                    while idx < len(raw_targets) and raw_targets[idx].is_combiner:
-                        term.append(raw_targets[idx + 1])
-                        idx += 2
-                    product_terms.append(term)
-
-                for term in product_terms:
-                    invert_res = False
-                    term_qubits: list[int] = []
-                    for gt in term:
-                        term_qubits.append(gt.qubit_value)
-                        if gt.is_inverted_result_target:
-                            invert_res = not invert_res
-                    if len(set(term_qubits)) < len(term_qubits):
-                        reduced, neg = reduce_hermitian_pauli_product(
-                            self.num_qubits,
-                            [
-                                (
-                                    gt.qubit_value,
-                                    "X" if gt.is_x_target else ("Y" if gt.is_y_target else "Z"),
-                                )
-                                for gt in term
-                            ],
-                        )
-                        invert_res = invert_res ^ neg
-                        if not reduced:
-                            substeps.append(
-                                MeasSubStepMeta(
-                                    q=-1,
-                                    invert_result=invert_res,
-                                    pre_ops=[],
-                                    post_ops=[],
-                                    meta=DetMeasMeta(
-                                        is_random=False,
-                                        q=-1,
-                                        m_ref=0,
-                                        beta_Z_words=np.zeros(self.n_words, dtype=np.uint64),
-                                    ),
-                                )
-                            )
-                            continue
-                        norm_pairs = reduced
-                    else:
-                        norm_pairs = [
-                            (
-                                gt.qubit_value,
-                                "X" if gt.is_x_target else ("Y" if gt.is_y_target else "Z"),
-                            )
-                            for gt in term
-                        ]
-                    pre_ops: list[stim.CircuitInstruction] = []
-                    post_ops: list[stim.CircuitInstruction] = []
-                    for q_r, pch in norm_pairs:
-                        if pch in ("X", "Y"):
-                            b_op = stim.CircuitInstruction("H" if pch == "X" else "H_YZ", [q_r])
-                            pre_ops.append(b_op)
-                            post_ops.insert(0, b_op)
-                    q0 = norm_pairs[0][0]
-                    cx_ops = [stim.CircuitInstruction("CX", [q_r, q0]) for q_r, _ in norm_pairs[1:]]
-                    pre_ops.extend(cx_ops)
-                    post_ops = list(reversed(cx_ops)) + post_ops
-                    _add_substep(q0, invert_res, pre_ops, post_ops)
-            elif name in ("MXX", "MYY", "MZZ"):
-                basis_pair = name[-1]
-                for i in range(0, len(raw_targets), 2):
-                    gt0, gt1 = raw_targets[i], raw_targets[i + 1]
-                    q0, q1 = gt0.qubit_value, gt1.qubit_value
-                    invert_res = bool(gt0.is_inverted_result_target ^ gt1.is_inverted_result_target)
-                    pre_ops = []
-                    post_ops = []
-                    if basis_pair in ("X", "Y"):
-                        b_op = stim.CircuitInstruction("H" if basis_pair == "X" else "H_YZ", [q0, q1])
-                        pre_ops.append(b_op)
-                        post_ops.append(b_op)
-                    cx_op = stim.CircuitInstruction("CX", [q1, q0])
-                    pre_ops.append(cx_op)
-                    post_ops.insert(0, cx_op)
-                    _add_substep(q0, invert_res, pre_ops, post_ops)
-            else:
-                basis_gate = "H" if name.endswith("X") else ("H_YZ" if name.endswith("Y") else None)
-                for gt in raw_targets:
-                    q = gt.qubit_value
-                    ops = [stim.CircuitInstruction(basis_gate, [q])] if basis_gate else []
-                    _add_substep(q, bool(gt.is_inverted_result_target), list(ops), list(ops), is_reset=gd.is_reset)
-
-            step = MeasStepMeta(
-                kind="meas",
-                op=op,
-                gate_name=name,
-                produces_measurements=gd.produces_measurements,
-                is_reset=gd.is_reset,
-                substeps=substeps,
-                _packed_words=self._get_packed_snapshot(),
-                num_qubits=self.num_qubits,
-            )
-            self.steps.append(step)
-            return step
-
-        if gd.is_unitary:
-            if name in ("SPP", "SPP_DAG"):
-                raise NotImplementedError(
-                    f"CosetsideSimulator does not support {name} (Pauli product rotations). Rewrite them "
-                    "with single- and two-qubit Clifford gates, or use TablesideSimulator or FlipsideSimulator."
-                )
-            raw_t = op.targets_copy()
-            if gd.is_two_qubit_gate and any(
-                t.qubit_value is None for t in raw_t
-            ):
-                quantum_targets: list[int] = []
-                for i in range(0, len(raw_t), 2):
-                    q0, q1 = raw_t[i].qubit_value, raw_t[i + 1].qubit_value
-                    if q0 is not None and q1 is not None:
-                        quantum_targets.extend([q0, q1])
-                if not quantum_targets:
-                    return self._append_noop(op)
-                targets = quantum_targets
-                quantum_op = stim.CircuitInstruction(
-                    name, quantum_targets, op.gate_args_copy()
-                )
-            else:
-                targets = [t.qubit_value for t in raw_t]
-                quantum_op = op
-            arity = 2 if gd.is_two_qubit_gate else 1
-            groups = [
-                tuple(targets[i : i + arity])
-                for i in range(0, len(targets), arity)
-            ]
-            is_disjoint = len(set(targets)) == len(targets)
-            if is_disjoint:
-                self.ref_chp.do_unitary(name, targets)
-                packed_after = self._get_packed_snapshot()
-                group_packed_words: list[PackedSymplecticTables] | None = None
-            else:
-                group_packed_words = []
-                for grp in groups:
-                    self.ref_chp.do_unitary(name, grp)
-                    group_packed_words.append(self.ref_chp.snapshot_packed())
-                self._last_packed_snapshot = group_packed_words[-1]
-                self.ref_chp._inv_dirty = False
-                packed_after = self._last_packed_snapshot
-            step = UnitaryStepMeta(
-                kind="unitary",
-                op=op,
-                gate_name=name,
-                num_qubits=self.num_qubits,
-                target_groups=groups,
-                quantum_op=quantum_op,
-                _group_packed_words=group_packed_words,
-                _packed_words=packed_after,
-                are_groups_disjoint=is_disjoint,
-            )
-            self.steps.append(step)
-            return step
-
-        return self._append_noop(op)
+        """Compile a single non-coordinate instruction atomically and append it."""
+        step, next_chp, next_snap = self.compile_instruction(op)
+        return self.append_compiled_step(step, next_chp, next_snap)

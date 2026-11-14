@@ -74,6 +74,8 @@ class MRQFState:
         return self._Gamma_view
 
     def _ensure_capacity(self, need_d: int) -> None:
+        if type(self._cap) is not int or self._cap < 1:
+            raise ValueError(f"MRQFState capacity must be >= 1, got {self._cap!r}")
         if need_d <= self._cap:
             return
         new_cap = self._cap

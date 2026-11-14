@@ -13,7 +13,7 @@ import pytest
 import stim
 
 import stimside.simulator_magic as sm
-from stimside import golden_test
+from stimside import CliffordFaultChannel, FaultBranch, golden_test
 from stimside._magic.phase_qfe import ImpossiblePostselectionError
 from stimside.op_handlers.abstract_op_handler import TrivialOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
@@ -1020,3 +1020,204 @@ def test_e1_external_do_spp_and_measure_z_invalidate_sid(
     sim_mz.finish_interactive_run()
     assert sim_mz._ref_memo.hits == hits_before_mz
     _assert_full_state_equal(ref_mz, sim_mz)
+
+
+def _assert_memo_interactive_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    setup_text: str,
+    run1: Callable[[MagicsideSimulator], None],
+    run2: Callable[[MagicsideSimulator], None],
+) -> None:
+    monkeypatch.setattr(sm, "_REF_MEMO_VERIFY", False)
+    base = stim.Circuit(setup_text)
+    monkeypatch.setattr(sm, "_REF_MEMO_ENABLED", False)
+    ref = MagicsideSimulator(base, batch_size=2, seed=1)
+    monkeypatch.setattr(sm, "_REF_MEMO_ENABLED", True)
+    sim = MagicsideSimulator(base, batch_size=2, seed=1)
+    for idx, fn in enumerate((run1, run2)):
+        if idx > 0:
+            ref.clear()
+            sim.clear()
+        monkeypatch.setattr(sm, "_REF_MEMO_ENABLED", False)
+        fn(ref)
+        ref.finish_interactive_run()
+        monkeypatch.setattr(sm, "_REF_MEMO_ENABLED", True)
+        fn(sim)
+        sim.finish_interactive_run()
+        _assert_full_state_equal(ref, sim)
+
+
+def test_e1_child_subfields_and_argument_ordering_witnesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _ido(text: str) -> Callable[[MagicsideSimulator], None]:
+        return lambda s: s.interactive_do(stim.Circuit(text))
+
+    _assert_memo_interactive_pair(
+        monkeypatch, "I 0 1", _ido("I 0 1\nH 0 1\nM 0\nM 1"), _ido("I 0 1\nH 0 1\nM 1\nM 1")
+    )
+    _assert_memo_interactive_pair(
+        monkeypatch, "I 0 1", _ido("I 0 1\nH 0 1\nR 0\nM 0 1"), _ido("I 0 1\nH 0 1\nR 1\nM 0 1")
+    )
+    _assert_memo_interactive_pair(
+        monkeypatch, "I 0", _ido("I 0\nH 0\nR 0\nM 0"), _ido("I 0\nH 0\nRX 0\nM 0")
+    )
+    _assert_memo_interactive_pair(
+        monkeypatch, "I 0 1", _ido("I 0 1\nH 0\nCX 0 1"), _ido("I 0 1\nH 0\nCX 1 0")
+    )
+    m = np.array([[True, False]])
+
+    def _fac_rev(s: MagicsideSimulator) -> None:
+        s.interactive_do(stim.Circuit("I 0 1\nH 0"))
+        s.do_conditional_clifford(stim.CircuitInstruction("CX", [1, 0]), m)
+        assert s.peek_pauli_born_batch([1], "Z")[0, 0] == 0.0
+
+    _assert_memo_interactive_pair(
+        monkeypatch,
+        "I 0 1",
+        lambda s: (
+            s.interactive_do(stim.Circuit("I 0 1\nH 0")),
+            s.do_conditional_clifford(stim.CircuitInstruction("CX", [0, 1]), m),
+        ),
+        _fac_rev,
+    )
+    op1 = stim.CircuitInstruction(
+        "SPP", [stim.target_z(0), stim.target_combiner(), stim.target_x(0),
+                stim.target_combiner(), stim.target_x(0)]
+    )
+    op2 = stim.CircuitInstruction(
+        "SPP", [stim.target_x(0), stim.target_combiner(), stim.target_z(0),
+                stim.target_combiner(), stim.target_x(0)]
+    )
+
+    def _axis_rev(s: MagicsideSimulator) -> None:
+        s.interactive_do(stim.Circuit("I 0\nH 0"))
+        s.do_conditional_clifford(op2, m)
+        assert s.peek_pauli_born_batch([0], "Y")[0, 0] == pytest.approx(1.0)
+
+    _assert_memo_interactive_pair(
+        monkeypatch,
+        "I 0",
+        lambda s: (s.interactive_do(stim.Circuit("I 0\nH 0")), s.do_conditional_clifford(op1, m)),
+        _axis_rev,
+    )
+
+    def _spp_rev(s: MagicsideSimulator) -> None:
+        s.interactive_do(stim.Circuit("I 0\nH 0\nSPP X0*Z0*X0"))
+        assert s.peek_pauli_born_batch([0], "Y")[0, 0] == pytest.approx(1.0)
+
+    _assert_memo_interactive_pair(
+        monkeypatch, "I 0", _ido("I 0\nH 0\nSPP Z0*X0*X0"), _spp_rev
+    )
+
+    def _ccz_rev(s: MagicsideSimulator) -> None:
+        s.interactive_do(stim.Circuit("I 0 1 2 3 4 5\nH 0 1 2 3 4 5\nI[CCZ] 1 3 5 0 2 4"))
+        sv = s.state_vector(0)
+        assert sv[42].real < 0.0 and sv[7].real > 0.0
+
+    _assert_memo_interactive_pair(
+        monkeypatch,
+        "I 0 1 2 3 4 5",
+        _ido("I 0 1 2 3 4 5\nH 0 1 2 3 4 5\nI[CCZ] 0 1 2 3 4 5"),
+        _ccz_rev,
+    )
+    memo_r = sm._RefMemo(max_entries=10, max_bytes=1000)
+    assert memo_r.root_sid(1) != memo_r.root_sid(2)
+
+
+def test_e1_byte_accounting_and_lru_boundary_witnesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sm, "_REF_MEMO_ENABLED", True)
+    monkeypatch.setattr(sm, "_REF_MEMO_VERIFY", False)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(sm, "_REF_MEMO_MAX_BYTES", 500)
+        sim_ax = MagicsideSimulator(stim.Circuit("X_ERROR(0.5) 2047\nM 2047"), batch_size=2, seed=1)
+        sim_ax._compile_axis([(0, "Z")])
+        assert len(sim_ax._ref_memo.entries) == 0
+
+        sim_mg = MagicsideSimulator(stim.Circuit("I[T] 2047\nM 2047"), batch_size=2, seed=1)
+        sim_mg._emit_magic_op(stim.CircuitInstruction("I", [0], tag="T"))
+        assert len(sim_mg._ref_memo.entries) == 0
+
+    with monkeypatch.context() as mp:
+        mp.setattr(sm, "_REF_MEMO_MAX_BYTES", 2000)
+        sim_pk = MagicsideSimulator(stim.Circuit("H 0\nM 127"), batch_size=2, seed=1)
+        sim_pk.interactive_do(stim.Circuit("H 0"))
+        assert len(sim_pk._ref_memo.entries) == 0
+
+    with monkeypatch.context() as mp:
+        mp.setattr(sm, "_REF_MEMO_MAX_BYTES", 100)
+        sim_oh = MagicsideSimulator(stim.Circuit("H 0\nM 0"), batch_size=2, seed=1)
+        sim_oh._compile_axis([(0, "Z")])
+        assert len(sim_oh._ref_memo.entries) == 0
+
+    memo_t = sm._RefMemo(max_entries=100, max_bytes=10000)
+    memo_t.max_trie = 2
+    s1 = memo_t.child(0, ("u", "H", (0,)))
+    memo_t.child(0, ("u", "X", (0,)))
+    assert memo_t.child(0, ("u", "H", (0,))) == s1
+    memo_t.child(0, ("u", "Z", (0,)))
+    assert memo_t.child(0, ("u", "H", (0,))) == s1
+
+    memo_w = sm._RefMemo(max_entries=100, max_bytes=500)
+    memo_w.put(("k", 0), np.zeros(1), 200)
+    memo_w.put(("k", 1), np.zeros(1), 200)
+    memo_w.put(("k", 2), np.zeros(1), 450)
+    assert memo_w.total_bytes <= 500
+
+    memo_eq = sm._RefMemo(max_entries=100, max_bytes=400)
+    memo_eq.put(("k", 0), np.zeros(1), 200)
+    memo_eq.put(("k", 1), np.zeros(1), 200)
+    assert len(memo_eq.entries) == 2 and memo_eq.total_bytes == 400
+
+    memo_ow = sm._RefMemo(max_entries=100, max_bytes=1000)
+    memo_ow.put(("k", 0), np.zeros(1), 200)
+    memo_ow.put(("k", 0), np.zeros(1), 300)
+    assert memo_ow.total_bytes == 300
+
+    memo_z = sm._RefMemo(max_entries=100, max_bytes=0)
+    memo_z.put(("k", 0), np.zeros(1), 0)
+    assert len(memo_z.entries) == 0
+
+
+def test_e1_finally_reset_eff_nq_and_enabled_toggle_witnesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for pre, tail in (("I 0\nSPP X0", "I 0\nSPP X0\nM 0"), ("I 0\nH 0\nM 0", "I 0\nH 0\nM 0\nM 0"),
+                      ("I 0\nRX 0", "I 0\nRX 0\nM 0")):
+        _assert_memo_interactive_pair(
+            monkeypatch,
+            "I 0",
+            lambda s, p=pre: (
+                s.interactive_do(stim.Circuit(p)),
+                s._live_ref_tab.do_unitary("H", [0]),
+                s.interactive_do(stim.Circuit("M 0")),
+            ),
+            lambda s, t=tail: s.interactive_do(stim.Circuit(t)),
+        )
+
+    fc = [CliffordFaultChannel(0, (FaultBranch(1.0, "H", (2,)),))]
+    monkeypatch.setattr(sm, "_REF_MEMO_VERIFY", False)
+    monkeypatch.setattr(sm, "_REF_MEMO_ENABLED", False)
+    ref = MagicsideSimulator(stim.Circuit("H 0\nM 0"), fault_channels=fc, batch_size=2, seed=1)
+    ref.run()
+    ref.clear()
+    ref.run()
+    monkeypatch.setattr(sm, "_REF_MEMO_ENABLED", True)
+    sim = MagicsideSimulator(stim.Circuit("H 0\nM 0"), fault_channels=fc, batch_size=2, seed=1)
+    sim.run()
+    assert sim._live_ref_tab.num_qubits == 3
+    sim.clear()
+    sim.run()
+    assert sim._live_ref_tab.num_qubits == 3
+    _assert_full_state_equal(ref, sim)
+
+    sim_off = MagicsideSimulator(stim.Circuit("H 0\nM 0"), batch_size=2, seed=1)
+    sim_off.run()
+    sim_off.clear()
+    hits_before = sim_off._ref_memo.hits
+    monkeypatch.setattr(sm, "_REF_MEMO_ENABLED", False)
+    sim_off.run()
+    assert sim_off._ref_memo.hits == hits_before

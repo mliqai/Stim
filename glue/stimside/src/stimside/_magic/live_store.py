@@ -151,8 +151,9 @@ def _frozen_key(lists: Sequence[CompiledCliffordFactorList]) -> tuple[Any, ...] 
     else None. Registration, not a read-only flag, is the test: a caller can make an `owndata`
     array writable again. The engine still never reads these arrays: `own_factor_table` copies
     them once, so this choice affects only which lists skip re-encoding, never memory safety."""
-    key = tuple(id(fac) for fac in lists)
-    return key if all(_OWN_LISTS.get(k) is fac for k, fac in zip(key, lists)) else None
+    lists_t = lists if type(lists) is tuple else tuple(lists)
+    key = tuple(id(fac) for fac in lists_t)
+    return key if all(_OWN_LISTS.get(k) is fac for k, fac in zip(key, lists_t)) else None
 
 
 def _encode_lists(lists: Sequence[CompiledCliffordFactorList], n_words: int) -> FactorTable:
@@ -498,7 +499,8 @@ class LiveExpansions(Sequence[ShotExpansion]):
         A cached entry holds its lists, so their ids cannot be reused while it lives; frozen
         dataclasses over frozen arrays make the encoding a function of those ids.
         """
-        key = _frozen_key(lists)
+        lists_t = lists if type(lists) is tuple else tuple(lists)
+        key = _frozen_key(lists_t)
         if key is None:
             return None
         cache = self._tables
@@ -506,10 +508,10 @@ class LiveExpansions(Sequence[ShotExpansion]):
         if hit is not None:
             cache.move_to_end(key)
             return hit[0]
-        if not well_formed_lists(lists, nw):
+        if not well_formed_lists(lists_t, nw):
             return None
-        owned = own_factor_table(_encode_lists(lists, nw), nw)
-        cache[key] = (owned, tuple(lists))
+        owned = own_factor_table(_encode_lists(lists_t, nw), nw)
+        cache[key] = (owned, lists_t)
         if len(cache) > _TABLE_CACHE_MAX:
             cache.popitem(last=False)
         return owned

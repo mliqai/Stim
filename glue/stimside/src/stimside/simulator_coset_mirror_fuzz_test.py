@@ -1,14 +1,18 @@
-"""Randomized and exhaustive-gate tests for `_compiled_unitary_rows` mirror parity (R3-F16)."""
+"""Randomized and exhaustive-gate tests for `CompiledReferenceCircuit.compile_instruction` (C-2)."""
 
 from __future__ import annotations
 
 import random
 from typing import Any
 
+import numpy as np
 import stim
 
-from stimside._coset.reference_compile import CompiledReferenceCircuit, UnitaryStepMeta
-from stimside.simulator_coset import _compiled_unitary_rows
+from stimside._coset.reference_compile import (
+    CompiledReferenceCircuit,
+    MeasStepMeta,
+    UnitaryStepMeta,
+)
 
 
 def _pauli_targets(rng: random.Random, num_qubits: int, combiner: bool) -> list[Any]:
@@ -62,14 +66,19 @@ def _random_op_for_gate(
         return None
 
 
-def test_compiled_unitary_rows_agrees_with_reference_compiler_across_all_gates() -> None:
-    """Seeded fuzz across every `stim.gate_data` name: `_compiled_unitary_rows` matches
-    `CompiledReferenceCircuit.compile_and_append_instruction` (and returns None if it raises)."""
+def _snap_eq(a: tuple[np.ndarray, ...], b: tuple[np.ndarray, ...]) -> bool:
+    return all(np.array_equal(x, y) for x, y in zip(a, b))
+
+
+def test_compile_instruction_and_append_agree_with_reference_compiler_across_all_gates() -> None:
+    """Seeded fuzz across every `stim.gate_data` name: `compile_instruction` never mutates
+    the reference, and `append_compiled_step` matches `compile_and_append_instruction`."""
     rng = random.Random(2026)
     all_gates = sorted(stim.gate_data().keys())
     num_qubits = 6
     base = stim.Circuit("R 0 1 2 3 4 5\nM 0 1 2 3")
     ref = CompiledReferenceCircuit(base)
+    ref2 = CompiledReferenceCircuit(base)
     seen: set[str] = set()
     checked = 0
     schedule = list(all_gates) * 2 + [rng.choice(all_gates) for _ in range(3500)]
@@ -79,15 +88,34 @@ def test_compiled_unitary_rows_agrees_with_reference_compiler_across_all_gates()
             continue
         if idx % 100 == 0:
             ref = CompiledReferenceCircuit(base)
-        pred = _compiled_unitary_rows(op)
+            ref2 = CompiledReferenceCircuit(base)
+        steps_before = len(ref.steps)
+        chp_before = ref.ref_chp.snapshot_packed()
+        last_before = ref._last_packed_snapshot
         try:
-            step = ref.compile_and_append_instruction(op)
-        except (NotImplementedError, ValueError):
-            assert pred is None, f"{op}: predicted {pred}, compiler raised"
-            seen.add(name)
-            continue
-        expect = len(step.target_groups) if isinstance(step, UnitaryStepMeta) else None
-        assert pred == expect, f"{op}: predicted {pred}, compiled {expect}"
+            step, next_chp, next_snap = ref.compile_instruction(op)
+        except (NotImplementedError, ValueError) as exc1:
+            assert len(ref.steps) == steps_before
+            assert _snap_eq(ref.ref_chp.snapshot_packed(), chp_before)
+            assert _snap_eq(ref._last_packed_snapshot, last_before)
+            try:
+                ref2.compile_and_append_instruction(op)
+            except type(exc1):
+                seen.add(name)
+                continue
+            raise AssertionError(f"{op}: compile_instruction raised {exc1}, append did not")
+        assert len(ref.steps) == steps_before
+        assert _snap_eq(ref.ref_chp.snapshot_packed(), chp_before)
+        assert _snap_eq(ref._last_packed_snapshot, last_before)
+        ref.append_compiled_step(step, next_chp, next_snap)
+        step2 = ref2.compile_and_append_instruction(op)
+        assert type(step) is type(step2) and step.op == step2.op
+        if isinstance(step, UnitaryStepMeta) and isinstance(step2, UnitaryStepMeta):
+            assert step.target_groups == step2.target_groups
+        elif isinstance(step, MeasStepMeta) and isinstance(step2, MeasStepMeta):
+            assert len(step.substeps) == len(step2.substeps)
+        assert _snap_eq(ref.ref_chp.snapshot_packed(), ref2.ref_chp.snapshot_packed())
+        assert _snap_eq(ref._last_packed_snapshot, ref2._last_packed_snapshot)
         seen.add(name)
         checked += 1
     assert seen == set(all_gates)

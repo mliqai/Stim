@@ -20,10 +20,14 @@ from stimside._native._kernel_loader import (
 )
 
 _c_int = ctypes.c_int
+_c_i64 = ctypes.c_int64
+_c_u8 = ctypes.c_uint8
 
 _LIB_INSTANCE: ctypes.CDLL | None = None
 
 _SPECS: tuple[AbiSpec, ...] = (
+    ("coset_kernels_abi_v2", [], _c_int),
+    ("coset_kernels_abi_v3", [], _c_int),
     ("engine_create", [_c_int, _c_int, u64_p], void_p),
     ("engine_destroy", [void_p], None),
     ("engine_set_rng_states", [void_p, u64_p], None),
@@ -48,7 +52,7 @@ _SPECS: tuple[AbiSpec, ...] = (
     (
         "engine_batch_mixed_substep",
         [
-            void_p, _c_int, ctypes.c_int64, ctypes.c_uint8, ctypes.c_int64,
+            void_p, _c_int, _c_i64, _c_u8, _c_i64,
             u64_p, u64_p, u64_p, _c_int, _c_int, i64_p, _c_int, i64_p,
             u8_p, u8_p, u8_p, u8_p, int_p, int_p,
         ],
@@ -65,6 +69,80 @@ _SPECS: tuple[AbiSpec, ...] = (
         [void_p, _c_int, i64_p, _c_int, u8_p, u8_p, u64_p, u64_p, u64_p, u64_p, u8_p, u8_p, i8_p],
         None,
     ),
+    ("engine_num_qubits", [void_p], _c_int),
+    ("engine_batch_size", [void_p], _c_int),
+    ("engine_n_words", [void_p], _c_int),
+    (
+        "engine_postselect_batch",
+        [
+            void_p, _c_i64, _c_int, _c_int, u8_p, _c_int, u8_p,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, _c_int,
+            u64_p, u64_p, u64_p, u64_p, u8_p, u8_p,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
+        ],
+        _c_int,
+    ),
+    (
+        "engine_project_pauli",
+        [
+            void_p, _c_int, _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, i64_p,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, _c_int,
+            u64_p, u64_p, u64_p, u64_p, u8_p, u8_p,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
+        ],
+        _c_int,
+    ),
+    (
+        "engine_register_unitary_step",
+        [
+            void_p, _c_int, _c_int, _c_int, i64_p, u8_p, u8_p, u8_p,
+            u64_p, u64_p, u8_p, u8_p, u8_p, u64_p, u64_p, u8_p,
+            _c_int, _c_int, u64_p, u64_p,
+        ],
+        _c_int,
+    ),
+    ("engine_unitary_step_num_groups", [void_p, _c_int], _c_int),
+    (
+        "engine_register_unitary_group_evict",
+        [void_p, _c_int, _c_int, _c_int, _c_int, u64_p, u64_p],
+        _c_int,
+    ),
+    (
+        "engine_inject_group_v3",
+        [
+            void_p, _c_int, _c_int, _c_int, u8_p,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
+        ],
+        _c_int,
+    ),
+    (
+        "engine_batch_inject_general_clifford_v3",
+        [
+            void_p, _c_int, _c_int, _c_int, u8_p,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
+        ],
+        _c_int,
+    ),
+    (
+        "engine_peek_pauli_batch_v3",
+        [
+            void_p, _c_int, i64_p, _c_int,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, _c_int,
+            u64_p, u64_p, u64_p, u64_p, u8_p, u8_p, _c_int, _c_int, i8_p,
+        ],
+        _c_int,
+    ),
+    (
+        "engine_batch_evict_v3",
+        [
+            void_p, _c_int, _c_int, u64_p, u64_p,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p,
+            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
+        ],
+        _c_int,
+    ),
 )
 
 
@@ -74,4 +152,10 @@ def _resolve_coset_kernels_so(force_recompile: bool = False) -> Path:
 
 def get_coset_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
     """Locate (or compile if needed) and return the cached ctypes CDLL for coset_kernels.cpp."""
-    return get_lib(sys.modules[__name__], "coset_kernels", "coset_kernels_abi_v2", _SPECS, force_recompile=force_recompile)
+    return get_lib(
+        sys.modules[__name__],
+        "coset_kernels",
+        "coset_kernels_abi_v3",
+        _SPECS,
+        force_recompile=force_recompile,
+    )

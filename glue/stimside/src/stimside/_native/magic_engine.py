@@ -56,6 +56,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -363,7 +364,12 @@ def _list_indices(shot_list: Any, n_lists: int, batch: int) -> Any:
         own = _as(shot_list, np.int32, (batch,), "shot_list")  # int32 needs no narrowing
         np.clip(own, -1, n_lists, out=own)
         return own
-    wide = _as(shot_list, np.int64, (batch,), "shot_list")
+    raw = np.array(shot_list, order="C", copy=True)
+    if raw.shape != (batch,):
+        raise ValueError(f"shot_list must have shape {(batch,)}, got {raw.shape}")
+    if raw.dtype.kind == "u":
+        return np.minimum(raw, np.uint64(n_lists)).astype(np.int32)
+    wide = _as(raw, np.int64, (batch,), "shot_list")
     return np.clip(wide, -1, n_lists).astype(np.int32)
 
 
@@ -391,10 +397,8 @@ def _owned_columns(
     return n_lists, n_axes, t, axes
 
 
-_ENGINE_SEAL = object()  # module-private: only `own_factor_table` can make an OwnedFactorTable
-
-
-class OwnedFactorTable(NamedTuple):
+@dataclass(frozen=True, eq=False, slots=True, weakref_slot=True)
+class OwnedFactorTable:
     """A factor table held by stimside alone: private copies made once by `own_factor_table`,
     read-only, never handed out. `inject_cliffords` uses it without copying it again (glue cut
     (b)); no caller array is ever behind it, so no caller can change it while the GIL is released.
@@ -403,7 +407,15 @@ class OwnedFactorTable(NamedTuple):
     cols: tuple[Any, ...]
     axes: tuple[Any, ...]
     n_words: int
-    seal: object
+    seal: object = None
+
+
+# Module-private weak registry: only `own_factor_table` registers instances and stores their
+# immutable buffers + n_words; `eq=False` prevents forged tables from matching, and storing the
+# arrays here prevents `object.__setattr__(own, "cols"/"axes", ...)` from poisoning C++ calls.
+_OWNED_TABLES: weakref.WeakKeyDictionary[
+    OwnedFactorTable, tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...], int]
+] = weakref.WeakKeyDictionary()
 
 
 def _immutable(arr: Any) -> Any:
@@ -416,10 +428,14 @@ def _immutable(arr: Any) -> Any:
 
 def own_factor_table(table: FactorTable, nw: int) -> OwnedFactorTable:
     """Copy and check `table` once (as `inject_cliffords` would), into immutable buffers."""
+    if type(nw) is not int or nw < 1:
+        raise ValueError(f"n_words must be a positive int, got {nw!r}")
     _, _, cols, axes = _owned_columns(table, nw)
-    return OwnedFactorTable(
-        tuple(_immutable(a) for a in cols), tuple(_immutable(a) for a in axes), nw, _ENGINE_SEAL
+    owned = OwnedFactorTable(
+        tuple(_immutable(a) for a in cols), tuple(_immutable(a) for a in axes), nw
     )
+    _OWNED_TABLES[owned] = (owned.cols, owned.axes, owned.n_words)
+    return owned
 
 
 def track_locks_for_fork(owner: Any) -> None:
@@ -639,11 +655,12 @@ class MagicBatchEngine:
         """
         nw = self.n_words
         if isinstance(table, OwnedFactorTable):
-            if type(table) is not OwnedFactorTable or table.seal is not _ENGINE_SEAL or (
-                table.n_words != nw
-            ):
-                raise TypeError("an OwnedFactorTable comes only from own_factor_table(.., n_words)")
-            t, axes = table.cols, table.axes
+            entry = None if type(table) is not OwnedFactorTable else _OWNED_TABLES.get(table)
+            if entry is None or type(entry[2]) is not int or type(nw) is not int or entry[2] != nw:
+                raise TypeError(
+                    "an OwnedFactorTable comes only from own_factor_table(.., n_words)"
+                )
+            t, axes, _ = entry
             n_lists, n_axes = int(t[0].shape[0]), int(axes[2].shape[0])
         else:
             n_lists, n_axes, t, axes = _owned_columns(table, nw)

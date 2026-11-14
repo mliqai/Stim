@@ -237,6 +237,7 @@ def test_coset_kernels_exports_and_checks_abi_sentinel() -> None:
     coset_kernels._LIB_INSTANCE = None
     lib = coset_kernels.get_coset_kernels_lib()
     assert lib.coset_kernels_abi_v2() == 2
+    assert lib.coset_kernels_abi_v3() == 3
 
 
 def test_packaging_single_version_source_and_no_sdist_so_globs() -> None:

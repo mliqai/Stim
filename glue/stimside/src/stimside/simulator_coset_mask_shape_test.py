@@ -32,7 +32,7 @@ import stim
 
 from stimside._coset.reference_compile import CompiledReferenceCircuit, UnitaryStepMeta
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
-from stimside.simulator_coset import CosetsideSimulator, _compiled_unitary_rows
+from stimside.simulator_coset import CosetsideSimulator
 
 _DCC_KERNEL = "engine_batch_inject_general_clifford"
 _RESET_KERNEL = "engine_batch_unmatched_noisy_reset_z"
@@ -347,17 +347,27 @@ def test_an_op_that_does_not_replay_the_step_is_reported_as_that_not_as_a_mask_e
     "M 0 1", "R 0", "TICK", "DEPOLARIZE1(0.1) 0 1", "MPP X0*X1", "SPP X0*X1", "H",
 ])
 def test_the_predicted_rows_of_a_past_the_end_step_are_those_it_compiles_to(op_text: str) -> None:
-    """`_compiled_unitary_rows` mirrors `compile_and_append_instruction`: the rows a mask is
-    checked against before the step exists must be the rows of the step that then gets built."""
+    """`compile_instruction` compiles without mutating the reference and matches
+    `compile_and_append_instruction` on target groups and exceptions."""
     op = stim.Circuit(op_text)[0]
     ref = CompiledReferenceCircuit(stim.Circuit("R 0 1 2 3 4 5"))
+    ref2 = CompiledReferenceCircuit(stim.Circuit("R 0 1 2 3 4 5"))
+    steps_before = len(ref.steps)
+    snap_before = [w.copy() for w in ref.ref_chp.snapshot_packed()]
     try:
-        step = ref.compile_and_append_instruction(op)
+        step, _, _ = ref.compile_instruction(op)
     except NotImplementedError:
-        assert _compiled_unitary_rows(op) is None
+        assert len(ref.steps) == steps_before
+        assert all(np.array_equal(a, b) for a, b in zip(ref.ref_chp.snapshot_packed(), snap_before))
+        with np.testing.assert_raises(NotImplementedError):
+            ref2.compile_and_append_instruction(op)
         return
-    expect = len(step.target_groups) if isinstance(step, UnitaryStepMeta) else None
-    assert _compiled_unitary_rows(op) == expect
+    assert len(ref.steps) == steps_before
+    assert all(np.array_equal(a, b) for a, b in zip(ref.ref_chp.snapshot_packed(), snap_before))
+    step2 = ref2.compile_and_append_instruction(op)
+    pred = len(step.target_groups) if isinstance(step, UnitaryStepMeta) else None
+    expect = len(step2.target_groups) if isinstance(step2, UnitaryStepMeta) else None
+    assert pred == expect
 
 
 class _OnceThenOther:
