@@ -46,7 +46,7 @@ from stimside._native import coset_kernels
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.simulator_coset import CosetsideSimulator, _own_mask
 
-_DCC_KERNEL = "engine_batch_inject_general_clifford"
+_DCC_KERNEL = "engine_batch_inject_general_clifford_v3"
 _RESET_KERNEL = "engine_batch_unmatched_noisy_reset_z"
 _N = 6  # qubits of every circuit below
 _B = 8  # batch size of the hook tests (even: a uint8 mask can be re-viewed as uint16)
@@ -87,7 +87,7 @@ class _MaskSpy:
 
         def spied(*args: Any) -> Any:
             if name == _DCC_KERNEL:
-                self._check(name, args[5], args[1])  # (eng, num_g, arity, n_fac, t_groups, cm)
+                self._check(name, args[4], args[2])  # (eng, step_id, rows, cols, cm, ...)
             else:
                 self._check(name, args[1], _N)  # (eng, reset_zero, reset_one, ...)
                 self._check(name, args[2], _N)
@@ -535,20 +535,23 @@ def test_the_callers_mask_arrays_are_not_modified_by_either_method(
 
 @pytest.mark.parametrize("layout", list(_LAYOUTS))
 def test_own_mask_is_a_private_c_ordered_plain_copy_of_the_callers_dtype(layout: str) -> None:
-    caller = _LAYOUTS[layout](np.random.default_rng(2).random((3, 8)) < 0.5)
+    expected = np.random.default_rng(2).random((3, 8)) < 0.5
+    caller = _LAYOUTS[layout](expected)
     got, plain = _own_mask(caller), np.asarray(caller)
-    assert type(got) is np.ndarray and got.shape == plain.shape and got.dtype == plain.dtype
+    assert type(got) is np.ndarray and got.shape == plain.shape and got.dtype == np.bool_
     assert got.flags.c_contiguous and got.flags.writeable and got.flags.owndata
     assert not np.shares_memory(got, plain)
-    assert np.array_equal(got, plain)
+    assert np.array_equal(got, expected)
 
 
 def test_own_mask_of_a_uint8_c_contiguous_array_is_not_the_array_numpy_would_pass_on() -> None:
     caller = np.ones((3, 8), np.uint8)
     assert np.ascontiguousarray(caller, dtype=np.uint8) is caller  # why the copy is needed
     got = _own_mask(caller)
-    assert got is not caller and np.ascontiguousarray(got, dtype=np.uint8) is got
-    got[...] = 0
+    assert got is not caller and got.dtype == np.bool_
+    got_u8 = got.view(np.uint8)
+    assert np.ascontiguousarray(got_u8, dtype=np.uint8) is got_u8
+    got[...] = False
     assert caller.all()  # writing the copy leaves the caller alone
 
 
@@ -647,84 +650,84 @@ _PINNED: dict[tuple[str, bool, int], str] = {
     ("bool", False, 1): "bc4be2e99214",
     ("bool", False, 7): "421b7467b576",
     ("bool", False, 64): "b30e3618adea",
-    ("uint8", True, 1): "9fbf76ad4efb",
-    ("uint8", True, 7): "8c2c3871a30b",
-    ("uint8", True, 64): "be0c94290819",
-    ("uint8", False, 1): "9fbf76ad4efb",
-    ("uint8", False, 7): "13ebcf7beb98",
-    ("uint8", False, 64): "2504364e0c49",
-    ("uint8_255", True, 1): "9fbf76ad4efb",
-    ("uint8_255", True, 7): "d85f91658f76",
-    ("uint8_255", True, 64): "24669d21b51c",
-    ("uint8_255", False, 1): "9fbf76ad4efb",
-    ("uint8_255", False, 7): "d85f91658f76",
-    ("uint8_255", False, 64): "24669d21b51c",
-    ("uint16", True, 1): "9fbf76ad4efb",
-    ("uint16", True, 7): "8c2c3871a30b",
-    ("uint16", True, 64): "be0c94290819",
-    ("uint16", False, 1): "9fbf76ad4efb",
-    ("uint16", False, 7): "13ebcf7beb98",
-    ("uint16", False, 64): "2504364e0c49",
-    ("int64_256", True, 1): "0b235aa80601",
-    ("int64_256", True, 7): "f366c5660af4",
-    ("int64_256", True, 64): "9aa35756b049",
-    ("int64_256", False, 1): "298d1fbcad25",
-    ("int64_256", False, 7): "5312195c19b4",
-    ("int64_256", False, 64): "d31fcf9ae97f",
-    ("float64", True, 1): "9aa82bc84503",
-    ("float64", True, 7): "e81c3ef19084",
-    ("float64", True, 64): "a6cca96a45eb",
-    ("float64", False, 1): "d6ac1209dc5a",
-    ("float64", False, 7): "13b2009c889c",
-    ("float64", False, 64): "1bc9fd0ba1c9",
-    ("object_bool", True, 1): "9fbf76ad4efb",
-    ("object_bool", True, 7): "8c2c3871a30b",
-    ("object_bool", True, 64): "be0c94290819",
-    ("object_bool", False, 1): "9fbf76ad4efb",
-    ("object_bool", False, 7): "13ebcf7beb98",
-    ("object_bool", False, 64): "2504364e0c49",
+    ("uint8", True, 1): "bc4be2e99214",
+    ("uint8", True, 7): "421b7467b576",
+    ("uint8", True, 64): "b30e3618adea",
+    ("uint8", False, 1): "bc4be2e99214",
+    ("uint8", False, 7): "421b7467b576",
+    ("uint8", False, 64): "b30e3618adea",
+    ("uint8_255", True, 1): "bc4be2e99214",
+    ("uint8_255", True, 7): "421b7467b576",
+    ("uint8_255", True, 64): "b30e3618adea",
+    ("uint8_255", False, 1): "bc4be2e99214",
+    ("uint8_255", False, 7): "421b7467b576",
+    ("uint8_255", False, 64): "b30e3618adea",
+    ("uint16", True, 1): "bc4be2e99214",
+    ("uint16", True, 7): "421b7467b576",
+    ("uint16", True, 64): "b30e3618adea",
+    ("uint16", False, 1): "bc4be2e99214",
+    ("uint16", False, 7): "421b7467b576",
+    ("uint16", False, 64): "b30e3618adea",
+    ("int64_256", True, 1): "bc4be2e99214",
+    ("int64_256", True, 7): "421b7467b576",
+    ("int64_256", True, 64): "b30e3618adea",
+    ("int64_256", False, 1): "bc4be2e99214",
+    ("int64_256", False, 7): "421b7467b576",
+    ("int64_256", False, 64): "b30e3618adea",
+    ("float64", True, 1): "bc4be2e99214",
+    ("float64", True, 7): "421b7467b576",
+    ("float64", True, 64): "b30e3618adea",
+    ("float64", False, 1): "bc4be2e99214",
+    ("float64", False, 7): "421b7467b576",
+    ("float64", False, 64): "b30e3618adea",
+    ("object_bool", True, 1): "bc4be2e99214",
+    ("object_bool", True, 7): "421b7467b576",
+    ("object_bool", True, 64): "b30e3618adea",
+    ("object_bool", False, 1): "bc4be2e99214",
+    ("object_bool", False, 7): "421b7467b576",
+    ("object_bool", False, 64): "b30e3618adea",
     ("fortran_bool", True, 1): "bc4be2e99214",
     ("fortran_bool", True, 7): "421b7467b576",
     ("fortran_bool", True, 64): "b30e3618adea",
     ("fortran_bool", False, 1): "bc4be2e99214",
     ("fortran_bool", False, 7): "421b7467b576",
     ("fortran_bool", False, 64): "b30e3618adea",
-    ("fortran_uint8", True, 1): "9fbf76ad4efb",
-    ("fortran_uint8", True, 7): "8c2c3871a30b",
-    ("fortran_uint8", True, 64): "be0c94290819",
-    ("fortran_uint8", False, 1): "9fbf76ad4efb",
-    ("fortran_uint8", False, 7): "13ebcf7beb98",
-    ("fortran_uint8", False, 64): "2504364e0c49",
+    ("fortran_uint8", True, 1): "bc4be2e99214",
+    ("fortran_uint8", True, 7): "421b7467b576",
+    ("fortran_uint8", True, 64): "b30e3618adea",
+    ("fortran_uint8", False, 1): "bc4be2e99214",
+    ("fortran_uint8", False, 7): "421b7467b576",
+    ("fortran_uint8", False, 64): "b30e3618adea",
     ("strided_bool", True, 1): "bc4be2e99214",
     ("strided_bool", True, 7): "421b7467b576",
     ("strided_bool", True, 64): "b30e3618adea",
     ("strided_bool", False, 1): "bc4be2e99214",
     ("strided_bool", False, 7): "421b7467b576",
     ("strided_bool", False, 64): "b30e3618adea",
-    ("strided_uint8", True, 1): "9fbf76ad4efb",
-    ("strided_uint8", True, 7): "8c2c3871a30b",
-    ("strided_uint8", True, 64): "be0c94290819",
-    ("strided_uint8", False, 1): "9fbf76ad4efb",
-    ("strided_uint8", False, 7): "13ebcf7beb98",
-    ("strided_uint8", False, 64): "2504364e0c49",
-    ("reversed_uint8", True, 1): "9fbf76ad4efb",
-    ("reversed_uint8", True, 7): "8c2c3871a30b",
-    ("reversed_uint8", True, 64): "be0c94290819",
-    ("reversed_uint8", False, 1): "9fbf76ad4efb",
-    ("reversed_uint8", False, 7): "13ebcf7beb98",
-    ("reversed_uint8", False, 64): "2504364e0c49",
+    ("strided_uint8", True, 1): "bc4be2e99214",
+    ("strided_uint8", True, 7): "421b7467b576",
+    ("strided_uint8", True, 64): "b30e3618adea",
+    ("strided_uint8", False, 1): "bc4be2e99214",
+    ("strided_uint8", False, 7): "421b7467b576",
+    ("strided_uint8", False, 64): "b30e3618adea",
+    ("reversed_uint8", True, 1): "bc4be2e99214",
+    ("reversed_uint8", True, 7): "421b7467b576",
+    ("reversed_uint8", True, 64): "b30e3618adea",
+    ("reversed_uint8", False, 1): "bc4be2e99214",
+    ("reversed_uint8", False, 7): "421b7467b576",
+    ("reversed_uint8", False, 64): "b30e3618adea",
     ("read_only_bool", True, 1): "bc4be2e99214",
     ("read_only_bool", True, 7): "421b7467b576",
     ("read_only_bool", True, 64): "b30e3618adea",
     ("read_only_bool", False, 1): "bc4be2e99214",
     ("read_only_bool", False, 7): "421b7467b576",
     ("read_only_bool", False, 64): "b30e3618adea",
-    ("read_only_uint8", True, 1): "9fbf76ad4efb",
-    ("read_only_uint8", True, 7): "8c2c3871a30b",
-    ("read_only_uint8", True, 64): "be0c94290819",
-    ("read_only_uint8", False, 1): "9fbf76ad4efb",
-    ("read_only_uint8", False, 7): "13ebcf7beb98",
-    ("read_only_uint8", False, 64): "2504364e0c49",
+    ("read_only_uint8", True, 1): "bc4be2e99214",
+    ("read_only_uint8", True, 7): "421b7467b576",
+    ("read_only_uint8", True, 64): "b30e3618adea",
+    ("read_only_uint8", False, 1): "bc4be2e99214",
+    ("read_only_uint8", False, 7): "421b7467b576",
+    ("read_only_uint8", False, 64): "b30e3618adea",
     ("list", True, 1): "bc4be2e99214",
     ("list", True, 7): "421b7467b576",
     ("list", True, 64): "b30e3618adea",

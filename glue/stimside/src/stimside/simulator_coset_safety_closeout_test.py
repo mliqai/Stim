@@ -24,7 +24,7 @@ from stimside.dem_generators.dem_generator_marginal import MarginalLeakageDemGen
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.simulator_coset import CosetsideSimulator
 
-_DCC_KERNEL = "engine_batch_inject_general_clifford"
+_DCC_KERNEL = "engine_batch_inject_general_clifford_v3"
 _RESET_KERNEL = "engine_batch_unmatched_noisy_reset_z"
 _PEEK_KERNEL = "engine_peek_pauli_batch"
 _B = 16
@@ -164,7 +164,7 @@ class _SafetyKernelSpy:
 
         def spied(*args: Any) -> Any:
             if name == _DCC_KERNEL:
-                self._check_buf(name, args[5], int(args[1]) * self._batch)
+                self._check_buf(name, args[4], int(args[2]) * self._batch)
             elif name == _RESET_KERNEL:
                 self._check_buf(name, args[1], self._num_qubits * self._batch)
                 self._check_buf(name, args[2], self._num_qubits * self._batch)
@@ -708,13 +708,13 @@ class _IntTrigger:
         self.v, self.cb, self.fired = v, cb, fired
 
     def __bool__(self) -> bool:
-        return self.v
-
-    def __int__(self) -> int:
         if not self.fired[0]:
             self.fired[0] = True
             self.cb()
-        return int(self.v)
+        return self.v
+
+    def __int__(self) -> int:
+        return int(self.__bool__())
 
 
 @_SKIP_NO_CPP

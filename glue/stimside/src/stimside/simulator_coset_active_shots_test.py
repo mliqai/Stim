@@ -1,19 +1,18 @@
-"""R3-F7: hostile `active_shots` entries never reach `engine_import_shot` / `engine_export_shot`.
+"""D-32 & R3-F7: `active_shots` read-only MappingProxyType, fresh-copy isolation, and export safety.
 
-`active_shots` is the live public dict. Before the fix an out-of-range key or a short buffer in
-an entry was handed to C++ unchecked (heap reads/writes under ASan). Now every entry is checked
-and copied before the engine is cleared, so a bad entry raises ValueError, changes nothing, and a
-held reference with short buffers is replaced on export instead of being written through.
+`active_shots` returns a read-only `MappingProxyType` of fresh `MRQFState.copy()` instances
+materialized at read time. Mapping mutations raise `TypeError`, writes to returned `MRQFState`
+copies never affect the simulator or engine, and tampered internal `_active_shots` cache entries
+are replaced rather than written through during `_sync_cpp_to_py()`.
 """
 
 from __future__ import annotations
 
 import copy
-import ctypes
 import os
 import pickle
-from collections.abc import Callable
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, cast
 
 import numpy as np
@@ -23,7 +22,7 @@ import stim
 from stimside._coset.mrqf_state import MRQFState
 from stimside._native import coset_kernels
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
-from stimside.simulator_coset import CosetsideSimulator, _owned_block
+from stimside.simulator_coset import CosetsideSimulator
 
 _B = 16
 _TEXT = "H 0 1 2 3\nTICK\nM 0 1 2 3 4 5"
@@ -60,116 +59,109 @@ def _rank(d: int) -> MRQFState:
     return st
 
 
-def _short(attr: str, value: object, d: int = 3) -> Callable[[], MRQFState]:
-    def make() -> MRQFState:
-        st = _rank(d)
-        setattr(st, attr, value)
-        return st
-
-    return make
-
-
-def _with(**kw: object) -> Callable[[], MRQFState]:
-    def make() -> MRQFState:
-        st = _rank(2)
-        for k, v in kw.items():
-            setattr(st, k, v)
-        return st
-
-    return make
-
-
-_BAD_STATES: dict[str, Callable[[], MRQFState]] = {
-    "d_big": _with(_d=1000),
-    "d_neg": _with(_d=-1),
-    "P_short": _with(P=[0]),
-    "P_neg": _with(P=[-5, 1]),
-    "P_ge_nq": _with(P=[0, 40]),
-    "h_short": _short("h_words", np.zeros(0, np.uint64)),
-    "h_dtype": _short("h_words", np.zeros(8, np.uint8)),
-    "au_short": _short("a_union", np.zeros(0, np.uint64)),
-    "A_short": _short("_A_buf", np.zeros((1, 1), np.uint64)),
-    "A_wide": _short("_A_buf", np.zeros((4, 2), np.uint64)),
-    "ell_short": _short("_ell_buf", np.zeros(1, np.uint8)),
-    "gamma_short": _short("_Gamma_buf", np.zeros((1, 1), np.uint8)),
-}
-
-
 def _bits(sim: CosetsideSimulator) -> bytes:
     return b"".join(
         sim.peek_pauli_batch([0, 1, 2, 3, 4, 5], p).tobytes() for p in "XYZ"
     )
 
 
-@pytest.mark.parametrize("key", [_B, _B + 5, 10**6, -1, -3])
-def test_an_out_of_range_key_raises_and_changes_nothing(key: int) -> None:
+@pytest.mark.parametrize("key", [0, 2, _B, _B + 5, 10**6, -1, -3, 2.0, True, "x"])
+def test_active_shots_mapping_rejects_assignment_and_deletion(key: object) -> None:
     sim, ref = _mk(), _mk()
+    m = np.ones((4, _B), bool)
+    m[:, ::3] = False
+    for s in (sim, ref):
+        s.do_conditional_clifford(stim.CircuitInstruction("H", [0, 1, 2, 3]), m)
     before = _bits(sim)
-    sim.active_shots[key] = MRQFState(6, 1)
-    with pytest.raises(ValueError, match="out of range"):
-        sim.peek_pauli_batch([0, 5])
-    del sim.active_shots[key]
+    shots = sim.active_shots
+    assert isinstance(shots, MappingProxyType)
+    with pytest.raises(TypeError):
+        cast(dict[Any, MRQFState], shots)[key] = MRQFState(6, 1)
+    with pytest.raises(TypeError):
+        del cast(dict[Any, MRQFState], shots)[key]
     assert _bits(sim) == before == _bits(ref)
     sim.run()
     ref.run()
     assert sim.get_detector_flips().tobytes() == ref.get_detector_flips().tobytes()
 
 
-@pytest.mark.parametrize("kind", list(_BAD_STATES))
-def test_an_entry_with_a_bad_rank_index_or_buffer_raises_before_the_engine_is_touched(
-    kind: str,
-) -> None:
-    sim = _mk()
+@pytest.mark.parametrize("mode", ["cpp", "py", "sync"])
+def test_active_shots_is_readonly_mapping_proxy_in_all_modes(mode: str) -> None:
+    c = stim.Circuit(_TEXT)
+    h = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=_B)
+    sim = CosetsideSimulator(
+        c, compiled_op_handler=h, batch_size=_B, seed=3, sync_tableside_rng=(mode == "sync")
+    )
+    if mode == "py":
+        sim._use_cpp = False
     m = np.ones((4, _B), bool)
     m[:, ::3] = False
     sim.do_conditional_clifford(stim.CircuitInstruction("H", [0, 1, 2, 3]), m)
-    before = _bits(sim)
     shots = sim.active_shots
-    saved = dict(shots)
-    shots[2] = _BAD_STATES[kind]()
-    with pytest.raises(ValueError, match=r"active_shots\[2\]"):
-        sim.peek_pauli_batch([0, 5])
-    shots.clear()
-    shots.update(saved)
-    assert _bits(sim) == before
+    assert isinstance(shots, MappingProxyType)
+    assert len(shots) > 0
+    for mut in (
+        lambda: cast(Any, shots).__setitem__(2, _rank(1)),
+        lambda: cast(Any, shots).__delitem__(0),
+        lambda: cast(Any, shots).clear(),
+        lambda: cast(Any, shots).pop(0),
+        lambda: cast(Any, shots).update({2: _rank(1)}),
+        lambda: cast(Any, shots).setdefault(2, _rank(1)),
+    ):
+        with pytest.raises((TypeError, AttributeError)):
+            mut()
 
 
-def test_a_valid_hand_built_entry_is_imported() -> None:
-    sim = _mk()
-    sim.active_shots[2] = _rank(3)
-    sim.peek_pauli_batch([0, 5])
-    assert set(sim.active_shots) == {2} and sim.active_shots[2].d == 3
-    sim.active_shots[2].check_invariants()
+def test_active_shots_materializes_fresh_copies_and_isolates_mutations() -> None:
+    for use_cpp in (True, False):
+        sim, ref = _mk(), _mk()
+        sim._use_cpp = use_cpp
+        ref._use_cpp = use_cpp
+        m = np.ones((4, _B), bool)
+        m[:, ::3] = False
+        for s in (sim, ref):
+            s.do_conditional_clifford(stim.CircuitInstruction("H", [0, 1, 2, 3]), m)
+        before = _bits(sim)
+        read1 = sim.active_shots
+        read2 = sim.active_shots
+        b0 = min(read1)
+        st1, st2 = read1[b0], read2[b0]
+        assert st1 is not st2 and st1 is not sim._active_shots[b0]
+        st1.check_invariants()
+        st1.h_words[0] ^= np.uint64(0x55)
+        st1.a_union[0] ^= np.uint64(0xAA)
+        st1.A_words[0, 0] ^= np.uint64(1)
+        st1.ell[0] ^= np.uint8(1)
+        st1.P.append(99)
+        st1._A_buf = np.zeros((0, 1), dtype=np.uint64)
+        assert _bits(sim) == before == _bits(ref)
+        assert sim.active_shots[b0].h_words.tobytes() == ref.active_shots[b0].h_words.tobytes()
+        assert sim.active_shots[b0].P == ref.active_shots[b0].P
 
 
-@pytest.mark.parametrize(
-    "swap",
-    [
+def test_export_cache_entry_with_short_buffers_is_replaced_on_sync() -> None:
+    for swap in (
         ("h_words", np.zeros(0, np.uint64)),
         ("_A_buf", np.zeros((0, 1), np.uint64)),
         ("a_union", np.zeros(1, np.uint8)),
-    ],
-    ids=["h_words", "A_buf", "a_union_dtype"],
-)
-def test_a_held_reference_with_short_buffers_is_replaced_on_export(
-    swap: tuple[str, np.ndarray],
-) -> None:
-    sim, ref = _mk(), _mk()
-    m = np.ones((4, _B), bool)
-    m[:, ::3] = False
-    held = sim.active_shots
-    for s in (sim, ref):
-        s.do_conditional_clifford(stim.CircuitInstruction("H", [0, 1, 2, 3]), m)
-    hostile = MRQFState(6, 1)
-    setattr(hostile, *swap)
-    held[0] = hostile  # not re-pushed (held across a kernel); the next export writes shot 0
-    exported = sim.active_shots[0]
-    assert exported is not hostile
-    assert getattr(hostile, swap[0]).shape == swap[1].shape
-    expect = ref.active_shots[0]
-    assert exported.d == expect.d and exported.P == expect.P
-    assert exported.h_words.tobytes() == expect.h_words.tobytes()
-    assert exported.A_words.tobytes() == expect.A_words.tobytes()
+    ):
+        sim, ref = _mk(), _mk()
+        m = np.ones((4, _B), bool)
+        m[:, ::3] = False
+        for s in (sim, ref):
+            s.do_conditional_clifford(stim.CircuitInstruction("H", [0, 1, 2, 3]), m)
+        sim._sync_cpp_to_py()
+        hostile = MRQFState(6, 1)
+        setattr(hostile, *swap)
+        sim._active_shots[0] = hostile
+        sim._cpp_dirty = True
+        exported = sim.active_shots[0]
+        assert exported is not hostile and sim._active_shots[0] is not hostile
+        assert getattr(hostile, swap[0]).shape == swap[1].shape
+        expect = ref.active_shots[0]
+        assert exported.d == expect.d and exported.P == expect.P
+        assert exported.h_words.tobytes() == expect.h_words.tobytes()
+        assert exported.A_words.tobytes() == expect.A_words.tobytes()
 
 
 class _SubArray(np.ndarray):
@@ -197,56 +189,34 @@ class _EvilInt(int):
         return True
 
 
-def test_bad_entry_preserves_cpp_engine_state_without_reimport() -> None:
-    sim = _mk()
-    m = np.ones((4, _B), bool)
-    m[:, ::3] = False
-    sim.do_conditional_clifford(stim.CircuitInstruction("H", [0, 1, 2, 3]), m)
-    before = _bits(sim)
-    shots = sim.active_shots
-    saved = dict(shots)
-    shots[1] = _rank(1)
-    shots[2] = _BAD_STATES["h_short"]()
-    with pytest.raises(ValueError, match=r"active_shots\[2\]"):
-        sim.peek_pauli_batch([0, 5])
-    out_idx = np.empty(_B, dtype=np.int32)
-    out_d = np.empty(_B, dtype=np.int32)
-    assert sim._cpp_lib is not None and sim._cpp_eng is not None
-    n_act = int(
-        sim._cpp_lib.engine_get_active_shot_indices(
-            sim._cpp_eng,
-            out_idx.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-            out_d.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-        )
-    )
-    assert n_act == len(saved) and set(out_idx[:n_act].tolist()) == set(saved)
-    sim._active_shots.clear()
-    sim._active_shots.update(saved)
-    sim._py_dirty = False
-    assert _bits(sim) == before
-
-
-def test_owned_block_and_shot_import_do_not_alias_caller_memory() -> None:
-    src = np.array([1], dtype=np.uint64)
-    blk = _owned_block(src, np.uint64, (1,), "h")
-    src[0] = 777
-    assert int(blk[0]) == 1
-
-    sim = _mk()
-    st0 = _rank(0)
-    h_src = np.array([1], dtype=np.uint64)
-    st0.h_words = h_src
-    st1 = _rank(0)
-
-    class _MutatingAu:
-        def __array__(self, dtype: object = None, copy: object = None) -> np.ndarray:
-            h_src[0] = 0
-            return np.zeros(1, dtype=np.uint64)
-
-    st1.a_union = cast(Any, _MutatingAu())
-    sim.active_shots[0] = st0
-    sim.active_shots[1] = st1
-    assert int(sim.peek_pauli_batch([0], "Z")[0, 0]) == -1
+def test_mrqf_state_copy_is_deeply_independent() -> None:
+    src = _rank(3)
+    src.h_words[0] = np.uint64(0b101)
+    src._ell_buf[:3] = np.array([1, 2, 3], dtype=np.uint8)
+    src._Gamma_buf[0, 1] = src._Gamma_buf[1, 0] = 1
+    cp = src.copy()
+    assert cp is not src and cp.P is not src.P and cp.P == src.P and cp.d == 3
+    for a, b in (
+        (cp.h_words, src.h_words),
+        (cp.a_union, src.a_union),
+        (cp._A_buf, src._A_buf),
+        (cp._ell_buf, src._ell_buf),
+        (cp._Gamma_buf, src._Gamma_buf),
+        (cp.A_words, src.A_words),
+        (cp.ell, src.ell),
+        (cp.Gamma, src.Gamma),
+    ):
+        assert not np.shares_memory(a, b)
+        assert np.array_equal(a, b)
+    cp.h_words[0] ^= np.uint64(1)
+    cp.a_union[0] ^= np.uint64(1)
+    cp.A_words[0, 0] ^= np.uint64(8)
+    cp.ell[0] ^= np.uint8(1)
+    cp.Gamma[0, 1] ^= np.uint8(1)
+    cp.P[0] = 5
+    assert int(src.h_words[0]) == 0b101
+    assert src.P == [0, 1, 2] and int(src.ell[0]) == 1 and int(src.Gamma[0, 1]) == 1
+    src.check_invariants()
 
 
 def _tampered_export(kind: str) -> MRQFState:
@@ -319,17 +289,19 @@ def _tampered_export(kind: str) -> MRQFState:
         "nwords_mismatch", "d_gt_cap", "d_neg", "subclass",
     ],
 )
-def test_held_reference_with_readonly_subclass_or_tampered_cap_is_replaced(kind: str) -> None:
+def test_export_cache_with_readonly_subclass_or_tampered_cap_is_replaced(kind: str) -> None:
     sim, ref = _mk(), _mk()
     m = np.ones((4, _B), bool)
     m[:, ::3] = False
-    held = sim.active_shots
     for s in (sim, ref):
         s.do_conditional_clifford(stim.CircuitInstruction("H", [0, 1, 2, 3]), m)
+    sim._sync_cpp_to_py()
     hostile = _tampered_export(kind)
-    held[0] = hostile
+    sim._active_shots[0] = hostile
+    sim._cpp_dirty = True
     exported = sim.active_shots[0]
-    assert exported is not hostile and type(exported) is MRQFState
+    assert exported is not hostile and sim._active_shots[0] is not hostile
+    assert type(exported) is MRQFState
     assert exported.h_words.flags.writeable and type(exported.h_words) is np.ndarray
     assert type(exported.n_words) is int
     assert not np.shares_memory(exported.h_words, exported.a_union)
@@ -346,22 +318,6 @@ def test_mrqf_ensure_capacity_rejects_nonpositive_cap() -> None:
             st._ensure_capacity(10)
 
 
-def test_rank_d_boundaries_exact_nq_and_out_of_range() -> None:
-    sim = _mk()
-    sim.active_shots[2] = _rank(6)
-    sim.peek_pauli_batch([0, 5])
-    assert sim.active_shots[2].d == 6
-
-    for bad_d, bad_p in ((-1, []), (7, [0, 1, 2, 3, 4, 5, 0])):
-        s_bad = _mk()
-        st = _rank(2)
-        st._d = bad_d
-        st.P = bad_p
-        s_bad.active_shots[2] = st
-        with pytest.raises(ValueError, match=rf"rank d={bad_d}"):
-            s_bad.peek_pauli_batch([0, 5])
-
-
 def test_cosetside_simulator_refuses_copy_deepcopy_and_pickle() -> None:
     sim = _mk()
     m = np.ones((4, _B), bool)
@@ -373,56 +329,14 @@ def test_cosetside_simulator_refuses_copy_deepcopy_and_pickle() -> None:
     assert sim.peek_pauli_batch([0, 5]).shape == (2, _B)
 
 
-def test_duplicate_nonint_p_key_d_and_oversized_words_raise() -> None:
-    bad_ps: list[object] = [
-        [0, 0], [0.5, 1.5], [0.0, 1.0], [False, True], [0, True], ["0", "1"], [0, 2**70],
-        np.array([False, True]), np.array([0.0, 1.0]),
-        np.array([0, 0], dtype=np.int64), np.array([-1, 0], dtype=np.int64),
-        np.array([0, 40], dtype=np.int64), np.array([0, 6], dtype=np.uint64),
-    ]
-    for bad_p in bad_ps:
-        sim = _mk()
-        st = _rank(2)
-        cast(Any, st).P = bad_p
-        sim.active_shots[2] = st
-        with pytest.raises(ValueError):
-            sim.peek_pauli_batch([0, 5])
-
-    for bad_key in (2.0, True, False, "x"):
-        sim = _mk()
-        cast(dict[Any, MRQFState], sim.active_shots)[bad_key] = _rank(1)
-        with pytest.raises((TypeError, ValueError)):
-            sim.peek_pauli_batch([0, 5])
-
-    for bad_d in (True, False, 1.0, "1"):
-        sim = _mk()
-        st = _rank(1)
-        cast(Any, st)._d = bad_d
-        sim.active_shots[2] = st
-        with pytest.raises((TypeError, ValueError)):
-            sim.peek_pauli_batch([0, 5])
-
-    for attr in ("h_words", "a_union"):
-        sim = _mk()
-        st = _rank(1)
-        setattr(st, attr, np.zeros(2, dtype=np.uint64))
-        sim.active_shots[2] = st
-        with pytest.raises(ValueError):
-            sim.peek_pauli_batch([0, 5])
-
-    sim_ok = _mk()
-    cast(dict[Any, MRQFState], sim_ok.active_shots)[np.int64(3)] = _rank(1)
-    assert sim_ok.peek_pauli_batch([0], "Z").shape == (1, _B)
-
-
 @pytest.mark.parametrize("kind", ["nwords_evil_int", "gamma_aliased_ell"])
-def test_held_reference_with_evil_int_nwords_or_gamma_alias_is_replaced(kind: str) -> None:
+def test_export_cache_with_evil_int_nwords_or_gamma_alias_is_replaced(kind: str) -> None:
     sim, ref = _mk(), _mk()
     m = np.ones((4, _B), bool)
     m[:, ::3] = False
-    held = sim.active_shots
     for s in (sim, ref):
         s.do_conditional_clifford(stim.CircuitInstruction("H", [0, 1, 2, 3]), m)
+    sim._sync_cpp_to_py()
     hostile = MRQFState(6, 1)
     if kind == "nwords_evil_int":
         hostile.n_words = cast(Any, _EvilInt(1))
@@ -431,10 +345,11 @@ def test_held_reference_with_evil_int_nwords_or_gamma_alias_is_replaced(kind: st
         raw = np.zeros(cap * cap + 16, dtype=np.uint8)
         hostile._Gamma_buf = raw[: cap * cap].reshape(cap, cap)
         hostile._ell_buf = raw[cap - 1 : 2 * cap - 1]
-    held[0] = hostile
+    sim._active_shots[0] = hostile
+    sim._cpp_dirty = True
     exported = sim.active_shots[0]
-    assert exported is not hostile and type(exported) is MRQFState
-    assert type(exported.n_words) is int
+    assert exported is not hostile and sim._active_shots[0] is not hostile
+    assert type(exported) is MRQFState and type(exported.n_words) is int
     assert not np.shares_memory(exported._ell_buf, exported._Gamma_buf)
     expect = ref.active_shots[0]
     assert exported.d == expect.d and exported.P == expect.P

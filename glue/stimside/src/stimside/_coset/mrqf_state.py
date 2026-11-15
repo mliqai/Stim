@@ -61,6 +61,21 @@ class MRQFState:
         self._ell_view = self._ell_buf[:d]
         self._Gamma_view = self._Gamma_buf[:d, :d]
 
+    def copy(self) -> MRQFState:
+        """Return an independent copy of this MRQFState with fresh backing buffers."""
+        out = MRQFState(self.num_qubits, self.n_words, _init_cap=max(4, self._cap, self._d))
+        d = self._d
+        out._d = d
+        np.copyto(out.h_words, self.h_words)
+        np.copyto(out.a_union, self.a_union)
+        if d > 0:
+            out._A_buf[:d] = self._A_buf[:d]
+            out._ell_buf[:d] = self._ell_buf[:d]
+            out._Gamma_buf[:d, :d] = self._Gamma_buf[:d, :d]
+        out.P = list(self.P)
+        out._refresh_views()
+        return out
+
     @property
     def A_words(self) -> NDArray[np.uint64]:
         return self._A_view

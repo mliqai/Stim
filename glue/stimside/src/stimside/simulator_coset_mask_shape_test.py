@@ -34,7 +34,7 @@ from stimside._coset.reference_compile import CompiledReferenceCircuit, UnitaryS
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.simulator_coset import CosetsideSimulator
 
-_DCC_KERNEL = "engine_batch_inject_general_clifford"
+_DCC_KERNEL = "engine_batch_inject_general_clifford_v3"
 _RESET_KERNEL = "engine_batch_unmatched_noisy_reset_z"
 _N = 6  # qubits of every circuit below
 _H4 = stim.CircuitInstruction("H", [0, 1, 2, 3])  # 4 disjoint groups
@@ -106,7 +106,7 @@ def _fingerprint(sim: CosetsideSimulator) -> str:
     xs, zs, _, _, _ = sim._flip_simulator.to_numpy(output_xs=True, output_zs=True)
     shots = sorted((b, st.d, st.h_words.tolist()) for b, st in sim._active_shots.items())
     rng = sim.np_rng.bit_generator.state["state"]
-    flags = (sim._py_dirty, sim._cpp_dirty, len(sim._measurement_columns), sim._step_cursor)
+    flags = (sim._cpp_dirty, len(sim._measurement_columns), sim._step_cursor)
     parts = (xs.tobytes(), zs.tobytes(), repr(shots), sim._shot_tiebreak_rng.tobytes(), repr(rng))
     ref = sim._compiled_ref
     words = [w.tobytes() for w in (*ref.ref_chp.snapshot_packed(), *sim._current_packed_words())]

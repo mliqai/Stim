@@ -181,6 +181,8 @@ class UnitaryStepMeta(_StepWordsMixin):
     _group_packed_words: list[PackedSymplecticTables] | None = None
     are_groups_disjoint: bool = True
     _packed_words: PackedSymplecticTables | None = None
+    _is_mixed: bool = dataclasses.field(default=False, init=False, repr=False, compare=False)
+    _op_bounds_nq: int = dataclasses.field(default=-1, init=False, repr=False, compare=False)
     _cpp_cocycle_arrays: (
         tuple[int, int, int, NDArray[np.int64], list[NDArray]] | None
     ) = dataclasses.field(default=None, init=False, repr=False, compare=False)
@@ -551,7 +553,8 @@ class CompiledReferenceCircuit:
                 "TablesideSimulator or FlipsideSimulator."
             )
         raw_t = op.targets_copy()
-        if gd.is_two_qubit_gate and any(t.qubit_value is None for t in raw_t):
+        is_mixed = gd.is_two_qubit_gate and any(t.qubit_value is None for t in raw_t)
+        if is_mixed:
             quantum_targets: list[int] = []
             for i in range(0, len(raw_t), 2):
                 q0, q1 = raw_t[i].qubit_value, raw_t[i + 1].qubit_value
@@ -564,6 +567,7 @@ class CompiledReferenceCircuit:
         else:
             targets = [t.qubit_value for t in raw_t]
             quantum_op = op
+        in_bounds = all(0 <= q < self.num_qubits for q in targets)
         arity = 2 if gd.is_two_qubit_gate else 1
         groups = [tuple(targets[i : i + arity]) for i in range(0, len(targets), arity)]
         is_disjoint = len(set(targets)) == len(targets)
@@ -579,12 +583,16 @@ class CompiledReferenceCircuit:
                 group_packed_words.append(chp.snapshot_packed())
             packed_after = group_packed_words[-1]
             chp._inv_dirty = False
-        return UnitaryStepMeta(
+        meta = UnitaryStepMeta(
             kind="unitary", op=op, gate_name=name, num_qubits=self.num_qubits,
             target_groups=groups, quantum_op=quantum_op,
             _group_packed_words=group_packed_words, _packed_words=packed_after,
             are_groups_disjoint=is_disjoint,
-        ), packed_after
+        )
+        meta._is_mixed = is_mixed
+        if in_bounds:
+            meta._op_bounds_nq = self.num_qubits
+        return meta, packed_after
 
     def _compile_on(
         self,
