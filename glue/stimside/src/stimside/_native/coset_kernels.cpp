@@ -2,11 +2,8 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
-#include <exception>
 #include <new>
 #include <vector>
-
-extern "C" {
 
 static inline int word_dot_parity(const uint64_t* u, const uint64_t* v, int n_words) {
     uint64_t acc = 0;
@@ -553,7 +550,7 @@ struct BatchedMRQFEngine {
     int batch_size;
     int n_words;
     int fail_kind = 0;
-    uint64_t* shot_rng_states;
+    std::vector<uint64_t> shot_rng_states_owned;
     std::vector<CppMRQFShot> shots;
     std::vector<uint8_t> is_active;
     std::vector<uint8_t> scratch_delta;
@@ -563,11 +560,11 @@ struct BatchedMRQFEngine {
     std::vector<uint64_t> tmp_words_4;
     std::vector<CppUnitaryStep> unitary_steps;
 
-    BatchedMRQFEngine(int nq, int bs, uint64_t* ext_rng_states)
+    BatchedMRQFEngine(int nq, int bs, const uint64_t* ext_rng_states)
         : num_qubits(nq),
           batch_size(bs),
           n_words(compute_n_words(nq)),
-          shot_rng_states(ext_rng_states),
+          shot_rng_states_owned(ext_rng_states, ext_rng_states + size_t(bs)),
           shots(bs),
           is_active(bs, 0),
           scratch_delta(bs, 0),
@@ -587,7 +584,7 @@ struct BatchedMRQFEngine {
     }
 
     int draw_bit(int b) {
-        return splitmix64_draw_bit(&shot_rng_states[b]);
+        return splitmix64_draw_bit(&shot_rng_states_owned[b]);
     }
 
     void inject_group_raw(
@@ -757,20 +754,65 @@ struct BatchedMRQFEngine {
         if (info.a_is_zero) {
             if (is_active[b] || activate_if_a_zero) {
                 if (activate_if_a_zero) is_active[b] = 1;
-                mrqf.p3_measure_diagonal(bw, (f_q ^ info.sign_bool) & 1, m, &shot_rng_states[b]);
+                mrqf.p3_measure_diagonal(
+                    bw, (f_q ^ info.sign_bool) & 1, m, &shot_rng_states_owned[b]
+                );
             }
         } else {
             is_active[b] = 1;
             const uint64_t* b_rot = tmp_words_1.data();
             const uint64_t* e_p = tmp_words_2.data();
             mrqf.p2_apply_quarter_turn(aw, b_rot, info.kappa_rot);
-            mrqf.p3_measure_diagonal(e_p, 0, (m ^ f_q) & 1, &shot_rng_states[b]);
+            mrqf.p3_measure_diagonal(e_p, 0, (m ^ f_q) & 1, &shot_rng_states_owned[b]);
             mrqf.p2_apply_quarter_turn(aw, b_rot, (info.kappa_rot + 2) & 3);
         }
     }
 };
 
-void* engine_create(int num_qubits, int batch_size, uint64_t* ext_rng_states) {
+namespace {
+
+template <class Fn>
+void run_void_guarded(
+    BatchedMRQFEngine* eng, Fn&& fn, int* flag1 = nullptr, int* flag2 = nullptr
+) {
+    try {
+        fn();
+    } catch (const std::bad_alloc&) {
+        eng->record_exception(1);
+        if (flag1) *flag1 = 0;
+        if (flag2) *flag2 = 0;
+    } catch (...) {
+        eng->record_exception(2);
+        if (flag1) *flag1 = 0;
+        if (flag2) *flag2 = 0;
+    }
+}
+
+template <class Fn>
+int run_int_guarded(
+    BatchedMRQFEngine* eng, int oom_rc, int err_rc, Fn&& fn,
+    int* flag1 = nullptr, int* flag2 = nullptr
+) {
+    try {
+        return fn();
+    } catch (const std::bad_alloc&) {
+        eng->record_exception(1);
+        if (flag1) *flag1 = 0;
+        if (flag2) *flag2 = 0;
+        return oom_rc;
+    } catch (...) {
+        eng->record_exception(2);
+        if (flag1) *flag1 = 0;
+        if (flag2) *flag2 = 0;
+        return err_rc;
+    }
+}
+
+}  // namespace
+
+extern "C" {
+
+void* engine_create(int num_qubits, int batch_size, const uint64_t* ext_rng_states) {
     g_last_create_err = 0;
     if (num_qubits < 0 || batch_size <= 0 || !ext_rng_states) return nullptr;
     int64_t nw64 = (int64_t(num_qubits) + 63) / 64;
@@ -804,59 +846,67 @@ int engine_create_last_error() {
     return g_last_create_err;
 }
 
-void engine_set_rng_states(void* ptr, uint64_t* ext_rng_states) {
-    if (!ptr || !ext_rng_states) return;
+int engine_set_rng_states(void* ptr, const uint64_t* ext_rng_states) {
+    if (!ptr || !ext_rng_states) return -1;
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
-    if (eng->fail_kind != 0) return;
-    try {
-        eng->shot_rng_states = ext_rng_states;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-    } catch (...) {
-        eng->record_exception(2);
+    if (eng->fail_kind != 0) return -2;
+    return run_int_guarded(eng, -2, -3, [&]() -> int {
+        if (eng->batch_size <= 0) return -1;
+        std::vector<uint64_t> next(ext_rng_states, ext_rng_states + size_t(eng->batch_size));
+        eng->shot_rng_states_owned.swap(next);
+        return 0;
+    });
+}
+
+int engine_get_rng_states(void* ptr, int n_shots, uint64_t* out_rng_states) {
+    if (!ptr || !out_rng_states) return -1;
+    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
+    if (eng->fail_kind != 0) return -2;
+    if (n_shots != eng->batch_size ||
+        eng->shot_rng_states_owned.size() != size_t(eng->batch_size)) {
+        return -3;
     }
+    return run_int_guarded(eng, -2, -4, [&]() -> int {
+        std::memcpy(
+            out_rng_states,
+            eng->shot_rng_states_owned.data(),
+            size_t(n_shots) * sizeof(uint64_t)
+        );
+        return 0;
+    });
 }
 
 void engine_clear(void* ptr) {
     if (!ptr) return;
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
     if (eng->fail_kind != 0) return;
-    try {
+    run_void_guarded(eng, [&]() {
         for (int b = 0; b < eng->batch_size; ++b) {
             if (eng->is_active[b]) {
                 eng->shots[b].clear();
                 eng->is_active[b] = 0;
             }
         }
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-    } catch (...) {
-        eng->record_exception(2);
-    }
+    });
 }
 
 int engine_get_active_shot_indices(void* ptr, int32_t* out_indices, int32_t* out_d) {
     if (!ptr) return -1;
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
     if (eng->fail_kind != 0) return -2;
-    try {
+    return run_int_guarded(eng, -2, -3, [&]() -> int {
         int count = 0;
         for (int b = 0; b < eng->batch_size; ++b) {
-            bool nz = words_any_nonzero(eng->shots[b].h_words.data(), eng->n_words);
-            if (eng->is_active[b] && (eng->shots[b].d > 0 || nz)) {
+            if (!eng->is_active[b]) continue;
+            const CppMRQFShot& s = eng->shots[b];
+            if (s.d > 0 || words_any_nonzero(s.h_words.data(), eng->n_words)) {
                 if (out_indices) out_indices[count] = b;
-                if (out_d) out_d[count] = eng->shots[b].d;
+                if (out_d) out_d[count] = s.d;
                 count++;
             }
         }
         return count;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        return -2;
-    } catch (...) {
-        eng->record_exception(2);
-        return -3;
-    }
+    });
 }
 
 void engine_export_shot(
@@ -872,7 +922,7 @@ void engine_export_shot(
     if (!ptr) return;
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
     if (eng->fail_kind != 0 || !out_h || !out_au) return;
-    try {
+    run_void_guarded(eng, [&]() {
         if (b < 0 || b >= eng->batch_size) return;
         const CppMRQFShot& s = eng->shots[b];
         int nw = eng->n_words;
@@ -892,11 +942,7 @@ void engine_export_shot(
             }
             std::memcpy(out_P, s.P.data(), size_t(d) * sizeof(int32_t));
         }
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-    } catch (...) {
-        eng->record_exception(2);
-    }
+    });
 }
 
 void engine_import_shot(
@@ -913,7 +959,7 @@ void engine_import_shot(
     if (!ptr) return;
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
     if (eng->fail_kind != 0 || !in_h || !in_au) return;
-    try {
+    run_void_guarded(eng, [&]() {
         if (b < 0 || b >= eng->batch_size || d < 0 || d > eng->num_qubits) return;
         if (d > 0) {
             if (!in_A || !in_ell || !in_Gamma || !in_P) return;
@@ -940,11 +986,7 @@ void engine_import_shot(
             std::memcpy(s.P.data(), in_P, size_t(d) * sizeof(int32_t));
         }
         eng->is_active[b] = (d > 0 || words_any_nonzero(in_h, nw)) ? 1 : 0;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-    } catch (...) {
-        eng->record_exception(2);
-    }
+    });
 }
 
 static void inject_general_clifford_impl(
@@ -1038,22 +1080,14 @@ void engine_batch_inject_general_clifford(
     *any_evict_z = 0;
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
     if (eng->fail_kind != 0) return;
-    try {
+    run_void_guarded(eng, [&]() {
         inject_general_clifford_impl(
             eng, num_groups, arity, n_factors, target_groups, cond_mask, xs_base, zs_base,
             factor_kinds, factor_lx1, factor_lz1, factor_a1_w, factor_b1_w, factor_kap1,
             factor_lx2, factor_lz2, factor_a2_w, factor_b2_w, factor_kap2,
             x2z_w, z2z_w, out_evict_x, out_evict_z, any_evict_x, any_evict_z
         );
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-    } catch (...) {
-        eng->record_exception(2);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-    }
+    }, any_evict_x, any_evict_z);
 }
 
 static void det_meas_step_impl(
@@ -1102,7 +1136,9 @@ static void det_meas_step_impl(
             } else {
                 size_t qb = size_t(q_arr[k]) * size_t(B) + size_t(b);
                 int sigma = (int(xs_base[qb]) ^ int(m_ref_arr[k])) & 1;
-                int m_val = mrqf.p3_measure_diagonal(b_k, sigma, -1, &eng->shot_rng_states[b]);
+                int m_val = mrqf.p3_measure_diagonal(
+                    b_k, sigma, -1, &eng->shot_rng_states_owned[b]
+                );
                 m_mat[kb] = uint8_t(m_val);
             }
         }
@@ -1133,20 +1169,12 @@ void engine_batch_det_meas_step(
     *any_evict_z = 0;
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
     if (eng->fail_kind != 0) return;
-    try {
+    run_void_guarded(eng, [&]() {
         det_meas_step_impl(
             eng, num_sub, q_arr, m_ref_arr, b_sub_words, xs_base, m_mat,
             x2z_w, z2z_w, accum_x_mask, accum_z_mask, any_evict_x, any_evict_z
         );
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-    } catch (...) {
-        eng->record_exception(2);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-    }
+    }, any_evict_x, any_evict_z);
 }
 
 // 2B. Fused mixed/random Z measurement step (handles Round 1 where is_random == True!)
@@ -1208,7 +1236,7 @@ static void mixed_substep_det(
             } else {
                 int sigma = (int(f_q_shots[b]) ^ int(m_ref)) & 1;
                 m_b = uint8_t(
-                    mrqf.p3_measure_diagonal(b_words, sigma, -1, &eng->shot_rng_states[b])
+                    mrqf.p3_measure_diagonal(b_words, sigma, -1, &eng->shot_rng_states_owned[b])
                 );
             }
         } else if (eng->is_active[b] && eng->shots[b].d == 0) {
@@ -1257,7 +1285,7 @@ static void mixed_substep_rand(
                 mrqf.p2_apply_quarter_turn(a_words, b_rot_words, kappa_rot);
                 int req = int(m_b ^ fq_b);
                 int m_eff = mrqf.p3_measure_diagonal(
-                    e_p_words, 0, req, &eng->shot_rng_states[b]
+                    e_p_words, 0, req, &eng->shot_rng_states_owned[b]
                 );
                 m_shots[b] = uint8_t(m_eff ^ fq_b);
             }
@@ -1314,7 +1342,7 @@ void engine_batch_mixed_substep(
         return;
     }
     if (!xs_base || !m_shots) return;
-    try {
+    run_void_guarded(eng, [&]() {
         if (!validate_mixed_substep_args(
                 eng, is_random, q, p, beta_or_a_words, b_rot_words, e_p_words,
                 num_gx, gx_indices, num_gz, gz_indices,
@@ -1331,15 +1359,7 @@ void engine_batch_mixed_substep(
             num_gx, gx_indices, num_gz, gz_indices, xs_base, m_shots,
             accum_x_mask, accum_z_mask, any_x_accum, any_z_accum
         );
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        if (any_x_accum) *any_x_accum = 0;
-        if (any_z_accum) *any_z_accum = 0;
-    } catch (...) {
-        eng->record_exception(2);
-        if (any_x_accum) *any_x_accum = 0;
-        if (any_z_accum) *any_z_accum = 0;
-    }
+    }, any_x_accum, any_z_accum);
 }
 
 void engine_batch_evict(
@@ -1363,19 +1383,11 @@ void engine_batch_evict(
     if (!x2z_w || !z2z_w || !accum_x_mask || !accum_z_mask || !any_evict_x || !any_evict_z) {
         return;
     }
-    try {
+    run_void_guarded(eng, [&]() {
         eng->evict_healed_shots(
             x2z_w, z2z_w, xs_base, zs_base, accum_x_mask, accum_z_mask, any_evict_x, any_evict_z
         );
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-    } catch (...) {
-        eng->record_exception(2);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-    }
+    }, any_evict_x, any_evict_z);
 }
 
 // 3. Fused batch unmatched noisy reset Z
@@ -1461,7 +1473,7 @@ void engine_batch_unmatched_noisy_reset_z(
     if (eng->fail_kind != 0) return;
     if (!reset_zero_mask || !reset_one_mask || !xs_base || !z2x_w || !z2z_w || !z_kappa ||
         !x2z_w || !out_x_kick_mask || !out_evict_z_mask) return;
-    try {
+    run_void_guarded(eng, [&]() {
         for (int q = 0; q < eng->num_qubits; ++q) {
             reset_z_qubit(
                 eng, q, reset_zero_mask, reset_one_mask, xs_base, z2x_w, z2z_w, z_kappa,
@@ -1472,15 +1484,7 @@ void engine_batch_unmatched_noisy_reset_z(
             x2z_w, z2z_w, xs_base, nullptr,
             out_x_kick_mask, out_evict_z_mask, any_x_kick, any_evict_z
         );
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        *any_x_kick = 0;
-        *any_evict_z = 0;
-    } catch (...) {
-        eng->record_exception(2);
-        *any_x_kick = 0;
-        *any_evict_z = 0;
-    }
+    }, any_x_kick, any_evict_z);
 }
 
 static void peek_pauli_batch_impl(
@@ -1553,7 +1557,7 @@ void engine_peek_pauli_batch(
     if (num_targets <= 0 || pauli_kind < 0 || pauli_kind > 2) return;
     if (!targets || !xs_base || !zs_base || !x2x_w || !x2z_w || !z2x_w || !z2z_w ||
         !x_kappa || !z_kappa || !out_exps) return;
-    try {
+    run_void_guarded(eng, [&]() {
         for (int idx = 0; idx < num_targets; ++idx) {
             if (targets[idx] < 0 || targets[idx] >= eng->num_qubits) return;
         }
@@ -1561,11 +1565,7 @@ void engine_peek_pauli_batch(
             eng, num_targets, targets, pauli_kind, xs_base, zs_base,
             x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa, out_exps
         );
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-    } catch (...) {
-        eng->record_exception(2);
-    }
+    });
 }
 
 int coset_kernels_abi_v2() {
@@ -1710,7 +1710,7 @@ int engine_postselect_batch(
         !x_kappa || !z_kappa || !out_evict_x || !out_evict_z || !any_evict_x || !any_evict_z) {
         return -1;
     }
-    try {
+    return run_int_guarded(eng, -9, -10, [&]() -> int {
         int vrc = validate_postselect_args(
             eng, q, pauli_kind, flip_len, desired_len, xs_rows, xs_cols, xs_base,
             zs_rows, zs_cols, zs_base, pw_rows, pw_cols,
@@ -1725,17 +1725,7 @@ int engine_postselect_batch(
             out_evict_x, out_evict_z, any_evict_x, any_evict_z
         );
         return 0;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-        return -9;
-    } catch (...) {
-        eng->record_exception(2);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-        return -10;
-    }
+    }, any_evict_x, any_evict_z);
 }
 
 static inline int validate_project_pauli_args(
@@ -1879,7 +1869,7 @@ int engine_project_pauli(
         !any_x_kick || !any_z_kick) {
         return -1;
     }
-    try {
+    return run_int_guarded(eng, -10, -11, [&]() -> int {
         int vrc = validate_project_pauli_args(
             eng, pauli_kind, r0_rows, r0_cols, r1_rows, r1_cols, num_order, order,
             xs_rows, xs_cols, xs_base, zs_rows, zs_cols, zs_base, pw_rows, pw_cols,
@@ -1906,17 +1896,7 @@ int engine_project_pauli(
             );
         }
         return 0;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        *any_x_kick = 0;
-        *any_z_kick = 0;
-        return -10;
-    } catch (...) {
-        eng->record_exception(2);
-        *any_x_kick = 0;
-        *any_z_kick = 0;
-        return -11;
-    }
+    }, any_x_kick, any_z_kick);
 }
 
 static inline int validate_register_step_args(
@@ -1985,7 +1965,7 @@ int engine_register_unitary_step(
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
     if (eng->fail_kind != 0) return -9;
     if (!x2z_w || !z2z_w) return -1;
-    try {
+    return run_int_guarded(eng, -9, -10, [&]() -> int {
         size_t tg_count = 0, gf_count = 0, pw_sz = 0, gfa = 0, gfw = 0;
         int vrc = validate_register_step_args(
             eng, num_groups, arity, n_factors, target_groups,
@@ -2017,29 +1997,17 @@ int engine_register_unitary_step(
         int step_id = int(eng->unitary_steps.size());
         eng->unitary_steps.push_back(std::move(st));
         return step_id;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        return -9;
-    } catch (...) {
-        eng->record_exception(2);
-        return -10;
-    }
+    });
 }
 
 int engine_unitary_step_num_groups(void* ptr, int step_id) {
     if (!ptr) return -1;
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
     if (eng->fail_kind != 0) return -2;
-    try {
+    return run_int_guarded(eng, -2, -3, [&]() -> int {
         if (step_id < 0 || step_id >= int(eng->unitary_steps.size())) return -1;
         return eng->unitary_steps[step_id].num_groups;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        return -2;
-    } catch (...) {
-        eng->record_exception(2);
-        return -3;
-    }
+    });
 }
 
 int engine_register_unitary_group_evict(
@@ -2053,7 +2021,7 @@ int engine_register_unitary_group_evict(
     if (!ptr) return -1;
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
     if (eng->fail_kind != 0) return -7;
-    try {
+    return run_int_guarded(eng, -7, -8, [&]() -> int {
         if (step_id < 0 || step_id >= int(eng->unitary_steps.size())) return -2;
         CppUnitaryStep& st = eng->unitary_steps[step_id];
         if (num_groups != st.num_groups) return -3;
@@ -2069,13 +2037,7 @@ int engine_register_unitary_group_evict(
         st.group_z2z_w.assign(group_z2z_w, group_z2z_w + total);
         st.has_group_evict = true;
         return 0;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        return -7;
-    } catch (...) {
-        eng->record_exception(2);
-        return -8;
-    }
+    });
 }
 
 int engine_inject_group_v3(
@@ -2101,7 +2063,7 @@ int engine_inject_group_v3(
         !any_evict_x || !any_evict_z) {
         return -1;
     }
-    try {
+    return run_int_guarded(eng, -7, -8, [&]() -> int {
         int N = eng->num_qubits;
         int B = eng->batch_size;
         int nw = eng->n_words;
@@ -2130,17 +2092,7 @@ int engine_inject_group_v3(
             ev_x2z, ev_z2z, xs_base, zs_base, out_evict_x, out_evict_z, any_evict_x, any_evict_z
         );
         return 0;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-        return -7;
-    } catch (...) {
-        eng->record_exception(2);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-        return -8;
-    }
+    }, any_evict_x, any_evict_z);
 }
 
 int engine_batch_inject_general_clifford_v3(
@@ -2164,7 +2116,7 @@ int engine_batch_inject_general_clifford_v3(
     if (!xs_base || !zs_base || !out_evict_x || !out_evict_z || !any_evict_x || !any_evict_z) {
         return -1;
     }
-    try {
+    return run_int_guarded(eng, -7, -8, [&]() -> int {
         int N = eng->num_qubits;
         int B = eng->batch_size;
         if (step_id < 0 || step_id >= int(eng->unitary_steps.size())) return -2;
@@ -2190,17 +2142,7 @@ int engine_batch_inject_general_clifford_v3(
             out_evict_x, out_evict_z, any_evict_x, any_evict_z
         );
         return 0;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-        return -7;
-    } catch (...) {
-        eng->record_exception(2);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-        return -8;
-    }
+    }, any_evict_x, any_evict_z);
 }
 
 int engine_peek_pauli_batch_v3(
@@ -2225,7 +2167,7 @@ int engine_peek_pauli_batch_v3(
     if (!xs_base || !zs_base || !x2x_w || !x2z_w || !z2x_w || !z2z_w || !x_kappa || !z_kappa) {
         return -1;
     }
-    try {
+    return run_int_guarded(eng, -8, -9, [&]() -> int {
         int N = eng->num_qubits;
         int B = eng->batch_size;
         int nw = eng->n_words;
@@ -2245,13 +2187,7 @@ int engine_peek_pauli_batch_v3(
             x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa, out_exps
         );
         return 0;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        return -8;
-    } catch (...) {
-        eng->record_exception(2);
-        return -9;
-    }
+    });
 }
 
 int engine_batch_evict_v3(
@@ -2276,7 +2212,7 @@ int engine_batch_evict_v3(
     if (!x2z_w || !z2z_w || !accum_x_mask || !accum_z_mask || !any_evict_x || !any_evict_z) {
         return -1;
     }
-    try {
+    return run_int_guarded(eng, -6, -7, [&]() -> int {
         int N = eng->num_qubits;
         int B = eng->batch_size;
         int nw = eng->n_words;
@@ -2290,17 +2226,57 @@ int engine_batch_evict_v3(
             x2z_w, z2z_w, xs_base, zs_base, accum_x_mask, accum_z_mask, any_evict_x, any_evict_z
         );
         return 0;
-    } catch (const std::bad_alloc&) {
-        eng->record_exception(1);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-        return -6;
-    } catch (...) {
-        eng->record_exception(2);
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-        return -7;
-    }
+    }, any_evict_x, any_evict_z);
+}
+
+// Export shot with explicit caller buffer capacities (R6-F1 / A''-1).
+// Returns d >= 0 on success, or < 0 on error without writing output buffers:
+//   -1: null ptr/out_h/out_au, or d > 0 with null out_A/out_ell/out_Gamma/out_P
+//   -2: invalid shot index b or negative cap_words / cap_d
+//   -3: cap_words < eng->n_words
+//   -4: shot rank s.d > cap_d (writes nothing)
+//   -6: failed engine (fail_kind != 0) or std::bad_alloc
+//   -7: other C++ exception
+int engine_export_shot_v3(
+    void* ptr,
+    int b,
+    int cap_words,
+    int cap_d,
+    uint64_t* out_h,
+    uint64_t* out_au,
+    uint64_t* out_A,
+    uint8_t* out_ell,
+    uint8_t* out_Gamma,
+    int32_t* out_P
+) {
+    if (!ptr) return -1;
+    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
+    if (eng->fail_kind != 0) return -6;
+    if (!out_h || !out_au) return -1;
+    if (b < 0 || b >= eng->batch_size || cap_words < 0 || cap_d < 0) return -2;
+    if (cap_words < eng->n_words) return -3;
+    return run_int_guarded(eng, -6, -7, [&]() -> int {
+        const CppMRQFShot& s = eng->shots[b];
+        int nw = eng->n_words;
+        int d = s.d;
+        if (d > cap_d) return -4;
+        if (d > 0 && (!out_A || !out_ell || !out_Gamma || !out_P)) return -1;
+        std::memcpy(out_h, s.h_words.data(), size_t(nw) * sizeof(uint64_t));
+        std::memcpy(out_au, s.a_union.data(), size_t(nw) * sizeof(uint64_t));
+        if (d > 0) {
+            std::memcpy(out_A, s.A_buf.data(), size_t(d) * size_t(nw) * sizeof(uint64_t));
+            std::memcpy(out_ell, s.ell_buf.data(), size_t(d) * sizeof(uint8_t));
+            for (int r = 0; r < d; ++r) {
+                std::memcpy(
+                    out_Gamma + size_t(r) * size_t(d),
+                    &s.Gamma_buf[size_t(r) * size_t(s.cap)],
+                    size_t(d) * sizeof(uint8_t)
+                );
+            }
+            std::memcpy(out_P, s.P.data(), size_t(d) * sizeof(int32_t));
+        }
+        return d;
+    });
 }
 
 int coset_kernels_abi_v3() {

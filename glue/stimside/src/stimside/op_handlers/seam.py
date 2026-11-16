@@ -65,7 +65,12 @@ class BatchedLeakageSimulator(Protocol):
         pauli: Literal["X", "Y", "Z"] = "Z",
         order: Sequence[int] | None = None,
     ) -> None:
-        """Noisy reset of unmatched shots; trace-preserving (the branch mass stays unchanged)."""
+        """Noisy reset of unmatched shots; trace-preserving (the branch mass stays unchanged).
+
+        ``order`` optionally lists qubit indices in ``[0, num_qubits)`` (deduplicated preserving
+        first occurrence): ``None`` resets masked qubits in ascending order; otherwise only masked
+        qubits present in ``order`` are reset, in that order (``order=[]`` resets nothing).
+        """
 
     def apply_pauli(
         self, pauli: Literal["X", "Y", "Z"], mask: NDArray[np.bool_], p: float = 1.0

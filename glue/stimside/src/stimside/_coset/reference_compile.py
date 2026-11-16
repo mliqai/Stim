@@ -181,7 +181,9 @@ class UnitaryStepMeta(_StepWordsMixin):
     _group_packed_words: list[PackedSymplecticTables] | None = None
     are_groups_disjoint: bool = True
     _packed_words: PackedSymplecticTables | None = None
-    _is_mixed: bool = dataclasses.field(default=False, init=False, repr=False, compare=False)
+    _is_mixed: bool | None = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
     _op_bounds_nq: int = dataclasses.field(default=-1, init=False, repr=False, compare=False)
     _cpp_cocycle_arrays: (
         tuple[int, int, int, NDArray[np.int64], list[NDArray]] | None
@@ -363,6 +365,7 @@ class NoopStepMeta(_StepWordsMixin):
     op: stim.CircuitInstruction
     _packed_words: PackedSymplecticTables | None = None
     num_qubits: int = 0
+    _op_bounds_nq: int = dataclasses.field(default=-1, init=False, repr=False, compare=False)
 
 
 StepMeta = UnitaryStepMeta | MeasStepMeta | NoopStepMeta
@@ -410,9 +413,15 @@ class CompiledReferenceCircuit:
     def _make_noop(
         self, op: stim.CircuitInstruction, snap: PackedSymplecticTables
     ) -> NoopStepMeta:
-        return NoopStepMeta(
+        meta = NoopStepMeta(
             kind="noop", op=op, _packed_words=snap, num_qubits=self.num_qubits
         )
+        if all(
+            t.qubit_value is None or 0 <= t.qubit_value < self.num_qubits
+            for t in op.targets_copy()
+        ):
+            meta._op_bounds_nq = self.num_qubits
+        return meta
 
     def _run_meas_substep(
         self,

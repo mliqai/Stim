@@ -1,8 +1,9 @@
 include LICENSE
 include README.md
+include CHANGELOG.md
 include pyproject.toml
 include setup.py
 recursive-include src *.py *.cpp golden_digests.json
 include src/stimside/_native/qfe_core.hpp
 include src/stimside/_native/magic_engine.hpp
-global-exclude *.so *.dylib *.pyd *.dll
+global-exclude *.so *.dylib *.pyd *.dll *.build_id

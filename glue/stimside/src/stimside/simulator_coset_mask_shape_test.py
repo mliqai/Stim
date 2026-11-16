@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import os
+from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -31,11 +33,22 @@ import pytest
 import stim
 
 from stimside._coset.reference_compile import CompiledReferenceCircuit, UnitaryStepMeta
+from stimside._native import coset_kernels
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.simulator_coset import CosetsideSimulator
 
 _DCC_KERNEL = "engine_batch_inject_general_clifford_v3"
+_GROUP_KERNEL = "engine_inject_group_v3"
 _RESET_KERNEL = "engine_batch_unmatched_noisy_reset_z"
+_PROJECT_KERNEL = "engine_project_pauli"
+_POSTSELECT_KERNEL = "engine_postselect_batch"
+_ALL_MASK_KERNELS = (
+    _DCC_KERNEL,
+    _GROUP_KERNEL,
+    _RESET_KERNEL,
+    _PROJECT_KERNEL,
+    _POSTSELECT_KERNEL,
+)
 _N = 6  # qubits of every circuit below
 _H4 = stim.CircuitInstruction("H", [0, 1, 2, 3])  # 4 disjoint groups
 _CX_DISJOINT = stim.CircuitInstruction("CX", [0, 1, 2, 3])  # 2 disjoint groups
@@ -44,12 +57,24 @@ _X4 = stim.CircuitInstruction("X", [0, 1, 2, 3])  # Pauli: bypasses the cocycle 
 _TAIL = "\nTICK\nM 0 1 2 3 4 5"
 
 
+def _coset_cpp_missing() -> bool:
+    native_dir = Path(coset_kernels.__file__).resolve().parent
+    has_so = (native_dir / "libcoset_kernels.so").exists()
+    can_compile = (native_dir / "coset_kernels.cpp").exists() and os.access(native_dir, os.W_OK)
+    return not (has_so or can_compile)
+
+
+_SKIP_NO_CPP = pytest.mark.skipif(
+    _coset_cpp_missing(), reason="coset C++ kernel library is unavailable"
+)
+
+
 class _KernelSpy:
     """Delegates to the real library; forbidden kernels raise AssertionError, others are counted."""
 
     def __init__(self, lib: ctypes.CDLL, forbid: tuple[str, ...] = ()) -> None:
         self._lib, self._forbid = lib, forbid
-        self.calls = {_DCC_KERNEL: 0, _RESET_KERNEL: 0}
+        self.calls = {k: 0 for k in _ALL_MASK_KERNELS}
 
     def __getattr__(self, name: str) -> Any:
         fn = getattr(self._lib, name)
@@ -77,7 +102,7 @@ def _sim(
         sim._use_cpp = False
     if sim._cpp_lib is None:
         return sim, None
-    spy = _KernelSpy(sim._cpp_lib, (_DCC_KERNEL, _RESET_KERNEL) if forbid else ())
+    spy = _KernelSpy(sim._cpp_lib, _ALL_MASK_KERNELS if forbid else ())
     sim._cpp_lib = cast(ctypes.CDLL, spy)
     return sim, spy
 
@@ -145,6 +170,7 @@ def test_conditional_clifford_rejects_every_wrong_mask_shape_before_the_kernel(
         assert _fingerprint(sim) == before, f"state changed by the rejected {name} call"
 
 
+@_SKIP_NO_CPP
 def test_the_asan_repro_a_one_row_mask_for_a_four_group_step_raises() -> None:
     """run2's mini.py: `H 0` with a (1, B) mask against the 4-group step of `H 0 1 2 3`.
 
@@ -155,6 +181,7 @@ def test_the_asan_repro_a_one_row_mask_for_a_four_group_step_raises() -> None:
     assert spy is not None and spy.calls[_DCC_KERNEL] == 0
 
 
+@_SKIP_NO_CPP
 def test_a_mask_that_fits_the_op_but_not_its_compiled_step_raises() -> None:
     """After `clear()` rewinds the step cursor a caller can replay an op against the wrong step;
     the mask then has one row per op group but fewer than the step's groups."""
@@ -165,6 +192,7 @@ def test_a_mask_that_fits_the_op_but_not_its_compiled_step_raises() -> None:
     assert spy is not None and spy.calls[_DCC_KERNEL] == 0
 
 
+@_SKIP_NO_CPP
 @pytest.mark.parametrize("batch", [1, 64])
 def test_a_step_with_no_target_groups_takes_a_zero_row_mask(batch: int) -> None:
     """Past the circuit's end `do_conditional_clifford` compiles a new step: `H` with no targets."""
@@ -659,6 +687,7 @@ def test_unmatched_reset_rejects_every_wrong_mask_shape_before_the_kernel(
         assert _fingerprint(sim) == before, f"state changed by the rejected {name} call"
 
 
+@_SKIP_NO_CPP
 def test_the_unmatched_reset_repro_a_short_mask_raises_instead_of_reading_past_it() -> None:
     sim, spy = _sim("H 0 1 2 3" + _TAIL, 64)
     r1 = np.zeros((1, 64), bool)
@@ -709,7 +738,9 @@ _VALID_DIGESTS: dict[tuple[int, bool], str] = {
 }
 
 
-@pytest.mark.parametrize("use_cpp", [True, False], ids=["kernel", "python"])
+@pytest.mark.parametrize(
+    "use_cpp", [pytest.param(True, marks=_SKIP_NO_CPP), False], ids=["kernel", "python"]
+)
 @pytest.mark.parametrize("batch", [1, 8, 65])
 def test_correctly_shaped_masks_give_the_results_of_the_unguarded_code(
     batch: int, use_cpp: bool
@@ -718,7 +749,12 @@ def test_correctly_shaped_masks_give_the_results_of_the_unguarded_code(
     sim, spy = _sim(text + _TAIL, batch, use_cpp=use_cpp, forbid=False)
     digest = _scenario(sim, batch)
     if use_cpp:
-        assert spy is not None and spy.calls[_DCC_KERNEL] >= 1 and spy.calls[_RESET_KERNEL] >= 1
+        assert (
+            spy is not None
+            and spy.calls[_DCC_KERNEL] >= 1
+            and spy.calls[_RESET_KERNEL] >= 1
+            and spy.calls[_PROJECT_KERNEL] >= 1
+        )
     assert digest == _VALID_DIGESTS[(batch, use_cpp)]
 
 

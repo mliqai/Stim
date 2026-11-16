@@ -58,7 +58,7 @@ _DET_MEASURE_CIRCUIT = stim.Circuit(
 )
 _CX_CIRCUIT = stim.Circuit(
     str(_DET_MEASURE_CIRCUIT[:4]) + "\nTICK\nCX 0 1 1 2 2 3\nTICK\nM 0 1 2 3"
-)  # overlapping CX groups: do_conditional_clifford takes its Python (non-disjoint) path
+)  # overlapping CX groups: do_conditional_clifford takes its sequential C++ kernel path
 _DISJOINT_CX_CIRCUIT = stim.Circuit(
     str(_DET_MEASURE_CIRCUIT[:4]) + "\nTICK\nCX 0 1 2 3\nTICK\nM 0 1 2 3"
 )  # disjoint CX groups: do_conditional_clifford takes its C++ kernel path
@@ -73,7 +73,7 @@ def batch(request: pytest.FixtureRequest) -> int:
 class _CountingLib:
     """Delegates to the real ctypes library and counts selected ``engine_*`` calls.
 
-    ``fail_export_call=n`` makes the n-th ``engine_export_shot`` raise KeyboardInterrupt (once).
+    ``fail_export_call=n`` makes the n-th ``engine_export_shot_v3`` raise KeyboardInterrupt (once).
     """
 
     def __init__(self, lib: ctypes.CDLL, fail_export_call: int | None = None) -> None:
@@ -82,7 +82,7 @@ class _CountingLib:
         self.counts = {
             "engine_import_shot": 0,
             "engine_clear": 0,
-            "engine_export_shot": 0,
+            "engine_export_shot_v3": 0,
         }
 
     def __getattr__(self, name: str):
@@ -92,7 +92,7 @@ class _CountingLib:
 
         def counted(*args):
             self.counts[name] += 1
-            if name == "engine_export_shot" and self.counts[name] == self.fail_export_call:
+            if name == "engine_export_shot_v3" and self.counts[name] == self.fail_export_call:
                 raise KeyboardInterrupt
             return fn(*args)
 
@@ -155,6 +155,14 @@ def _postselect(sim: CosetsideSimulator, pauli: _Pauli = "Z") -> None:
 def _peek_all(sim: CosetsideSimulator) -> np.ndarray:
     qs = list(range(sim.num_qubits))
     return np.vstack([sim.peek_pauli_batch(qs, p) for p in _PAULIS])
+
+
+def _py_peek_all(sim: CosetsideSimulator) -> np.ndarray:
+    """Compute Pauli expectations purely from Python ``_active_shots`` (independent of C++)."""
+    qs = np.arange(sim.num_qubits, dtype=np.int64)
+    xs_b, zs_b, _, _, _ = sim._flip_simulator.to_numpy(output_xs=True, output_zs=True)
+    pw = sim._current_packed_words()
+    return np.vstack([sim._peek_pauli_batch_py(qs, p, xs_b, zs_b, pw) for p in _PAULIS])
 
 
 def _shot_state(sim: CosetsideSimulator) -> dict:
@@ -321,7 +329,7 @@ def test_conditional_clifford_group_fn_peeking_mid_loop_agrees_with_python_path(
         sim = _setup_sim(batch, use_cpp, circuit)
         seen: list[np.ndarray] = []
         sim.interactive_do(list(circuit)[4])  # TICK
-        sim.peek_pauli_batch([0], "Z")  # engine clean, so the group peeks below must re-import
+        sim.peek_pauli_batch([0], "Z")  # engine clean, so group peeks below stay in C++
 
         def group_fn(g: int, sim: CosetsideSimulator = sim, seen: list = seen) -> np.ndarray:
             seen.append(sim.peek_pauli_batch([0, 1, 2, 3], "X").copy())
@@ -356,7 +364,7 @@ def test_export_interrupted_midway_keeps_cpp_dirty_and_retries_cleanly(batch: in
     lib = _install_counting_lib(cpp, fail_export_call=2)
     with pytest.raises(KeyboardInterrupt):
         _ = cpp.active_shots
-    assert lib.counts["engine_export_shot"] == 2
+    assert lib.counts["engine_export_shot_v3"] == 2
     assert cpp._cpp_dirty
     cpp._cpp_lib = real_lib
     assert _shot_state(cpp) == _shot_state(py)
@@ -402,17 +410,20 @@ def _reset_bad_order(pauli: _Pauli) -> Callable[[CosetsideSimulator, pytest.Monk
 
 
 @pytest.mark.parametrize(
-    "scenario",
+    ("scenario", "expected_exc"),
     [
-        pytest.param(_post_short_desired_bits, id="postselect_short_desired_bits"),
-        pytest.param(_post_keyboard_interrupt, id="postselect_keyboard_interrupt"),
-        pytest.param(_reset_bad_order("X"), id="unmatched_reset_X_bad_order"),
-        pytest.param(_reset_bad_order("Y"), id="unmatched_reset_Y_bad_order"),
+        pytest.param(_post_short_desired_bits, ValueError, id="postselect_short_desired_bits"),
+        pytest.param(
+            _post_keyboard_interrupt, KeyboardInterrupt, id="postselect_keyboard_interrupt"
+        ),
+        pytest.param(_reset_bad_order("X"), IndexError, id="unmatched_reset_X_bad_order"),
+        pytest.param(_reset_bad_order("Y"), IndexError, id="unmatched_reset_Y_bad_order"),
     ],
 )
-def test_python_writer_raising_midway_leaves_engine_consistent(
+def test_rejected_or_interrupted_writer_leaves_engine_consistent(
     batch: int,
     scenario: Callable[[CosetsideSimulator, pytest.MonkeyPatch], None],
+    expected_exc: type[BaseException],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Upfront operand normalization rejects invalid/interrupting inputs before _cpp_dirty or shots.
@@ -423,7 +434,7 @@ def test_python_writer_raising_midway_leaves_engine_consistent(
         engine_before = _peek_all(sim)
         before = _raw_state(sim)
         assert sim._cpp_dirty is start_dirty
-        with pytest.raises((IndexError, ValueError, KeyboardInterrupt)):
+        with pytest.raises(expected_exc):
             scenario(sim, monkeypatch)
         assert sim._cpp_dirty is start_dirty
         assert _raw_state(sim) == before
@@ -653,7 +664,7 @@ def test_interrupt_after_a_mutating_kernel_returns_leaves_a_flag_raised(
     engine_view = _peek_all(sim)
     _ = sim.active_shots
     assert not sim._cpp_dirty
-    np.testing.assert_array_equal(engine_view, _peek_all(sim))
+    np.testing.assert_array_equal(_py_peek_all(sim), engine_view)
 
 
 _G1 = ["H", "S", "SQRT_X", "C_XYZ", "S_DAG", "SQRT_Y", "X", "Z"]
@@ -756,7 +767,7 @@ def _run_random_ops(seed: int, fb: int) -> list[np.ndarray]:
     return out
 
 
-def test_random_op_sequences_match_pre_fix_digest(batch: int) -> None:
+def test_random_op_sequences_match_pinned_digest(batch: int) -> None:
     digest = hashlib.sha256()
     for seed in range(60):
         for out in _run_random_ops(seed, _FUZZ_BATCH[batch]):
@@ -865,7 +876,7 @@ def test_interrupted_clear_leaves_pre_clear_state_until_retried(
     with pytest.raises(KeyboardInterrupt):
         sim.clear()
     assert not lib.armed
-    assert sim._cpp_dirty is engine_ahead
+    assert sim._cpp_dirty is True
     np.testing.assert_array_equal(_peek_all(sim), peeks_before)
     sim.clear()
     assert not sim._cpp_dirty and len(sim.active_shots) == 0
@@ -923,4 +934,4 @@ def test_interrupt_after_the_first_nonrandom_mixed_kernel_leaves_a_flag_raised(
     engine_view = _peek_all(sim)
     _ = sim.active_shots
     assert not sim._cpp_dirty
-    np.testing.assert_array_equal(engine_view, _peek_all(sim))
+    np.testing.assert_array_equal(_py_peek_all(sim), engine_view)

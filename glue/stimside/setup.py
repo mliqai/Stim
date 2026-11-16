@@ -21,6 +21,7 @@ import shutil
 import sys
 
 from setuptools import Extension, setup
+from setuptools.command.bdist_wheel import bdist_wheel
 from setuptools.command.build_ext import build_ext
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -54,7 +55,7 @@ class StimsideBuildExt(build_ext):
         out: dict[str, int] = {}
         for ext in self.extensions:
             mtimes = [
-                (PROJECT_ROOT / src).stat().st_mtime_ns
+                _KERNEL_LOADER._source_mtime_ns(PROJECT_ROOT / src)
                 for src in ext.sources
                 if (PROJECT_ROOT / src).exists()
             ]
@@ -62,23 +63,39 @@ class StimsideBuildExt(build_ext):
                 out[ext.name] = max(mtimes)
         return out
 
+    def _capture_build_ids(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for ext in self.extensions:
+            if not ext.sources:
+                continue
+            cpp_path = PROJECT_ROOT / ext.sources[0]
+            if cpp_path.exists():
+                out[ext.name] = _KERNEL_LOADER._compute_build_id(
+                    cpp_path, ext.extra_compile_args, ext.extra_link_args
+                )
+        return out
+
     def run(self) -> None:
         # The in-tree build_base persists across builds and its up-to-date check ignores
-        # compile-flag changes (e.g. STIMSIDE_PORTABLE_BUILD), so always rebuild.
+        # compile-flag changes (e.g. STIMSIDE_NATIVE_BUILD / STIMSIDE_PORTABLE_BUILD), so force.
         self.force = True
         src_mtimes = self._capture_source_mtimes()
+        build_ids = self._capture_build_ids()
         super().run()
-        self._sync_extensions_to_source_dir(src_mtimes)
+        self._sync_extensions_to_source_dir(src_mtimes, build_ids)
 
     def copy_extensions_to_source(self) -> None:
         self._sync_extensions_to_source_dir()
 
     def _sync_extensions_to_source_dir(
-        self, src_mtimes: dict[str, int] | None = None
+        self,
+        src_mtimes: dict[str, int] | None = None,
+        build_ids: dict[str, str] | None = None,
     ) -> None:
         package_dir_map = self.distribution.package_dir or {"": "src"}
         root_src = package_dir_map.get("", "src")
         captured = src_mtimes if src_mtimes is not None else self._capture_source_mtimes()
+        captured_ids = build_ids if build_ids is not None else self._capture_build_ids()
         for ext in self.extensions:
             rel_ext_path = self.get_ext_filename(ext.name)
             built_path = (Path(self.build_lib) / rel_ext_path).resolve()
@@ -96,9 +113,20 @@ class StimsideBuildExt(build_ext):
                     if src_mtime_ns is not None:
                         os.utime(tmp_dest, ns=(src_mtime_ns, src_mtime_ns))
                     os.replace(tmp_dest, dest_path)
+                build_id = captured_ids.get(ext.name)
+                if build_id is not None:
+                    _KERNEL_LOADER._write_build_id(dest_path, build_id)
             except OSError:
                 if self.inplace:
                     raise
+
+
+class StimsideBdistWheel(bdist_wheel):
+    """Tag wheels as py3-none-<platform> (ctypes C++ libraries use no Python C-API)."""
+
+    def get_tag(self) -> tuple[str, str, str]:
+        _, _, plat = super().get_tag()
+        return "py3", "none", plat
 
 
 _EXTENSIONS = (
@@ -125,6 +153,6 @@ def _get_extensions() -> list[Extension]:
 
 setup(
     ext_modules=_get_extensions(),
-    cmdclass={"build_ext": StimsideBuildExt},
+    cmdclass={"build_ext": StimsideBuildExt, "bdist_wheel": StimsideBdistWheel},
     options={"build": {"build_base": "python_build_stimside"}},
 )

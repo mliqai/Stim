@@ -512,9 +512,11 @@ def test_c12_evict_begin_end_and_callback_guards(monkeypatch: pytest.MonkeyPatch
         s_int.interactive_do(mpp_op)
     assert s_int._cpp_dirty
     monkeypatch.setattr(s_int, "_cpp_lib", real_lib)
+    s_int.clear()
     assert list(s_int.active_shots.keys()) == []
     assert not s_int._cpp_dirty
-    assert int(s_int.peek_pauli_batch([0], "Z")[0, 0]) == 1
+    fresh_i, _ = _mk_pair("MPP X0*X0\nM 0 1", 4, seed=18)
+    assert np.array_equal(s_int.peek_pauli_batch([0], "Z"), fresh_i.peek_pauli_batch([0], "Z"))
 
     # 3. Hostile condition_group_fn callbacks raise RuntimeError / ValueError cleanly
     s_cb, _ = _mk_pair("CX 0 1 1 2\nH 0\nM 0 1 2", 4, seed=19)
@@ -522,19 +524,27 @@ def test_c12_evict_begin_end_and_callback_guards(monkeypatch: pytest.MonkeyPatch
     h0 = stim.CircuitInstruction("H", [0])
     tick = stim.CircuitInstruction("TICK", [])
     xerr = stim.CircuitInstruction("X_ERROR", [0], [0.1])
-    forbidden: list[Any] = [
-        lambda: s_cb.clear(),
-        lambda: s_cb.run(),
-        lambda: s_cb.interactive_do(tick),
-        lambda: s_cb.finish_interactive_run(),
-        lambda: s_cb.do_conditional_clifford(h0, np.ones((1, 4), bool)),
-        lambda: s_cb.do_conditional_pauli_noise(xerr, None),
-        lambda: s_cb.do_unmatched_noisy_reset_z(np.zeros((3, 4), bool), np.zeros((3, 4), bool)),
-        lambda: s_cb.do_copies_on_fused_step(tick, [], lambda _: None),
-        lambda: s_cb._do_bare_instruction(tick),
-        lambda: s_cb._next_step_meta(tick),
+    forbidden: list[tuple[str, Any]] = [
+        ("clear", lambda: s_cb.clear()),
+        ("run", lambda: s_cb.run()),
+        ("interactive_do", lambda: s_cb.interactive_do(tick)),
+        ("finish_interactive_run", lambda: s_cb.finish_interactive_run()),
+        (
+            "do_conditional_clifford",
+            lambda: s_cb.do_conditional_clifford(h0, np.ones((1, 4), bool)),
+        ),
+        ("do_conditional_pauli_noise", lambda: s_cb.do_conditional_pauli_noise(xerr, None)),
+        (
+            "do_unmatched_noisy_reset_z",
+            lambda: s_cb.do_unmatched_noisy_reset_z(
+                np.zeros((3, 4), bool), np.zeros((3, 4), bool)
+            ),
+        ),
+        ("do_copies_on_fused_step", lambda: s_cb.do_copies_on_fused_step(tick, [], lambda _: None)),
+        ("_do_bare_instruction", lambda: s_cb._do_bare_instruction(tick)),
+        ("_next_step_meta", lambda: s_cb._next_step_meta(tick)),
     ]
-    for fn in forbidden:
+    for fn_name, fn in forbidden:
         s_cb._step_cursor = 0
 
         def hostile(g_idx: int, action: Any = fn) -> np.ndarray:
@@ -542,7 +552,8 @@ def test_c12_evict_begin_end_and_callback_guards(monkeypatch: pytest.MonkeyPatch
                 action()
             return np.ones(4, dtype=bool)
 
-        with pytest.raises(RuntimeError, match="forbidden inside condition_group_fn"):
+        pat = rf"^{fn_name} is forbidden inside condition_group_fn"
+        with pytest.raises(RuntimeError, match=pat):
             s_cb.do_conditional_clifford(cx, condition_group_fn=hostile)
         assert not s_cb._in_group_callback
 
@@ -1141,11 +1152,26 @@ def test_r3_med2_post_1711_int_invert_and_allowed_postselect() -> None:
         obj_m = np.empty((2, 2), dtype=object)
         for idx in np.ndindex(2, 2):
             obj_m[idx] = _Trig(False, lambda s=sim: s.do_conditional_clifford(x0, m_x), fired)
-        with pytest.raises((RuntimeError, ValueError)):
+        pat_m = r"condition_met_mask has shape \(1, 2\), expected \(2, 2\)"
+        with pytest.raises(ValueError, match=pat_m):
             sim.do_conditional_clifford(h2, obj_m)  # type: ignore[arg-type]
         xs, zs, _, _, _ = sim._flip_simulator.to_numpy(output_xs=True, output_zs=True)
         assert fired[0] and sim._step_cursor == 0
         assert not xs.any() and not zs.any()
+
+        sim_fit, _ = _mk_pair("X 0 1\nH 0 1\nTICK\nM 0 1", 2, seed=77)
+        sim_fit._use_cpp = use_cpp
+        x01 = stim.CircuitInstruction("X", [0, 1])
+        fired_fit = [False]
+        fit_m = np.empty((2, 2), dtype=object)
+        for idx in np.ndindex(2, 2):
+            fit_m[idx] = _Trig(
+                False,
+                lambda s=sim_fit, op=x01: s.do_conditional_clifford(op, np.ones((2, 2), bool)),
+                fired_fit,
+            )
+        sim_fit.do_conditional_clifford(h2, fit_m)  # type: ignore[arg-type]
+        assert fired_fit[0] and sim_fit._step_cursor == 2
 
     s12 = stim.CircuitInstruction("S", [1, 2])
     h0 = stim.CircuitInstruction("H", [0])
@@ -1215,6 +1241,28 @@ def test_r3_low1_clear_epoch_and_clear_run_restore() -> None:
         sys.setprofile(None)
     assert fired10[0] and sim10._step_cursor == 2 and len(sim10._compiled_ref.steps) == 2
 
+    sim11, _ = _mk_pair("H 0 1\nM 0 1", 2, seed=81)
+    h01 = stim.CircuitInstruction("H", [0, 1])
+    fired11 = [False]
+
+    def prof_nsm_clr_reenter(frame: Any, event: str, _arg: Any) -> None:
+        if (
+            not fired11[0]
+            and event == "return"
+            and frame.f_code.co_name == "_next_step_meta"
+        ):
+            fired11[0] = True
+            sim11.clear()
+            sim11.do_conditional_clifford(h01, np.ones((2, 2), bool))
+
+    sys.setprofile(prof_nsm_clr_reenter)
+    try:
+        with pytest.raises(ValueError, match="cleared"):
+            sim11.do_conditional_clifford(h01, np.zeros((2, 2), bool))
+    finally:
+        sys.setprofile(None)
+    assert fired11[0] and sim11._step_cursor == 1
+
 
 def _mk_sim_r4(
     c_txt: str,
@@ -1237,7 +1285,7 @@ def test_r5_sa_r4_med2_seq_eval_group_return_reentry_rejected() -> None:
     """R4 probe_2a & probe_2b: clear() at _eval_group_condition return raises cleanly."""
     c_txt = "H 0 1 2\nM 0 1 2"
     cx = stim.CircuitInstruction("CX", [0, 1, 1, 2])
-    sim_py = _mk_sim_r4(c_txt)
+    sim_py = _mk_sim_r4(c_txt, use_cpp=False)
     sim_py.run()
     calls = [0]
 
@@ -1249,7 +1297,7 @@ def test_r5_sa_r4_med2_seq_eval_group_return_reentry_rejected() -> None:
 
     sys.setprofile(prof_g1)
     try:
-        with pytest.raises((RuntimeError, ValueError)):
+        with pytest.raises(RuntimeError, match="forbidden inside condition_group_fn"):
             sim_py.do_conditional_clifford(cx, condition_group_fn=lambda _g: np.zeros(2, bool))
     finally:
         sys.setprofile(None)
@@ -1268,7 +1316,7 @@ def test_r5_sa_r4_med2_seq_eval_group_return_reentry_rejected() -> None:
 
     sys.setprofile(prof_g0)
     try:
-        with pytest.raises((RuntimeError, ValueError)):
+        with pytest.raises(RuntimeError, match="forbidden inside condition_group_fn"):
             sim_cpp._dcc_sequential_cpp(
                 st_meta, pw, None, lambda _g: np.zeros(2, bool)  # type: ignore[arg-type]
             )
@@ -1879,7 +1927,7 @@ def test_b2_public_sequential_and_callback_grid_parity(
 def test_b2_routing_targets_inject_group_v3_and_preserves_sync_and_python_modes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify B.2 routing to engine_inject_group_v3, callback invariants, v2 disjoint, sync."""
+    """Verify B.2 routing to engine_inject_group_v3, callback invariants, v3 disjoint, sync."""
     c_txt = "H 0 1 2\nTICK\nCX 0 1 1 2\nTICK\nCX 0 1\nTICK\nI 0 1\nM 0 1 2"
     s_cpp, s_py = _mk_pair(c_txt, 4, seed=505)
     h_op = stim.CircuitInstruction("H", [0, 1, 2])

@@ -25,7 +25,10 @@ from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUin
 from stimside.simulator_coset import CosetsideSimulator
 
 _DCC_KERNEL = "engine_batch_inject_general_clifford_v3"
+_GROUP_KERNEL = "engine_inject_group_v3"
 _RESET_KERNEL = "engine_batch_unmatched_noisy_reset_z"
+_PROJECT_KERNEL = "engine_project_pauli"
+_POSTSELECT_KERNEL = "engine_postselect_batch"
 _PEEK_KERNEL = "engine_peek_pauli_batch"
 _B = 16
 
@@ -143,7 +146,14 @@ class _SafetyKernelSpy:
         self._num_qubits = num_qubits
         self._batch = batch
         self._caller_bufs = caller_bufs or set()
-        self.calls: dict[str, int] = {_DCC_KERNEL: 0, _RESET_KERNEL: 0, _PEEK_KERNEL: 0}
+        self.calls: dict[str, int] = {
+            _DCC_KERNEL: 0,
+            _GROUP_KERNEL: 0,
+            _RESET_KERNEL: 0,
+            _PROJECT_KERNEL: 0,
+            _POSTSELECT_KERNEL: 0,
+            _PEEK_KERNEL: 0,
+        }
         self.expected_targets_len: int | None = None
 
     def _addr(self, ptr: Any) -> int:
@@ -165,9 +175,16 @@ class _SafetyKernelSpy:
         def spied(*args: Any) -> Any:
             if name == _DCC_KERNEL:
                 self._check_buf(name, args[4], int(args[2]) * self._batch)
+            elif name == _GROUP_KERNEL:
+                self._check_buf(name, args[4], int(args[3]))
             elif name == _RESET_KERNEL:
                 self._check_buf(name, args[1], self._num_qubits * self._batch)
                 self._check_buf(name, args[2], self._num_qubits * self._batch)
+            elif name == _PROJECT_KERNEL:
+                self._check_buf(name, args[4], int(args[2]) * self._batch)
+                self._check_buf(name, args[7], int(args[5]) * self._batch)
+            elif name == _POSTSELECT_KERNEL:
+                self._check_buf(name, args[4], int(args[3]))
             elif name == _PEEK_KERNEL:
                 n_t = int(args[1])
                 t_addr = self._addr(args[2])

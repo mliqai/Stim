@@ -4,6 +4,7 @@ python_build_stimside/
 *.egg-info/
 src/*.egg-info/
 *.so
+*.build_id
 __pycache__/
 .pytest_cache/
 .benchmarks/

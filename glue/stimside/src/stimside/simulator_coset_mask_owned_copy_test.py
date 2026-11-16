@@ -1,13 +1,12 @@
-"""A mask is copied first: the call checks and uses its own private copy (R3-F11).
+"""A mask is copied first: the call checks and uses its own private bool copy (R3-F11).
 
-`do_conditional_clifford` and `do_unmatched_noisy_reset_z` check the shape of a mask and later
-hand it to a C++ kernel that reads `rows * batch_size` bytes. `np.ascontiguousarray(mask,
-dtype=np.uint8)` returns the caller's OWN array for a C-contiguous uint8 mask and re-reads its
-shape and dtype at that moment, so a caller that changed the array in between (a signal handler
-flipping `mask.dtype`, a second thread calling `mask.resize(..., refcheck=False)`, an
-object-dtype `__bool__` hook) made the check and the kernel disagree: ASan heap-buffer-overflow at
-coset_kernels.cpp:629 / :891. Both methods now take one private copy (`_own_mask`), check that
-copy and use only that copy.
+`do_conditional_clifford`, `do_unmatched_noisy_reset_z`, and `postselect_z_batch` check the shape
+of a mask and later hand it to a C++ kernel. `np.ascontiguousarray(mask, dtype=np.uint8)` returns
+the caller's OWN array for a C-contiguous uint8 mask and re-reads its shape and dtype at that
+moment, so a caller that changed the array in between (a signal handler flipping `mask.dtype`, a
+second thread calling `mask.resize(..., refcheck=False)`, an object-dtype `__bool__` hook) made the
+check and the kernel disagree. These methods now take one private bool copy (`_own_mask` /
+`_own_group_row`), check that copy, and use only that copy.
 
 The tests are deterministic: a hook on an instance method fires once, after the shape check and
 before the mask is used, and changes the caller's array there directly, from a real signal
@@ -19,9 +18,9 @@ They check that
   spy checks that and stands in for the kernel, so a regression is an AssertionError, not an
   out-of-bounds read inside the test run);
 * the kernel is never handed the caller's own buffer, and the caller's arrays are not modified;
-* `_own_mask` returns a private, C-ordered, plain, writable array of the caller's dtype;
-* masks of every accepted dtype and layout give exactly the results of round 3 (digests pinned
-  on the code before this fix, which converted with `np.asarray` only), error outcomes included.
+* `_own_mask` returns a private, C-ordered, plain, writable `bool` copy;
+* masks of every accepted dtype and layout give the pinned truth-value outcomes, error outcomes
+  included.
 """
 
 from __future__ import annotations
@@ -47,7 +46,10 @@ from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUin
 from stimside.simulator_coset import CosetsideSimulator, _own_mask
 
 _DCC_KERNEL = "engine_batch_inject_general_clifford_v3"
+_GROUP_KERNEL = "engine_inject_group_v3"
 _RESET_KERNEL = "engine_batch_unmatched_noisy_reset_z"
+_PROJECT_KERNEL = "engine_project_pauli"
+_POSTSELECT_KERNEL = "engine_postselect_batch"
 _N = 6  # qubits of every circuit below
 _B = 8  # batch size of the hook tests (even: a uint8 mask can be re-viewed as uint16)
 _H4 = stim.CircuitInstruction("H", [0, 1, 2, 3])
@@ -71,7 +73,13 @@ class _MaskSpy:
     def __init__(self, lib: ctypes.CDLL, extents: dict[int, int], batch: int) -> None:
         self._lib, self._extents, self._batch = lib, extents, batch
         self.is_input: set[int] = set()  # addresses where np.ascontiguousarray made no new array
-        self.mask_ptrs: dict[str, list[int]] = {_DCC_KERNEL: [], _RESET_KERNEL: []}
+        self.mask_ptrs: dict[str, list[int]] = {
+            _DCC_KERNEL: [],
+            _GROUP_KERNEL: [],
+            _RESET_KERNEL: [],
+            _PROJECT_KERNEL: [],
+            _POSTSELECT_KERNEL: [],
+        }
 
     def _check(self, name: str, ptr: Any, rows: int) -> None:
         addr = ctypes.cast(ptr, ctypes.c_void_p).value or 0
@@ -88,6 +96,15 @@ class _MaskSpy:
         def spied(*args: Any) -> Any:
             if name == _DCC_KERNEL:
                 self._check(name, args[4], args[2])  # (eng, step_id, rows, cols, cm, ...)
+            elif name == _GROUP_KERNEL:
+                assert int(args[3]) == self._batch
+                self._check(name, args[4], 1)  # (eng, step_id, g_idx, n_b, cm_row, ...)
+            elif name == _PROJECT_KERNEL:
+                self._check(name, args[4], int(args[2]))  # (eng, p_kind, n_q, n_b, r0, ...)
+                self._check(name, args[7], int(args[5]))  # (..., n_q, n_b, r1, ...)
+            elif name == _POSTSELECT_KERNEL:
+                assert int(args[3]) == self._batch
+                self._check(name, args[4], 1)  # (eng, qi, p_kind, n_b, fm, ...)
             else:
                 self._check(name, args[1], _N)  # (eng, reset_zero, reset_one, ...)
                 self._check(name, args[2], _N)
@@ -319,10 +336,11 @@ def test_a_condition_met_mask_changed_after_the_check_is_not_what_the_call_uses(
 
     got, spy = _dcc_run(case, mask, use_cpp, change, monkeypatch)
     assert got == expected
-    if use_cpp and case[4] in ("h_disjoint", "cx_disjoint", "mixed_record_controlled") and (
-        not got.endswith("Error")
-    ):
-        assert len(_require_cpp_spy(spy).mask_ptrs[_DCC_KERNEL]) == 1  # ran, on a checked copy
+    if use_cpp and not got.endswith("Error"):
+        if case[4] in ("h_disjoint", "cx_disjoint", "mixed_record_controlled"):
+            assert len(_require_cpp_spy(spy).mask_ptrs[_DCC_KERNEL]) == 1
+        elif case[4] == "cx_overlapping":
+            assert len(_require_cpp_spy(spy).mask_ptrs[_GROUP_KERNEL]) == 3
 
 
 def _reset_run(
@@ -365,8 +383,9 @@ def test_a_reset_mask_changed_after_the_check_is_not_what_the_call_uses(
 
     got, spy = _reset_run(which, mask, use_cpp, change, monkeypatch, pauli=pauli)
     assert got == expected
-    if use_cpp and pauli == "Z":  # X/Y run on the Python path; Z ran on the kernel
-        ptrs = _require_cpp_spy(spy).mask_ptrs[_RESET_KERNEL]
+    if use_cpp:
+        kernel = _RESET_KERNEL if pauli == "Z" else _PROJECT_KERNEL
+        ptrs = _require_cpp_spy(spy).mask_ptrs[kernel]
         assert len(ptrs) == (4 if which == "zero" else 2)
 
 
@@ -413,8 +432,8 @@ def test_the_kernel_is_never_handed_the_callers_own_buffer(monkeypatch: pytest.M
 def test_a_uint8_mask_is_copied_once_the_kernel_gets_the_copy_itself(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The private copy is already C-ordered uint8, so `np.ascontiguousarray` hands it on as it
-    is: one copy per mask, not a copy of a copy (a Fortran-ordered copy would be copied again)."""
+    """The private copy is already C-ordered bool, so its uint8 view is C-ordered and
+    `np.ascontiguousarray` hands it on as it is: one copy per mask, not a copy of a copy."""
     sim, spy = _sim("H 0 1 2 3" + _TAIL, watch=monkeypatch)
     spy = _require_cpp_spy(spy)
     sim.do_conditional_clifford(_H4, _some_failed(4, _B, np.uint8))
@@ -534,7 +553,7 @@ def test_the_callers_mask_arrays_are_not_modified_by_either_method(
 
 
 @pytest.mark.parametrize("layout", list(_LAYOUTS))
-def test_own_mask_is_a_private_c_ordered_plain_copy_of_the_callers_dtype(layout: str) -> None:
+def test_own_mask_is_a_private_c_ordered_plain_bool_copy(layout: str) -> None:
     expected = np.random.default_rng(2).random((3, 8)) < 0.5
     caller = _LAYOUTS[layout](expected)
     got, plain = _own_mask(caller), np.asarray(caller)
@@ -642,7 +661,7 @@ def _outcome(layout: str, use_cpp: bool, batch: int) -> str:
     return hashlib.sha256(repr(_outcomes(layout, use_cpp, batch)).encode()).hexdigest()[:12]
 
 
-# (layout, use_cpp, batch) -> outcome digest, taken on the round-3 code (`np.asarray` only)
+# (layout, use_cpp, batch) -> outcome digest, pinned for valid truth-value conversions
 _PINNED: dict[tuple[str, bool, int], str] = {
     ("bool", True, 1): "bc4be2e99214",
     ("bool", True, 7): "421b7467b576",
@@ -746,9 +765,82 @@ _PINNED: dict[tuple[str, bool, int], str] = {
 @pytest.mark.parametrize("batch", [1, 7, 64])
 @pytest.mark.parametrize("use_cpp", _PATH_PARAMS, ids=_PATH_IDS)
 @pytest.mark.parametrize("layout", list(_LAYOUTS))
-def test_masks_of_every_dtype_and_layout_act_as_they_did_before_the_copy(
+def test_masks_of_every_dtype_and_layout_match_pinned_truth_value_digests(
     layout: str, use_cpp: bool, batch: int
 ) -> None:
     assert _outcome(layout, use_cpp, batch) == _PINNED[(layout, use_cpp, batch)], _outcomes(
         layout, use_cpp, batch
     )
+
+
+@pytest.mark.parametrize("pauli", ["Z", "X", "Y"])
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("kind", _MUTATIONS)
+@pytest.mark.parametrize("use_cpp", _PATH_PARAMS, ids=_PATH_IDS)
+def test_g2_postselect_mask_is_copied_and_mutation_isolated(
+    use_cpp: bool,
+    kind: str,
+    dtype: Any,
+    pauli: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G2: `postselect_z_batch` hands the kernel a private copy, not the caller's buffer."""
+    p_lit = cast(Literal["X", "Y", "Z"], pauli)
+    db = np.arange(_B, dtype=np.uint8) & 1
+
+    def run(mutate: bool) -> tuple[str, _MaskSpy | None, int]:
+        sim, spy = _sim("H 0 1 2 3" + _TAIL, use_cpp=use_cpp, watch=monkeypatch if mutate else None)
+        sim.do_conditional_clifford(_H4, _some_failed(4, _B, np.bool_))
+        fm = _some_failed(1, _B, dtype)[0].copy()
+        if mutate:
+            act = (
+                (lambda: fm.resize((1,), refcheck=False))
+                if kind == "resize"
+                else (lambda: _mutate(fm, kind))
+            )
+            _fire_once(sim, "_current_packed_words", act)
+        sim.postselect_z_batch(0, fm, db, pauli=p_lit)
+        return _digest(sim), spy, fm.ctypes.data
+
+    expected, _, _ = run(False)
+    got, spy, caller_addr = run(True)
+    assert got == expected
+    if use_cpp:
+        ptrs = _require_cpp_spy(spy).mask_ptrs[_POSTSELECT_KERNEL]
+        assert len(ptrs) == 1 and caller_addr not in ptrs
+
+
+@pytest.mark.parametrize("use_cpp", _PATH_PARAMS, ids=_PATH_IDS)
+def test_g4_condition_group_fn_bool_row_is_copied_and_mutation_isolated(
+    use_cpp: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G4: `_own_group_row` copies a C-contiguous bool row returned by `condition_group_fn`."""
+    rows = _some_failed(3, _B, np.bool_)
+    row_addrs: list[int] = []
+    kept_bufs: list[np.ndarray] = []
+
+    def run(mutate: bool) -> tuple[str, _MaskSpy | None]:
+        sim, spy = _sim(
+            "CX 0 1 1 2 2 3" + _TAIL, use_cpp=use_cpp, watch=monkeypatch if mutate else None
+        )
+
+        def group_fn(g_idx: int) -> np.ndarray:
+            buf = rows[g_idx].copy()
+            if mutate:
+                kept_bufs.append(buf)
+                row_addrs.append(buf.ctypes.data)
+            return buf
+
+        if mutate:
+            _fire_once(
+                sim, "_apply_unitary_to_frames", lambda: kept_bufs[-1].__setitem__(..., False)
+            )
+        sim.do_conditional_clifford(_CX3, condition_group_fn=group_fn)
+        return _digest(sim), spy
+
+    expected, _ = run(False)
+    got, spy = run(True)
+    assert got == expected
+    if use_cpp:
+        ptrs = _require_cpp_spy(spy).mask_ptrs[_GROUP_KERNEL]
+        assert len(ptrs) == 3 and not (set(row_addrs) & set(ptrs))

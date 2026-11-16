@@ -1,4 +1,16 @@
-"""Shared locate-or-compile logic for the ctypes kernel libraries (coset / tableside / marginal_dem / magic)."""
+"""Shared locate-or-compile logic for the ctypes kernel libraries.
+
+Loader policy (D-39):
+- Installed package (outside a source tree, e.g. ``site-packages``): prebuilt ``lib<name>.so``
+  is loaded directly without checking source mtimes or build IDs and without invoking a compiler.
+- Missing ABI symbol or unloadable installed library: ``load_cdll`` triggers a one-time rebuild
+  only if ``<name>.cpp`` is present and the directory is writable; otherwise it raises a clear
+  error instructing the user to run ``pip install``. If an older copy remains loaded in the
+  process, it raises ``RuntimeError`` advising to restart Python.
+- Source tree (``setup.py`` present and ``_native`` writable): recompiles automatically when
+  ``lib<name>.so`` is missing, older than ``<name>.cpp`` / regular non-symlink ``*.hpp`` headers,
+  or mismatched against its ``.lib<name>.build_id`` sidecar (source, headers, and build flags).
+"""
 
 from __future__ import annotations
 
@@ -12,7 +24,6 @@ import platform
 import shlex
 import stat
 import subprocess
-import tempfile
 from types import ModuleType
 from typing import Any
 
@@ -60,6 +71,7 @@ def get_cpp_compile_and_link_args(
     ]
     if (
         include_march_native
+        and os.environ.get("STIMSIDE_NATIVE_BUILD") == "1"
         and os.environ.get("STIMSIDE_PORTABLE_BUILD") != "1"
         and any(
             arch in machine
@@ -87,93 +99,161 @@ def _source_mtime_ns(cpp_path: Path) -> int:
     return max(mtimes)
 
 
+def _build_id_path(so_path: Path) -> Path:
+    return so_path.with_name(f".{so_path.stem}.build_id")
+
+
+def _compute_build_id(
+    cpp_path: Path,
+    compile_args: Sequence[str],
+    link_args: Sequence[str],
+) -> str:
+    """Compute SHA-256 build ID over source, regular non-symlink headers, and flags."""
+    h = hashlib.sha256(b"stimside-build-id-v1\0")
+    cpp_bytes = cpp_path.read_bytes()
+    h.update(f"cpp:{cpp_path.name}\0{len(cpp_bytes)}\0".encode())
+    h.update(cpp_bytes)
+    for hpp in sorted(cpp_path.parent.glob("*.hpp")):
+        try:
+            st = hpp.lstat()
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            hpp_bytes = hpp.read_bytes()
+        except OSError:
+            continue
+        h.update(f"hpp:{hpp.name}\0{len(hpp_bytes)}\0".encode())
+        h.update(hpp_bytes)
+    for arg in compile_args:
+        h.update(b"c:" + arg.encode("utf-8") + b"\0")
+    for arg in link_args:
+        h.update(b"l:" + arg.encode("utf-8") + b"\0")
+    return h.hexdigest()
+
+
+def _read_build_id(so_path: Path) -> str | None:
+    try:
+        return _build_id_path(so_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _write_build_id(so_path: Path, build_id: str) -> None:
+    tmp_id = so_path.with_name(f".{so_path.stem}.{os.getpid()}.tmp.build_id")
+    try:
+        tmp_id.write_text(f"{build_id}\n", encoding="utf-8")
+        os.replace(tmp_id, _build_id_path(so_path))
+    except BaseException:
+        tmp_id.unlink(missing_ok=True)
+        raise
+
+
+def _is_source_build_stale(
+    so_path: Path,
+    cpp_path: Path,
+    in_source_tree: bool,
+    compile_args: Sequence[str],
+    link_args: Sequence[str],
+) -> bool:
+    if not so_path.exists():
+        return True
+    if not (in_source_tree and cpp_path.exists() and os.access(so_path.parent, os.W_OK)):
+        return False
+    if _source_mtime_ns(cpp_path) > so_path.stat().st_mtime_ns:
+        return True
+    return _read_build_id(so_path) != _compute_build_id(cpp_path, compile_args, link_args)
+
+
+def _acquire_dir_lock(here: Path) -> int | None:
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    lock_fd: int | None = None
+    try:
+        import fcntl  # POSIX-only, and only needed when compiling.
+
+        dir_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        lock_fd = os.open(here, dir_flags)
+        if os.fstat(lock_fd).st_uid == uid:  # Never wait on another user's lock.
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except (ImportError, OSError):
+        pass  # Build without the cross-process lock.
+    return lock_fd
+
+
 def resolve_so(
     module_file: str,
     name: str,
     force_recompile: bool = False,
 ) -> Path:
-    """Locate lib<name>.so next to `module_file`; compile from `<name>.cpp` if missing or stale."""
+    """Locate lib<name>.so next to `module_file`; compile from `<name>.cpp` if missing/stale."""
     here = Path(module_file).resolve().parent
     cpp_path = here / f"{name}.cpp"
     so_path = here / f"lib{name}.so"
-
     in_source_tree = (
         "site-packages" not in here.parts
         and "dist-packages" not in here.parts
         and (here.parent.parent.parent / "setup.py").exists()
     )
-    need_compile = (
-        force_recompile
-        or not so_path.exists()
-        or (
-            in_source_tree
-            and cpp_path.exists()
-            and os.access(here, os.W_OK)
-            and _source_mtime_ns(cpp_path) > so_path.stat().st_mtime_ns
+    c_native, link_args = get_cpp_compile_and_link_args(include_march_native=True)
+    c_generic, _ = get_cpp_compile_and_link_args(include_march_native=False)
+    if not force_recompile and not _is_source_build_stale(
+        so_path, cpp_path, in_source_tree, c_native, link_args
+    ):
+        return so_path
+    if not cpp_path.exists():
+        raise FileNotFoundError(
+            f"Compiled shared library '{so_path.name}' not found in {here} "
+            f"and source '{cpp_path.name}' is missing. "
+            f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
         )
-    )
-    if need_compile:
-        if not cpp_path.exists():
-            raise FileNotFoundError(
-                f"Compiled shared library '{so_path.name}' not found in {here} "
-                f"and source '{cpp_path.name}' is missing. "
-                f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
-            )
-        if not os.access(here, os.W_OK):
-            raise PermissionError(
-                f"Cannot compile '{so_path.name}' into read-only directory {here}. "
-                f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
-            )
-        tmp_so = here / f".lib{name}.{os.getpid()}.tmp.so"
-        cxx = shlex.split(os.environ.get("CXX") or "c++") or ["c++"]
-        c_native, link_args = get_cpp_compile_and_link_args(include_march_native=True)
-        c_generic, _ = get_cpp_compile_and_link_args(include_march_native=False)
-        cmd_variants = [[*cxx, *c_native, *link_args, str(cpp_path), "-o", str(tmp_so)]]
-        if c_generic != c_native:
-            cmd_variants.append([*cxx, *c_generic, *link_args, str(cpp_path), "-o", str(tmp_so)])
-        last_exc: Exception | None = None
-        lock_digest = hashlib.sha1(os.fsencode(so_path)).hexdigest()[:16]
-        uid = os.getuid() if hasattr(os, "getuid") else 0
-        lock_path = Path(tempfile.gettempdir()) / f".stimside_build_{uid}_{lock_digest}.lock"
-        lf = None
-        try:
-            import fcntl  # POSIX-only, and only needed when compiling.
-
-            fd = os.open(
-                lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
-            )
-            lf = os.fdopen(fd, "a+b")
-            if os.fstat(fd).st_uid == uid:  # Never wait on a lock file another user created.
-                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass  # Build without the cross-process lock.
-        try:
-            if (
-                not force_recompile
-                and so_path.exists()
-                and (not in_source_tree or _source_mtime_ns(cpp_path) <= so_path.stat().st_mtime_ns)
-            ):
-                return so_path
-            for cmd in cmd_variants:
-                try:
-                    src_mtime_ns = _source_mtime_ns(cpp_path)
-                    subprocess.run(cmd, check=True)
-                    os.utime(tmp_so, ns=(src_mtime_ns, src_mtime_ns))
-                    os.replace(tmp_so, so_path)
-                    last_exc = None
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    if tmp_so.exists():
-                        tmp_so.unlink(missing_ok=True)
-        finally:
-            if lf is not None:
-                lf.close()
-        if last_exc is not None and (force_recompile or not so_path.exists()):
-            raise RuntimeError(
-                f"Failed to compile {cpp_path} with {cmd_variants[0]}. "
-                f"Please build/install stimside via 'pip install -e .' or 'pip install .'."
-            ) from last_exc
+    if not os.access(here, os.W_OK):
+        raise PermissionError(
+            f"Cannot compile '{so_path.name}' into read-only directory {here}. "
+            f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
+        )
+    tmp_so = here / f".lib{name}.{os.getpid()}.tmp.so"
+    cxx = shlex.split(os.environ.get("CXX") or "c++") or ["c++"]
+    variants = [(c_native, [*cxx, *c_native, *link_args, str(cpp_path), "-o", str(tmp_so)])]
+    if c_generic != c_native:
+        variants.append(
+            (c_generic, [*cxx, *c_generic, *link_args, str(cpp_path), "-o", str(tmp_so)])
+        )
+    last_exc: Exception | None = None
+    lock_fd = _acquire_dir_lock(here)
+    try:
+        if not force_recompile and not _is_source_build_stale(
+            so_path, cpp_path, in_source_tree, c_native, link_args
+        ):
+            return so_path
+        for used_c_args, cmd in variants:
+            try:
+                src_mtime_ns = _source_mtime_ns(cpp_path)
+                build_id = (
+                    _compute_build_id(cpp_path, used_c_args, link_args)
+                    if in_source_tree
+                    else None
+                )
+                subprocess.run(cmd, check=True)
+                os.utime(tmp_so, ns=(src_mtime_ns, src_mtime_ns))
+                os.replace(tmp_so, so_path)
+                if build_id is not None:
+                    _write_build_id(so_path, build_id)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if tmp_so.exists():
+                    tmp_so.unlink(missing_ok=True)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+    if last_exc is not None and (force_recompile or not so_path.exists()):
+        raise RuntimeError(
+            f"Failed to compile {cpp_path} with {variants[0][1]}. "
+            f"Please build/install stimside via 'pip install -e .' or 'pip install .'."
+        ) from last_exc
     return so_path
 
 

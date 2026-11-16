@@ -3,13 +3,25 @@
 ABI notes:
 - ABI v2 (``coset_kernels_abi_v2() == 2``): void-returning entry points validate pointers,
   dimensions, and qubit/target ranges and return silently on invalid input without returning an
-  error code (zeroing output kick flags when non-null). ``engine_set_rng_states(ptr, NULL)`` is
-  a no-op (retains the previous RNG state pointer). ``engine_get_active_shot_indices`` returns
-  ``-1`` on ``NULL``.
+  error code. On a healthy engine (``fail_kind == 0``), ``engine_batch_inject_general_clifford``,
+  ``engine_batch_det_meas_step``, and ``engine_batch_unmatched_noisy_reset_z`` zero non-null
+  output kick flags on invalid input (with non-null ``ptr``), whereas ``engine_batch_mixed_substep``
+  and ``engine_batch_evict`` leave accumulator flags untouched on invalid input; no v2 kernel
+  touches flags when ``ptr == NULL``. ``engine_set_rng_states`` returns ``0`` on success or
+  ``< 0`` (retaining previous owned RNG states on ``NULL``/error/OOM); ``engine_get_rng_states``
+  copies owned RNG states with ``n_shots == batch_size`` check. ``engine_get_active_shot_indices``
+  returns ``-1`` on ``NULL``.
 - ABI v3 (``coset_kernels_abi_v3() == 3``): additive ``int``-returning entry points validate
   engine-owned dimensions and return ``< 0`` on invalid arguments or allocation failure.
-- Exception safety: ``get_coset_kernels_lib()`` wraps the CDLL so caught C++ exceptions mark the
-  engine failed and raise ``MemoryError`` (for ``std::bad_alloc``) or ``RuntimeError``.
+- Failed-engine & exception safety: ``engine_failed(ptr)`` returns ``0`` (healthy), ``1``
+  (``std::bad_alloc``), ``2`` (other C++ exception), or ``-1`` (``NULL``);
+  ``engine_create_last_error()`` reports ``0``/``1``/``2`` for the last ``engine_create`` on the
+  current thread. When ``fail_kind != 0``, v2 void kernels zero non-null output/accumulator kick
+  flags and return early, while ``int``-returning exports return ``< 0`` (``-2`` on
+  ``engine_get_active_shot_indices``, ``engine_num_qubits``, ``engine_batch_size``,
+  ``engine_n_words``, and ``engine_unitary_step_num_groups``; negative codes on v3 kernels) and
+  zero non-null output flags. ``get_coset_kernels_lib()`` wraps the CDLL so caught C++ exceptions
+  raise ``MemoryError`` (``1``) or ``RuntimeError`` (``> 0``).
 """
 
 from __future__ import annotations
@@ -44,10 +56,16 @@ _SPECS: tuple[AbiSpec, ...] = (
     ("coset_kernels_abi_v3", [], _c_int),
     ("engine_create", [_c_int, _c_int, u64_p], void_p),
     ("engine_destroy", [void_p], None),
-    ("engine_set_rng_states", [void_p, u64_p], None),
+    ("engine_set_rng_states", [void_p, u64_p], _c_int),
+    ("engine_get_rng_states", [void_p, _c_int, u64_p], _c_int),
     ("engine_clear", [void_p], None),
     ("engine_get_active_shot_indices", [void_p, i32_p, i32_p], _c_int),
     ("engine_export_shot", [void_p, _c_int, u64_p, u64_p, u64_p, u8_p, u8_p, i32_p], None),
+    (
+        "engine_export_shot_v3",
+        [void_p, _c_int, _c_int, _c_int, u64_p, u64_p, u64_p, u8_p, u8_p, i32_p],
+        _c_int,
+    ),
     ("engine_import_shot", [void_p, _c_int, _c_int, u64_p, u64_p, u64_p, u8_p, u8_p, i32_p], None),
     (
         "engine_batch_inject_general_clifford",
@@ -170,7 +188,6 @@ _NO_GUARD: frozenset[str] = frozenset({
 })
 
 _VOID_FNS: frozenset[str] = frozenset({
-    "engine_set_rng_states",
     "engine_clear",
     "engine_export_shot",
     "engine_import_shot",
@@ -183,7 +200,10 @@ _VOID_FNS: frozenset[str] = frozenset({
 })
 
 _INT_FNS: frozenset[str] = frozenset({
+    "engine_set_rng_states",
+    "engine_get_rng_states",
     "engine_get_active_shot_indices",
+    "engine_export_shot_v3",
     "engine_num_qubits",
     "engine_batch_size",
     "engine_n_words",
@@ -197,6 +217,10 @@ _INT_FNS: frozenset[str] = frozenset({
     "engine_peek_pauli_batch_v3",
     "engine_batch_evict_v3",
 })
+
+_SPEC_NAMES: frozenset[str] = frozenset(spec[0] for spec in _SPECS)
+assert {"engine_create"} | _NO_GUARD | _VOID_FNS | _INT_FNS == _SPEC_NAMES
+assert len(_NO_GUARD) + len(_VOID_FNS) + len(_INT_FNS) + 1 == len(_SPEC_NAMES)
 
 
 def _raise_for_err(err: int) -> None:
@@ -257,9 +281,6 @@ class _CosetKernelsLib:
             setattr(self, name, _wrap_void(getattr(raw, name), failed_fn))
         for name in _INT_FNS:
             setattr(self, name, _wrap_int(getattr(raw, name), failed_fn))
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._raw, name)
 
 
 def _resolve_coset_kernels_so(force_recompile: bool = False) -> Path:
