@@ -31,6 +31,14 @@ def _under_sanitizer() -> bool:
         return False
 
 
+def _under_tsan() -> bool:
+    try:
+        libc = ctypes.CDLL(None)
+        return hasattr(libc, "__tsan_init")
+    except OSError:
+        return False
+
+
 def _ptr(arr: np.ndarray[Any, Any], c_type: Any) -> Any:
     return arr.ctypes.data_as(c_type) if arr.size > 0 else ctypes.cast(0, c_type)
 
@@ -200,10 +208,11 @@ def test_export_shot_v3_error_codes_leave_sentinel_buffers_untouched() -> None:
 def test_stale_so_missing_export_shot_v3_triggers_sentinel_rebuild(tmp_path: Path) -> None:
     if shutil.which("c++") is None:
         pytest.skip("requires C++ compiler")
-    src = tmp_path / "src"
+    # Place under site-packages without setup.py so resolve_so() does not trigger source-tree
+    # staleness; only load_cdll()'s full sentinel tuple can trigger the rebuild (kills K10).
+    src = tmp_path / "site-packages"
     native = src / "stimside" / "_native"
     native.mkdir(parents=True)
-    (tmp_path / "setup.py").write_text("# marker\n", encoding="utf-8")
     (src / "stimside" / "__init__.py").write_text("", encoding="utf-8")
     (native / "__init__.py").write_text("", encoding="utf-8")
     for fname in ("_kernel_loader.py", "coset_kernels.py", "coset_kernels.cpp"):
@@ -334,14 +343,13 @@ def test_coset_kernels_lib_fake_raw_kills_m5_m5b_m5c() -> None:
 
 
 _RLIMIT_CHILD = r"""
-import ctypes, resource, sys
+import resource, sys
 import numpy as np
 sys.path.insert(0, sys.argv[1])
 from stimside._native import _kernel_loader as kl
 from stimside._native import coset_kernels as ck
 
 lib = ck.get_coset_kernels_lib()
-raw = lib._raw
 
 # Cap address space at current VmSize + 256 MiB so 2+ GiB allocations fail with bad_alloc.
 vm_kb = 0
@@ -356,7 +364,7 @@ if hard != resource.RLIM_INFINITY:
     cap = min(cap, hard)
 resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
 
-# 1. Verify engine_create OOM raises MemoryError (M5c on real C++)
+# Verify engine_create OOM raises MemoryError using a properly sized rng buffer (L-7 safe).
 big_rng = np.arange(1, 4001, dtype=np.uint64)
 try:
     lib.engine_create(64000, 4000, big_rng.ctypes.data_as(kl.u64_p))
@@ -364,162 +372,14 @@ try:
 except MemoryError:
     pass
 assert lib.engine_create_last_error() == 1
-
-# 2. Create a small engine and OOM engine_import_shot (M5 on real C++)
-rng = np.arange(1, 2, dtype=np.uint64)
-eng = lib.engine_create(200_000, 1, rng.ctypes.data_as(kl.u64_p))
-nw = lib.engine_n_words(eng)
-h = np.zeros(nw, np.uint64)
-au = np.zeros(nw, np.uint64)
-A = np.zeros((1, nw), np.uint64)
-ell = np.zeros(1, np.uint8)
-G = np.zeros((1, 1), np.uint8)
-P = np.zeros(200_000, np.int32)
-p64 = lambda a: a.ctypes.data_as(kl.u64_p)
-p8 = lambda a: a.ctypes.data_as(kl.u8_p)
-p32 = lambda a: a.ctypes.data_as(kl.i32_p)
-pi64 = lambda a: a.ctypes.data_as(kl.i64_p)
-pi8 = lambda a: a.ctypes.data_as(kl.i8_p)
-try:
-    lib.engine_import_shot(eng, 0, 200_000, p64(h), p64(au), p64(A), p8(ell), p8(G), p32(P))
-    raise AssertionError("expected MemoryError from 200k import")
-except MemoryError:
-    pass
-assert lib.engine_failed(eng) == 1
-
-# 3. Every guarded export raises MemoryError on failed engine; raw returns < 0 & keeps sentinels
-out_idx = np.full(1, -99, np.int32)
-out_d = np.full(1, -99, np.int32)
-sh = np.full(nw, 0xAA, np.uint64)
-sau = np.full(nw, 0xAA, np.uint64)
-sA = np.full((1, nw), 0xAA, np.uint64)
-sell = np.full(1, 0xAA, np.uint8)
-sG = np.full((1, 1), 0xAA, np.uint8)
-sP = np.full(1, -1431655766, np.int32)
-tg = np.zeros(1, np.int64)
-u8_nb = np.full(1, 0xAA, np.uint8)
-u8_1 = np.full(1, 0xAA, np.uint8)
-i8_1 = np.full((1, 1), 77, np.int8)
-ax, az = ctypes.c_int(9), ctypes.c_int(9)
-pw = np.full(nw, 0xAA, np.uint64)
-kp = np.full(1, 0xAA, np.uint8)
-N = 200_000
-
-guarded_calls = [
-    ("engine_num_qubits", lambda: lib.engine_num_qubits(eng)),
-    ("engine_batch_size", lambda: lib.engine_batch_size(eng)),
-    ("engine_n_words", lambda: lib.engine_n_words(eng)),
-    ("engine_clear", lambda: lib.engine_clear(eng)),
-    ("engine_set_rng_states", lambda: lib.engine_set_rng_states(eng, p64(rng))),
-    ("engine_get_rng_states", lambda: lib.engine_get_rng_states(eng, 1, p64(sh))),
-    ("engine_get_active_shot_indices",
-     lambda: lib.engine_get_active_shot_indices(eng, p32(out_idx), p32(out_d))),
-    ("engine_export_shot",
-     lambda: lib.engine_export_shot(
-         eng, 0, p64(sh), p64(sau), p64(sA), p8(sell), p8(sG), p32(sP))),
-    ("engine_export_shot_v3",
-     lambda: lib.engine_export_shot_v3(
-         eng, 0, nw, 1, p64(sh), p64(sau), p64(sA), p8(sell), p8(sG), p32(sP))),
-    ("engine_import_shot",
-     lambda: lib.engine_import_shot(
-         eng, 0, 0, p64(h), p64(au), p64(A), p8(ell), p8(G), p32(P))),
-    ("engine_unitary_step_num_groups", lambda: lib.engine_unitary_step_num_groups(eng, 0)),
-    ("engine_register_unitary_step",
-     lambda: lib.engine_register_unitary_step(
-         eng, 0, 1, 0, pi64(tg), p8(u8_1), p8(u8_1), p8(u8_1), p64(h), p64(h),
-         p8(u8_1), p8(u8_1), p8(u8_1), p64(h), p64(h), p8(u8_1), N, nw, p64(pw), p64(pw))),
-    ("engine_register_unitary_group_evict",
-     lambda: lib.engine_register_unitary_group_evict(eng, 0, 0, N, nw, p64(pw), p64(pw))),
-    ("engine_batch_det_meas_step",
-     lambda: lib.engine_batch_det_meas_step(
-         eng, 0, pi64(tg), p8(u8_1), p64(h), p8(u8_nb), p8(u8_1),
-         p64(pw), p64(pw), p8(u8_nb), p8(u8_nb), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_batch_mixed_substep",
-     lambda: lib.engine_batch_mixed_substep(
-         eng, 0, 0, 0, 0, p64(h), p64(h), p64(h), 0, 0, pi64(tg), 0, pi64(tg),
-         p8(u8_nb), p8(u8_1), p8(u8_nb), p8(u8_nb), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_batch_evict",
-     lambda: lib.engine_batch_evict(
-         eng, p64(pw), p64(pw), p8(u8_nb), p8(u8_nb),
-         p8(u8_nb), p8(u8_nb), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_batch_unmatched_noisy_reset_z",
-     lambda: lib.engine_batch_unmatched_noisy_reset_z(
-         eng, p8(u8_nb), p8(u8_nb), p8(u8_nb), p64(pw), p64(pw), p8(kp),
-         p64(pw), p8(u8_nb), p8(u8_nb), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_peek_pauli_batch",
-     lambda: lib.engine_peek_pauli_batch(
-         eng, 1, pi64(tg), 2, p8(u8_nb), p8(u8_nb),
-         p64(pw), p64(pw), p64(pw), p64(pw), p8(kp), p8(kp), pi8(i8_1))),
-    ("engine_peek_pauli_batch_v3",
-     lambda: lib.engine_peek_pauli_batch_v3(
-         eng, 1, pi64(tg), 2, N, 1, p8(u8_nb), N, 1, p8(u8_nb), N, nw,
-         p64(pw), p64(pw), p64(pw), p64(pw), p8(kp), p8(kp), 1, 1, pi8(i8_1))),
-    ("engine_postselect_batch",
-     lambda: lib.engine_postselect_batch(
-         eng, 0, 2, 1, p8(u8_1), 1, p8(u8_1), N, 1, p8(u8_nb), N, 1, p8(u8_nb), N, nw,
-         p64(pw), p64(pw), p64(pw), p64(pw), p8(kp), p8(kp),
-         N, 1, p8(u8_nb), N, 1, p8(u8_nb), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_project_pauli",
-     lambda: lib.engine_project_pauli(
-         eng, 2, N, 1, p8(u8_nb), N, 1, p8(u8_nb), -1, pi64(tg),
-         N, 1, p8(u8_nb), N, 1, p8(u8_nb), N, nw,
-         p64(pw), p64(pw), p64(pw), p64(pw), p8(kp), p8(kp),
-         N, 1, p8(u8_nb), N, 1, p8(u8_nb), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_inject_group_v3",
-     lambda: lib.engine_inject_group_v3(
-         eng, 0, 0, 1, p8(u8_1), N, 1, p8(u8_nb), N, 1, p8(u8_nb),
-         N, 1, p8(u8_nb), N, 1, p8(u8_nb), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_batch_inject_general_clifford_v3",
-     lambda: lib.engine_batch_inject_general_clifford_v3(
-         eng, 0, 1, 1, p8(u8_1), N, 1, p8(u8_nb), N, 1, p8(u8_nb),
-         N, 1, p8(u8_nb), N, 1, p8(u8_nb), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_batch_evict_v3",
-     lambda: lib.engine_batch_evict_v3(
-         eng, N, nw, p64(pw), p64(pw), N, 1, p8(u8_nb), N, 1, p8(u8_nb),
-         N, 1, p8(u8_nb), N, 1, p8(u8_nb), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_batch_inject_general_clifford",
-     lambda: lib.engine_batch_inject_general_clifford(
-         eng, 0, 1, 0, pi64(tg), p8(u8_1), p8(u8_nb), p8(u8_nb),
-         p8(u8_1), p8(u8_1), p8(u8_1), p64(h), p64(h), p8(u8_1),
-         p8(u8_1), p8(u8_1), p64(h), p64(h), p8(u8_1), p64(pw), p64(pw),
-         p8(u8_nb), p8(u8_nb), ctypes.byref(ax), ctypes.byref(az))),
-]
-for name, fn in guarded_calls:
-    try:
-        fn()
-        raise AssertionError(f"{name} did not raise MemoryError on failed engine")
-    except MemoryError:
-        pass
-
-# 4. Raw unguarded int exports return < 0 and leave sentinels untouched
-assert raw.engine_num_qubits(eng) == -2
-assert raw.engine_batch_size(eng) == -2
-assert raw.engine_n_words(eng) == -2
-assert raw.engine_set_rng_states(eng, p64(rng)) == -2
-assert raw.engine_get_rng_states(eng, 1, p64(sh)) == -2
-assert raw.engine_unitary_step_num_groups(eng, 0) == -2
-assert raw.engine_get_active_shot_indices(eng, p32(out_idx), p32(out_d)) == -2
-assert raw.engine_export_shot_v3(
-    eng, 0, nw, 1, p64(sh), p64(sau), p64(sA), p8(sell), p8(sG), p32(sP)) == -6
-assert raw.engine_peek_pauli_batch_v3(
-    eng, 1, pi64(tg), 2, N, 1, p8(u8_nb), N, 1, p8(u8_nb), N, nw,
-    p64(pw), p64(pw), p64(pw), p64(pw), p8(kp), p8(kp), 1, 1, pi8(i8_1)) == -8
-assert raw.engine_postselect_batch(
-    eng, 0, 2, 1, p8(u8_1), 1, p8(u8_1), N, 1, p8(u8_nb), N, 1, p8(u8_nb), N, nw,
-    p64(pw), p64(pw), p64(pw), p64(pw), p8(kp), p8(kp),
-    N, 1, p8(u8_nb), N, 1, p8(u8_nb), ctypes.byref(ax), ctypes.byref(az)) == -9
-assert ax.value == 0 and az.value == 0
-assert np.all(out_idx == -99) and np.all(out_d == -99)
-assert np.all(sh == 0xAA) and np.all(sau == 0xAA) and np.all(sA == 0xAA)
-assert np.all(sell == 0xAA) and np.all(sG == 0xAA) and np.all(sP == -1431655766)
-assert np.all(u8_nb == 0xAA) and np.all(u8_1 == 0xAA)
-assert np.all(i8_1 == 77)
-lib.engine_destroy(eng)
 print("RLIMIT_AS_OK")
 """
 
 
-@pytest.mark.skipif(_under_sanitizer(), reason="sanitizer shadow memory conflicts with RLIMIT_AS")
+@pytest.mark.skipif(
+    _under_sanitizer() or not Path("/proc/self/status").is_file(),
+    reason="needs Linux /proc/self/status and no sanitizer shadow memory",
+)
 def test_rlimit_as_oom_and_sticky_failed_engine_guard() -> None:
     env = {
         **os.environ,
@@ -534,6 +394,367 @@ def test_rlimit_as_oom_and_sticky_failed_engine_guard() -> None:
     )
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert proc.stdout.strip().splitlines()[-1] == "RLIMIT_AS_OK"
+
+
+_FI_STICKY_CPP = r"""
+#include <cstdlib>
+#include <new>
+static thread_local long g_countdown = -1;
+static thread_local long g_count = 0;
+extern "C" void fi_arm(long n) { g_countdown = n; g_count = 0; }
+extern "C" long fi_count() { return g_count; }
+extern "C" void fi_disarm() { g_countdown = -1; }
+static void* alloc(size_t sz) {
+    g_count++;
+    if (g_countdown == 0) { g_countdown = -1; throw std::bad_alloc(); }
+    if (g_countdown > 0) --g_countdown;
+    void* p = std::malloc(sz ? sz : 1);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void* operator new(size_t sz) { return alloc(sz); }
+void* operator new[](size_t sz) { return alloc(sz); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+void operator delete[](void* p, size_t) noexcept { std::free(p); }
+"""
+
+_FI_STICKY_CHILD = r"""
+import ctypes, sys
+import numpy as np
+sys.path.insert(0, sys.argv[1])
+fi = ctypes.CDLL(sys.argv[2])
+fi.fi_arm.argtypes = [ctypes.c_long]
+fi.fi_count.restype = ctypes.c_long
+from stimside._native import _kernel_loader as kl
+from stimside._native import coset_kernels as ck
+
+lib = ck.get_coset_kernels_lib()
+raw = lib._raw
+N, B = 66, 2
+p64 = lambda a: a.ctypes.data_as(kl.u64_p)
+p8 = lambda a: a.ctypes.data_as(kl.u8_p)
+p32 = lambda a: a.ctypes.data_as(kl.i32_p)
+pi64 = lambda a: a.ctypes.data_as(kl.i64_p)
+pi8 = lambda a: a.ctypes.data_as(kl.i8_p)
+
+rng = np.array([11, 22], dtype=np.uint64)
+eng = lib.engine_create(N, B, p64(rng))
+nw = lib.engine_n_words(eng)
+assert nw == 2
+
+# Import shot 0 (d=1 active) and shot 1 (d=0, h!=0 healed) so eviction & reads have real work.
+h0 = np.array([1, 0], np.uint64)
+au0 = np.array([1, 0], np.uint64)
+A0 = np.zeros((1, nw), np.uint64); A0[0, 0] = 1
+ell0 = np.array([1], np.uint8)
+G0 = np.zeros((1, 1), np.uint8)
+P0 = np.array([0], np.int32)
+lib.engine_import_shot(eng, 0, 1, p64(h0), p64(au0), p64(A0), p8(ell0), p8(G0), p32(P0))
+h1 = np.array([1, 0], np.uint64)
+au1 = np.zeros(nw, np.uint64)
+lib.engine_import_shot(eng, 1, 0, p64(h1), p64(au1), p64(A0), p8(ell0), p8(G0), p32(P0))
+
+# Register a valid 1-group, arity=1, n_factors=1 unitary step (step_id=0) before failing engine.
+tg = np.array([0], np.int64)
+fk = np.array([1], np.uint8)
+f_u8 = np.zeros(1, np.uint8)
+f_a = np.zeros((1, nw), np.uint64); f_a[0, 0] = 1
+f_b = np.zeros((1, nw), np.uint64); f_b[0, 0] = 1
+x2x = np.zeros((N, nw), np.uint64); x2x[0, 0] = 1
+x2z = np.zeros((N, nw), np.uint64); x2z[0, 0] = 1
+z2x = np.zeros((N, nw), np.uint64)
+z2z = np.zeros((N, nw), np.uint64); z2z[0, 0] = 1; z2z[1, 0] = 1
+kp = np.zeros(N, np.uint8)
+sid = lib.engine_register_unitary_step(
+    eng, 1, 1, 1, pi64(tg), p8(fk), p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
+    p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8), N, nw, p64(x2z), p64(z2z),
+)
+assert sid == 0
+
+# Trigger real std::bad_alloc inside engine_register_unitary_step -> fail_kind == 1.
+fi.fi_arm(0)
+rc_oom = int(raw.engine_register_unitary_step(
+    eng, 1, 1, 1, pi64(tg), p8(fk), p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
+    p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8), N, nw, p64(x2z), p64(z2z),
+))
+fi.fi_disarm()
+assert rc_oom == -9 and int(raw.engine_failed(eng)) == 1
+
+# Properly sized sentinel buffers & valid effect-producing inputs for all 25 guarded exports.
+out_rng = np.full(B, 0xAAAAAAAAAAAAAAAA, np.uint64)
+out_idx = np.full(B, -99, np.int32)
+out_d = np.full(B, -99, np.int32)
+sh = np.full(nw, 0xAAAAAAAAAAAAAAAA, np.uint64)
+sau = np.full(nw, 0xAAAAAAAAAAAAAAAA, np.uint64)
+sA = np.full((1, nw), 0xAAAAAAAAAAAAAAAA, np.uint64)
+sell = np.full(1, 0xAA, np.uint8)
+sG = np.full((1, 1), 0xAA, np.uint8)
+sP = np.full(1, -1431655766, np.int32)
+xs = np.zeros((N, B), np.uint8); xs[0, :] = 1
+zs = np.zeros((N, B), np.uint8)
+xs_orig = xs.copy()
+ox = np.full((N, B), 0xAA, np.uint8)
+oz = np.full((N, B), 0xAA, np.uint8)
+cm_row = np.zeros(B, np.uint8)
+cm_mat = np.zeros((1, B), np.uint8)
+mref = np.zeros(1, np.uint8)
+b_sub = np.zeros((1, nw), np.uint64); b_sub[0, 0] = 1
+m_mat = np.full((1, B), 9, np.uint8)
+m_shots = np.full(B, 9, np.uint8)
+r0 = np.zeros((N, B), np.uint8); r0[0, :] = 1
+r1 = np.zeros((N, B), np.uint8)
+fm = np.ones(B, np.uint8)
+db = np.zeros(B, np.uint8)
+out_exp = np.full((1, B), 77, np.int8)
+# Properly sized d=65 > init_cap=64 import buffers so missing sticky guard allocates (>= 4 allocs).
+d_big = 65
+h_big = np.zeros(nw, np.uint64)
+au_big = np.zeros(nw, np.uint64)
+A_big = np.zeros((d_big, nw), np.uint64)
+ell_big = np.zeros(d_big, np.uint8)
+G_big = np.zeros((d_big, d_big), np.uint8)
+P_big = np.arange(d_big, dtype=np.int32)
+
+ax, az = ctypes.c_int(7), ctypes.c_int(9)
+def reset_flags():
+    ax.value, az.value = 7, 9
+def assert_zero_flags(name):
+    assert ax.value == 0 and az.value == 0, (name, ax.value, az.value)
+def assert_sentinels(name):
+    assert np.all(out_rng == np.uint64(0xAAAAAAAAAAAAAAAA)), name
+    assert np.all(out_idx == -99) and np.all(out_d == -99), name
+    assert np.all(sh == np.uint64(0xAAAAAAAAAAAAAAAA)), name
+    assert np.all(sau == np.uint64(0xAAAAAAAAAAAAAAAA)), name
+    assert np.all(sA == np.uint64(0xAAAAAAAAAAAAAAAA)), name
+    assert np.all(sell == 0xAA) and np.all(sG == 0xAA) and np.all(sP == -1431655766), name
+    assert np.all(ox == 0xAA) and np.all(oz == 0xAA), name
+    assert np.all(m_mat == 9) and np.all(m_shots == 9) and np.all(out_exp == 77), name
+    assert np.array_equal(xs, xs_orig), name
+
+# 1. All 16 raw int exports: exact negative rc, zeroed flags, untouched sentinels, 0 allocs.
+rng2 = np.array([33, 44], np.uint64)
+assert int(raw.engine_num_qubits(eng)) == -2
+assert int(raw.engine_batch_size(eng)) == -2
+assert int(raw.engine_n_words(eng)) == -2
+assert int(raw.engine_set_rng_states(eng, p64(rng2))) == -2
+assert int(raw.engine_get_rng_states(eng, B, p64(out_rng))) == -2
+assert int(raw.engine_get_active_shot_indices(eng, p32(out_idx), p32(out_d))) == -2
+assert int(raw.engine_export_shot_v3(
+    eng, 0, nw, 1, p64(sh), p64(sau), p64(sA), p8(sell), p8(sG), p32(sP))) == -6
+assert int(raw.engine_unitary_step_num_groups(eng, 0)) == -2
+
+fi.fi_arm(10**9)
+rc_reg = int(raw.engine_register_unitary_step(
+    eng, 1, 1, 1, pi64(tg), p8(fk), p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
+    p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8), N, nw, p64(x2z), p64(z2z)))
+assert rc_reg == -9 and fi.fi_count() == 0
+fi.fi_arm(10**9)
+rc_ev = int(raw.engine_register_unitary_group_evict(eng, 0, 1, N, nw, p64(x2z), p64(z2z)))
+assert rc_ev == -7 and fi.fi_count() == 0
+fi.fi_disarm()
+
+reset_flags()
+assert int(raw.engine_inject_group_v3(
+    eng, 0, 0, B, p8(cm_row), N, B, p8(xs), N, B, p8(zs),
+    N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))) == -7
+assert_zero_flags("engine_inject_group_v3")
+reset_flags()
+assert int(raw.engine_batch_inject_general_clifford_v3(
+    eng, 0, 1, B, p8(cm_mat), N, B, p8(xs), N, B, p8(zs),
+    N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))) == -7
+assert_zero_flags("engine_batch_inject_general_clifford_v3")
+assert int(raw.engine_peek_pauli_batch_v3(
+    eng, 1, pi64(tg), 2, N, B, p8(xs), N, B, p8(zs), N, nw,
+    p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp), 1, B, pi8(out_exp))) == -8
+reset_flags()
+assert int(raw.engine_batch_evict_v3(
+    eng, N, nw, p64(x2z), p64(z2z), N, B, p8(xs), N, B, p8(zs),
+    N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))) == -6
+assert_zero_flags("engine_batch_evict_v3")
+reset_flags()
+assert int(raw.engine_postselect_batch(
+    eng, 0, 2, B, p8(fm), B, p8(db), N, B, p8(xs), N, B, p8(zs), N, nw,
+    p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp),
+    N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))) == -9
+assert_zero_flags("engine_postselect_batch")
+reset_flags()
+assert int(raw.engine_project_pauli(
+    eng, 2, N, B, p8(r0), N, B, p8(r1), -1, pi64(tg), N, B, p8(xs), N, B, p8(zs), N, nw,
+    p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp),
+    N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))) == -10
+assert_zero_flags("engine_project_pauli")
+assert_sentinels("raw_int_exports")
+
+# 2. All 9 raw void exports: zeroed flags, untouched sentinels, 0 allocs on import_shot.
+raw.engine_export_shot(eng, 0, p64(sh), p64(sau), p64(sA), p8(sell), p8(sG), p32(sP))
+raw.engine_peek_pauli_batch(
+    eng, 1, pi64(tg), 2, p8(xs), p8(zs),
+    p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp), pi8(out_exp))
+reset_flags()
+raw.engine_batch_det_meas_step(
+    eng, 1, pi64(tg), p8(mref), p64(b_sub), p8(xs), p8(m_mat),
+    p64(x2z), p64(z2z), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))
+assert_zero_flags("engine_batch_det_meas_step")
+reset_flags()
+raw.engine_batch_mixed_substep(
+    eng, 0, 0, 0, 0, p64(b_sub), p64(b_sub), p64(b_sub), 0, 0, pi64(tg), 0, pi64(tg),
+    p8(xs), p8(m_shots), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))
+assert_zero_flags("engine_batch_mixed_substep")
+reset_flags()
+raw.engine_batch_evict(
+    eng, p64(x2z), p64(z2z), p8(xs), p8(zs), p8(ox), p8(oz),
+    ctypes.byref(ax), ctypes.byref(az))
+assert_zero_flags("engine_batch_evict")
+reset_flags()
+raw.engine_batch_unmatched_noisy_reset_z(
+    eng, p8(r0), p8(r1), p8(xs), p64(z2x), p64(z2z), p8(kp),
+    p64(x2z), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))
+assert_zero_flags("engine_batch_unmatched_noisy_reset_z")
+reset_flags()
+raw.engine_batch_inject_general_clifford(
+    eng, 1, 1, 1, pi64(tg), p8(cm_mat), p8(xs), p8(zs), p8(fk),
+    p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
+    p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
+    p64(x2z), p64(z2z), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))
+assert_zero_flags("engine_batch_inject_general_clifford")
+fi.fi_arm(10**9)
+raw.engine_import_shot(
+    eng, 0, d_big, p64(h_big), p64(au_big), p64(A_big), p8(ell_big), p8(G_big), p32(P_big))
+assert fi.fi_count() == 0, fi.fi_count()
+fi.fi_disarm()
+# engine_clear writes no caller buffer and allocates nothing; with all readers guarding
+# fail_kind != 0, removing only its early return is unobservable at the raw ABI.
+raw.engine_clear(eng)
+assert_sentinels("raw_void_exports")
+
+# 3. All 25 guarded wrapper calls raise MemoryError on the failed engine.
+wrapped_calls = [
+    ("engine_num_qubits", lambda: lib.engine_num_qubits(eng)),
+    ("engine_batch_size", lambda: lib.engine_batch_size(eng)),
+    ("engine_n_words", lambda: lib.engine_n_words(eng)),
+    ("engine_clear", lambda: lib.engine_clear(eng)),
+    ("engine_set_rng_states", lambda: lib.engine_set_rng_states(eng, p64(rng2))),
+    ("engine_get_rng_states", lambda: lib.engine_get_rng_states(eng, B, p64(out_rng))),
+    ("engine_get_active_shot_indices",
+     lambda: lib.engine_get_active_shot_indices(eng, p32(out_idx), p32(out_d))),
+    ("engine_export_shot",
+     lambda: lib.engine_export_shot(
+         eng, 0, p64(sh), p64(sau), p64(sA), p8(sell), p8(sG), p32(sP))),
+    ("engine_export_shot_v3",
+     lambda: lib.engine_export_shot_v3(
+         eng, 0, nw, 1, p64(sh), p64(sau), p64(sA), p8(sell), p8(sG), p32(sP))),
+    ("engine_import_shot",
+     lambda: lib.engine_import_shot(
+         eng, 0, d_big, p64(h_big), p64(au_big), p64(A_big), p8(ell_big), p8(G_big), p32(P_big))),
+    ("engine_unitary_step_num_groups", lambda: lib.engine_unitary_step_num_groups(eng, 0)),
+    ("engine_register_unitary_step",
+     lambda: lib.engine_register_unitary_step(
+         eng, 1, 1, 1, pi64(tg), p8(fk), p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
+         p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8), N, nw, p64(x2z), p64(z2z))),
+    ("engine_register_unitary_group_evict",
+     lambda: lib.engine_register_unitary_group_evict(eng, 0, 1, N, nw, p64(x2z), p64(z2z))),
+    ("engine_batch_det_meas_step",
+     lambda: lib.engine_batch_det_meas_step(
+         eng, 1, pi64(tg), p8(mref), p64(b_sub), p8(xs), p8(m_mat),
+         p64(x2z), p64(z2z), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_batch_mixed_substep",
+     lambda: lib.engine_batch_mixed_substep(
+         eng, 0, 0, 0, 0, p64(b_sub), p64(b_sub), p64(b_sub), 0, 0, pi64(tg), 0, pi64(tg),
+         p8(xs), p8(m_shots), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_batch_evict",
+     lambda: lib.engine_batch_evict(
+         eng, p64(x2z), p64(z2z), p8(xs), p8(zs), p8(ox), p8(oz),
+         ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_batch_unmatched_noisy_reset_z",
+     lambda: lib.engine_batch_unmatched_noisy_reset_z(
+         eng, p8(r0), p8(r1), p8(xs), p64(z2x), p64(z2z), p8(kp),
+         p64(x2z), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_peek_pauli_batch",
+     lambda: lib.engine_peek_pauli_batch(
+         eng, 1, pi64(tg), 2, p8(xs), p8(zs),
+         p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp), pi8(out_exp))),
+    ("engine_peek_pauli_batch_v3",
+     lambda: lib.engine_peek_pauli_batch_v3(
+         eng, 1, pi64(tg), 2, N, B, p8(xs), N, B, p8(zs), N, nw,
+         p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp), 1, B, pi8(out_exp))),
+    ("engine_postselect_batch",
+     lambda: lib.engine_postselect_batch(
+         eng, 0, 2, B, p8(fm), B, p8(db), N, B, p8(xs), N, B, p8(zs), N, nw,
+         p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp),
+         N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_project_pauli",
+     lambda: lib.engine_project_pauli(
+         eng, 2, N, B, p8(r0), N, B, p8(r1), -1, pi64(tg), N, B, p8(xs), N, B, p8(zs), N, nw,
+         p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp),
+         N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_inject_group_v3",
+     lambda: lib.engine_inject_group_v3(
+         eng, 0, 0, B, p8(cm_row), N, B, p8(xs), N, B, p8(zs),
+         N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_batch_inject_general_clifford_v3",
+     lambda: lib.engine_batch_inject_general_clifford_v3(
+         eng, 0, 1, B, p8(cm_mat), N, B, p8(xs), N, B, p8(zs),
+         N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_batch_evict_v3",
+     lambda: lib.engine_batch_evict_v3(
+         eng, N, nw, p64(x2z), p64(z2z), N, B, p8(xs), N, B, p8(zs),
+         N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_batch_inject_general_clifford",
+     lambda: lib.engine_batch_inject_general_clifford(
+         eng, 1, 1, 1, pi64(tg), p8(cm_mat), p8(xs), p8(zs), p8(fk),
+         p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
+         p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
+         p64(x2z), p64(z2z), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+]
+assert {n for n, _ in wrapped_calls} == (ck._VOID_FNS | ck._INT_FNS)
+assert len(wrapped_calls) == 25
+for name, fn in wrapped_calls:
+    try:
+        fn()
+        raise AssertionError(f"{name} did not raise MemoryError on failed engine")
+    except MemoryError:
+        pass
+assert_sentinels("wrapped_exports")
+lib.engine_destroy(eng)
+print("STICKY_25_OK")
+"""
+
+
+@pytest.mark.skipif(
+    _under_tsan() or shutil.which("c++") is None,
+    reason="needs a C++ compiler and no TSan runtime (TSan owns operator new)",
+)
+def test_failed_engine_all_25_exports_refuse_work_raw_and_wrapped(tmp_path: Path) -> None:
+    """L-1 + L-7: all 25 guarded exports refuse valid work on a failed engine (raw + wrapped)."""
+    cpp, so = tmp_path / "fi_sticky.cpp", tmp_path / "libfi_sticky.so"
+    cpp.write_text(_FI_STICKY_CPP, encoding="utf-8")
+    subprocess.run(["c++", "-shared", "-fPIC", "-O1", str(cpp), "-o", str(so)], check=True)
+    existing_preload = os.environ.get("LD_PRELOAD", "").strip()
+    ld_preload = f"{so} {existing_preload}" if existing_preload else str(so)
+    env = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(_SRC),
+        "LD_PRELOAD": ld_preload,
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+    }
+    if existing_preload:
+        asan_opts = env.get("ASAN_OPTIONS", "")
+        if "verify_asan_link_order=0" not in asan_opts:
+            env["ASAN_OPTIONS"] = (
+                f"{asan_opts}:verify_asan_link_order=0"
+                if asan_opts
+                else "verify_asan_link_order=0"
+            )
+    proc = subprocess.run(
+        [sys.executable, "-c", _FI_STICKY_CHILD, str(_SRC), str(so)],
+        capture_output=True, text=True, env=env, timeout=120, check=False,
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert proc.stdout.strip().splitlines()[-1] == "STICKY_25_OK"
 
 
 def test_engine_owns_rng_states_and_validates_set_get_args() -> None:

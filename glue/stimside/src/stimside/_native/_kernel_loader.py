@@ -1,15 +1,30 @@
 """Shared locate-or-compile logic for the ctypes kernel libraries.
 
-Loader policy (D-39):
-- Installed package (outside a source tree, e.g. ``site-packages``): prebuilt ``lib<name>.so``
-  is loaded directly without checking source mtimes or build IDs and without invoking a compiler.
+Loader policy (D-39, D-42):
+- Installed package (outside a ``.../src/stimside/_native`` source checkout with ``setup.py``,
+  e.g. ``site-packages``): prebuilt ``lib<name>.so`` is loaded directly without checking source
+  mtimes or ``.build_id`` sidecars and without invoking a compiler.
 - Missing ABI symbol or unloadable installed library: ``load_cdll`` triggers a one-time rebuild
   only if ``<name>.cpp`` is present and the directory is writable; otherwise it raises a clear
   error instructing the user to run ``pip install``. If an older copy remains loaded in the
   process, it raises ``RuntimeError`` advising to restart Python.
-- Source tree (``setup.py`` present and ``_native`` writable): recompiles automatically when
-  ``lib<name>.so`` is missing, older than ``<name>.cpp`` / regular non-symlink ``*.hpp`` headers,
-  or mismatched against its ``.lib<name>.build_id`` sidecar (source, headers, and build flags).
+- Writable source checkout (``.../src/stimside/_native`` with ``setup.py``): rebuilds only when
+  ``lib<name>.so`` is missing, older than ``<name>.cpp`` or regular non-symlink ``*.hpp`` headers,
+  mismatched against the source hash in ``.lib<name>.build_id``, or when ``STIMSIDE_NATIVE_BUILD=1``
+  / ``STIMSIDE_PORTABLE_BUILD=1`` explicitly requests the opposite mode from the recorded one.
+  With no flag set, flags never trigger a rebuild and source-triggered rebuilds keep the recorded
+  mode (defaulting to portable without a record). A missing or legacy ``.build_id`` is adopted
+  without rebuilding (recording mode ``"unknown"``) until the first explicit flag request.
+  ``.lib<name>.build_id`` records the requested build inputs (source hash and mode), not a hash
+  of the compiled binary; if the compiler rejects ``-march=native`` and falls back to portable,
+  the native request is still recorded so later runs do not loop.
+- Concurrency and failure safety: builds acquire a bounded non-blocking ``flock`` on ``_native``
+  (warning once on stderr and proceeding without the lock on timeout). Without the lock (timeout,
+  foreign directory owner, or filesystems without ``flock``), concurrent builds remain correct
+  because each process compiles into a PID-unique ``.lib<name>.<pid>.tmp.so`` and atomically
+  ``os.replace``s it; a killed build's ``.tmp.so`` is never loaded. If a rebuild fails when an
+  existing ``lib<name>.so`` is present, the loader warns once per library on stderr and uses the
+  existing library.
 """
 
 from __future__ import annotations
@@ -17,13 +32,17 @@ from __future__ import annotations
 import _ctypes
 from collections.abc import Callable, Sequence
 import ctypes
+import errno
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
 import shlex
 import stat
 import subprocess
+import sys
+import time
 from types import ModuleType
 from typing import Any
 
@@ -60,26 +79,49 @@ def c_w_ptr(w: Any) -> Any:
     return c_ptr(w.view("float64"), f64_p)
 
 
-def get_cpp_compile_and_link_args(
+_VALID_BUILD_MODES = frozenset({"portable", "native", "unknown"})
+_SOURCE_CHECKOUT_SUFFIX = Path("src/stimside/_native").parts
+_LOCK_MAX_RETRIES: int = 600
+_LOCK_RETRY_DELAY_S: float = 0.05
+_WARNED_FAILED_REBUILDS: set[Path] = set()
+_WARNED_FAILED_BUILD_IDS: set[Path] = set()
+
+
+def _requested_build_mode() -> str | None:
+    if os.environ.get("STIMSIDE_PORTABLE_BUILD") == "1":
+        return "portable"
+    if os.environ.get("STIMSIDE_NATIVE_BUILD") == "1":
+        return "native"
+    return None
+
+
+def _arch_supports_march_native() -> bool:
+    machine = (platform.machine() or platform.processor() or "").lower()
+    return any(
+        arch in machine
+        for arch in ("x86_64", "amd64", "i686", "i386", "arm64", "aarch64")
+    )
+
+
+def _compile_args_for_mode(
+    mode: str,
     include_march_native: bool = True,
 ) -> tuple[list[str], list[str]]:
-    machine = (platform.machine() or platform.processor() or "").lower()
     compile_args = [
         "-std=c++17", "-O3", "-fPIC", "-fno-strict-aliasing",
         "-ffp-contract=off",  # no FMA: keeps exact references and native/portable builds in step
         "-g0",
     ]
-    if (
-        include_march_native
-        and os.environ.get("STIMSIDE_NATIVE_BUILD") == "1"
-        and os.environ.get("STIMSIDE_PORTABLE_BUILD") != "1"
-        and any(
-            arch in machine
-            for arch in ("x86_64", "amd64", "i686", "i386", "arm64", "aarch64")
-        )
-    ):
+    if include_march_native and mode == "native" and _arch_supports_march_native():
         compile_args.append("-march=native")
     return compile_args, ["-O3", "-shared"]
+
+
+def get_cpp_compile_and_link_args(
+    include_march_native: bool = True,
+) -> tuple[list[str], list[str]]:
+    mode = "native" if _requested_build_mode() == "native" else "portable"
+    return _compile_args_for_mode(mode, include_march_native=include_march_native)
 
 
 def _source_mtime_ns(cpp_path: Path) -> int:
@@ -103,13 +145,9 @@ def _build_id_path(so_path: Path) -> Path:
     return so_path.with_name(f".{so_path.stem}.build_id")
 
 
-def _compute_build_id(
-    cpp_path: Path,
-    compile_args: Sequence[str],
-    link_args: Sequence[str],
-) -> str:
-    """Compute SHA-256 build ID over source, regular non-symlink headers, and flags."""
-    h = hashlib.sha256(b"stimside-build-id-v1\0")
+def _compute_source_hash(cpp_path: Path) -> str:
+    """Compute SHA-256 hash over source and regular non-symlink headers beside it."""
+    h = hashlib.sha256(b"stimside-source-hash-v2\0")
     cpp_bytes = cpp_path.read_bytes()
     h.update(f"cpp:{cpp_path.name}\0{len(cpp_bytes)}\0".encode())
     h.update(cpp_bytes)
@@ -123,47 +161,94 @@ def _compute_build_id(
             continue
         h.update(f"hpp:{hpp.name}\0{len(hpp_bytes)}\0".encode())
         h.update(hpp_bytes)
-    for arg in compile_args:
-        h.update(b"c:" + arg.encode("utf-8") + b"\0")
-    for arg in link_args:
-        h.update(b"l:" + arg.encode("utf-8") + b"\0")
     return h.hexdigest()
 
 
-def _read_build_id(so_path: Path) -> str | None:
+def _read_build_record(so_path: Path) -> tuple[str, str] | None:
+    """Return ``(source_hash, mode)`` from a v2 JSON sidecar, or ``None`` if absent/invalid."""
     try:
-        return _build_id_path(so_path).read_text(encoding="utf-8").strip()
-    except OSError:
+        data = json.loads(_build_id_path(so_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
+    if not isinstance(data, dict):
+        return None
+    ver = data.get("version")
+    src_hash = data.get("source_hash")
+    mode = data.get("mode")
+    if (
+        type(ver) is not int
+        or ver != 2
+        or not isinstance(src_hash, str)
+        or not src_hash
+        or not isinstance(mode, str)
+        or mode not in _VALID_BUILD_MODES
+    ):
+        return None
+    return src_hash, mode
 
 
-def _write_build_id(so_path: Path, build_id: str) -> None:
+def _write_build_record(so_path: Path, source_hash: str, mode: str) -> None:
+    """Atomically write v2 JSON sidecar describing requested build inputs (not binary hash)."""
+    payload = json.dumps({"mode": mode, "source_hash": source_hash, "version": 2}, sort_keys=True)
     tmp_id = so_path.with_name(f".{so_path.stem}.{os.getpid()}.tmp.build_id")
     try:
-        tmp_id.write_text(f"{build_id}\n", encoding="utf-8")
+        tmp_id.write_text(f"{payload}\n", encoding="utf-8")
         os.replace(tmp_id, _build_id_path(so_path))
     except BaseException:
         tmp_id.unlink(missing_ok=True)
         raise
 
 
-def _is_source_build_stale(
+def _is_source_checkout(here: Path) -> bool:
+    return (
+        "site-packages" not in here.parts
+        and "dist-packages" not in here.parts
+        and here.parts[-3:] == _SOURCE_CHECKOUT_SUFFIX
+        and (here.parent.parent.parent / "setup.py").exists()
+    )
+
+
+def _plan_source_build(
     so_path: Path,
     cpp_path: Path,
     in_source_tree: bool,
-    compile_args: Sequence[str],
-    link_args: Sequence[str],
-) -> bool:
-    if not so_path.exists():
-        return True
+    requested_mode: str | None,
+    force_recompile: bool,
+) -> tuple[bool, str]:
+    """Decide whether to rebuild and which build mode to use under D-42 sticky-flag rules."""
+    rec = _read_build_record(so_path) if in_source_tree else None
+    rec_mode = rec[1] if rec is not None else None
+    keep_mode = rec_mode if rec_mode in ("portable", "native") else "portable"
+    effective_mode = requested_mode if requested_mode is not None else keep_mode
+    if force_recompile or not so_path.exists():
+        return True, effective_mode
     if not (in_source_tree and cpp_path.exists() and os.access(so_path.parent, os.W_OK)):
-        return False
+        return False, "portable"
     if _source_mtime_ns(cpp_path) > so_path.stat().st_mtime_ns:
-        return True
-    return _read_build_id(so_path) != _compute_build_id(cpp_path, compile_args, link_args)
+        return True, effective_mode
+    src_hash = _compute_source_hash(cpp_path)
+    if rec is None:
+        if requested_mode is None:
+            try:
+                _write_build_record(so_path, src_hash, "unknown")
+            except OSError:
+                pass
+            return False, "unknown"
+        return True, requested_mode
+    if rec[0] != src_hash:
+        return True, effective_mode
+    if requested_mode is not None and requested_mode != rec_mode:
+        return True, requested_mode
+    return False, rec_mode or "portable"
 
 
 def _acquire_dir_lock(here: Path) -> int | None:
+    """Lock ``here`` with bounded non-blocking ``flock``; return fd or None to build lockless.
+
+    When the lock is skipped (missing ``fcntl``, foreign owner, unsupported filesystem such as
+    NFSv4 ``EBADF``, or timeout), concurrent builds remain correct because each process compiles
+    to a PID-unique ``.lib<name>.<pid>.tmp.so`` and atomically ``os.replace``s it.
+    """
     uid = os.getuid() if hasattr(os, "getuid") else 0
     lock_fd: int | None = None
     try:
@@ -175,11 +260,99 @@ def _acquire_dir_lock(here: Path) -> int | None:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         lock_fd = os.open(here, dir_flags)
-        if os.fstat(lock_fd).st_uid == uid:  # Never wait on another user's lock.
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if os.fstat(lock_fd).st_uid != uid:  # Never wait on another user's lock.
+            fd, lock_fd = lock_fd, None
+            os.close(fd)
+            return None
+        for attempt in range(_LOCK_MAX_RETRIES + 1):
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lock_fd
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+                if attempt == _LOCK_MAX_RETRIES:
+                    sys.stderr.write(
+                        f"stimside warning: timed out waiting for build lock on {here}; "
+                        "proceeding to build without cross-process lock\n"
+                    )
+                    fd, lock_fd = lock_fd, None
+                    os.close(fd)
+                    return None
+                time.sleep(_LOCK_RETRY_DELAY_S)
     except (ImportError, OSError):
-        pass  # Build without the cross-process lock.
+        if lock_fd is not None:
+            fd, lock_fd = lock_fd, None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return None
+    except BaseException:
+        if lock_fd is not None:
+            fd, lock_fd = lock_fd, None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
     return lock_fd
+
+
+def _warn_failed_build_id_once(so_path: Path, exc: Exception) -> None:
+    if so_path not in _WARNED_FAILED_BUILD_IDS:
+        _WARNED_FAILED_BUILD_IDS.add(so_path)
+        sys.stderr.write(
+            f"stimside warning: failed to write build record for {so_path.name} ({exc}); "
+            f"using newly built library {so_path}\n"
+        )
+
+
+def _compile_so_variants(
+    cpp_path: Path,
+    so_path: Path,
+    in_source_tree: bool,
+    effective_mode: str,
+) -> tuple[Exception | None, list[str]]:
+    """Compile ``cpp_path`` into ``so_path`` via PID-unique ``.tmp.so`` with fallback variant."""
+    c_primary, link_args = _compile_args_for_mode(effective_mode, include_march_native=True)
+    c_generic, _ = _compile_args_for_mode(effective_mode, include_march_native=False)
+    tmp_so = so_path.parent / f".{so_path.stem}.{os.getpid()}.tmp.so"
+    cxx = shlex.split(os.environ.get("CXX") or "c++") or ["c++"]
+    variants = [[*cxx, *c_primary, *link_args, str(cpp_path), "-o", str(tmp_so)]]
+    if c_generic != c_primary:
+        variants.append([*cxx, *c_generic, *link_args, str(cpp_path), "-o", str(tmp_so)])
+    last_exc: Exception | None = None
+    for cmd in variants:
+        try:
+            src_mtime_ns = _source_mtime_ns(cpp_path)
+            src_hash = _compute_source_hash(cpp_path) if in_source_tree else None
+            subprocess.run(cmd, check=True)
+            os.utime(tmp_so, ns=(src_mtime_ns, src_mtime_ns))
+            os.replace(tmp_so, so_path)
+            if src_hash is not None:
+                # Record requested mode even on portable fallback so later runs do not loop.
+                try:
+                    _write_build_record(so_path, src_hash, effective_mode)
+                except OSError as exc:
+                    _warn_failed_build_id_once(so_path, exc)
+            return None, variants[0]
+        except (OSError, subprocess.SubprocessError) as exc:
+            last_exc = exc
+            tmp_so.unlink(missing_ok=True)
+        except BaseException:
+            tmp_so.unlink(missing_ok=True)
+            raise
+    return last_exc, variants[0]
+
+
+def _warn_failed_rebuild_once(so_path: Path, exc: Exception) -> None:
+    if so_path not in _WARNED_FAILED_REBUILDS:
+        _WARNED_FAILED_REBUILDS.add(so_path)
+        sys.stderr.write(
+            f"stimside warning: failed to rebuild {so_path.name} ({exc}); "
+            f"using existing library {so_path}\n"
+        )
 
 
 def resolve_so(
@@ -191,16 +364,12 @@ def resolve_so(
     here = Path(module_file).resolve().parent
     cpp_path = here / f"{name}.cpp"
     so_path = here / f"lib{name}.so"
-    in_source_tree = (
-        "site-packages" not in here.parts
-        and "dist-packages" not in here.parts
-        and (here.parent.parent.parent / "setup.py").exists()
+    in_source_tree = _is_source_checkout(here)
+    requested_mode = _requested_build_mode()
+    needs_build, _ = _plan_source_build(
+        so_path, cpp_path, in_source_tree, requested_mode, force_recompile
     )
-    c_native, link_args = get_cpp_compile_and_link_args(include_march_native=True)
-    c_generic, _ = get_cpp_compile_and_link_args(include_march_native=False)
-    if not force_recompile and not _is_source_build_stale(
-        so_path, cpp_path, in_source_tree, c_native, link_args
-    ):
+    if not needs_build:
         return so_path
     if not cpp_path.exists():
         raise FileNotFoundError(
@@ -213,47 +382,26 @@ def resolve_so(
             f"Cannot compile '{so_path.name}' into read-only directory {here}. "
             f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
         )
-    tmp_so = here / f".lib{name}.{os.getpid()}.tmp.so"
-    cxx = shlex.split(os.environ.get("CXX") or "c++") or ["c++"]
-    variants = [(c_native, [*cxx, *c_native, *link_args, str(cpp_path), "-o", str(tmp_so)])]
-    if c_generic != c_native:
-        variants.append(
-            (c_generic, [*cxx, *c_generic, *link_args, str(cpp_path), "-o", str(tmp_so)])
-        )
-    last_exc: Exception | None = None
     lock_fd = _acquire_dir_lock(here)
     try:
-        if not force_recompile and not _is_source_build_stale(
-            so_path, cpp_path, in_source_tree, c_native, link_args
-        ):
+        needs_build, effective_mode = _plan_source_build(
+            so_path, cpp_path, in_source_tree, requested_mode, force_recompile
+        )
+        if not needs_build:
             return so_path
-        for used_c_args, cmd in variants:
-            try:
-                src_mtime_ns = _source_mtime_ns(cpp_path)
-                build_id = (
-                    _compute_build_id(cpp_path, used_c_args, link_args)
-                    if in_source_tree
-                    else None
-                )
-                subprocess.run(cmd, check=True)
-                os.utime(tmp_so, ns=(src_mtime_ns, src_mtime_ns))
-                os.replace(tmp_so, so_path)
-                if build_id is not None:
-                    _write_build_id(so_path, build_id)
-                last_exc = None
-                break
-            except Exception as exc:
-                last_exc = exc
-                if tmp_so.exists():
-                    tmp_so.unlink(missing_ok=True)
+        last_exc, primary_cmd = _compile_so_variants(
+            cpp_path, so_path, in_source_tree, effective_mode
+        )
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
-    if last_exc is not None and (force_recompile or not so_path.exists()):
-        raise RuntimeError(
-            f"Failed to compile {cpp_path} with {variants[0][1]}. "
-            f"Please build/install stimside via 'pip install -e .' or 'pip install .'."
-        ) from last_exc
+    if last_exc is not None:
+        if force_recompile or not so_path.exists():
+            raise RuntimeError(
+                f"Failed to compile {cpp_path} with {primary_cmd}. "
+                f"Please build/install stimside via 'pip install -e .' or 'pip install .'."
+            ) from last_exc
+        _warn_failed_rebuild_once(so_path, last_exc)
     return so_path
 
 

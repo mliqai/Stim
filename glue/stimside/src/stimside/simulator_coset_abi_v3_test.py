@@ -998,6 +998,9 @@ def test_c2_setprofile_reentrancy_past_end_dcc() -> None:
     finally:
         sys.setprofile(None)
     assert fired_b[0] and sim_b._step_cursor == 0
+    with pytest.raises(RuntimeError, match=r"clear\(\)"):
+        sim_b.peek_pauli_batch([0, 1], "Z")
+    sim_b.clear()
     assert np.array_equal(sim_b.peek_pauli_batch([0, 1], "Z"), np.ones((2, 2), dtype=np.int8))
 
 

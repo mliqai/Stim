@@ -224,19 +224,27 @@ def test_max_components_exception_and_partial_state_match_the_list_path(
 
 
 @pytest.mark.skipif(
-    sm._LIVE_STORE_ENGINE is not False,
-    reason="pins the OFF default: forcing the switch ON (to run the suite on the engine) or "
-    "flipping the default is the owner's decision and retires this pin, not a regression",
+    sm._LIVE_STORE_ENGINE is not True,
+    reason="pins the ON default: forcing the switch OFF (to run the suite on the reference "
+    "list) skips this default pin, not a regression",
 )
-def test_the_default_keeps_the_reference_path_and_never_builds_an_engine(
+def test_the_default_uses_the_engine_path_and_switch_off_keeps_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from stimside._magic.live_store import engine_numerics_available
+
     monkeypatch.setattr(sm, "LiveExpansions", _BlockStore)
     _BlockStore.commands = 0
-    assert sm._LIVE_STORE_ENGINE is False
+    assert sm._LIVE_STORE_ENGINE is True
     sim = MagicsideSimulator(stim.Circuit(_NOISY), batch_size=4, seed=1)
     sim.run()
-    assert isinstance(sim._live_exps, list) and _BlockStore.commands == 0
+    if engine_numerics_available():
+        assert isinstance(sim._live_exps, LiveExpansions) and _BlockStore.commands >= 1
+    monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", False)
+    _BlockStore.commands = 0
+    ref = MagicsideSimulator(stim.Circuit(_NOISY), batch_size=4, seed=1)
+    ref.run()
+    assert isinstance(ref._live_exps, list) and _BlockStore.commands == 0
 
 
 _CAPPED = "H 0 1 2\nI[T] 0\nZ_ERROR(0.5) 0 1 2\nI[T] 1\nI[CCZ] 0 1 2\nH 0 1 2\nM 0"

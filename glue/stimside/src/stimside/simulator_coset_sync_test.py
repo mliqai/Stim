@@ -661,10 +661,12 @@ def test_interrupt_after_a_mutating_kernel_returns_leaves_a_flag_raised(
         op(sim)
     assert lib.fired
     assert sim._cpp_dirty
-    engine_view = _peek_all(sim)
-    _ = sim.active_shots
-    assert not sim._cpp_dirty
-    np.testing.assert_array_equal(_py_peek_all(sim), engine_view)
+    with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
+        _peek_all(sim)
+    with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
+        _ = sim.active_shots
+    sim.clear()
+    assert not sim._cpp_dirty and len(sim.active_shots) == 0
 
 
 _G1 = ["H", "S", "SQRT_X", "C_XYZ", "S_DAG", "SQRT_Y", "X", "Z"]
@@ -836,8 +838,15 @@ def test_interrupt_before_mutating_kernel_at_cpp_dirty_store_keeps_engine_consis
     with pytest.raises(KeyboardInterrupt):
         op(sim)
     assert sim._cpp_dirty
-    assert _shot_state(sim) == before
+    assert isinstance(sim, Trapped)
+    with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
+        _ = sim.active_shots
+    sim._sync_cpp_to_py()
     assert not sim._cpp_dirty
+    assert _raw_state(sim) == before
+    sim.clear()
+    assert type(sim) is Trapped
+    assert not sim._cpp_dirty and len(sim.active_shots) == 0
 
 
 class _RaiseAtEngineClear:
@@ -868,7 +877,7 @@ def test_interrupted_clear_leaves_pre_clear_state_until_retried(
     _peek_all(sim)
     if engine_ahead:
         _unmatched_reset(sim, "Z")
-    peeks_before = _peek_all(sim)
+    _peek_all(sim)
     assert sim._cpp_dirty is engine_ahead
     assert sim._cpp_lib is not None
     lib = _RaiseAtEngineClear(sim._cpp_lib)
@@ -877,7 +886,8 @@ def test_interrupted_clear_leaves_pre_clear_state_until_retried(
         sim.clear()
     assert not lib.armed
     assert sim._cpp_dirty is True
-    np.testing.assert_array_equal(_peek_all(sim), peeks_before)
+    with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
+        _peek_all(sim)
     sim.clear()
     assert not sim._cpp_dirty and len(sim.active_shots) == 0
     np.testing.assert_array_equal(_peek_all(sim), _peek_all(_make_sim(batch)))
@@ -931,7 +941,9 @@ def test_interrupt_after_the_first_nonrandom_mixed_kernel_leaves_a_flag_raised(
             sim.interactive_do(inst)
     assert modes == [0]  # the interrupted kernel was the non-random branch
     assert sim._cpp_dirty
-    engine_view = _peek_all(sim)
-    _ = sim.active_shots
-    assert not sim._cpp_dirty
-    np.testing.assert_array_equal(_py_peek_all(sim), engine_view)
+    with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
+        _peek_all(sim)
+    with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
+        _ = sim.active_shots
+    sim.clear()
+    assert not sim._cpp_dirty and len(sim.active_shots) == 0

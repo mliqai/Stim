@@ -96,17 +96,23 @@ def test_clear_reuses_one_engine_and_resets_it(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.skipif(
-    sm._LIVE_STORE_ENGINE is not False,
-    reason="pins the OFF default: forcing the switch ON (to run the suite on the engine) or "
-    "flipping the default is the owner's decision and retires this pin, not a regression",
+    sm._LIVE_STORE_ENGINE is not True,
+    reason="pins the ON default: forcing the switch OFF (to run the suite on the reference "
+    "list) skips this default pin, not a regression",
 )
-def test_the_switch_is_private_and_off_by_default() -> None:
+def test_the_switch_is_private_and_on_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     import stimside
+    from stimside._magic.live_store import engine_numerics_available
 
-    assert sm._LIVE_STORE_ENGINE is False
+    assert sm._LIVE_STORE_ENGINE is True
     assert not any("live" in n.lower() or "engine" in n.lower() for n in stimside.__all__)
-    sim = MagicsideSimulator(stim.Circuit("H 0\nI[T] 0\nH 0\nM 0\n"), batch_size=2, seed=1)
-    assert isinstance(sim._live_exps, list)  # the reference path is the default
+    circ = stim.Circuit("H 0\nI[T] 0\nH 0\nM 0\n")
+    sim = MagicsideSimulator(circ, batch_size=2, seed=1)
+    if engine_numerics_available():
+        assert isinstance(sim._live_exps, LiveExpansions)
+    monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", False)
+    ref = MagicsideSimulator(circ, batch_size=2, seed=1)
+    assert isinstance(ref._live_exps, list)
 
 
 def test_with_the_switch_on_the_realization_style_chi_zero_assignment_still_works(

@@ -63,26 +63,26 @@ class StimsideBuildExt(build_ext):
                 out[ext.name] = max(mtimes)
         return out
 
-    def _capture_build_ids(self) -> dict[str, str]:
-        out: dict[str, str] = {}
+    def _capture_build_ids(self) -> dict[str, tuple[str, str]]:
+        mode = "native" if _KERNEL_LOADER._requested_build_mode() == "native" else "portable"
+        out: dict[str, tuple[str, str]] = {}
         for ext in self.extensions:
             if not ext.sources:
                 continue
             cpp_path = PROJECT_ROOT / ext.sources[0]
             if cpp_path.exists():
-                out[ext.name] = _KERNEL_LOADER._compute_build_id(
-                    cpp_path, ext.extra_compile_args, ext.extra_link_args
-                )
+                out[ext.name] = (_KERNEL_LOADER._compute_source_hash(cpp_path), mode)
         return out
 
     def run(self) -> None:
         # The in-tree build_base persists across builds and its up-to-date check ignores
-        # compile-flag changes (e.g. STIMSIDE_NATIVE_BUILD / STIMSIDE_PORTABLE_BUILD), so force.
+        # compile-flag changes (STIMSIDE_NATIVE_BUILD / STIMSIDE_PORTABLE_BUILD), so force.
+        # Build release wheels from the sdist: persistent build_base can retain deleted files.
         self.force = True
         src_mtimes = self._capture_source_mtimes()
-        build_ids = self._capture_build_ids()
+        build_records = self._capture_build_ids()
         super().run()
-        self._sync_extensions_to_source_dir(src_mtimes, build_ids)
+        self._sync_extensions_to_source_dir(src_mtimes, build_records)
 
     def copy_extensions_to_source(self) -> None:
         self._sync_extensions_to_source_dir()
@@ -90,12 +90,14 @@ class StimsideBuildExt(build_ext):
     def _sync_extensions_to_source_dir(
         self,
         src_mtimes: dict[str, int] | None = None,
-        build_ids: dict[str, str] | None = None,
+        build_records: dict[str, tuple[str, str]] | None = None,
     ) -> None:
         package_dir_map = self.distribution.package_dir or {"": "src"}
         root_src = package_dir_map.get("", "src")
         captured = src_mtimes if src_mtimes is not None else self._capture_source_mtimes()
-        captured_ids = build_ids if build_ids is not None else self._capture_build_ids()
+        captured_records = (
+            build_records if build_records is not None else self._capture_build_ids()
+        )
         for ext in self.extensions:
             rel_ext_path = self.get_ext_filename(ext.name)
             built_path = (Path(self.build_lib) / rel_ext_path).resolve()
@@ -113,9 +115,9 @@ class StimsideBuildExt(build_ext):
                     if src_mtime_ns is not None:
                         os.utime(tmp_dest, ns=(src_mtime_ns, src_mtime_ns))
                     os.replace(tmp_dest, dest_path)
-                build_id = captured_ids.get(ext.name)
-                if build_id is not None:
-                    _KERNEL_LOADER._write_build_id(dest_path, build_id)
+                record = captured_records.get(ext.name)
+                if record is not None:
+                    _KERNEL_LOADER._write_build_record(dest_path, record[0], record[1])
             except OSError:
                 if self.inplace:
                     raise

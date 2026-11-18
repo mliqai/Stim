@@ -1,4 +1,5 @@
-"""OOM fault-injection tests for all 11 allocating production `engine_*` calls and sticky guard."""
+"""OOM fault-injection tests for all 11 allocating production `engine_*` calls (13 OOM cases),
+zero-allocation `engine_set_rng_states` (12 functions, 14 cases total), and sticky guard."""
 
 from __future__ import annotations
 
@@ -253,30 +254,40 @@ def _run_one(name, k):
         return f"{type(exc).__name__}: {exc}", hooked_fn, state["calls"], state["allocs"]
 
 
-_, hooked_fn, hook_calls, allocs = _run_one(case, 10**9)
-assert hook_calls >= 1 and allocs >= 1, (case, hooked_fn, hook_calls, allocs)
-results = [_run_one(case, k)[0] for k in range(allocs)]
-print(json.dumps({
-    "case": case,
-    "hooked_fn": hooked_fn,
-    "hook_calls": hook_calls,
-    "allocs": allocs,
-    "results": results,
-}))
+if case == "pub_set_rng_states":
+    status, hooked_fn, hook_calls, allocs = _run_one(case, 0)
+    print(json.dumps({
+        "case": case,
+        "hooked_fn": hooked_fn,
+        "hook_calls": hook_calls,
+        "allocs": allocs,
+        "results": [status],
+    }))
+else:
+    _, hooked_fn, hook_calls, allocs = _run_one(case, 10**9)
+    assert hook_calls >= 1 and allocs >= 1, (case, hooked_fn, hook_calls, allocs)
+    results = [_run_one(case, k)[0] for k in range(allocs)]
+    print(json.dumps({
+        "case": case,
+        "hooked_fn": hooked_fn,
+        "hook_calls": hook_calls,
+        "allocs": allocs,
+        "results": results,
+    }))
 """
 
 
-def _under_sanitizer() -> bool:
+def _under_tsan() -> bool:
     try:
         libc = ctypes.CDLL(None)
-        return hasattr(libc, "__asan_init") or hasattr(libc, "__tsan_init")
+        return hasattr(libc, "__tsan_init")
     except OSError:
         return False
 
 
 pytestmark = pytest.mark.skipif(
-    _under_sanitizer() or shutil.which("c++") is None,
-    reason="needs a C++ compiler and no sanitizer allocator (they own operator new)",
+    _under_tsan() or shutil.which("c++") is None,
+    reason="needs a C++ compiler and no TSan runtime (TSan owns operator new)",
 )
 
 
@@ -290,13 +301,23 @@ def fi_so(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _run_child(fi_so: Path, case: str, timeout: int = 300) -> dict[str, Any]:
+    existing_preload = os.environ.get("LD_PRELOAD", "").strip()
+    ld_preload = f"{fi_so} {existing_preload}" if existing_preload else str(fi_so)
     env = {
         **os.environ,
         "PYTHONDONTWRITEBYTECODE": "1",
-        "LD_PRELOAD": str(fi_so),
+        "LD_PRELOAD": ld_preload,
         "OPENBLAS_NUM_THREADS": "1",
         "OMP_NUM_THREADS": "1",
     }
+    if existing_preload:
+        asan_opts = env.get("ASAN_OPTIONS", "")
+        if "verify_asan_link_order=0" not in asan_opts:
+            env["ASAN_OPTIONS"] = (
+                f"{asan_opts}:verify_asan_link_order=0"
+                if asan_opts
+                else "verify_asan_link_order=0"
+            )
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD, str(_SRC), str(fi_so), case],
         capture_output=True, text=True, env=env, timeout=timeout, check=False,
@@ -308,7 +329,6 @@ def _run_child(fi_so: Path, case: str, timeout: int = 300) -> dict[str, Any]:
 
 _CASES = [
     "pub_engine_create",
-    "pub_set_rng_states",
     "pub_register_unitary_step",
     "pub_register_unitary_group_evict",
     "pub_disjoint_clifford_v3",
@@ -338,3 +358,11 @@ def test_coset_engine_oom_becomes_memory_error_and_latches_failed_engine(
     assert out["hook_calls"] >= 1, out
     assert out["allocs"] >= 1, out
     assert out["results"] == ["MemoryError"] * out["allocs"], out
+
+
+def test_coset_engine_set_rng_states_zero_alloc(fi_so: Path) -> None:
+    out = _run_child(fi_so, "pub_set_rng_states")
+    assert out["hooked_fn"] == "engine_set_rng_states", out
+    assert out["hook_calls"] >= 1, out
+    assert out["allocs"] == 0, out
+    assert out["results"] == ["ok"], out

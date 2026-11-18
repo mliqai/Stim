@@ -7,8 +7,8 @@ ABI notes:
   ``engine_batch_det_meas_step``, and ``engine_batch_unmatched_noisy_reset_z`` zero non-null
   output kick flags on invalid input (with non-null ``ptr``), whereas ``engine_batch_mixed_substep``
   and ``engine_batch_evict`` leave accumulator flags untouched on invalid input; no v2 kernel
-  touches flags when ``ptr == NULL``. ``engine_set_rng_states`` returns ``0`` on success or
-  ``< 0`` (retaining previous owned RNG states on ``NULL``/error/OOM); ``engine_get_rng_states``
+  touches flags when ``ptr == NULL``. ``engine_set_rng_states`` copies in place (no heap
+  allocation) and returns ``0`` on success or ``< 0`` on ``NULL``/error; ``engine_get_rng_states``
   copies owned RNG states with ``n_shots == batch_size`` check. ``engine_get_active_shot_indices``
   returns ``-1`` on ``NULL``.
 - ABI v3 (``coset_kernels_abi_v3() == 3``): additive ``int``-returning entry points validate

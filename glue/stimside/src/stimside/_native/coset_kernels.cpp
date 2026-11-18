@@ -851,9 +851,15 @@ int engine_set_rng_states(void* ptr, const uint64_t* ext_rng_states) {
     auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
     if (eng->fail_kind != 0) return -2;
     return run_int_guarded(eng, -2, -3, [&]() -> int {
-        if (eng->batch_size <= 0) return -1;
-        std::vector<uint64_t> next(ext_rng_states, ext_rng_states + size_t(eng->batch_size));
-        eng->shot_rng_states_owned.swap(next);
+        if (eng->batch_size <= 0 ||
+            eng->shot_rng_states_owned.size() != size_t(eng->batch_size)) {
+            return -1;
+        }
+        std::copy(
+            ext_rng_states,
+            ext_rng_states + size_t(eng->batch_size),
+            eng->shot_rng_states_owned.begin()
+        );
         return 0;
     });
 }

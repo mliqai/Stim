@@ -131,8 +131,21 @@ def _fingerprint(sim: CosetsideSimulator) -> str:
     xs, zs, _, _, _ = sim._flip_simulator.to_numpy(output_xs=True, output_zs=True)
     shots = sorted((b, st.d, st.h_words.tolist()) for b, st in sim._active_shots.items())
     rng = sim.np_rng.bit_generator.state["state"]
+    if sim._use_cpp and sim._cpp_eng is not None and sim._cpp_lib is not None:
+        tie_rng = np.empty(sim._init_batch_size, dtype=np.uint64)
+        rc = int(
+            sim._cpp_lib.engine_get_rng_states(
+                sim._cpp_eng,
+                sim._init_batch_size,
+                tie_rng.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+            )
+        )
+        assert rc == 0
+        tie_bytes = tie_rng.tobytes()
+    else:
+        tie_bytes = sim._shot_tiebreak_rng.tobytes()
     flags = (sim._cpp_dirty, len(sim._measurement_columns), sim._step_cursor)
-    parts = (xs.tobytes(), zs.tobytes(), repr(shots), sim._shot_tiebreak_rng.tobytes(), repr(rng))
+    parts = (xs.tobytes(), zs.tobytes(), repr(shots), tie_bytes, repr(rng))
     ref = sim._compiled_ref
     words = [w.tobytes() for w in (*ref.ref_chp.snapshot_packed(), *sim._current_packed_words())]
     blob = b"|".join(p if isinstance(p, bytes) else p.encode() for p in (*parts, *words))

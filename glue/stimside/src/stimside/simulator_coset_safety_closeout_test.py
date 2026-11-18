@@ -518,8 +518,12 @@ def test_h2_profile_replay_to_replay_is_atomic(
 
     assert fired[0] and sim._step_cursor == ref._step_cursor == 2
     assert _fp(sim) == _fp(ref)
-    sim.do_conditional_clifford(stim.CircuitInstruction("H", [0, 1, 2, 3]), np.ones((4, _B), bool))
-    assert sim._step_cursor == 3
+    with pytest.raises(RuntimeError, match=r"ValueError.*clear\(\)"):
+        sim.do_conditional_clifford(
+            stim.CircuitInstruction("H", [0, 1, 2, 3]), np.ones((4, _B), bool)
+        )
+    sim.clear()
+    assert sim._step_cursor == 0 and sim.active_shots == {}
 
 
 @_SKIP_NO_SIGALRM
@@ -597,8 +601,10 @@ def test_h2_replay_to_append_and_clear_rollbacks(monkeypatch: pytest.MonkeyPatch
     assert len(sim._compiled_ref.steps) == len(ref._compiled_ref.steps) == 3
     assert sim._step_cursor == ref._step_cursor == 3
     assert _fp(sim) == _fp(ref)
-    sim.do_conditional_clifford(h4, np.ones((4, _B), bool))
-    assert len(sim._compiled_ref.steps) == 4 and sim._step_cursor == 4
+    with pytest.raises(RuntimeError, match=r"ValueError.*clear\(\)"):
+        sim.do_conditional_clifford(h4, np.ones((4, _B), bool))
+    sim.clear()
+    assert sim._step_cursor == 0 and sim.active_shots == {}
 
     c_clr = "H 0 1 2 3\nTICK\nM 0 1 2 3"
     ref_clr = _mk(c_clr)

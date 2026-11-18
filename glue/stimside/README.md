@@ -20,9 +20,12 @@ pip install -e .
 pip install .
 ```
 
-The kernels are compiled as portable binaries by default (without `-march=native`, using `-ffp-contract=off` so portable and native builds match). To compile with `-march=native` on x86 and ARM64 machines for the local CPU only, set `STIMSIDE_NATIVE_BUILD=1` in the build environment (`STIMSIDE_NATIVE_BUILD=1 pip install -e .` or `STIMSIDE_NATIVE_BUILD=1 pip install .`). Setting `STIMSIDE_PORTABLE_BUILD=1` always forces a portable build and overrides `STIMSIDE_NATIVE_BUILD=1`.
+The kernels are compiled as portable binaries by default (without `-march=native`, using `-ffp-contract=off` so portable and native builds match). Wheels are tagged `py3-none-<platform>` (compatible across Python 3.11+ on the same platform); build release wheels from the sdist (`setup.py` reuses a persistent `python_build_stimside` directory). To compile with `-march=native` on x86 and ARM64 machines for the local CPU only, set `STIMSIDE_NATIVE_BUILD=1` in the build environment (`STIMSIDE_NATIVE_BUILD=1 pip install -e .` or `STIMSIDE_NATIVE_BUILD=1 pip install .`). Setting `STIMSIDE_PORTABLE_BUILD=1` always forces a portable build and overrides `STIMSIDE_NATIVE_BUILD=1`.
+Portable and native builds perform comparably on Cosetside and standard Magicside QEC workloads;
+on amplitude-heavy Magicside circuits (such as random `T`+`CX` circuits), a native build
+(`STIMSIDE_NATIVE_BUILD=1`) is about 10% faster.
 
-At runtime, an installed package (`site-packages`) loads the prebuilt shared libraries directly without compiling unless a required ABI symbol is missing (which rebuilds in place if sources are present and writable, or else raises an error prompting `pip install`). In a writable source checkout, importing `stimside` recompiles automatically when a library is missing, older than its C++/header sources, or mismatched against its `.lib*.build_id` sidecar (e.g. when switching `STIMSIDE_NATIVE_BUILD=1`), and `pip install` always rebuilds. Builds serialize via `flock` on the `_native` directory and create no lock files; if upgrading from an older version, any stale `/tmp/.stimside_build_*.lock` files can be removed (`rm -f /tmp/.stimside_build_*.lock`).
+At runtime, nothing compiles at `import stimside`; each C++ kernel library is compiled lazily on first use. An installed package (`site-packages`, `dist-packages`, or outside `.../src/stimside/_native`) loads the prebuilt shared libraries directly without compiling unless a library is missing, unloadable, or missing a required ABI symbol (rebuilding in place only if `.cpp` sources are present and `_native` is writable, or else raising an error prompting `pip install`). In a writable source checkout (`.../src/stimside/_native` with `setup.py`), build flags are sticky (`D-42`): with no env var set, flags never trigger a rebuild and source-triggered rebuilds (missing library, newer `.cpp`/`.hpp` mtime, or changed source hash in `.lib*.build_id`) keep the recorded mode (defaulting to portable without a record). A missing or legacy `.lib*.build_id` sidecar is adopted without rebuilding (recording mode `"unknown"`), and the first explicit `STIMSIDE_NATIVE_BUILD=1` or `STIMSIDE_PORTABLE_BUILD=1` rebuilds once; if a compiler rejects `-march=native` and falls back to portable, the native request is still recorded so later starts do not loop. `pip install .` and `pip install -e .` always rebuild with their environment's flags and record them. Builds serialize via a bounded non-blocking `flock` on the `_native` directory (warning once on stderr on timeout, and proceeding safely without the lock on timeout, foreign directory owner, or filesystems without `flock`), create no lock files, and warn once on stderr when a rebuild fails and falls back to an existing `.so`. If upgrading from an older version, any stale lock files live in `$TMPDIR` (default `/tmp`) and can be removed (`rm -f "${TMPDIR:-/tmp}"/.stimside_build_*.lock`).
 
 `BranchAndBoundDecoder`, and so the paper examples `examples/paper_static_surface_code.py` and `examples/paper_moonwalking_surface_code.py`, need the PyMatching version with per-shot `edge_reweights` (and `return_no_matching`) in `Matching.decode_batch`; with the released `pymatching` package it raises `ImportError`. `MarginalDecoder(decompose_errors=True, reweight_only=True)` works with either: without per-shot `edge_reweights` it decodes each distinct reweighted DEM instead, which is slower. So does `decode_with_generated_dems` with a `sinter.Decoder` or `"pymatching"`, but not with a `pymatching.Matching` instance: that decodes `edge_reweights` with `Matching.decode_batch(..., edge_reweights=...)`, which raises `TypeError` with the released package.
 
@@ -180,6 +183,33 @@ res_fault = stimside.EvaluateQueries(
 print(res_clean.mass, res_fault.mass, res_fault.prefix_probs)
 print(res_fault.diagnostics.peak_terms, res_fault.diagnostics.cache_hits)
 ```
+
+### Native Batch Engine & Operational Limits
+
+- **Default ON:** In live streaming mode (`fault_mode="DIRECT"`, `backend="STREAM"`),
+  `MagicsideSimulator` keeps per-shot expansions in the C++ batch engine (`libmagic_kernels.so`,
+  wrapped by `MagicBatchEngine` and `LiveExpansions`) by default.
+- **Automatic Python fallback:** If `libmagic_kernels.so` cannot be loaded or
+  `engine_numerics_available()` returns `False` (when `numerics_match_numpy()` detects that
+  platform/NumPy complex-multiply or pairwise-norm results differ from the engine),
+  `MagicsideSimulator` falls back automatically to the Python reference list path.
+- **Operational limits:**
+  - **Not async-signal-safe (`FNF-31`):** Re-entrant calls into an engine from a signal handler
+    or GC finalizer on the owning thread raise `RuntimeError` (and `close()` is deferred until
+    the active native section exits), but the wrapper is not async-signal-safe at arbitrary
+    opcode boundaries; do not touch an engine from signal handlers or finalizers on the owning
+    thread.
+  - **Cross-engine lock order (`FNF-32`):** Each engine has its own per-engine lock (independent
+    engines run concurrently; one shared engine is serialized), so nesting calls across two
+    different engines in opposite orders across threads or signal handlers can deadlock.
+  - **`os.fork()` behaviour (`FNF-34`):** `os.fork()` takes no engine locks in the parent; in
+    the child, locks and flags are renewed via `os.register_at_fork(after_in_child=...)`.
+    Engines idle at `fork()` (or created afterward) work normally in the child, whereas any
+    engine whose native section was active on another thread at the moment of `fork()` is
+    poisoned in the child (its handle is never freed there and any subsequent use raises
+    `RuntimeError`).
+  - **Copy / pickling:** `copy.copy(sim)` gives the copy its own independent engine with the
+    same shots; `LiveExpansions` cannot be pickled (`__getstate__` raises `TypeError`).
 
 ### Detector & Observable Conversion (`m2d_reference_mode`)
 

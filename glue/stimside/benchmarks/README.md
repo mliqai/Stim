@@ -23,20 +23,20 @@ Circuits are built in `_circuits.py`.
   same load**: interleave runs of the old and new tree, at least 3 rounds, take the best.
 - Throughput is a performance reference only: no test asserts on it.
 
-## Baseline (plan v2 §3, quiet-ish machine, W3 tree)
+## Baseline (Plan v8 §0.2, portable build, engine ON by default, B=64, pinned-core CPU shots/s)
 
 | Benchmark | Expected |
 |---|---|
-| leaky SC d=3, Coset vs Magic | 4,518 vs 538 shots/s (8.4x) |
-| leaky SC d=5, Coset vs Magic | 1,720 vs 109 shots/s (15.8x) |
-| X-memory d=3 + k T, live, k = 0 / 2 / 4 / 6 | 1,141 / 909 / 591 / 468 shots/s |
-| X-memory d=3 + k T, compiled | 89-99 shots/s |
-| X-memory d=3 + k T, QUERY | ~72 shots/s |
-| random T+CX n=12 (43 T), live | 44 shots/s |
+| leaky SC d=3, Coset vs Magic | 4,275–4,367 vs 1,675 shots/s (~2.6x; OFF 675, ON/OFF ~2.4–2.5x) |
+| leaky SC d=5, Coset vs Magic | 1,647–1,670 vs 397 shots/s (~4.2x; OFF 128, ON/OFF ~3.1x) |
+| X-memory d=3 + k=6 T, live | 4,019 shots/s (OFF 905, ON/OFF ~4.3–4.4x) |
+| X-memory d=3 + k T, compiled / QUERY | ~89–99 / ~72 shots/s (W3 ref; no live engine) |
+| random T+CX n=12 (43 T), live | 180–189 shots/s portable (~206 native; OFF 133, ~1.35–1.4x) |
 
-First measurement of this harness (WP-24 batch B1, tree with the header move, no behavioural
-change) is in the WP-24 B1 handoff; it matched the ratios above and was lower in absolute terms
-because of machine load.
+Measured on `11b42b5` / Run 8 Stage A with `STIMSIDE_PORTABLE_BUILD` (the default); setting
+`STIMSIDE_NATIVE_BUILD=1` gives ~10% higher throughput on `random T+CX n=12` (~206 shots/s) and
+matches within noise on SC and X-memory. Compiled and `QUERY` modes do not use the live engine
+and keep their W3 reference figures.
 
 ## Related checks that are NOT here
 

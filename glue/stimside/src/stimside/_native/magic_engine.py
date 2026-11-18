@@ -32,10 +32,10 @@ not exist there. An engine that another thread was inside a native section of at
 raises `RuntimeError` and it is never freed there. An engine that was idle at the fork, or is
 created afterwards, works normally in the child.
 
-Limits (found, not fixed; the engine path is private and OFF by default): the wrapper is not
-async-signal-safe, so a signal handler or finalizer on the owner thread must not touch an engine
-beyond what is refused above, nor nest engine access while another thread is inside a different
-engine in the opposite order (two threads would then wait on each other).
+Limits (found, not fixed; the engine path is ON by default via `_LIVE_STORE_ENGINE`): the
+wrapper is not async-signal-safe, so a signal handler or finalizer on the owner thread must not
+touch an engine beyond what is refused above, nor nest engine access while another thread is
+inside a different engine in the opposite order (two threads would then wait on each other).
 
 The raw `mbe_*` ABI trusts its caller (live handle, buffers sized from `mbe_shot_header`, a mask
 of `batch_size` bytes, Pauli words of `n_words`); the wrapper is the only caller and enforces that

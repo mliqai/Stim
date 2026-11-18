@@ -87,7 +87,7 @@ M2D_MODES: dict[str, Literal["auto", "magicside", "stim", "zero"]] = {
 
 # Private switch (no public flag): True keeps the live per-shot expansions in the C++
 # MagicBatchEngine behind the `_live_exps` proxy; False keeps the reference Python list.
-_LIVE_STORE_ENGINE = False
+_LIVE_STORE_ENGINE = True
 
 # Private E1 reference-tableau memo controls (per-instance bounded LRU; off for compiled engines).
 _REF_MEMO_ENABLED = True
