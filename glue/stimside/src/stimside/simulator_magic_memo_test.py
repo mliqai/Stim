@@ -615,7 +615,7 @@ def test_e1_bounded_caps_trie_and_oversized_skip(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.parametrize("engine", [False, True])
-def test_e1_copy_isolation_and_shallow_dict_parity(
+def test_e1_copy_isolation_in_both_engine_modes(
     monkeypatch: pytest.MonkeyPatch, engine: bool
 ) -> None:
     monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", engine)
@@ -624,20 +624,22 @@ def test_e1_copy_isolation_and_shallow_dict_parity(
     sim = MagicsideSimulator(stim.Circuit("H 0\nI[T] 0\nM 0"), batch_size=4, seed=1)
     sim.interactive_do(stim.Circuit("H 0\nI[T] 0"))
     twin = copy.copy(sim)
-    if not engine:
-        assert twin.__dict__.keys() == sim.__dict__.keys()
-        assert all(twin.__dict__[k] is v for k, v in sim.__dict__.items())
-    else:
-        assert twin._live_ref_tab is not sim._live_ref_tab
+    assert twin.__dict__.keys() == sim.__dict__.keys()
+    assert twin._live_ref_tab is not sim._live_ref_tab
+    assert twin._live_exps is not sim._live_exps
     assert twin._ref_memo is not sim._ref_memo
     assert twin._ref_memo.hits == 0 and twin._ref_memo.misses == 0
+    sim_sid = _tab_sid(sim)
+    assert sim_sid is not None
     twin.interactive_do(stim.Circuit("M 0"))
     twin.finish_interactive_run()
     assert twin._ref_memo.hits == 0 and twin._ref_memo.misses == 0
-    if not engine:
-        assert _tab_sid(sim) is None
+    assert _tab_sid(sim) == sim_sid
     sim.interactive_do(stim.Circuit("M 0"))
     sim.finish_interactive_run()
+    np.testing.assert_array_equal(
+        twin.get_final_measurement_records(), sim.get_final_measurement_records()
+    )
     twin.clear()
     twin.run()
     assert twin._ref_memo.misses > 0

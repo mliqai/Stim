@@ -275,7 +275,9 @@ class MarginalLeakageDemGenerator:
             with a ``UserWarning`` once per analysed circuit: it is treated as a
             plain ``SWAP`` and the unleaked-to-leaked events it makes are ignored,
             so the DEMs are approximate. Without ``loss_oracle`` it raises
-            NotImplementedError.
+            NotImplementedError. Supports circuits whose consecutive zero-target
+            instructions fuse under ``stim.Circuit.flattened()`` via
+            ``unrolled_to_flattened_indices``.
     """
 
     def __init__(

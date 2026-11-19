@@ -87,6 +87,18 @@ class LeakageEventsRecorderMixin:
         return [sort_shot_events(ev) for ev in self._leakage_events]
 
 
+_U2F_NON_FUSING = frozenset(
+    {
+        "DETECTOR",
+        "E",
+        "ELSE_CORRELATED_ERROR",
+        "OBSERVABLE_INCLUDE",
+        "QUBIT_COORDS",
+        "TICK",
+    }
+)
+
+
 def unrolled_to_flattened_indices(
     circuit: stim.Circuit, *, validate: bool = True
 ) -> NDArray[np.int64]:
@@ -95,7 +107,9 @@ def unrolled_to_flattened_indices(
     ``SHIFT_COORDS`` ops (dropped by ``flattened()``) map to -1. ``flattened()``
     fuses identical consecutive ops (e.g. the last op of a ``REPEAT`` iteration
     with the first op of the next one), so several consecutive unrolled ops can
-    map to one flattened op, whose targets are theirs in order. With
+    map to one flattened op, whose targets are theirs in order. Consecutive
+    identical zero-target ops (excluding ``_U2F_NON_FUSING`` ops and
+    ``SHIFT_COORDS``) also fuse across ``REPEAT`` and ``SHIFT_COORDS`` boundaries. With
     ``validate=True`` the map is checked against ``circuit.flattened()``: the
     mapped ops must agree in name, tag and targets, and in gate args except for
     ``DETECTOR``/``QUBIT_COORDS`` (whose coordinates ``flattened()`` shifts).
@@ -110,7 +124,15 @@ def unrolled_to_flattened_indices(
         if a.name == "SHIFT_COORDS":
             continue
         a_targets = a.targets_copy()
-        if used == len(flat_targets):
+        fused_zero = (
+            not a_targets
+            and f >= 0
+            and a.name not in _U2F_NON_FUSING
+            and a.name == flat_ops[f].name
+            and a.tag == flat_ops[f].tag
+            and a.gate_args_copy() == flat_ops[f].gate_args_copy()
+        )
+        if used == len(flat_targets) and not fused_zero:
             f += 1
             if f >= len(flat_ops):
                 raise ValueError(

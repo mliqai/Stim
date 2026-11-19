@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import collections
+import copy
 import dataclasses
+import functools
 import math
 import struct
+import types
 import weakref
 from typing import Any, Callable, Literal, Mapping, Sequence
 
@@ -397,8 +400,131 @@ def _group_shots_by_state(exps: Sequence[ShotExpansion]) -> list[list[int]]:
     return groups
 
 
+_IMMUTABLE_STIM_TYPES = (
+    stim.CircuitInstruction,
+    stim.CircuitRepeatBlock,
+    stim.GateTarget,
+    stim.DemInstruction,
+    stim.DemRepeatBlock,
+    stim.DemTarget,
+    stim.GateData,
+    stim.Flow,
+)
+_MEMO_SKIP_TYPES = (
+    type(None),
+    bool,
+    int,
+    float,
+    complex,
+    str,
+    bytes,
+    type,
+    types.FunctionType,
+    types.BuiltinFunctionType,
+    types.ModuleType,
+)
+
+
+def _stim_deepcopy_memo(root: Any) -> dict[int, Any]:
+    """Build a deepcopy memo mapping immutable unpicklable Stim objects to themselves."""
+    memo: dict[int, Any] = {}
+    seen: set[int] = set()
+    stack: list[Any] = [root]
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, _MEMO_SKIP_TYPES):
+            continue
+        oid = id(obj)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        if isinstance(obj, _IMMUTABLE_STIM_TYPES):
+            memo[oid] = obj
+            continue
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                stack.append(k)
+                stack.append(v)
+        elif isinstance(obj, (list, tuple, set, frozenset, collections.deque)):
+            stack.extend(obj)
+        elif isinstance(obj, np.ndarray):
+            if obj.dtype == object:
+                stack.extend(obj.flat)
+            continue
+        elif isinstance(obj, functools.partial):
+            stack.append(obj.func)
+            stack.extend(obj.args)
+            if obj.keywords:
+                stack.extend(obj.keywords.values())
+        elif isinstance(obj, types.MethodType):
+            stack.append(obj.__self__)
+            continue
+        try:
+            d = object.__getattribute__(obj, "__dict__")
+        except AttributeError:
+            d = None
+        if isinstance(d, dict):
+            stack.extend(d.values())
+        obj_cls = type(obj)
+        for cls in obj_cls.__mro__:
+            slots = cls.__dict__.get("__slots__")
+            if not slots:
+                continue
+            for name in (slots,) if isinstance(slots, str) else slots:
+                if name in ("__dict__", "__weakref__"):
+                    continue
+                if (
+                    name.startswith("__")
+                    and not name.endswith("__")
+                    and (stripped := cls.__name__.lstrip("_"))
+                ):
+                    name = f"_{stripped}{name}"
+                descr = cls.__dict__.get(name)
+                if isinstance(descr, types.MemberDescriptorType):
+                    try:
+                        stack.append(descr.__get__(obj, obj_cls))
+                    except AttributeError:
+                        pass
+    return memo
+
+
+def _clone_op_handler(handler: CompiledOpHandler[Any]) -> CompiledOpHandler[Any]:
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import (
+        CompiledLeakageUint8Coset,
+    )
+    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import (
+        CompiledLeakageUint8Magic,
+    )
+
+    if type(handler) in (CompiledLeakageUint8Coset, CompiledLeakageUint8Magic):
+        assert isinstance(handler, CompiledLeakageUint8Coset)
+        clone = copy.copy(handler)
+        clone._state = handler._state.copy()
+        clone._alloc_scratch(handler.batch_size)
+        clone.ops_to_params = dict(handler.ops_to_params)
+        clone.claimed_ops_keys = set(handler.claimed_ops_keys)
+        if (
+            isinstance(handler, CompiledLeakageUint8Magic)
+            and isinstance(clone, CompiledLeakageUint8Magic)
+        ):
+            clone.u_measurement_ops = set(handler.u_measurement_ops)
+            clone.magic_ops = {k: list(v) for k, v in handler.magic_ops.items()}
+        return clone
+    if (
+        getattr(type(handler), "__copy__", None) is not None
+        and getattr(type(handler), "__deepcopy__", None) is None
+    ):
+        return copy.copy(handler)
+    return copy.deepcopy(handler, _stim_deepcopy_memo(handler))
+
+
 class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixin):
-    """Non-Clifford Phase-QFE simulator compatible with CosetsideSimulator APIs."""
+    """Non-Clifford Phase-QFE simulator compatible with CosetsideSimulator APIs.
+
+    Lifecycle & copying: each ``run()`` refuses dirty retries after instruction 0 fails
+    until ``clear()`` resets the simulator, and ``copy.copy(sim)`` deep-clones mutable
+    simulator state, stores, and op handlers into an independent instance.
+    """
 
     def __init__(
         self, circuit: stim.Circuit, compiled_op_handler: CompiledOpHandler[Any] | None = None, *,
@@ -525,6 +651,11 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._measurement_columns[index][:] = values
 
     def clear(self) -> None:
+        """Reset simulator state, RNGs, and batch store for a fresh circuit run.
+
+        Re-reads ``_LIVE_STORE_ENGINE`` when reinitializing ``_live_exps`` and clears
+        ``_started`` so ``run()`` can start a fresh batch even after an earlier error.
+        """
         self._measurement_columns.clear()
         self._cached_m2d: tuple[NDArray[np.bool_], NDArray[np.bool_]] | None = None
         self.qubit_coords: dict[int, list[float]] = {}
@@ -539,6 +670,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._circuit_time = 0
         self._used_interactively = False
         self._finished_running_circuit = False
+        self._started = False
         self._live_ref_tab: ReferenceCHPTableau = (
             self._new_ref_tab() if _REF_MEMO_ENABLED else ReferenceCHPTableau(self._eff_nq)
         )
@@ -570,8 +702,22 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         return self._circuit_time
 
     def run(self) -> list[np.ndarray] | None:
-        if self._used_interactively or self._circuit_time != 0 or self._finished_running_circuit:
+        """Execute the full circuit across all ``batch_size`` shots.
+
+        Sets ``_started = True`` before instruction 0; if instruction 0 or any later
+        operation raises, subsequent ``run()``, ``interactive_do()`` and
+        ``finish_interactive_run()`` calls raise ``ValueError`` until ``clear()``
+        resets the simulator. Returns ``get_unleaked_to_leaked_records()`` when
+        ``record_unleaked_to_leaked`` is enabled, otherwise ``None``.
+        """
+        if (
+            self._started
+            or self._used_interactively
+            or self._circuit_time != 0
+            or self._finished_running_circuit
+        ):
             raise ValueError("MagicsideSimulator is not clean; call .clear() before .run().")
+        self._started = True
         can_use_compiled = self._has_trivial_handler and not self.sync_tableside_rng
         if self.backend == "QUERY":
             self._run_compiled_query()
@@ -707,8 +853,13 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if self._has_non_fault_reals:
             raise ValueError("Interactive execution only supports fault-slot keys in fault_realizations")
 
+    def _reject_after_failed_run(self) -> None:
+        if self._started and not self._finished_running_circuit:
+            raise ValueError("MagicsideSimulator is not clean after a failed run(); call .clear().")
+
     def interactive_do(self, this: stim.Circuit | stim.CircuitInstruction | stim.CircuitRepeatBlock, /) -> None:
         self._check_interactive_mode()
+        self._reject_after_failed_run()
         if self._finished_running_circuit:
             raise RuntimeError("Cannot call interactive_do after finish_interactive_run().")
         self._used_interactively = True
@@ -716,6 +867,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
     def finish_interactive_run(self) -> None:
         self._check_interactive_mode()
+        self._reject_after_failed_run()
         if not self._finished_running_circuit:
             if self._circuit_time == 0 and len(self._unrolled_ops) == 0 and 0 in self._prog_faults:
                 for slot_idx, ch in self._prog_faults[0]:
@@ -781,19 +933,70 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         return store
 
     def __copy__(self) -> MagicsideSimulator:
-        """Shallow copy (as the default), except that a native store is never shared: the copy
-        gets its own engine holding the same shots (freeing one must not reset the other)."""
+        """Return an independent simulator copy in both engine-backed and Python-list modes."""
         new = self.__class__.__new__(self.__class__)
         new.__dict__.update(self.__dict__)
         store: LiveExpansions | None = self.__dict__.get("_live_store")
+        in_use = store is not None and self._live_exps is store
         if store is not None:
-            in_use = self._live_exps is store  # else a compiled run left a list behind
-            new._live_store = store.copy() if in_use else LiveExpansions(
-                store.batch_size, store.n_qubits, store.atol
+            new_store = (
+                store.copy()
+                if in_use
+                else LiveExpansions(store.batch_size, store.n_qubits, store.atol)
             )
-            if in_use:
-                new._live_exps = new._live_store
-                new._live_ref_tab = self._live_ref_tab.copy()
+            new._live_store = new_store
+            new._live_exps = (
+                new_store
+                if in_use
+                else [exp.copy() for exp in self._live_exps]
+            )
+        else:
+            new._live_exps = [exp.copy() for exp in self._live_exps]
+        new._pending_magic = list(self._pending_magic)
+        new._measurement_columns = [col.copy() for col in self._measurement_columns]
+        new._cached_m2d = (
+            None
+            if self._cached_m2d is None
+            else (self._cached_m2d[0].copy(), self._cached_m2d[1].copy())
+        )
+        new._log_branch_masses = self._log_branch_masses.copy()
+        new._corr_occurred = self._corr_occurred.copy()
+        new._live_ref_tab = self._live_ref_tab.copy()
+        new._live_frame_events = list(self._live_frame_events)
+        new._shot_tabs = (
+            None if self._shot_tabs is None else [t.copy() for t in self._shot_tabs]
+        )
+        new._shot_sel_bits = (
+            None
+            if self._shot_sel_bits is None
+            else [None if sb is None else sb.copy() for sb in self._shot_sel_bits]
+        )
+        new.qubit_coords = {k: list(v) for k, v in self.qubit_coords.items()}
+        new.qubit_tags = dict(self.qubit_tags)
+        new.coords_shifts = list(self.coords_shifts)
+        new._unleaked_to_leaked_events = [list(ev) for ev in self._unleaked_to_leaked_events]
+        new._leakage_events = [list(ev) for ev in self._leakage_events]
+        new._ref_sample_cache = dict(self._ref_sample_cache)
+        if self._shot_np_rngs is not None:
+            new._shot_np_rngs = [copy.deepcopy(r) for r in self._shot_np_rngs]
+            new.np_rng = (
+                new._shot_np_rngs[0]
+                if self.np_rng is self._shot_np_rngs[0]
+                else copy.deepcopy(self.np_rng)
+            )
+        else:
+            new.np_rng = copy.deepcopy(self.np_rng)
+        if self._tab_rngs is not None:
+            new._tab_rngs = [t.copy(copy_rng=True) for t in self._tab_rngs]
+        if self._tab_rngs_x is not None:
+            new._tab_rngs_x = [t.copy(copy_rng=True) for t in self._tab_rngs_x]
+        cloned_handler = _clone_op_handler(self._compiled_op_handler)
+        new._compiled_op_handler = cloned_handler
+        new.compiled_op_handler = (
+            cloned_handler
+            if self.compiled_op_handler is self._compiled_op_handler
+            else _clone_op_handler(self.compiled_op_handler)
+        )
         return new
 
     @property

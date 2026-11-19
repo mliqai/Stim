@@ -18,6 +18,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -38,7 +39,7 @@ from stimside._magic.live_store_measure_edges_test import (
 )
 from stimside._native import magic_engine as me
 from stimside._native.magic_engine_hostile_test import _run_child
-from stimside._native.magic_engine_oom_test import _FI_CPP, _under_sanitizer
+from stimside._native.magic_engine_oom_test import _FI_CPP
 from stimside._native.magic_engine_test import _SpyLib
 
 _N, _ATOL = 5, 1e-10
@@ -494,10 +495,23 @@ print(json.dumps({"allocs": n_allocs, "kinds": kinds, "bad": bad}))
 
 
 def _oom_child(fi_so: Path, case: str) -> dict[str, Any]:
+    existing_preload = os.environ.get("LD_PRELOAD", "").strip()
+    ld_preload = f"{fi_so} {existing_preload}" if existing_preload else str(fi_so)
     env = {
-        **os.environ, "PYTHONDONTWRITEBYTECODE": "1", "LD_PRELOAD": str(fi_so),
-        "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "LD_PRELOAD": ld_preload,
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
     }
+    if existing_preload:
+        asan_opts = env.get("ASAN_OPTIONS", "")
+        if "verify_asan_link_order=0" not in asan_opts:
+            env["ASAN_OPTIONS"] = (
+                f"{asan_opts}:verify_asan_link_order=0"
+                if asan_opts
+                else "verify_asan_link_order=0"
+            )
     proc = subprocess.run(
         [sys.executable, "-c", _OOM, str(_SRC), str(fi_so), case],
         capture_output=True, text=True, env=env, timeout=900, check=False,
@@ -518,7 +532,8 @@ def fi_so(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 _skip_sanitized = pytest.mark.skipif(
-    _under_sanitizer(), reason="the sanitizer allocator owns operator new"
+    _under_tsan() or shutil.which("c++") is None,
+    reason="needs a C++ compiler and no TSan runtime (TSan owns operator new)",
 )
 
 

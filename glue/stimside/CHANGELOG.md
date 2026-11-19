@@ -2,6 +2,137 @@
 
 All notable user-visible changes to `stimside` are documented in this file.
 
+## Unreleased — Magicside, Cosetside, Kernel Loader, and Circuit-IR Updates
+
+- **Independent `copy.copy(MagicsideSimulator)` in both engine and list modes:** Rewrote
+  `MagicsideSimulator.__copy__` and added `_clone_op_handler` in `src/stimside/simulator_magic.py`
+  so `copy.copy(sim)` returns an independent simulator in both engine-backed (`LiveExpansions`
+  via `LiveExpansions.copy`) and Python-list (`ShotExpansion.copy`, whether `_LIVE_STORE_ENGINE`
+  is `False` or a compiled run left a `list`) modes, cloning all mutable simulator state
+  (`_pending_magic`, `_measurement_columns`, `_cached_m2d`, `_log_branch_masses`, `_corr_occurred`,
+  `_live_ref_tab`, `_live_frame_events`, `_shot_tabs`, `_shot_sel_bits`, `qubit_coords`,
+  `qubit_tags`, `coords_shifts`, `_unleaked_to_leaked_events`, `_leakage_events`,
+  `_ref_sample_cache`, `np_rng` / `_shot_np_rngs`, `_tab_rngs` / `_tab_rngs_x`, and
+  `_compiled_op_handler` / `compiled_op_handler`).
+- **`MagicsideSimulator.run()` refusal after a failed first instruction:** Added `_started`
+  (reset to `False` in `clear()` and checked/set to `True` in `run()` before the first
+  instruction runs) so an exception inside instruction `0` makes subsequent `run()` calls raise
+  `ValueError` until `clear()` is called (without adding an aborted-call latch).
+- **Magicside tests & ASan+UBSan hostile-engine coverage:**
+  - Retargeted the copy-isolation tests in `src/stimside/simulator_magic_live_store_test.py` and
+    `src/stimside/simulator_magic_memo_test.py` for independent `copy.copy` semantics across both
+    engine modes, and added boundary-copy, pending-magic copy, custom-handler copy, and
+    first-instruction failure retry tests in `src/stimside/simulator_magic_live_store_test.py`.
+  - Added `else:` list-mode fallback assertions to the default engine checks in
+    `src/stimside/simulator_magic_live_store_test.py` and
+    `src/stimside/simulator_magic_block_engine_test.py`.
+  - Enabled ASan+UBSan execution (prepending `fi_so` in `LD_PRELOAD` with
+    `verify_asan_link_order=0`, skipping only under `_under_tsan()` or when `c++` is missing) in
+    `src/stimside/_native/magic_engine_oom_test.py`,
+    `src/stimside/_native/magic_engine_born_hostile_test.py`, and
+    `src/stimside/_native/magic_engine_measure_hostile_test.py`.
+- **Magicside & Cosetside documentation corrections:** Updated `README.md` to clarify that
+  `MagicsideSimulator` requires `libmagic_kernels.so` (Python list fallback applies only when
+  `engine_numerics_available()` / `numerics_match_numpy()` returns `False`), note when compiled
+  stream/query paths produce a Python `list` or per-call fallbacks occur, document that
+  `_LIVE_STORE_ENGINE` is checked on every `clear()`, and describe independent `copy.copy(sim)`
+  semantics and the updated kernel-loader policy; replaced the stale `"zero overhead on the healthy
+  path"` claim in `CHANGELOG.md` with the paired-worker `run()` ratios (`0.989x–1.008x`) and
+  pre-optimization `interactive_do` timings (`~1.18-1.24x` slower).
+- **Faster `CosetsideSimulator.interactive_do` whole-circuit replay:** Cached the unrolled
+  instruction sequence and step-match verdict in `_compute_unrolled_ops`, added a `whole_match`
+  fast path in `interactive_do` for the whole circuit at time 0, and a per-instruction fast
+  branch in validation that is taken only while the instruction equals the reference step at the
+  step cursor (after a direct step call such as `do_conditional_clifford` between
+  `interactive_do` calls, the next `interactive_do` raises `ValueError` as before instead of
+  replaying against the wrong steps; the step check during execution is kept),
+  deferred `rec[-k]` measurement counting in `_update_and_check_meas_count`,
+  `_validate_interactive_slow_op`, and `_validate_interactive_item` via `num_measurements` and
+  `_REC_FEEDBACK_OPS`, removed unreachable empty/non-positive checks, and restored the detailed
+  Pauli product rotation (`SPP`/`SPP_DAG`) guidance error message (`0.832x–0.941x` of the
+  pre-validation baseline on plain surface-code `interactive_do` timings).
+- **Ordinary-subclass contract for `CosetsideSimulator`:** Added construction-time behavioural
+  latch verification via `_ensure_subclass_latch` and `_SUBCLASS_VERDICTS` (raising `TypeError`
+  for unsupported subclasses whose latched classes cannot be built or class-swapped), and removed
+  the instance-`__dict__` fallback latch, `abc.ABCMeta.__new__` special-casing, per-class latch
+  attribute caching, and redundant property guards on `unleaked_to_leaked_records` and
+  `active_shots`.
+- **Callback-flag unwind & docstring clarifications:** Moved `_override_packed_words` and
+  `_in_group_callback = True` assignments inside `try:` across `_eval_group_condition`,
+  `_dcc_sequential_py`, `_dcc_sequential_cpp`, and `_dcc_run_unitary`, restored `prev_cb` at
+  `_dcc_run_unitary` exit, cleared both flags in `do_conditional_clifford`'s outer
+  `except BaseException:` and `_clear_body`, and updated the `CosetsideSimulator` docstring
+  with post-completion exception non-latching, latched `type(sim)` / read-only count behavior,
+  and unsupported-subclass `TypeError` behavior.
+- **Cosetside safety & sync test coverage:** Added tests in
+  `src/stimside/simulator_coset_r8_safety_test.py` covering outer `run()` / `interactive_do`
+  handler/interrupt latching, `rec[-k]` and `REPEAT` replay boundaries, whole-match /
+  mismatched `compiled_ref` rejection, `condition_group_fn` flag-unwind windows, direct
+  seam/mutator interrupt latching, `BaseException` `__str__` formatting, and non-vacuous
+  interrupt-count assertions; restored C++-to-Python mirror and pre-clear state comparisons in
+  `src/stimside/simulator_coset_sync_test.py`; tightened the `t == 0` interrupt assertion in
+  `src/stimside/simulator_coset_r7_safety_test.py`; and retargeted the exotic-subclass tests in
+  `src/stimside/simulator_coset_r8_safety_test.py` to expect `TypeError` at construction.
+- **Kernel loader & packaging hardening (`src/stimside/_native/_kernel_loader.py`,
+  `src/stimside/_native/packaging_build_test.py`):**
+  - Increased the default `_native` directory `flock` wait from `30` s (`_LOCK_MAX_RETRIES = 600`)
+    to `600` s (`12000` retries at `0.05` s), configurable via `STIMSIDE_BUILD_LOCK_TIMEOUT_S`
+    (emitting a `RuntimeWarning` and falling back to the default on invalid values).
+  - Caught `RecursionError` alongside `(OSError, ValueError)` in `_read_build_record` when parsing
+    deeply nested `.build_id` JSON.
+  - Kept `_plan_source_build` pure and moved sidecar adoption (`_adopt_build_record`) under
+    `_acquire_dir_lock`, using `os.link` and a locked re-read so adoption never replaces an existing
+    valid v2 record while still upgrading legacy/invalid records and swallowing `OSError`.
+  - Switched lock-timeout and once-per-library failed-rebuild warnings from `sys.stderr.write` to
+    `warnings.warn(..., RuntimeWarning)` so callers can filter them with `warnings` /
+    `PYTHONWARNINGS`.
+  - Recorded `"machine"` (`_current_machine()`) and a `/proc/cpuinfo` `"cpu_flags"` digest
+    (`_cpu_flags_digest()`) in `"native"` `.build_id` sidecars (including `setup.py` in-tree sync
+    during wheel and editable builds), triggering a native rebuild if either changes.
+  - Allocated temporary library and build-record files under unique random names inside
+    `_native`, created with the umask applied to modes `0777` / `0666` (as the compiler would), so
+    built libraries and records stay readable by other users; and excluded `pip install --target`
+    trees containing `stimside*.dist-info` in `_is_source_checkout`.
+  - Expanded `src/stimside/_native/packaging_build_test.py` (`+16` test cases) covering
+    configurable lock timeouts, `PYTHONWARNINGS` filtering, `RecursionError` records, locked
+    non-replacing adoption, native machine/CPU-flags mismatch rebuilds, `.dist-info` vs
+    `.egg-info` checkout detection, failed-compile temp-file cleanup, `site-packages` forced
+    recompile isolation, and `setup.py` wheel/editable sync and `inplace` error handling.
+
+- **Zero-target fusion in `unrolled_to_flattened_indices` and loss-oracle DEM generation:**
+  Updated `unrolled_to_flattened_indices` (`src/stimside/util/leakage_events.py`,
+  `_U2F_NON_FUSING`) so consecutive identical zero-target instructions fused by
+  `circuit.flattened()` across `REPEAT` and `SHIFT_COORDS` boundaries map cleanly to accurate
+  `flattened()` indices, superseding the previous `ValueError` limitation noted below so
+  `MarginalLeakageDemGenerator(loss_oracle=True)` and `Builder` accept zero-target-fusing
+  circuits while corrupted alignments with `validate=True` still raise `ValueError`.
+- **`CircuitIR` performance, lazy alignment, tag equality, and verification updates:**
+  - Memoized `classify_category` and `classify_untagged` (`stim.gate_data is _REAL_GATE_DATA`,
+    `op_memo`), made `_FlatAlignment` (`flat_index`, `flat_offset`, `flat_ops`) evaluate lazily
+    on first alignment access, removed `_tag_token` in favor of direct `op.tag == flat_op.tag`
+    comparison, and switched `IRInstr` and `CircuitIR` to `@dataclass(frozen=True, eq=False)`
+    for Python 3.11+ compatibility in `src/stimside/util/circuit_ir.py` and
+    `src/stimside/util/circuit_ir_test.py`.
+  - Added lazy `circuit_ir` imports inside `w12_ir_fields` and `w12b_tableau_layout` plus 14
+    additional parity and zero-target/gate-semantics witness circuits in
+    `src/stimside/ir_oracle_test.py` without modifying existing oracle entries, and expanded
+    `tools/ir_mutants/run_required_mutants.py`, `tools/ir_mutants/required_mutants.tsv`, and
+    `tools/ir_mutants/README.md`.
+- **Internal `CircuitIR` migrations with unchanged simulator and oracle outputs:**
+  - Migrated `src/stimside/util/known_states.py` (`compute_known_states_uint8(..., ir=...)`,
+    `_forward_known_states`, `_backward_known_states`, rejecting conflicting `unrolled_ops` and
+    `ir`) onto `CircuitIR`, with unit tests in `src/stimside/util/known_states_ir_test.py`.
+  - Migrated `src/stimside/_flip/sync_reference.py` (`compute_sync_reference(..., ir=...)`,
+    `_record_op_ref_z`, `_step_mpad`, `_step_product_meas`, `_step_controlled_pauli`,
+    `_resolve_ir`) and `src/stimside/simulator_flip.py` (`FlipsideSimulator` building `self._ir`
+    once in `__init__`) onto `CircuitIR`, with unit tests in
+    `src/stimside/_flip/sync_reference_ir_test.py`.
+  - Migrated `src/stimside/_coset/reference_compile.py`
+    (`CompiledReferenceCircuit(..., ir=None)` validating `ir.num_qubits` and
+    `ir.num_measurements` before `ReferenceCHPTableau` allocation and dispatching via
+    `_compile_on` without recursive `REPEAT` walking) onto `CircuitIR`, with unit tests in
+    `src/stimside/_coset/reference_compile_ir_test.py`.
+
 ## Run 8 — Stage A (Magicside Batch Engine Default ON)
 
 - **Magicside native batch engine ON by default (`P3`, `D-35`):** Flipped `_LIVE_STORE_ENGINE`
@@ -40,8 +171,12 @@ All notable user-visible changes to `stimside` are documented in this file.
   `_do_bare_instruction`, `_next_step_meta`, `_record_unleaked_to_leaked_counts`,
   `_record_leakage_event`, and `sample_pauli_noise_sync`) raise `RuntimeError` after an aborted
   mutating call (until `clear()` resets the simulator) or permanently after a native engine
-  failure, with zero overhead on the healthy path (3-tree isolated benchmark showed no regression;
-  `D-36` stays in and `L-ABORTED-CALL` is removed). In the Stage B delta round (`R8-B-C2-M1`),
+  failure. In paired-worker benchmarks against the pre-latch tree (`run()` throughput ratios),
+  plain SC `d=3, B=64` measured 0.991x (0.984-0.997, 4,086 shots/s), `d=5, B=64` measured
+  0.989x (0.980-1.000, 1,591-1,604 shots/s), `d=5, B=256` measured 1.008x (0.991-1.016,
+  4,387-4,408 shots/s), and dense 0/1 `d=5, B=256` measured 1.005x (0.992-1.025, 602-607
+  shots/s), while `interactive_do(whole circuit)` on plain SC was ~1.18-1.24x slower before
+  the subsequent validation optimization. In the Stage B delta round (`R8-B-C2-M1`),
   hardened latching against broken `__str__()` and heap exhaustion via `_fmt_latch_msg` with
   pre-allocated fallbacks (`_FAILED_FB`, `_ABORT_FB`), pre-warmed `_get_failed_class` /
   `_get_aborted_class` in `CosetsideSimulator.__init__` for subclasses, validated cached classes

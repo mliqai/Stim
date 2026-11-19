@@ -1,10 +1,38 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
 from typing import Any, cast
 
 import numpy as np
 import stim  # type: ignore[import-untyped]
 
-from stimside.util.circuit import qubit_targets, unroll_circuit
+from stimside.util.circuit import qubit_targets
+from stimside.util.circuit_ir import Category, CircuitIR, build_ir, classify_category
 from stimside.util.numpy_types import Bool1DArray
+
+_SKIP_KNOWN_STATE_CATS = frozenset(
+    {Category.ANNOTATION, Category.NOISE, Category.MPAD, Category.HERALD, Category.OTHER}
+)
+# Single-qubit measurements (distinct from multi-qubit product measurements).
+_SINGLE_QUBIT_MEAS = frozenset({"M", "MZ", "MX", "MY"})
+# Measurement/reset Pauli basis inferred from op name suffix.
+_BASIS_BASE_CODE = {"X": 1, "Y": 3}
+
+_REAL_GATE_DATA = stim.gate_data
+_IS_1Q_GATE_CACHE: dict[str, bool] = {}
+
+
+def _is_single_qubit_gate(op_name: str) -> bool:
+    """Return whether ``op_name`` is a single-qubit gate."""
+    if stim.gate_data is _REAL_GATE_DATA:
+        cached = _IS_1Q_GATE_CACHE.get(op_name)
+        if cached is not None:
+            return cached
+        res = bool(stim.gate_data(op_name).is_single_qubit_gate)
+        if len(_IS_1Q_GATE_CACHE) < 4096:
+            _IS_1Q_GATE_CACHE[op_name] = res
+        return res
+    return bool(stim.gate_data(op_name).is_single_qubit_gate)
 
 
 def _without_noise_preserving_heralds(circuit: stim.Circuit) -> stim.Circuit:
@@ -17,26 +45,29 @@ def _without_noise_preserving_heralds(circuit: stim.Circuit) -> stim.Circuit:
                     _without_noise_preserving_heralds(item.body_copy()),
                 )
             )
-        elif item.name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
+            continue
+        cat = classify_category(item.name)
+        if cat is Category.HERALD:
             mpad_targets = [
                 1 if t.is_inverted_result_target else 0
                 for t in item.targets_copy()
             ]
             out.append(stim.CircuitInstruction("MPAD", mpad_targets))
+        elif cat is Category.NOISE:
+            continue
+        elif (
+            cat in (Category.MEASURE, Category.MEASURE_RESET, Category.MPAD)
+            and item.gate_args_copy()
+        ):
+            out.append(
+                stim.CircuitInstruction(item.name, item.targets_copy(), [])
+            )
         else:
-            gd = stim.gate_data(item.name)
-            if gd.is_noisy_gate and not gd.produces_measurements:
-                continue
-            if gd.produces_measurements and item.gate_args_copy():
-                out.append(
-                    stim.CircuitInstruction(item.name, item.targets_copy(), [])
-                )
-            else:
-                out.append(item)
+            out.append(item)
     return out
 
 
-def compute_known_measurements(circuit) -> list[int | None]:
+def compute_known_measurements(circuit: stim.Circuit) -> list[int | None]:
     """Make a sample describing each deterministic measurement outcome.
 
     Basically, like a reference sample, except for non-deterministic measurements,
@@ -110,64 +141,34 @@ def _get_gate_luts(op_name: str) -> tuple[np.ndarray, np.ndarray]:
     return fwd, bwd
 
 
-def compute_known_states_uint8(
-    circuit: stim.Circuit,
-    unrolled_ops: list[stim.CircuitInstruction] | None = None,
+def _forward_known_states(
+    ir: CircuitIR,
+    known_measurements: list[int | None],
+    num_qubits: int,
 ) -> np.ndarray:
-    """Compute known states as a fast (num_ops + 1, num_qubits) uint8 array.
-
-    Codes:
-        0: _ (unknown)
-        1: +X, 2: -X
-        3: +Y, 4: -Y
-        5: +Z, 6: -Z
-    """
-    known_measurements = compute_known_measurements(circuit)
-    if unrolled_ops is None:
-        unrolled_ops = unroll_circuit(circuit)
-
-    num_ops = len(unrolled_ops)
-    num_qubits = circuit.num_qubits
+    num_ops = len(ir.instrs)
     states_uint8 = np.empty((num_ops + 1, num_qubits), dtype=np.uint8)
     states_uint8[0, :] = 5  # All qubits start in +Z (|0>)
 
-    measurements_consumed = 0
-
-    for i, op in enumerate(unrolled_ops):
+    for instr in ir.instrs:
+        i = instr.unrolled_index
         states_uint8[i + 1] = states_uint8[i]
-        gd = stim.gate_data(op.name)
-
-        # Annotations (QUBIT_COORDS, SHIFT_COORDS, DETECTOR, OBSERVABLE_INCLUDE, TICK, etc.)
-        if not (
-            gd.is_unitary or gd.is_reset or gd.produces_measurements or gd.is_noisy_gate
-        ):
+        cat = instr.category
+        if cat in _SKIP_KNOWN_STATE_CATS:
             continue
 
-        # Pure noise instructions (e.g. X_ERROR, DEPOLARIZE1, II_ERROR, CORRELATED_ERROR)
-        if gd.is_noisy_gate and not gd.produces_measurements:
-            continue
-
+        op = instr.op
         raw_targets = op.targets_copy()
-        if op.name == "MPAD":
-            measurements_consumed += len(raw_targets)
-            continue
-        q_targets = qubit_targets(raw_targets)
-        has_dup_targets = len(set(q_targets.tolist())) != len(q_targets)
-
-        if gd.is_reset:
-            # R, RX, RY, RZ, MR, MRX, MRY, MRZ
-            reset_code = {"X": 1, "Y": 3}.get(op.name[-1], 5)
+        if cat in (Category.RESET, Category.MEASURE_RESET):
+            q_targets = qubit_targets(raw_targets)
+            reset_code = _BASIS_BASE_CODE.get(op.name[-1], 5)
             states_uint8[i + 1, q_targets] = reset_code
-            if gd.produces_measurements:
-                measurements_consumed += len(raw_targets)
-
-        elif gd.produces_measurements:
-            if op.name in ("M", "MZ", "MX", "MY"):
-                base_code = {"X": 1, "Y": 3}.get(op.name[-1], 5)
-
-                for t in raw_targets:
-                    this_measurement = known_measurements[measurements_consumed]
-                    measurements_consumed += 1
+        elif cat is Category.MEASURE:
+            if op.name in _SINGLE_QUBIT_MEAS:
+                base_code = _BASIS_BASE_CODE.get(op.name[-1], 5)
+                meas_base = instr.first_measurement
+                for offset, t in enumerate(raw_targets):
+                    this_measurement = known_measurements[meas_base + offset]
                     q = t.qubit_value
                     if this_measurement is not None:
                         actual_bit = bool(this_measurement) ^ bool(
@@ -177,48 +178,47 @@ def compute_known_states_uint8(
                     else:
                         states_uint8[i + 1, q] = 0
             else:
-                measurements_consumed += len(op.target_groups())
-                if op.name not in (
-                    "MPAD",
-                    "HERALDED_ERASE",
-                    "HERALDED_PAULI_CHANNEL_1",
-                ):
-                    states_uint8[i + 1, q_targets] = 0
-
-        elif gd.is_single_qubit_gate and gd.is_unitary:
+                states_uint8[i + 1, qubit_targets(raw_targets)] = 0
+        elif cat is Category.UNITARY and _is_single_qubit_gate(op.name):
+            q_targets = qubit_targets(raw_targets)
             fwd_lut, _ = _get_gate_luts(op.name)
-            if has_dup_targets:
+            if len(set(q_targets.tolist())) != len(q_targets):
                 for q in q_targets:
                     states_uint8[i + 1, q] = fwd_lut[states_uint8[i + 1, q]]
             else:
                 states_uint8[i + 1, q_targets] = fwd_lut[
                     states_uint8[i + 1, q_targets]
                 ]
-
         else:
-            states_uint8[i + 1, q_targets] = 0
+            states_uint8[i + 1, qubit_targets(raw_targets)] = 0
 
-    # Backward pass: propagate known states backwards from deterministic measurements
-    measurements_consumed = len(known_measurements) - 1
-    for i in range(num_ops - 1, -1, -1):
-        op = unrolled_ops[i]
-        gd = stim.gate_data(op.name)
+    return states_uint8
+
+
+def _backward_known_states(
+    ir: CircuitIR,
+    known_measurements: list[int | None],
+    states_uint8: np.ndarray,
+) -> None:
+    shift = len(known_measurements) - ir.num_measurements
+    for instr in reversed(ir.instrs):
+        i = instr.unrolled_index
+        op = instr.op
+        cat = instr.category
         new_known_state = states_uint8[i + 1].copy()
 
-        if not (
-            gd.is_unitary or gd.is_reset or gd.produces_measurements or gd.is_noisy_gate
-        ) or (gd.is_noisy_gate and not gd.produces_measurements):
+        if cat in _SKIP_KNOWN_STATE_CATS:
             pass
-        elif gd.is_reset and not gd.produces_measurements:
+        elif cat is Category.RESET:
             new_known_state[qubit_targets(op.targets_copy())] = 0
-        elif gd.produces_measurements:
+        elif cat in (Category.MEASURE, Category.MEASURE_RESET):
             raw_targets = op.targets_copy()
-            if op.name in ("M", "MZ", "MX", "MY", "MR", "MRX", "MRY", "MRZ"):
-                base_code = {"X": 1, "Y": 3}.get(op.name[-1], 5)
-
-                for t in raw_targets[::-1]:
-                    this_measurement = known_measurements[measurements_consumed]
-                    measurements_consumed -= 1
+            if cat is Category.MEASURE_RESET or op.name in _SINGLE_QUBIT_MEAS:
+                base_code = _BASIS_BASE_CODE.get(op.name[-1], 5)
+                meas_base = instr.first_measurement + shift
+                for offset in range(len(raw_targets) - 1, -1, -1):
+                    t = raw_targets[offset]
+                    this_measurement = known_measurements[meas_base + offset]
                     q = t.qubit_value
                     if this_measurement is not None:
                         actual_bit = bool(this_measurement) ^ bool(
@@ -228,14 +228,8 @@ def compute_known_states_uint8(
                     else:
                         new_known_state[q] = 0
             else:
-                measurements_consumed -= len(op.target_groups())
-                if op.name not in (
-                    "MPAD",
-                    "HERALDED_ERASE",
-                    "HERALDED_PAULI_CHANNEL_1",
-                ):
-                    new_known_state[qubit_targets(raw_targets)] = 0
-        elif gd.is_single_qubit_gate and gd.is_unitary:
+                new_known_state[qubit_targets(raw_targets)] = 0
+        elif cat is Category.UNITARY and _is_single_qubit_gate(op.name):
             q_targets = qubit_targets(op.targets_copy())
             _, bwd_lut = _get_gate_luts(op.name)
             if len(set(q_targets.tolist())) != len(q_targets):
@@ -261,10 +255,32 @@ def compute_known_states_uint8(
         fill_mask = (already_known == 0) & (new_known_state != 0)
         states_uint8[i, fill_mask] = new_known_state[fill_mask]
 
+
+def compute_known_states_uint8(
+    circuit: stim.Circuit,
+    unrolled_ops: Sequence[stim.CircuitInstruction] | None = None,
+    *,
+    ir: CircuitIR | None = None,
+) -> np.ndarray:
+    """Compute known states as a fast (num_ops + 1, num_qubits) uint8 array.
+
+    Codes:
+        0: _ (unknown)
+        1: +X, 2: -X
+        3: +Y, 4: -Y
+        5: +Z, 6: -Z
+    """
+    if unrolled_ops is not None and ir is not None:
+        raise ValueError("Cannot pass both unrolled_ops and ir.")
+    known_measurements = compute_known_measurements(circuit)
+    if ir is None:
+        ir = build_ir(circuit) if unrolled_ops is None else build_ir(unrolled_ops)
+    states_uint8 = _forward_known_states(ir, known_measurements, circuit.num_qubits)
+    _backward_known_states(ir, known_measurements, states_uint8)
     return states_uint8
 
 
-def compute_known_states(circuit) -> list[list[stim.PauliString]]:
+def compute_known_states(circuit: stim.Circuit) -> list[list[stim.PauliString]]:
     """Find circuit locations with known single qubit states."""
     states_uint8 = compute_known_states_uint8(circuit)
     return [
@@ -317,4 +333,3 @@ def convert_paulis_to_arrays(
         codes == 5,
         codes == 6,
     )
-

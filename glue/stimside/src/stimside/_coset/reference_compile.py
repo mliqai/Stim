@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Literal
+from typing import Literal
 
 import numpy as np
-from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
+from numpy.typing import NDArray
 
 from stimside.util.circuit import reduce_hermitian_pauli_product
+from stimside.util.circuit_ir import (
+    Category,
+    CircuitIR,
+    build_ir,
+    classify_category,
+)
 from stimside.util.reference_chp import (
     DetMeasMeta,
     PackedSymplecticTables,
@@ -33,6 +39,9 @@ RawFactor = (
 )
 
 _GATE_MRQF_FACTORS_CACHE: dict[str, tuple[RawFactor, ...]] = {}
+_MEAS_CATEGORIES = frozenset(
+    {Category.MEASURE, Category.MEASURE_RESET, Category.RESET}
+)
 
 # Elementary local decompositions for E = U_gate^dagger in application order (rightmost factor first).
 # Entries are either:
@@ -374,41 +383,49 @@ StepMeta = UnitaryStepMeta | MeasStepMeta | NoopStepMeta
 class CompiledReferenceCircuit:
     """Precompiles a stim.Circuit into a Phase 0 reference step tape without stim.Tableau conjugation."""
 
-    def __init__(self, circuit: stim.Circuit) -> None:
+    def __init__(
+        self,
+        circuit: stim.Circuit,
+        *,
+        ir: CircuitIR | None = None,
+    ) -> None:
         self.circuit = circuit
         self.num_qubits = circuit.num_qubits
         self.n_words = max(1, (self.num_qubits + 63) // 64)
+        if ir is None:
+            ir = build_ir(circuit)
+        elif (
+            ir.num_qubits != self.num_qubits
+            or ir.num_measurements != circuit.num_measurements
+        ):
+            raise ValueError(
+                "Supplied CircuitIR does not match circuit "
+                f"(num_qubits={ir.num_qubits} vs {self.num_qubits}, "
+                f"num_measurements={ir.num_measurements} vs {circuit.num_measurements})."
+            )
         self.ref_chp = ReferenceCHPTableau(self.num_qubits)
         self._last_packed_snapshot = self.ref_chp.snapshot_packed()
         self._initial_packed_words = self._last_packed_snapshot
         self.steps: list[StepMeta] = []
-        self._compile_block(circuit)
+        for instr in ir.instrs:
+            op = instr.op
+            cat = instr.category
+            if cat is Category.ANNOTATION and op.name in ("QUBIT_COORDS", "SHIFT_COORDS"):
+                continue
+            step, next_snap = self._compile_on(
+                op,
+                self.ref_chp,
+                self._last_packed_snapshot,
+                category=cat,
+            )
+            self._last_packed_snapshot = next_snap
+            self.steps.append(step)
 
     def _get_packed_snapshot(self) -> PackedSymplecticTables:
         if self.ref_chp._inv_dirty:
             self._last_packed_snapshot = self.ref_chp.snapshot_packed()
             self.ref_chp._inv_dirty = False
         return self._last_packed_snapshot
-
-    def _compile_block(
-        self,
-        block: stim.Circuit | stim.CircuitRepeatBlock | stim.CircuitInstruction,
-    ) -> None:
-        if isinstance(block, stim.Circuit):
-            for op in block:
-                self._compile_block(op)
-        elif isinstance(block, stim.CircuitRepeatBlock):
-            body = block.body_copy()
-            for _ in range(block.repeat_count):
-                self._compile_block(body)
-        elif isinstance(block, stim.CircuitInstruction):
-            if block.name in ("QUBIT_COORDS", "SHIFT_COORDS"):
-                return
-            step, next_snap = self._compile_on(
-                block, self.ref_chp, self._last_packed_snapshot
-            )
-            self._last_packed_snapshot = next_snap
-            self.steps.append(step)
 
     def _make_noop(
         self, op: stim.CircuitInstruction, snap: PackedSymplecticTables
@@ -495,11 +512,13 @@ class CompiledReferenceCircuit:
     def _compile_meas_step(
         self,
         op: stim.CircuitInstruction,
-        gd: Any,
+        cat: Category,
         chp: ReferenceCHPTableau,
         last_snap: PackedSymplecticTables,
     ) -> tuple[MeasStepMeta, PackedSymplecticTables]:
         name = op.name
+        produces_meas = cat is not Category.RESET
+        is_reset = cat is not Category.MEASURE
         substeps: list[MeasSubStepMeta] = []
         raw_targets = op.targets_copy()
         if name == "MPP":
@@ -536,21 +555,20 @@ class CompiledReferenceCircuit:
                 substeps.append(
                     self._run_meas_substep(
                         chp, q, bool(gt.is_inverted_result_target),
-                        list(ops), list(ops), is_reset=gd.is_reset,
+                        list(ops), list(ops), is_reset=is_reset,
                     )
                 )
         snap = chp.snapshot_packed() if chp._inv_dirty else last_snap
         chp._inv_dirty = False
         return MeasStepMeta(
             kind="meas", op=op, gate_name=name,
-            produces_measurements=gd.produces_measurements, is_reset=gd.is_reset,
+            produces_measurements=produces_meas, is_reset=is_reset,
             substeps=substeps, _packed_words=snap, num_qubits=self.num_qubits,
         ), snap
 
     def _compile_unitary_step(
         self,
         op: stim.CircuitInstruction,
-        gd: Any,
         chp: ReferenceCHPTableau,
         last_snap: PackedSymplecticTables,
     ) -> tuple[UnitaryStepMeta | NoopStepMeta, PackedSymplecticTables]:
@@ -561,6 +579,7 @@ class CompiledReferenceCircuit:
                 "Rewrite them with single- and two-qubit Clifford gates, or use "
                 "TablesideSimulator or FlipsideSimulator."
             )
+        gd = stim.gate_data(name)
         raw_t = op.targets_copy()
         is_mixed = gd.is_two_qubit_gate and any(t.qubit_value is None for t in raw_t)
         if is_mixed:
@@ -608,15 +627,14 @@ class CompiledReferenceCircuit:
         op: stim.CircuitInstruction,
         chp: ReferenceCHPTableau,
         last_snap: PackedSymplecticTables,
+        *,
+        category: Category | None = None,
     ) -> tuple[StepMeta, PackedSymplecticTables]:
-        name = op.name
-        gd = stim.gate_data(name)
-        if gd.is_reset or gd.produces_measurements:
-            if name in ("MPAD", "HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
-                return self._make_noop(op, last_snap), last_snap
-            return self._compile_meas_step(op, gd, chp, last_snap)
-        if gd.is_unitary:
-            return self._compile_unitary_step(op, gd, chp, last_snap)
+        cat = category if category is not None else classify_category(op.name)
+        if cat in _MEAS_CATEGORIES:
+            return self._compile_meas_step(op, cat, chp, last_snap)
+        if cat is Category.UNITARY:
+            return self._compile_unitary_step(op, chp, last_snap)
         return self._make_noop(op, last_snap), last_snap
 
     def compile_instruction(

@@ -7,8 +7,8 @@ no other exception type, no hang. An entry point that makes no allocation (the n
 helpers) is pinned at zero allocations. The probes run in a child process because a regression
 is a dead process (rc 134), not a failed assertion.
 
-Skipped under ASan/TSan (their allocator aborts on an impossible `new` / owns `operator new`)
-and without a C++ compiler.
+Skipped under TSan (which owns operator new) and without a C++ compiler; runs under ASan
+via LD_PRELOAD with verify_asan_link_order=0.
 """
 
 from __future__ import annotations
@@ -240,17 +240,17 @@ else:
 """
 
 
-def _under_sanitizer() -> bool:
+def _under_tsan() -> bool:
     try:
         libc = ctypes.CDLL(None)
-        return hasattr(libc, "__asan_init") or hasattr(libc, "__tsan_init")
+        return hasattr(libc, "__tsan_init")
     except OSError:
         return False
 
 
 pytestmark = pytest.mark.skipif(
-    _under_sanitizer() or shutil.which("c++") is None,
-    reason="needs a C++ compiler and no sanitizer allocator (they own operator new)",
+    _under_tsan() or shutil.which("c++") is None,
+    reason="needs a C++ compiler and no TSan runtime (TSan owns operator new)",
 )
 
 
@@ -264,10 +264,23 @@ def fi_so(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _child(fi_so: Path, case: str, timeout: int = 900) -> dict[str, Any]:
+    existing_preload = os.environ.get("LD_PRELOAD", "").strip()
+    ld_preload = f"{fi_so} {existing_preload}" if existing_preload else str(fi_so)
     env = {
-        **os.environ, "PYTHONDONTWRITEBYTECODE": "1", "LD_PRELOAD": str(fi_so),
-        "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "LD_PRELOAD": ld_preload,
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
     }
+    if existing_preload:
+        asan_opts = env.get("ASAN_OPTIONS", "")
+        if "verify_asan_link_order=0" not in asan_opts:
+            env["ASAN_OPTIONS"] = (
+                f"{asan_opts}:verify_asan_link_order=0"
+                if asan_opts
+                else "verify_asan_link_order=0"
+            )
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD, str(_SRC), str(fi_so), case],
         capture_output=True, text=True, env=env, timeout=timeout, check=False,

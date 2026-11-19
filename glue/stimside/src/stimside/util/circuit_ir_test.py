@@ -39,6 +39,7 @@ from stimside.op_handlers.leakage_handlers.tag_registry import (
 )
 from stimside.util import circuit_ir
 from stimside.util.circuit import unroll_circuit
+from stimside.util.known_states import compute_known_measurements
 from stimside.util.leakage_events import unrolled_to_flattened_indices
 from stimside.util.stim_workarounds import split_fused_instruction
 
@@ -592,6 +593,29 @@ def _scan_tree_i6w(util_dir: Path, ir_tags_path: Path) -> list[str]:
     return violations
 
 
+def _eq_tag_pair_ids(tree: ast.AST) -> set[int]:
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.Eq)
+            and len(node.comparators) == 1
+        ):
+            left, right = node.left, node.comparators[0]
+            if (
+                isinstance(left, ast.Attribute)
+                and left.attr == "tag"
+                and isinstance(left.ctx, ast.Load)
+                and isinstance(right, ast.Attribute)
+                and right.attr == "tag"
+                and isinstance(right.ctx, ast.Load)
+            ):
+                ids.add(id(left))
+                ids.add(id(right))
+    return ids
+
+
 def _scan_circuit_ir_i6(src: str) -> list[str]:
     tree = ast.parse(src)
     violations: list[str] = []
@@ -622,15 +646,18 @@ def _scan_circuit_ir_i6(src: str) -> list[str]:
         and arg.attr == "tag"
         and isinstance(arg.ctx, ast.Load)
     ]
+    ctor_ids = {id(arg) for arg in direct_ctor_tags}
+    allowed_ids = ctor_ids | _eq_tag_pair_ids(tree)
     cond_types = (ast.If, ast.IfExp, ast.Compare, ast.BoolOp, ast.Match)
-    in_cond = [
+    ctor_in_cond = [
         inner
         for node in ast.walk(tree)
         if isinstance(node, cond_types)
         for inner in ast.walk(node)
-        if isinstance(inner, ast.Attribute) and inner.attr == "tag"
+        if id(inner) in ctor_ids
     ]
-    if len(tag_loads) != 1 or len(direct_ctor_tags) != 1 or in_cond:
+    bad_loads = [node for node in tag_loads if id(node) not in allowed_ids]
+    if not ctor_ids or bad_loads or ctor_in_cond:
         violations.append("I6c-tag-only-copied")
     return violations
 
@@ -1071,7 +1098,10 @@ def test_i20_dataclasses_frozen_and_hashable() -> None:
     # Mutation must raise FrozenInstanceError on every single one of the 5 dataclasses.
     mutations: tuple[tuple[Any, str, Any], ...] = (
         (ir.instrs[0], "unrolled_index", 99),
+        (ir.instrs[0], "flat_index", 99),
+        (ir.instrs[0], "flat_offset", 99),
         (ir, "num_qubits", 99),
+        (ir, "flat_ops", ()),
         (sm, "skip", frozenset()),
         (lay, "step_to_unrolled", ()),
         (cm, "copy_len", ()),
@@ -1311,18 +1341,48 @@ def test_i6w_and_i6c_self_sensitivity(tmp_path: Path) -> None:
     )
 
 
-def test_i19_build_ir_linear_complexity() -> None:
-    """I19: guard against O(N^2) regressions across circuit and op-list inputs."""
+def test_i6c_tag_eq_comparison_self_sensitivity() -> None:
+    """Self-test: I6c allows symmetric ``.tag == .tag`` and rejects tag inspection."""
+    clean_base = "def f(op, cur):\n    return IRInstr(0, op, op.tag)\n"
+    assert _scan_circuit_ir_i6(
+        clean_base + "def eq(a, b):\n    return a.tag == b.tag\n"
+    ) == []
+    assert _scan_circuit_ir_i6(
+        clean_base + "def neq(a, b):\n    if not (a.tag == b.tag):\n        return False\n"
+    ) == []
+    bad_snippets = (
+        clean_base + 'def b1(op):\n    return op.tag == ""\n',
+        clean_base + 'def b2(op):\n    return "" == op.tag\n',
+        clean_base + "def b3(a, b):\n    return a.tag != b.tag\n",
+        clean_base + "def b4(a, b):\n    return a.tag < b.tag\n",
+        clean_base + "def b5(a, b):\n    return a.tag.strip() == b.tag\n",
+        clean_base + "def b6(a, b, c):\n    return a.tag == b.tag == c.tag\n",
+        "def b7(op, c):\n    if c:\n        return IRInstr(0, op, op.tag)\n",
+        "def b8(a, b):\n    return a.tag == b.tag\n",
+    )
+    for snippet in bad_snippets:
+        assert "I6c-tag-only-copied" in _scan_circuit_ir_i6(snippet), snippet
 
-    def _best_time(src: stim.Circuit | list[stim.CircuitInstruction], *, uc: bool) -> float:
+
+def test_i19_build_ir_linear_complexity() -> None:
+    """Guard against O(N^2) regressions across circuit, op-list, and alignment paths."""
+
+    def _best_time(
+        src: stim.Circuit | list[stim.CircuitInstruction],
+        *,
+        uc: bool,
+        align: bool = False,
+    ) -> float:
         best = float("inf")
         for _ in range(3):
             t0 = time.process_time()
-            circuit_ir.build_ir(src, uc=uc)
+            ir = circuit_ir.build_ir(src, uc=uc)
+            if align:
+                circuit_ir.unrolled_to_flat(ir)
             best = min(best, time.process_time() - t0)
         return best
 
-    # Guard 1 (kills B14 quadratic prefix sum immediately without waiting on larger N).
+    # Guard 1 (kills quadratic prefix sum immediately without waiting on larger N).
     c_small = stim.Circuit("R 0 1\nREPEAT 500 {\n H 0\n CX 0 1\n M 1\n}")
     c_large = stim.Circuit("R 0 1\nREPEAT 4000 {\n H 0\n CX 0 1\n M 1\n}")
     t_small = _best_time(c_small, uc=True)
@@ -1351,11 +1411,11 @@ def test_i19_build_ir_linear_complexity() -> None:
         f"(500={lt_small:.4f}s, 16000={lt_large:.4f}s)"
     )
 
-    # Guard 4 (16x fused REPEAT: verifies flat_tag cache avoids O(N^2) str(flat_op)).
+    # Guard 4 (16x fused REPEAT: verifies alignment avoids O(N^2) stringification).
     fh_small = stim.Circuit("REPEAT 500 {\n H 0\n}")
     fh_large = stim.Circuit("REPEAT 8000 {\n H 0\n}")
-    ft_small = _best_time(fh_small, uc=False)
-    ft_large = _best_time(fh_large, uc=False)
+    ft_small = _best_time(fh_small, uc=False, align=True)
+    ft_large = _best_time(fh_large, uc=False, align=True)
     assert ft_large / ft_small < 50.0, (
         f"build_ir fused REPEAT H 16x ratio {ft_large / ft_small:.1f}x >= 50x "
         f"(500={ft_small:.4f}s, 8000={ft_large:.4f}s)"
@@ -1364,23 +1424,23 @@ def test_i19_build_ir_linear_complexity() -> None:
     # Guard 5 (16x zero-target fused REPEAT: verifies linear scaling on empty REPEAT).
     zh_small = stim.Circuit("REPEAT 500 {\n H\n}")
     zh_large = stim.Circuit("REPEAT 8000 {\n H\n}")
-    zt_small = _best_time(zh_small, uc=False)
-    zt_large = _best_time(zh_large, uc=False)
+    zt_small = _best_time(zh_small, uc=False, align=True)
+    zt_large = _best_time(zh_large, uc=False, align=True)
     assert zt_large / zt_small < 50.0, (
         f"build_ir empty-target REPEAT H 16x ratio {zt_large / zt_small:.1f}x >= 50x "
         f"(500={zt_small:.4f}s, 8000={zt_large:.4f}s)"
     )
 
-    # Guard 6 (wide flat op + many zero-target fused ops: kills missing meta_ready cache).
+    # Guard 6 (wide flat op + many zero-target fused ops: kills O(N*W) regressions).
     def _wide_zero(n: int) -> stim.Circuit:
         q = " ".join(str(i) for i in range(n))
         return stim.Circuit(f"H {q}\nREPEAT {n} {{\n SHIFT_COORDS(1)\n H\n}}\n")
 
-    wz_small = _best_time(_wide_zero(200), uc=False)
-    wz_large = _best_time(_wide_zero(1600), uc=False)
-    assert wz_large / wz_small < 25.0, (
-        f"build_ir wide+zero-target 8x ratio {wz_large / wz_small:.1f}x >= 25x "
-        f"(200={wz_small:.4f}s, 1600={wz_large:.4f}s)"
+    wz_small = _best_time(_wide_zero(200), uc=False, align=True)
+    wz_large = _best_time(_wide_zero(3200), uc=False, align=True)
+    assert wz_large / wz_small < 40.0, (
+        f"build_ir wide+zero-target 16x ratio {wz_large / wz_small:.1f}x >= 40x "
+        f"(200={wz_small:.4f}s, 3200={wz_large:.4f}s)"
     )
 
 
@@ -1390,7 +1450,7 @@ def test_i19_build_ir_linear_complexity() -> None:
 def test_rf_build_ir_flattened_too_few_ops_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Direct error-branch test for build_ir when flat_ops runs out (also kills G151)."""
+    """Direct error-branch test for alignment when flat_ops runs out (also kills G151)."""
     circ = stim.Circuit("H 0\n")
     for extra_ops in (
         [stim.Circuit("H 0")[0], stim.Circuit("X 0")[0]],
@@ -1398,7 +1458,7 @@ def test_rf_build_ir_flattened_too_few_ops_raises(
     ):
         monkeypatch.setattr(circuit_ir, "unroll_circuit", lambda _c, e=extra_ops: list(e))
         try:
-            circuit_ir.build_ir(circ)
+            circuit_ir.unrolled_to_flat(circuit_ir.build_ir(circ))
         except ValueError as exc:
             assert "too few for the unrolled circuit" in str(exc)
         except IndexError as exc:
@@ -1481,20 +1541,22 @@ def test_rf_direct_fields_enums_and_empty_circuit() -> None:
         "tag",
         "category",
         "untagged_filter",
-        "flat_index",
-        "flat_offset",
         "num_measurements",
         "first_measurement",
+        "_flat",
     )
     assert tuple(f.name for f in dataclasses.fields(circuit_ir.CircuitIR)) == (
         "instrs",
-        "flat_ops",
         "num_qubits",
         "num_measurements",
         "has_repeat",
         "uc",
         "from_op_list",
+        "_flat",
     )
+    assert isinstance(circuit_ir.IRInstr.flat_index, property)
+    assert isinstance(circuit_ir.IRInstr.flat_offset, property)
+    assert isinstance(circuit_ir.CircuitIR.flat_ops, property)
     assert tuple(f.name for f in dataclasses.fields(circuit_ir.StepMap)) == (
         "skip",
         "step_to_unrolled",
@@ -1722,19 +1784,29 @@ _ZERO_TARGET_WITNESSES: tuple[tuple[str, str, list[int]], ...] = (
         "REPEAT 2 {\n  QUBIT_COORDS(0, 0) 0\n  SHIFT_COORDS(1, 0)\n}\n",
         [0, -1, 1, -1],
     ),
+    (
+        "fused_tagged_feedback_across_repeat",
+        "M 0\nREPEAT 2 {\n  CX[a] rec[-1] 1\n}\n",
+        [0, 1, 1],
+    ),
+    (
+        "tagged_detector_after_shift_coords",
+        "M 0\nSHIFT_COORDS(1)\nDETECTOR[a](0) rec[-1]\n",
+        [0, -1, 1],
+    ),
+    (
+        "fused_tagged_sweep_control",
+        "REPEAT 2 {\n  CX[a] sweep[0] 1\n}\n",
+        [0, 0],
+    ),
 )
 
 
 def test_zero_target_fusion_witnesses_and_offsets() -> None:
-    """R8-C-REV-M1 / R8-C-C6-M1: exact flat_index & flat_offset for zero-target fusion."""
+    """Exact flat_index and flat_offset for zero-target and tagged fusion cases."""
     for label, txt, want in _ZERO_TARGET_WITNESSES:
         ir = _assert_valid_alignment(label, stim.Circuit(txt))
         assert circuit_ir.unrolled_to_flat(ir) == want, label
-
-    # Direct _tag_token contract (kills slice off-by-1 returning leading '[').
-    assert circuit_ir._tag_token(stim.Circuit("H 0")[0]) == ""
-    assert circuit_ir._tag_token(stim.Circuit("H[foo] 0")[0]) == "foo"
-    assert circuit_ir._tag_token(stim.CircuitInstruction("H", [0], tag="a]b\\c")) == "a\\Cb\\Bc"
 
     # Escaped special tags must stay bijective ("a]b\\c" != "a\\Cb\\Bc").
     c_esc = stim.Circuit()
@@ -1851,7 +1923,7 @@ def test_build_ir_alignment_validation_errors(monkeypatch: pytest.MonkeyPatch) -
         circ = stim.Circuit(text)
         monkeypatch.setattr(circuit_ir, "unroll_circuit", lambda _c, u=fake_unrolled: list(u))
         with pytest.raises(ValueError):
-            circuit_ir.build_ir(circ)
+            circuit_ir.unrolled_to_flat(circuit_ir.build_ir(circ))
 
     # Mocked unfused duplicate flat_ops ([H 0, H]) vs [H 0, H]: trailing check catches it.
     h0 = inst("H", [0])
@@ -1861,14 +1933,17 @@ def test_build_ir_alignment_validation_errors(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_legacy_u2f_validate_true_kills_a4_witnesses() -> None:
-    """Pin validate=True on untouched util/leakage_events.py (kills A4_u2f_validate_off).
+    """Verify u2f validation on mismatched flattened() and zero-target fusion support."""
 
-    Note: ``util/leakage_events.py`` is frozen in Stage C per D-46; its pre-existing
-    zero-target fusion limitation is tracked as carry-forward ``R8-CF-U2F-ZEROTARGET``.
-    Unlike mutant ``A4_u2f_validate_off`` (which silently returns corrupted maps),
-    clean ``validate=True`` raises loud ``ValueError`` on ``c_shift``, ``W12``, ``W16``.
-    Meanwhile ``circuit_ir.build_ir()`` maps all three accurately without raising.
-    """
+    class _BadFlatCircuit(stim.Circuit):
+        def flattened(self) -> stim.Circuit:
+            return stim.Circuit("X 0")
+
+    bad_circ = _BadFlatCircuit("H 0")
+    with pytest.raises(ValueError, match="does not match flattened op"):
+        unrolled_to_flattened_indices(bad_circ, validate=True)
+    assert unrolled_to_flattened_indices(bad_circ, validate=False).tolist() == [0]
+
     c_shift = stim.Circuit(
         "R 0\nX 0\nSHIFT_COORDS(1)\nX\nZ 0\nM 0\nDETECTOR rec[-1]\n"
     )
@@ -1879,14 +1954,77 @@ def test_legacy_u2f_validate_true_kills_a4_witnesses() -> None:
         "H 0\nSHIFT_COORDS(1)\nH\nX 1\nM 0 1\nDETECTOR rec[-1]\n"
     )
     for circ in (c_shift, w12, w16):
-        with pytest.raises(ValueError, match="does not match flattened op"):
-            unrolled_to_flattened_indices(circ, validate=True)
-        _assert_valid_alignment("a4_witness", circ)
+        ir = _assert_valid_alignment("a4_witness", circ)
+        got = unrolled_to_flattened_indices(circ, validate=True).tolist()
+        assert got == circuit_ir.unrolled_to_flat(ir)
 
-    with pytest.raises(ValueError, match="does not match flattened op"):
-        Builder(w16, True).build(oracle=True)
-    with pytest.raises(ValueError, match="does not match flattened op"):
-        MarginalLeakageDemGenerator(loss_oracle=True).base_dem(w16)
+    assert Builder(w16, True).build(oracle=True) is not None
+    assert MarginalLeakageDemGenerator(loss_oracle=True).base_dem(w16) is not None
+
+
+def test_known_measurements_herald_inversion_kills_ks22() -> None:
+    """Inverted herald targets invert deterministic measurement outcomes."""
+    circ = stim.Circuit("R 0\nHERALDED_ERASE(0.1) !0\nM 0\n")
+    assert compute_known_measurements(circ) == [True, False]
+
+
+def test_lazy_alignment_snapshot_and_cross_circuit_equality() -> None:
+    """Mutating source post-build and comparing equal ops with distinct flat coords."""
+    c_mut = stim.Circuit("H 0\nM 0\n")
+    ir_mut = circuit_ir.build_ir(c_mut, uc=True)
+    c_mut.append("X", [0])
+    assert [str(op) for op in ir_mut.flat_ops] == ["H 0", "M 0"]
+    assert circuit_ir.unrolled_to_flat(ir_mut) == [0, 1]
+
+    c1 = stim.Circuit("H 0\nSHIFT_COORDS(1)\nH 1\n")
+    c2 = stim.Circuit("X 0\nSHIFT_COORDS(1)\nH 1\n")
+    ir1a = circuit_ir.build_ir(c1, uc=True)
+    ir1b = circuit_ir.build_ir(c1, uc=True)
+    ir2 = circuit_ir.build_ir(c2, uc=True)
+    assert ir1a == ir1b
+    assert hash(ir1a) == hash(ir1b)
+    assert ir1a.instrs[2] == ir1b.instrs[2]
+    assert hash(ir1a.instrs[2]) == hash(ir1b.instrs[2])
+    assert ir1a.instrs[2].flat_index == 0 and ir1a.instrs[2].flat_offset == 1
+    assert ir2.instrs[2].flat_index == 1 and ir2.instrs[2].flat_offset == 0
+    assert ir1a.instrs[2] != ir2.instrs[2]
+    assert ir1a != ir2
+
+    # Direct construction without _flat defaults to -1/0/() and remains frozen/hashable.
+    direct = circuit_ir.IRInstr(
+        0,
+        c1[0],
+        "",
+        circuit_ir.Category.UNITARY,
+        circuit_ir.UntaggedFilter.ONE_QUBIT,
+        0,
+        0,
+    )
+    assert direct.flat_index == -1
+    assert direct.flat_offset == 0
+    assert hash(direct) == hash(direct)
+
+
+def test_lazy_alignment_defers_flattened_and_align(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Building IR and reading eager fields/hashes never triggers flat alignment."""
+    circ = stim.Circuit("R 0\nREPEAT 3 {\n  H 0\n}\nM 0\n")
+
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("_align_flat_ops should not run eagerly")
+
+    monkeypatch.setattr(circuit_ir, "_align_flat_ops", _boom)
+    ir = circuit_ir.build_ir(circ, uc=True)
+    assert len(ir.instrs) == 5
+    assert [i.category for i in ir.instrs][1] == circuit_ir.Category.UNITARY
+    assert [i.untagged_filter for i in ir.instrs][1] == circuit_ir.UntaggedFilter.ONE_QUBIT
+    assert ir.instrs[1] != ir.instrs[2]
+    assert {ir: 1, ir.instrs[1]: 2}[ir] == 1
+    assert len(ir.flat_ops) == 3  # flat_ops computes flattened() without _align_flat_ops
+
+    monkeypatch.undo()
+    assert circuit_ir.unrolled_to_flat(ir) == [0, 1, 1, 1, 2]
 
 
 def test_precondition_guards_and_negative_copy_len() -> None:

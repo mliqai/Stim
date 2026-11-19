@@ -747,7 +747,7 @@ def test_r8_b3_interactive_do_interrupted_at_t0_keeps_used_and_blocks_run(
     assert fired[0]
     assert sim._circuit_time == 0
     assert sim._used_interactively is True
-    with pytest.raises((ValueError, RuntimeError)):
+    with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
         sim.run()
     sim.clear()
     sim.run()

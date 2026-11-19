@@ -1,9 +1,10 @@
 """Byte-for-byte structural oracle test suite for WP-27 (RFC §6 & §7.3).
 
 Self-contained pytest suite (zero external ``e2e_tests/`` dependencies) pinning
-exact structural SHA-256 digests for 21 circuit walkers across 123 circuits
-(2,583 total entries: 18 golden ``CORPUS`` + 4 ``s01-s04`` + 5 ``x05-x09`` +
-10 ``y10-y15`` + 6 ``y16-y21`` error-order circuits + 80 ``g_<NAME>`` circuits
+exact structural SHA-256 digests for 21 circuit walkers across 137 circuits
+(2,877 total entries: 18 golden ``CORPUS`` + 4 ``s01-s04`` + 5 ``x05-x09`` +
+10 ``y10-y15`` + 6 ``y16-y21`` error-order circuits + 14 ``p01-p14`` witness
+circuits + 80 ``g_<NAME>`` circuits
 covering every non-``REPEAT`` Stim instruction name).
 
 Per D-46 and RFC Q9, ``FROZEN_DIGESTS`` was generated once from the Stage C
@@ -46,7 +47,6 @@ from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import (
     _parse_leakage_in_circuit_magic,
     _strip_circuit_for_noiseless_ref,
 )
-from stimside.util import circuit_ir
 from stimside.util.circuit import unroll_circuit
 from stimside.util.known_states import compute_known_states_uint8
 from stimside.util.leakage_events import unrolled_to_flattened_indices
@@ -301,6 +301,26 @@ _SUPPLEMENT_Y_REV3: tuple[tuple[str, str], ...] = (
     ),
 )
 
+_SUPPLEMENT_WITNESSES: tuple[tuple[str, str], ...] = (
+    ("p01_inv_m", "R 0\nM !0"),
+    ("p02_inv_mzz", "R 0 1\nMZZ 0 !1"),
+    ("p03_mpad1", "MPAD 1\nM 0"),
+    ("p04_mpp_rep", "R 0 1\nMPP X0*Z0*Y0"),
+    ("p05_mpp_neg", "RX 0\nMPP Z0*X0*Z0"),
+    ("p06_fb_mpad", "R 0\nMPAD 1\nCX rec[-1] 0\nM 0"),
+    ("p07_fb_qrec", "R 0 1\nX 0\nM 0\nXCZ 1 rec[-1]\nM 1"),
+    ("p08_fb_cz_qrec", "R 0 1\nX 0\nM 0\nH 1\nCZ 1 rec[-1]\nH 1\nM 1"),
+    ("p09_fb_mixed", "R 0 1 2\nX 0\nM 0\nCX rec[-1] 1 0 2\nM 1 2"),
+    ("p10_mpad_z_super", f"R 0 1 2\nH 1\n{_TAG2} 0 0\nM 1 2"),
+    (
+        "p11_lt_reset",
+        "R 0\nX 0\nI[LEAKAGE_TRANSITION_1: (0.1, 2-->1)] 0\nM 0",
+    ),
+    ("p12_bwd_mpp", "R 0 1 2\nX 2\nM 2\nMPP Z0*Z1\nM 0"),
+    ("p13_rx_order", "R 0 1 2\nH 0\nCX 0 2\nRX 1 0\nMX 2"),
+    ("p14_xcz_sweep_target", "R 0 1\nH 0\nXCZ sweep[0] 1\nM 0 1"),
+)
+
 _GATE_BODY: dict[str, str] = {
     "MPP": "MPP X0*X1",
     "SPP": "SPP X0*Z1",
@@ -334,11 +354,17 @@ def _gate_circuit(name: str) -> stim.Circuit:
 def build_corpus(
     extra_circuits: Sequence[tuple[str, stim.Circuit]] = (),
 ) -> list[tuple[str, stim.Circuit]]:
-    """Build the self-contained 123-circuit corpus (no external file access)."""
+    """Build the self-contained 137-circuit corpus (no external file access)."""
     out: list[tuple[str, stim.Circuit]] = [
         (name, stim.Circuit(text)) for name, _tags, _leak, text in golden_test.CORPUS
     ]
-    for group in (_SUPPLEMENT_S, _SUPPLEMENT_X, _SUPPLEMENT_Y_REV2, _SUPPLEMENT_Y_REV3):
+    for group in (
+        _SUPPLEMENT_S,
+        _SUPPLEMENT_X,
+        _SUPPLEMENT_Y_REV2,
+        _SUPPLEMENT_Y_REV3,
+        _SUPPLEMENT_WITNESSES,
+    ):
         for name, text in group:
             out.append((name, stim.Circuit(text)))
     for gname in sorted(stim.gate_data()):
@@ -582,6 +608,8 @@ def _copy_len_fixture(op: stim.CircuitInstruction) -> int:
 
 
 def w12_ir_fields(c: stim.Circuit) -> list[Any]:
+    from stimside.util import circuit_ir
+
     out: list[Any] = []
     for uc in (True, False):
         ir = circuit_ir.build_ir(c, uc=uc)
@@ -626,6 +654,8 @@ def w12_ir_fields(c: stim.Circuit) -> list[Any]:
 
 
 def w12b_tableau_layout(c: stim.Circuit) -> list[list[int]]:
+    from stimside.util import circuit_ir
+
     p = PrecompiledTablesideCircuit(c.copy(), True)
     ir = circuit_ir.build_ir(c, uc=True)
     lay = circuit_ir.tableau_step_layout(
@@ -3530,6 +3560,328 @@ FROZEN_DIGESTS: dict[str, dict[str, tuple[str, int]]] = {
         "w8b_parse_tableau": ("6175e5ae673dadd8b48f472e", 134),
         "w9_collapses_z": ("3cbc87c7681f34db4617feaa", 4),
     },
+    "p01_inv_m": {
+        "w10_unroll": ("3d6e5ae304e399972cf40563", 14),
+        "w11_u2f_and_swap": ("dd1cebcbe68f9c7d8e08f466", 35),
+        "w12_ir_fields": ("0c5c758bd04e48ddc7d707d5", 320),
+        "w12b_tableau_layout": ("ce6ac9ddc0ce7df6ed718720", 45),
+        "w1_tableau_precompile": ("74944304083ff73064688999", 332),
+        "w1b_tableau_precompile_ucu_false": ("1f1d06177bca5da37613030a", 146),
+        "w2_coset_reference": ("b68d06b8daf35f3c4fff6f24", 529),
+        "w3_magic_pass": ("e92f5fac022648fcb272933b", 911),
+        "w3b_extract_faults": ("45efdee707c79551fee3f42c", 15),
+        "w3c_magic_pass_external_fault_slots": ("c90a991429fb4086b95cb0e5", 1858),
+        "w4_marginal_builder": ("5e011bfacca442c9f7f2b1f3", 728),
+        "w4b_marginal_builder_oracle": ("cde0b0471a8444b954c9c6db", 750),
+        "w4c_marginal_builder_abi": ("da3418befc685ed9df4d2e28", 570),
+        "w4d_marginal_builder_uc_false": ("cde0b0471a8444b954c9c6db", 750),
+        "w5_sync_reference": ("a03cb4b8ae4a23a7df211ade", 21),
+        "w5b_sync_reference_nohandler": ("a03cb4b8ae4a23a7df211ade", 21),
+        "w6_known_states": ("f8e4b59d48a3a578ba533ae8", 16),
+        "w7_strip": ("e03600c96d8b89a8afa72a47", 19),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p02_inv_mzz": {
+        "w10_unroll": ("782d7bd377a8bc6d2482bbf4", 20),
+        "w11_u2f_and_swap": ("dd1cebcbe68f9c7d8e08f466", 35),
+        "w12_ir_fields": ("1138cc87420ac7c1c5ce8fc5", 350),
+        "w12b_tableau_layout": ("ce6ac9ddc0ce7df6ed718720", 45),
+        "w1_tableau_precompile": ("8a37d3c1f5a3583888adb926", 352),
+        "w1b_tableau_precompile_ucu_false": ("9602ad1c0ee0bf6479cf6914", 152),
+        "w2_coset_reference": ("f8da8de40fade099132a8ea4", 733),
+        "w3_magic_pass": ("54e226988c3ff082427cc457", 1238),
+        "w3b_extract_faults": ("4dd335bdd7abf43881f78e04", 21),
+        "w3c_magic_pass_external_fault_slots": ("1074dca401c3b22765f06bbd", 2185),
+        "w4_marginal_builder": ("5e011bfacca442c9f7f2b1f3", 728),
+        "w4b_marginal_builder_oracle": ("cde0b0471a8444b954c9c6db", 750),
+        "w4c_marginal_builder_abi": ("3de686970f0cf8e03bdb0ed0", 582),
+        "w4d_marginal_builder_uc_false": ("cde0b0471a8444b954c9c6db", 750),
+        "w5_sync_reference": ("a03cb4b8ae4a23a7df211ade", 21),
+        "w5b_sync_reference_nohandler": ("a03cb4b8ae4a23a7df211ade", 21),
+        "w6_known_states": ("cfa12b6c1ce9e17329dd39b2", 19),
+        "w7_strip": ("0ea997b82abd5cfb6237a230", 25),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p03_mpad1": {
+        "w10_unroll": ("45e09d410ed0410efed940ce", 16),
+        "w11_u2f_and_swap": ("dd1cebcbe68f9c7d8e08f466", 35),
+        "w12_ir_fields": ("1693945aa2906057919b82bb", 328),
+        "w12b_tableau_layout": ("ce6ac9ddc0ce7df6ed718720", 45),
+        "w1_tableau_precompile": ("a6fc04f413555d91b070279d", 341),
+        "w1b_tableau_precompile_ucu_false": ("7dec0eee926fb91d32335697", 148),
+        "w2_coset_reference": ("7263594f16b6e380ed75be7b", 471),
+        "w3_magic_pass": ("ec3991e086acc82dc3f8d546", 705),
+        "w3b_extract_faults": ("a5361614f8d6296246495d1d", 17),
+        "w3c_magic_pass_external_fault_slots": ("ef6b7bd2ef5cdd9fe906d9b8", 1652),
+        "w4_marginal_builder": ("0c0ba562e7d4516cff45fd5c", 728),
+        "w4b_marginal_builder_oracle": ("333dbb7c841e41b7b69f7028", 750),
+        "w4c_marginal_builder_abi": ("38d96505fe11561cc56d3679", 566),
+        "w4d_marginal_builder_uc_false": ("333dbb7c841e41b7b69f7028", 750),
+        "w5_sync_reference": ("5f81c67df23797ebf5ae7da8", 22),
+        "w5b_sync_reference_nohandler": ("5f81c67df23797ebf5ae7da8", 22),
+        "w6_known_states": ("582f7823deee16e572b47ac0", 19),
+        "w7_strip": ("5c5341d266b212f0483a1b8b", 21),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p04_mpp_rep": {
+        "w10_unroll": ("e5f5b2fb2765e36df7b83b95", 24),
+        "w11_u2f_and_swap": ("dd1cebcbe68f9c7d8e08f466", 35),
+        "w12_ir_fields": ("8afb2f7cf387eaec3e6589d0", 370),
+        "w12b_tableau_layout": ("ce6ac9ddc0ce7df6ed718720", 45),
+        "w1_tableau_precompile": ("ce3ef10532d9c4b7c00cb23c", 364),
+        "w1b_tableau_precompile_ucu_false": ("3d98c9530f14feb71e8f44ec", 156),
+        "w2_coset_reference": ("cc980d96e4e3805c4139b1d2", -1),
+        "w3_magic_pass": ("d8eb3ea2bd85040bb74ace7d", -1),
+        "w3b_extract_faults": ("fa54ce9aa6c5f1a893828f36", 25),
+        "w3c_magic_pass_external_fault_slots": ("d8eb3ea2bd85040bb74ace7d", -1),
+        "w4_marginal_builder": ("b93a8566e6d4d65630c0aa57", -1),
+        "w4b_marginal_builder_oracle": ("b93a8566e6d4d65630c0aa57", -1),
+        "w4c_marginal_builder_abi": ("b93a8566e6d4d65630c0aa57", -1),
+        "w4d_marginal_builder_uc_false": ("b93a8566e6d4d65630c0aa57", -1),
+        "w5_sync_reference": ("0fd7e244b3c1e54208dacc60", -1),
+        "w5b_sync_reference_nohandler": ("0fd7e244b3c1e54208dacc60", -1),
+        "w6_known_states": ("8190e7d2c08731474624a9a3", -1),
+        "w7_strip": ("bb59c292ea5d77cd92ae040b", 29),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p05_mpp_neg": {
+        "w10_unroll": ("fb1928f066237094d1a9a527", 23),
+        "w11_u2f_and_swap": ("dd1cebcbe68f9c7d8e08f466", 35),
+        "w12_ir_fields": ("96eb5c22892a7219c90b2ed0", 365),
+        "w12b_tableau_layout": ("ce6ac9ddc0ce7df6ed718720", 45),
+        "w1_tableau_precompile": ("6d3abf400f11fdb9461723be", 362),
+        "w1b_tableau_precompile_ucu_false": ("136689724860005cd5241c7a", 155),
+        "w2_coset_reference": ("a5bfe8a8b275927a0828c09f", 692),
+        "w3_magic_pass": ("04fe30ed889cc7223281010c", 1188),
+        "w3b_extract_faults": ("d73afdd965a637898227b000", 24),
+        "w3c_magic_pass_external_fault_slots": ("8ebf1521bbc60c1ad63ef1d1", 2135),
+        "w4_marginal_builder": ("5e011bfacca442c9f7f2b1f3", 728),
+        "w4b_marginal_builder_oracle": ("cde0b0471a8444b954c9c6db", 750),
+        "w4c_marginal_builder_abi": ("5a189cbe8256c00f10f41a66", 570),
+        "w4d_marginal_builder_uc_false": ("cde0b0471a8444b954c9c6db", 750),
+        "w5_sync_reference": ("a03cb4b8ae4a23a7df211ade", 21),
+        "w5b_sync_reference_nohandler": ("a03cb4b8ae4a23a7df211ade", 21),
+        "w6_known_states": ("6abbebd6a63d8dc1fd9795ac", 16),
+        "w7_strip": ("c80ca0ac1e02183fcbde6401", 28),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p06_fb_mpad": {
+        "w10_unroll": ("572ab55aa9566594bde276d5", 37),
+        "w11_u2f_and_swap": ("f082a425bca6de5a5839a87a", 51),
+        "w12_ir_fields": ("77a6c46f094bb730ec792dc5", 592),
+        "w12b_tableau_layout": ("b5bd5d46bdc906f8d7eaa5ae", 69),
+        "w1_tableau_precompile": ("77a49e3334e2113fb92ca4e0", 631),
+        "w1b_tableau_precompile_ucu_false": ("ff9dfe52817f8b06c84d1231", 289),
+        "w2_coset_reference": ("47d435405d1c9d2845ed470a", 947),
+        "w3_magic_pass": ("748c29c864115e8fba746d53", 1164),
+        "w3b_extract_faults": ("30b9083b2ea5aa88e90b3cd6", 34),
+        "w3c_magic_pass_external_fault_slots": ("41b2447186be4540ea06dbb9", 2111),
+        "w4_marginal_builder": ("0c0ba562e7d4516cff45fd5c", 728),
+        "w4b_marginal_builder_oracle": ("6ef5cf8f13212871373ddc42", 766),
+        "w4c_marginal_builder_abi": ("87a3aa33fa04075b28a7d65c", 678),
+        "w4d_marginal_builder_uc_false": ("6ef5cf8f13212871373ddc42", 766),
+        "w5_sync_reference": ("f075b87ec79544607a6ec615", 22),
+        "w5b_sync_reference_nohandler": ("f075b87ec79544607a6ec615", 22),
+        "w6_known_states": ("39fde4207f8a350351725e14", 23),
+        "w7_strip": ("31b2c61adbd9831459c3d844", 40),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p07_fb_qrec": {
+        "w10_unroll": ("d0fb567d77e3a9bb2ae62417", 43),
+        "w11_u2f_and_swap": ("fd971af69de9ec97197ab780", 59),
+        "w12_ir_fields": ("c1ae0f50e9a1191b5175d7a9", 712),
+        "w12b_tableau_layout": ("ddb25e99c6ba64288c294a2f", 81),
+        "w1_tableau_precompile": ("df99dd9cbf337e010647dfb3", 764),
+        "w1b_tableau_precompile_ucu_false": ("8d4817c4439ae04e943d1585", 355),
+        "w2_coset_reference": ("bb83aef304508ffe17fefc41", 1386),
+        "w3_magic_pass": ("615b80e9104b19be5104379a", 1622),
+        "w3b_extract_faults": ("71ada6c2efae54a2d32f015f", 38),
+        "w3c_magic_pass_external_fault_slots": ("6f136628a22fe9fe523df908", 2569),
+        "w4_marginal_builder": ("0c0ba562e7d4516cff45fd5c", 728),
+        "w4b_marginal_builder_oracle": ("2d05922f1500593e9ddcb793", 774),
+        "w4c_marginal_builder_abi": ("4c4a30b458448df2934deba9", 775),
+        "w4d_marginal_builder_uc_false": ("2d05922f1500593e9ddcb793", 774),
+        "w5_sync_reference": ("f075b87ec79544607a6ec615", 22),
+        "w5b_sync_reference_nohandler": ("f075b87ec79544607a6ec615", 22),
+        "w6_known_states": ("5f73585c72650f343d505a6f", 25),
+        "w7_strip": ("6b02852e354a3099f7a6852e", 45),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p08_fb_cz_qrec": {
+        "w10_unroll": ("b1e74f515f05f4676d00972d", 54),
+        "w11_u2f_and_swap": ("e6bdd9a5db6e6fac616a0e8c", 75),
+        "w12_ir_fields": ("557d1feb979445053c93275d", 935),
+        "w12b_tableau_layout": ("7d16bba6913abd2fd7b73baa", 105),
+        "w1_tableau_precompile": ("d34c930842fc6368f06b3673", 1014),
+        "w1b_tableau_precompile_ucu_false": ("1cbd833408a81724df9c4d75", 486),
+        "w2_coset_reference": ("0342ecb91632c2e7bb3b771f", 1781),
+        "w3_magic_pass": ("10bafde41cdf52460935b959", 1710),
+        "w3b_extract_faults": ("82c748280d23a9da0da47358", 45),
+        "w3c_magic_pass_external_fault_slots": ("decfa4faae044c17dbabf89b", 2657),
+        "w4_marginal_builder": ("0c0ba562e7d4516cff45fd5c", 728),
+        "w4b_marginal_builder_oracle": ("71b562396a99b960f4000679", 790),
+        "w4c_marginal_builder_abi": ("f60ef01baad7298fd4f59e36", 915),
+        "w4d_marginal_builder_uc_false": ("71b562396a99b960f4000679", 790),
+        "w5_sync_reference": ("f075b87ec79544607a6ec615", 22),
+        "w5b_sync_reference_nohandler": ("f075b87ec79544607a6ec615", 22),
+        "w6_known_states": ("73b39de5b0ecfcf155041295", 29),
+        "w7_strip": ("4051745c1ff9e6e339353eec", 54),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p09_fb_mixed": {
+        "w10_unroll": ("ee7062513b17c342d7d0b880", 50),
+        "w11_u2f_and_swap": ("fd971af69de9ec97197ab780", 59),
+        "w12_ir_fields": ("b731503a2aa9394459ecaced", 747),
+        "w12b_tableau_layout": ("ddb25e99c6ba64288c294a2f", 81),
+        "w1_tableau_precompile": ("3571bc54ba8ba3e80f0062f8", 808),
+        "w1b_tableau_precompile_ucu_false": ("432fc736658f0488bed336de", 362),
+        "w2_coset_reference": ("b3c307fc9b26a734bc6a845d", 1822),
+        "w3_magic_pass": ("cfcc78ea51fabdec899cb02d", 2170),
+        "w3b_extract_faults": ("5bf95db11f2928461b429f96", 45),
+        "w3c_magic_pass_external_fault_slots": ("ff5f2714bf166c2ae6ddf1f8", 3117),
+        "w4_marginal_builder": ("c00519ad5a1177cc0384dc1d", 728),
+        "w4b_marginal_builder_oracle": ("8a2311830c52d0c69a6c3823", 774),
+        "w4c_marginal_builder_abi": ("a3fb4fa164c7e34459462407", 804),
+        "w4d_marginal_builder_uc_false": ("8a2311830c52d0c69a6c3823", 774),
+        "w5_sync_reference": ("7c917f31de11c94853080396", 23),
+        "w5b_sync_reference_nohandler": ("7c917f31de11c94853080396", 23),
+        "w6_known_states": ("3a284cd263c30a1f7d13a40c", 31),
+        "w7_strip": ("2df2164f8e29da3470a98a94", 52),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p10_mpad_z_super": {
+        "w10_unroll": ("b7dd6eb20d3ea27894fd9969", 78),
+        "w11_u2f_and_swap": ("f082a425bca6de5a5839a87a", 51),
+        "w12_ir_fields": ("65bd364b366c4715dcfb0235", 877),
+        "w12b_tableau_layout": ("b5bd5d46bdc906f8d7eaa5ae", 69),
+        "w1_tableau_precompile": ("821682b251604eae49b00ba6", 901),
+        "w1b_tableau_precompile_ucu_false": ("b3f4742d251a75c7ca2a9cf6", 330),
+        "w2_coset_reference": ("f0d5f6b1daefe1d85aed790b", 1620),
+        "w3_magic_pass": ("15de25adc2079cda442ea34d", 2109),
+        "w3b_extract_faults": ("1b6f59b1876bd7d9a499ad2e", 75),
+        "w3c_magic_pass_external_fault_slots": ("f7fdccfcb9674a0a3a11bb9b", 3056),
+        "w4_marginal_builder": ("7c18cf2a888f37546252b4ff", 762),
+        "w4b_marginal_builder_oracle": ("7fab56f7fb2fe490252be2b3", 784),
+        "w4c_marginal_builder_abi": ("65afbbc636c874c64a1f6e6f", 747),
+        "w4d_marginal_builder_uc_false": ("7fab56f7fb2fe490252be2b3", 784),
+        "w5_sync_reference": ("4a0f91c0ba4212f36c67dcd7", 53),
+        "w5b_sync_reference_nohandler": ("c62c18fd5a3df2a67e7d6165", 24),
+        "w6_known_states": ("ee49fb1b408acc802915aaf2", 28),
+        "w7_strip": ("5bf243ca6ac6a863ae1bc2e1", 84),
+        "w8_parse_magic": ("08a644330c210a45bae417cb", 187),
+        "w8b_parse_tableau": ("45b14b2c826757c1abf41393", 179),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p11_lt_reset": {
+        "w10_unroll": ("d45fcd230126116226633e63", 61),
+        "w11_u2f_and_swap": ("f082a425bca6de5a5839a87a", 51),
+        "w12_ir_fields": ("3a6654624eb30dfb52c7a88d", 791),
+        "w12b_tableau_layout": ("e27342a05ff82ae8f29217d5", 69),
+        "w1_tableau_precompile": ("cfc66c12e9a4856a32241fe3", 913),
+        "w1b_tableau_precompile_ucu_false": ("cfea1460ee20709376ad4394", 271),
+        "w2_coset_reference": ("3335e905eb8b15d22db4fad3", 929),
+        "w3_magic_pass": ("58f2bda8e1916c26fe356b3c", 1082),
+        "w3b_extract_faults": ("0a629b49a1f1fff7c8f256b3", 58),
+        "w3c_magic_pass_external_fault_slots": ("5b1e302ad5be0646cef93c87", 2029),
+        "w4_marginal_builder": ("5e011bfacca442c9f7f2b1f3", 728),
+        "w4b_marginal_builder_oracle": ("94959f71b97750d3459d92fd", 766),
+        "w4c_marginal_builder_abi": ("61df76626e3cffba962e03d2", 771),
+        "w4d_marginal_builder_uc_false": ("94959f71b97750d3459d92fd", 766),
+        "w5_sync_reference": ("d3e9941fef6b4109272cb579", 37),
+        "w5b_sync_reference_nohandler": ("a03cb4b8ae4a23a7df211ade", 21),
+        "w6_known_states": ("3e21784119b6f3e416d83209", 18),
+        "w7_strip": ("83ff7d1ce74485a8bc375742", 23),
+        "w8_parse_magic": ("59f04b77dcfee5735348a1a1", 148),
+        "w8b_parse_tableau": ("0d1c38218df8912128d6e8d2", 140),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p12_bwd_mpp": {
+        "w10_unroll": ("f6756ac617fce5bff23320ce", 41),
+        "w11_u2f_and_swap": ("fd971af69de9ec97197ab780", 59),
+        "w12_ir_fields": ("23d76e7898b8485324a3c068", 697),
+        "w12b_tableau_layout": ("ddb25e99c6ba64288c294a2f", 81),
+        "w1_tableau_precompile": ("8f94234676ed6fa216945226", 726),
+        "w1b_tableau_precompile_ucu_false": ("925df6afa4d468dd264badee", 353),
+        "w2_coset_reference": ("b92f0a0384cc5dd355e4e4c7", 1813),
+        "w3_magic_pass": ("09a96e4da32aecf6b6d28266", 1957),
+        "w3b_extract_faults": ("b0c20c86ef32b851e899fee0", 36),
+        "w3c_magic_pass_external_fault_slots": ("44987edad2863f805dc9a66c", 2904),
+        "w4_marginal_builder": ("c00519ad5a1177cc0384dc1d", 728),
+        "w4b_marginal_builder_oracle": ("8a2311830c52d0c69a6c3823", 774),
+        "w4c_marginal_builder_abi": ("a401556db3d0aa240ae869c6", 779),
+        "w4d_marginal_builder_uc_false": ("8a2311830c52d0c69a6c3823", 774),
+        "w5_sync_reference": ("fc626bca513b3de7ccc049f5", 23),
+        "w5b_sync_reference_nohandler": ("fc626bca513b3de7ccc049f5", 23),
+        "w6_known_states": ("878037ac0a30314fc0cf1e15", 31),
+        "w7_strip": ("edd2eaae3f080084d2b62584", 43),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p13_rx_order": {
+        "w10_unroll": ("4cece47f4b92a2b7b7cecdd5", 42),
+        "w11_u2f_and_swap": ("fd971af69de9ec97197ab780", 59),
+        "w12_ir_fields": ("bd173129f7550bf9e23cc373", 703),
+        "w12b_tableau_layout": ("ddb25e99c6ba64288c294a2f", 81),
+        "w1_tableau_precompile": ("aa513e4ccae2ded9e6b02b97", 762),
+        "w1b_tableau_precompile_ucu_false": ("6026bb8d3fec4e942658b368", 354),
+        "w2_coset_reference": ("38ebe8b1cbdb076b91eb5a60", 2116),
+        "w3_magic_pass": ("a2b1f4e1630c8bf60e393147", 2796),
+        "w3b_extract_faults": ("61e26ae1ee658a53c3a56df8", 37),
+        "w3c_magic_pass_external_fault_slots": ("15676384551caf246c4a6bcb", 3743),
+        "w4_marginal_builder": ("5e011bfacca442c9f7f2b1f3", 728),
+        "w4b_marginal_builder_oracle": ("a281405443888b5b6dc3a0ea", 774),
+        "w4c_marginal_builder_abi": ("29a72586550b4f5d22bdc52b", 791),
+        "w4d_marginal_builder_uc_false": ("a281405443888b5b6dc3a0ea", 774),
+        "w5_sync_reference": ("a03cb4b8ae4a23a7df211ade", 21),
+        "w5b_sync_reference_nohandler": ("a03cb4b8ae4a23a7df211ade", 21),
+        "w6_known_states": ("abefa94cf9437d6dc0304320", 31),
+        "w7_strip": ("5897e325d3db9cdef17b4244", 44),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
+    "p14_xcz_sweep_target": {
+        "w10_unroll": ("957da901eb6c3435bd899f66", 40),
+        "w11_u2f_and_swap": ("f082a425bca6de5a5839a87a", 51),
+        "w12_ir_fields": ("74d433a4577bdaf84b2bd1fb", 618),
+        "w12b_tableau_layout": ("b5bd5d46bdc906f8d7eaa5ae", 69),
+        "w1_tableau_precompile": ("bc2bb9ad8d87e641429c7f9b", 658),
+        "w1b_tableau_precompile_ucu_false": ("fc502e6610e69be6d59b6065", 292),
+        "w2_coset_reference": ("648f4f7a6d4a1be8289b299c", 1334),
+        "w3_magic_pass": ("7f67802f93515be756ca82e2", -1),
+        "w3b_extract_faults": ("c27ff654a0fcc73202a7f43d", 37),
+        "w3c_magic_pass_external_fault_slots": ("7f67802f93515be756ca82e2", -1),
+        "w4_marginal_builder": ("1a7f3f603d192c758db01723", -1),
+        "w4b_marginal_builder_oracle": ("1a7f3f603d192c758db01723", -1),
+        "w4c_marginal_builder_abi": ("1a7f3f603d192c758db01723", -1),
+        "w4d_marginal_builder_uc_false": ("1a7f3f603d192c758db01723", -1),
+        "w5_sync_reference": ("2f574ba6068a831f476f67ee", 22),
+        "w5b_sync_reference_nohandler": ("2f574ba6068a831f476f67ee", 22),
+        "w6_known_states": ("2b87b45f376071245e408e59", -1),
+        "w7_strip": ("0b1a4f012b924cf6f1d39392", 43),
+        "w8_parse_magic": ("5ae1625b488b3935122d8dd6", 10),
+        "w8b_parse_tableau": ("4f53cda18c2baa0c0354bb5f", 2),
+        "w9_collapses_z": ("60a33e6cf5151f2d52eddae9", 5),
+    },
 }
 
 
@@ -3542,7 +3894,7 @@ def _flatten_expected() -> dict[str, tuple[str, int]]:
 
 
 def test_corpus_and_walker_inventory() -> None:
-    """Verify exact 21 walkers, 123 self-contained circuits, and 2,583 entries."""
+    """Verify exact 21 walkers, 137 self-contained circuits, and 2,877 entries."""
     expected_walkers = {
         "w1_tableau_precompile",
         "w1b_tableau_precompile_ucu_false",
@@ -3572,7 +3924,7 @@ def test_corpus_and_walker_inventory() -> None:
     corpus = build_corpus()
     names = [name for name, _circ in corpus]
     assert len(names) == len(set(names)), "duplicate circuit names in corpus"
-    assert len(corpus) == 123
+    assert len(corpus) == 137
 
     expected_gates = {f"g_{n}" for n in stim.gate_data() if n != "REPEAT"}
     assert len(expected_gates) == 80
@@ -3582,8 +3934,8 @@ def test_corpus_and_walker_inventory() -> None:
     for cname, entries in FROZEN_DIGESTS.items():
         assert set(entries) == expected_walkers, f"walker mismatch on {cname}"
     flat = _flatten_expected()
-    assert len(flat) == 123 * 21
-    assert sum(1 for _sha, nbytes in flat.values() if nbytes == -1) == 193
+    assert len(flat) == 137 * 21
+    assert sum(1 for _sha, nbytes in flat.values() if nbytes == -1) == 210
 
 
 def test_canon_rejects_memory_addresses_and_is_stable() -> None:

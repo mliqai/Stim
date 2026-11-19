@@ -665,6 +665,11 @@ def test_interrupt_after_a_mutating_kernel_returns_leaves_a_flag_raised(
         _peek_all(sim)
     with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
         _ = sim.active_shots
+    qs = list(range(sim.num_qubits))
+    engine_view = np.vstack([CosetsideSimulator.peek_pauli_batch(sim, qs, p) for p in _PAULIS])
+    sim._sync_cpp_to_py()
+    assert not sim._cpp_dirty
+    np.testing.assert_array_equal(_py_peek_all(sim), engine_view)
     sim.clear()
     assert not sim._cpp_dirty and len(sim.active_shots) == 0
 
@@ -877,7 +882,7 @@ def test_interrupted_clear_leaves_pre_clear_state_until_retried(
     _peek_all(sim)
     if engine_ahead:
         _unmatched_reset(sim, "Z")
-    _peek_all(sim)
+    peeks_before = _peek_all(sim)
     assert sim._cpp_dirty is engine_ahead
     assert sim._cpp_lib is not None
     lib = _RaiseAtEngineClear(sim._cpp_lib)
@@ -888,6 +893,12 @@ def test_interrupted_clear_leaves_pre_clear_state_until_retried(
     assert sim._cpp_dirty is True
     with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
         _peek_all(sim)
+    qs = list(range(sim.num_qubits))
+    engine_view = np.vstack([CosetsideSimulator.peek_pauli_batch(sim, qs, p) for p in _PAULIS])
+    np.testing.assert_array_equal(engine_view, peeks_before)
+    sim._sync_cpp_to_py()
+    assert not sim._cpp_dirty
+    np.testing.assert_array_equal(_py_peek_all(sim), peeks_before)
     sim.clear()
     assert not sim._cpp_dirty and len(sim.active_shots) == 0
     np.testing.assert_array_equal(_peek_all(sim), _peek_all(_make_sim(batch)))
@@ -945,5 +956,10 @@ def test_interrupt_after_the_first_nonrandom_mixed_kernel_leaves_a_flag_raised(
         _peek_all(sim)
     with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
         _ = sim.active_shots
+    qs = list(range(sim.num_qubits))
+    engine_view = np.vstack([CosetsideSimulator.peek_pauli_batch(sim, qs, p) for p in _PAULIS])
+    sim._sync_cpp_to_py()
+    assert not sim._cpp_dirty
+    np.testing.assert_array_equal(_py_peek_all(sim), engine_view)
     sim.clear()
     assert not sim._cpp_dirty and len(sim.active_shots) == 0

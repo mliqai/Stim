@@ -240,6 +240,8 @@ def test_the_default_uses_the_engine_path_and_switch_off_keeps_reference(
     sim.run()
     if engine_numerics_available():
         assert isinstance(sim._live_exps, LiveExpansions) and _BlockStore.commands >= 1
+    else:
+        assert isinstance(sim._live_exps, list) and _BlockStore.commands == 0
     monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", False)
     _BlockStore.commands = 0
     ref = MagicsideSimulator(stim.Circuit(_NOISY), batch_size=4, seed=1)

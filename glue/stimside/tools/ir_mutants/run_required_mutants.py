@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Scripted required-mutant runner for WP-27 Step 0 (RFC §7.2, §7.3, §7.5).
+"""Scripted required-mutant runner for stimside IR and HEAD contracts.
 
-Executes the 50 required mutants listed in ``required_mutants.tsv`` (35 rev-2
-required + 11 rev-3 §7.5 known survivors K1..K4 + 4 rev-3 error-order K5
-mutants; all 50 non-equivalent, including ``A4_u2f_validate_off``)
-against isolated scratch copies of the ``stimside`` package.
+Executes the required mutants listed in ``required_mutants.tsv`` against isolated
+scratch copies of the ``stimside`` package.
 
-Mandatory E6 Runner-Hygiene Rule (RFC §7.3 item 6):
+Mandatory Baseline-First Hygiene Rule:
 1. Pre-check ``PATTERN-COUNT == 1`` for every selected row against the unmutated
    baseline snapshot; abort with nonzero exit (``rc=2``) if any row fails.
 2. Run ALL detectors on the unmutated baseline snapshot FIRST:
    ``INV`` (``util/circuit_ir_test.py``), ``ORACLE`` (``ir_oracle_test.py``),
    and every named owner-test group (``GOLD``, ``TAB``, ``MAGIC``, ``DEM``,
-   ``UTIL``), plus optional ``E2E_ORACLE`` if ``--include-e2e-circuits`` is set.
-   Abort with nonzero exit (``rc=3``) if any baseline detector fails or crashes.
+   ``UTIL``, ``FLIP``, ``COSET``), plus optional ``E2E_ORACLE`` if
+   ``--include-e2e-circuits`` is set. Abort with nonzero exit (``rc=3``) if
+   any baseline detector fails or crashes.
 3. Never modify the live package tree. Every mutant runs in an isolated scratch
    copy with ``PYTHONDONTWRITEBYTECODE=1``, ``-p no:cacheprovider``, and
    ``--basetemp`` inside ``--work``.
@@ -57,6 +56,11 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "dem_generators/dem_generator_oracle_test.py",
     ),
     "UTIL": ("util",),
+    "FLIP": (
+        "simulator_flip_test.py",
+        "op_handlers/leakage_handlers/leakage_uint8_flip_test.py",
+    ),
+    "COSET": ("simulator_coset_test.py",),
 }
 
 _ASSERT_EXCS = frozenset({"AssertionError", "Failed"})
@@ -416,6 +420,8 @@ def _run_baseline(
         ("MAGIC", GROUPS["MAGIC"], (), None),
         ("DEM", GROUPS["DEM"], (), None),
         ("UTIL", GROUPS["UTIL"], ("--ignore=src/stimside/util/circuit_ir_test.py",), None),
+        ("FLIP", GROUPS["FLIP"], (), None),
+        ("COSET", GROUPS["COSET"], (), None),
     ]
     results: dict[str, DetectorResult] = {}
 
@@ -645,8 +651,16 @@ def _summarize_and_write(
     out_prefix: Path | None,
 ) -> int:
     tsv_text, md_text, payload = _format_outputs(results, baseline)
-    n_k_test = sum(1 for r in results if r.verdict == "KILLED(test)")
-    n_k_crash = sum(1 for r in results if r.verdict == "KILLED(crash)")
+    n_k_test = sum(
+        1
+        for r in results
+        if r.spec.expected == "kill" and r.verdict == "KILLED(test)"
+    )
+    n_k_crash = sum(
+        1
+        for r in results
+        if r.spec.expected == "kill" and r.verdict == "KILLED(crash)"
+    )
     n_eq_surv = sum(1 for r in results if r.verdict == "SURVIVED(justified_equiv)")
     n_bad_surv = sum(1 for r in results if r.verdict == "SURVIVED")
     n_timeout = sum(1 for r in results if r.verdict == "TIMEOUT")

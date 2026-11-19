@@ -15,7 +15,7 @@ Implements the RFC section 3 design rules:
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import stim
@@ -41,6 +41,9 @@ _NON_FUSING = frozenset(
     }
 )
 _SHIFTED_ARGS_GATES = frozenset({"DETECTOR", "QUBIT_COORDS"})
+_REAL_GATE_DATA = stim.gate_data
+_CATEGORY_CACHE: dict[str, Category] = {}
+_UNTAGGED_CACHE: dict[tuple[str, bool], UntaggedFilter] = {}
 
 
 class Category(str, Enum):
@@ -67,8 +70,7 @@ class UntaggedFilter(str, Enum):
     PAULI_TERMS = "pauli_terms"
 
 
-def classify_category(name: str) -> Category:
-    """Classify a Stim gate/instruction name into its coarse ``Category``."""
+def _classify_category_uncached(name: str) -> Category:
     gd = stim.gate_data(name)
     name = gd.name
     if name in _ANNOTATION:
@@ -90,8 +92,20 @@ def classify_category(name: str) -> Category:
     return Category.OTHER
 
 
-def classify_untagged(name: str, *, uc: bool) -> UntaggedFilter:
-    """Rule R1 for an op not claimed by a tag (the caller decides 'claimed')."""
+def classify_category(name: str) -> Category:
+    """Classify a Stim gate/instruction name into its coarse ``Category``."""
+    if stim.gate_data is _REAL_GATE_DATA:
+        cached = _CATEGORY_CACHE.get(name)
+        if cached is not None:
+            return cached
+        res = _classify_category_uncached(name)
+        if len(_CATEGORY_CACHE) < 4096:
+            _CATEGORY_CACHE[name] = res
+        return res
+    return _classify_category_uncached(name)
+
+
+def _classify_untagged_uncached(name: str, *, uc: bool) -> UntaggedFilter:
     if not uc:
         return UntaggedFilter.NONE
     gd = stim.gate_data(name)
@@ -109,7 +123,51 @@ def classify_untagged(name: str, *, uc: bool) -> UntaggedFilter:
     return UntaggedFilter.NONE
 
 
-@dataclass(frozen=True)
+def classify_untagged(name: str, *, uc: bool) -> UntaggedFilter:
+    """Rule R1 for an op not claimed by a tag (the caller decides 'claimed')."""
+    if stim.gate_data is _REAL_GATE_DATA:
+        key = (name, uc)
+        cached = _UNTAGGED_CACHE.get(key)
+        if cached is not None:
+            return cached
+        res = _classify_untagged_uncached(name, uc=uc)
+        if len(_UNTAGGED_CACHE) < 4096:
+            _UNTAGGED_CACHE[key] = res
+        return res
+    return _classify_untagged_uncached(name, uc=uc)
+
+
+class _FlatAlignment:
+    """Lazy cache for ``flattened()`` ops and unrolled-to-flat target alignment."""
+
+    __slots__ = ("_circuit", "_flat_ops", "_ops", "_where")
+
+    def __init__(
+        self,
+        circuit: stim.Circuit,
+        ops: tuple[stim.CircuitInstruction, ...],
+    ) -> None:
+        self._circuit: stim.Circuit | None = circuit
+        self._ops: tuple[stim.CircuitInstruction, ...] = ops
+        self._flat_ops: tuple[stim.CircuitInstruction, ...] | None = None
+        self._where: list[tuple[int, int]] | None = None
+
+    def get_flat_ops(self) -> tuple[stim.CircuitInstruction, ...]:
+        if self._flat_ops is None:
+            assert self._circuit is not None
+            self._flat_ops = tuple(self._circuit.flattened())
+        return self._flat_ops
+
+    def get_where(self) -> list[tuple[int, int]]:
+        if self._where is None:
+            flat_ops = self.get_flat_ops()
+            self._where = _align_flat_ops(self._ops, flat_ops)
+            self._circuit = None
+            self._ops = ()
+        return self._where
+
+
+@dataclass(frozen=True, eq=False)
 class IRInstr:
     """Single unrolled instruction record in ``CircuitIR``."""
 
@@ -118,32 +176,107 @@ class IRInstr:
     tag: str
     category: Category
     untagged_filter: UntaggedFilter
-    flat_index: int  # -1 for SHIFT_COORDS or an op-list source
-    flat_offset: int  # first target of this op inside its (possibly fused) flat op
     num_measurements: int
     first_measurement: int
+    _flat: _FlatAlignment | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def flat_index(self) -> int:
+        """Index in ``flattened()``, or -1 for ``SHIFT_COORDS`` / op lists."""
+        if self._flat is None:
+            return -1
+        return self._flat.get_where()[self.unrolled_index][0]
+
+    @property
+    def flat_offset(self) -> int:
+        """First target index inside the corresponding flattened instruction."""
+        if self._flat is None:
+            return 0
+        return self._flat.get_where()[self.unrolled_index][1]
+
+    def __eq__(self, other: object) -> bool:
+        if self is other:
+            return True
+        if not isinstance(other, IRInstr):
+            return NotImplemented
+        if (
+            self.unrolled_index != other.unrolled_index
+            or self.num_measurements != other.num_measurements
+            or self.first_measurement != other.first_measurement
+            or self.category != other.category
+            or self.untagged_filter != other.untagged_filter
+            or not (self.tag == other.tag)
+            or self.op != other.op
+        ):
+            return False
+        if self._flat is other._flat:
+            return True
+        return (
+            self.flat_index == other.flat_index
+            and self.flat_offset == other.flat_offset
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.unrolled_index,
+                self.op,
+                self.category,
+                self.untagged_filter,
+                self.num_measurements,
+                self.first_measurement,
+            )
+        )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CircuitIR:
     """Immutable, hashable circuit IR built from a circuit or op sequence."""
 
     instrs: tuple[IRInstr, ...]
-    flat_ops: tuple[stim.CircuitInstruction, ...]  # () for an op-list source
     num_qubits: int
     num_measurements: int
     has_repeat: bool
     uc: bool
     from_op_list: bool
+    _flat: _FlatAlignment | None = field(default=None, repr=False, compare=False)
 
+    @property
+    def flat_ops(self) -> tuple[stim.CircuitInstruction, ...]:
+        """Flattened instruction tuple (``()`` for an op-list source)."""
+        if self._flat is None:
+            return ()
+        return self._flat.get_flat_ops()
 
-def _tag_token(op: stim.CircuitInstruction) -> str:
-    """Return Stim's injective escaped-tag header token without reading ``.tag``."""
-    text = str(op)
-    n = len(op.name)
-    if len(text) > n and text[n] == "[":
-        return text[n + 1 : text.index("]", n + 1)]
-    return ""
+    def __eq__(self, other: object) -> bool:
+        if self is other:
+            return True
+        if not isinstance(other, CircuitIR):
+            return NotImplemented
+        if (
+            self.num_qubits != other.num_qubits
+            or self.num_measurements != other.num_measurements
+            or self.has_repeat != other.has_repeat
+            or self.uc != other.uc
+            or self.from_op_list != other.from_op_list
+            or self.instrs != other.instrs
+        ):
+            return False
+        if self._flat is other._flat:
+            return True
+        return self.flat_ops == other.flat_ops
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.instrs,
+                self.num_qubits,
+                self.num_measurements,
+                self.has_repeat,
+                self.uc,
+                self.from_op_list,
+            )
+        )
 
 
 def _op_matches_flat(
@@ -153,7 +286,6 @@ def _op_matches_flat(
     flat_targets: list[stim.GateTarget],
     used: int,
     flat_args: list[float],
-    flat_tag: str,
 ) -> bool:
     """Return True iff unrolled ``op`` matches ``flat_op`` at target offset ``used``."""
     if op.name != flat_op.name:
@@ -164,7 +296,7 @@ def _op_matches_flat(
         return False
     if op.name not in _SHIFTED_ARGS_GATES and op.gate_args_copy() != flat_args:
         return False
-    return _tag_token(op) == flat_tag
+    return op.tag == flat_op.tag
 
 
 def _try_fuse_zero(
@@ -172,17 +304,15 @@ def _try_fuse_zero(
     cur: stim.CircuitInstruction,
     meta_ready: bool,
     flat_args: list[float],
-    flat_tag: str,
-) -> tuple[bool, bool, list[float], str]:
-    """Return ``(fused, meta_ready, flat_args, flat_tag)`` for a zero-target op."""
+) -> tuple[bool, bool, list[float]]:
+    """Return ``(fused, meta_ready, flat_args)`` for a zero-target op."""
     if op.name in _NON_FUSING or op.name != cur.name:
-        return False, meta_ready, flat_args, flat_tag
+        return False, meta_ready, flat_args
     if not meta_ready:
         flat_args = cur.gate_args_copy()
-        flat_tag = _tag_token(cur)
         meta_ready = True
-    fused = op.gate_args_copy() == flat_args and _tag_token(op) == flat_tag
-    return fused, meta_ready, flat_args, flat_tag
+    fused = op.tag == cur.tag and op.gate_args_copy() == flat_args
+    return fused, meta_ready, flat_args
 
 
 def _align_flat_ops(
@@ -195,7 +325,6 @@ def _align_flat_ops(
     flat_targets: list[stim.GateTarget] = []
     flat_len = 0
     flat_args: list[float] = []
-    flat_tag = ""
     meta_ready = False
     used = 0
     for u_idx, op in enumerate(ops):
@@ -207,8 +336,8 @@ def _align_flat_ops(
         if used == flat_len:
             fused_zero = False
             if n_tgt == 0 and f >= 0:
-                fused_zero, meta_ready, flat_args, flat_tag = _try_fuse_zero(
-                    op, flat_ops[f], meta_ready, flat_args, flat_tag
+                fused_zero, meta_ready, flat_args = _try_fuse_zero(
+                    op, flat_ops[f], meta_ready, flat_args
                 )
             if not fused_zero:
                 f += 1
@@ -227,17 +356,16 @@ def _align_flat_ops(
                     flat_targets = cur.targets_copy()
                     flat_len = len(flat_targets)
                     flat_args = cur.gate_args_copy()
-                    flat_tag = _tag_token(cur)
                     meta_ready = True
                     if not _op_matches_flat(
-                        op, op_targets, cur, flat_targets, 0, flat_args, flat_tag
+                        op, op_targets, cur, flat_targets, 0, flat_args
                     ):
                         raise ValueError(
                             f"Unrolled op {u_idx} ({op}) does not match "
                             f"flattened op {f} ({cur})."
                         )
         elif not _op_matches_flat(
-            op, op_targets, flat_ops[f], flat_targets, used, flat_args, flat_tag
+            op, op_targets, flat_ops[f], flat_targets, used, flat_args
         ):
             raise ValueError(
                 f"Unrolled op {u_idx} ({op}) does not match "
@@ -253,6 +381,72 @@ def _align_flat_ops(
     return where
 
 
+def _build_circuit_instrs(
+    ops: list[stim.CircuitInstruction],
+    uc: bool,
+    flat: _FlatAlignment,
+) -> tuple[IRInstr, ...]:
+    instrs: list[IRInstr] = []
+    append = instrs.append
+    first = 0
+    for i, op in enumerate(ops):
+        name = op.name
+        k = op.num_measurements
+        append(
+            IRInstr(
+                i,
+                op,
+                op.tag,
+                classify_category(name),
+                classify_untagged(name, uc=uc),
+                k,
+                first,
+                flat,
+            )
+        )
+        first += k
+    return tuple(instrs)
+
+
+def _build_oplist_instrs(
+    ops: list[stim.CircuitInstruction],
+    uc: bool,
+) -> tuple[tuple[IRInstr, ...], int, int]:
+    instrs: list[IRInstr] = []
+    append = instrs.append
+    op_memo: dict[
+        stim.CircuitInstruction, tuple[Category, UntaggedFilter, int, int]
+    ] = {}
+    max_q = -1
+    first = 0
+    for i, op in enumerate(ops):
+        if isinstance(op, stim.CircuitRepeatBlock):
+            raise TypeError(
+                "build_ir op sequence cannot contain stim.CircuitRepeatBlock; "
+                "pass a stim.Circuit or unroll_circuit() output instead."
+            )
+        entry = op_memo.get(op)
+        if entry is None:
+            cat = classify_category(op.name)
+            uf = classify_untagged(op.name, uc=uc)
+            omq = -1
+            for t in op.targets_copy():
+                qv = t.qubit_value
+                if qv is not None and qv > omq:
+                    omq = qv
+            nm = op.num_measurements
+            entry = (cat, uf, omq, nm)
+            if len(op_memo) < 4096:
+                op_memo[op] = entry
+        else:
+            cat, uf, omq, nm = entry
+        max_q = max(max_q, omq)
+        append(IRInstr(i, op, op.tag, cat, uf, nm, first))
+        first += nm
+    num_qubits = 1 + max_q if max_q >= 0 else 0
+    return tuple(instrs), num_qubits, first
+
+
 def build_ir(
     src: stim.Circuit | Sequence[stim.CircuitInstruction],
     *,
@@ -260,51 +454,22 @@ def build_ir(
 ) -> CircuitIR:
     """Build a ``CircuitIR`` from a ``stim.Circuit`` or an explicit op list."""
     if isinstance(src, stim.Circuit):
-        from_list = False
         ops = unroll_circuit(src)
-        flat_ops: tuple[stim.CircuitInstruction, ...] = tuple(src.flattened())
         has_repeat = any(isinstance(i, stim.CircuitRepeatBlock) for i in src)
-        num_qubits, num_meas = src.num_qubits, src.num_measurements
-    else:
-        from_list = True
-        ops = list(src)
-        if any(isinstance(o, stim.CircuitRepeatBlock) for o in ops):
-            raise TypeError(
-                "build_ir op sequence cannot contain stim.CircuitRepeatBlock; "
-                "pass a stim.Circuit or unroll_circuit() output instead."
-            )
-        flat_ops = ()
-        has_repeat = False
-        qs = [
-            t.qubit_value
-            for o in ops
-            for t in o.targets_copy()
-            if t.qubit_value is not None
-        ]
-        num_qubits = 1 + max(qs) if qs else 0
-        num_meas = sum(o.num_measurements for o in ops)
-    where = [(-1, 0)] * len(ops) if from_list else _align_flat_ops(ops, flat_ops)
-    instrs: list[IRInstr] = []
-    first = 0
-    for i, op in enumerate(ops):
-        k = op.num_measurements
-        instrs.append(
-            IRInstr(
-                i,
-                op,
-                op.tag,
-                classify_category(op.name),
-                classify_untagged(op.name, uc=uc),
-                where[i][0],
-                where[i][1],
-                k,
-                first,
-            )
+        flat = _FlatAlignment(src.copy(), tuple(ops))
+        instrs = _build_circuit_instrs(ops, uc, flat)
+        return CircuitIR(
+            instrs,
+            src.num_qubits,
+            src.num_measurements,
+            has_repeat,
+            uc,
+            False,
+            flat,
         )
-        first += k
-    return CircuitIR(
-        tuple(instrs), flat_ops, num_qubits, num_meas, has_repeat, uc, from_list
-    )
+    ops = list(src)
+    instrs, num_qubits, num_meas = _build_oplist_instrs(ops, uc)
+    return CircuitIR(instrs, num_qubits, num_meas, False, uc, True)
 
 
 # ---- derived passes (functions of the IR, not IR fields) ---------------------
@@ -392,4 +557,6 @@ def split_copies(
 
 def unrolled_to_flat(ir: CircuitIR) -> list[int]:
     """Return ``flat_index`` for every unrolled instruction in ``ir``."""
-    return [i.flat_index for i in ir.instrs]
+    if ir._flat is None:
+        return [-1] * len(ir.instrs)
+    return [f for f, _off in ir._flat.get_where()]

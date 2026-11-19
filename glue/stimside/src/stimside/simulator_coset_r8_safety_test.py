@@ -619,6 +619,8 @@ def test_r7_f6_run_detects_in_place_and_reassigned_circuit_changes() -> None:
 
 
 def test_r8_r2_clear_aborted_latch_interrupt_at_every_line_recovers() -> None:
+    injected = 0
+    prev_trace = sys.gettrace()
     for target_hit in range(1, 8):
         sim = _mk_sim("H 0\nM 0", batch_size=3, seed=7)
         sim._record_aborted_call(KeyboardInterrupt("initial-abort"))
@@ -643,10 +645,11 @@ def test_r8_r2_clear_aborted_latch_interrupt_at_every_line_recovers() -> None:
         except KeyboardInterrupt:
             caught = True
         finally:
-            sys.settrace(None)
+            sys.settrace(prev_trace)
         if not caught:
             assert type(sim) is CosetsideSimulator
             break
+        injected += 1
         with pytest.raises(RuntimeError, match=r"clear\(\)"):
             sim.run()
         sim.clear()
@@ -654,6 +657,7 @@ def test_r8_r2_clear_aborted_latch_interrupt_at_every_line_recovers() -> None:
         assert sim._orig_class is None and sim._aborted_call_msg is None
         sim.run()
         assert sim.get_final_measurement_records().shape == (3, 1)
+    assert injected >= 3
 
     sim_fb = _mk_sim("H 0\nM 0", batch_size=2, seed=1)
     object.__setattr__(sim_fb, "_aborted_call_msg", None)
@@ -665,6 +669,9 @@ def test_r8_r2_clear_aborted_latch_interrupt_at_every_line_recovers() -> None:
 
 
 def test_r8_r2_record_engine_failed_interrupt_completes_swap_on_retry() -> None:
+    injected = 0
+    seen_failed = 0
+    prev_trace = sys.gettrace()
     for target_hit in range(1, 10):
         sim = _mk_sim("H 0\nM 0", batch_size=2, seed=3)
         hits = [0]
@@ -688,10 +695,12 @@ def test_r8_r2_record_engine_failed_interrupt_completes_swap_on_retry() -> None:
         except KeyboardInterrupt:
             caught = True
         finally:
-            sys.settrace(None)
+            sys.settrace(prev_trace)
         if not caught:
             break
+        injected += 1
         if sim._engine_failed_msg is not None:
+            seen_failed += 1
             with pytest.raises(RuntimeError, match="MemoryError: simulated"):
                 sim.clear()
             assert type(sim) is _FailedCosetsideSimulator
@@ -699,6 +708,7 @@ def test_r8_r2_record_engine_failed_interrupt_completes_swap_on_retry() -> None:
                 sim.get_current_circuit_time()
             with pytest.raises(RuntimeError, match="MemoryError: simulated"):
                 sim.apply_pauli("X", np.ones((1, 2), dtype=bool))
+    assert injected >= 3 and seen_failed >= 1
 
 
 def test_r8_r2_subclasses_init_subclass_kwarg_registry_and_custom_meta() -> None:
@@ -732,6 +742,25 @@ def test_r8_r2_subclasses_init_subclass_kwarg_registry_and_custom_meta() -> None
         def metric(self) -> int:
             return 99
 
+    c = stim.Circuit("H 0\nM 0")
+    before_seen = set(tracked_seen)
+    for cls in (ConcreteKwargSub, TrackedSub, ConcreteABCSim):
+        h = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
+        sim = cls(c, compiled_op_handler=h, batch_size=2, seed=1)
+        sim._record_aborted_call(KeyboardInterrupt("sub-ki"))
+        assert isinstance(sim, cls)
+        with pytest.raises(RuntimeError, match="KeyboardInterrupt"):
+            sim.get_current_circuit_time()
+        sim.clear()
+        assert type(sim) is cls
+        sim._record_engine_failed("MemoryError")
+        assert isinstance(sim, cls)
+        with pytest.raises(RuntimeError, match="MemoryError"):
+            sim.clear()
+    assert tracked_seen == before_seen
+
+
+def test_r8_r2_custom_metaclass_subclasses_rejected_and_cached() -> None:
     class CustomMeta(type):
         def __new__(
             mcls, name: str, bases: tuple[type, ...], ns: dict[str, Any], *,
@@ -757,21 +786,25 @@ def test_r8_r2_subclasses_init_subclass_kwarg_registry_and_custom_meta() -> None
         pass
 
     c = stim.Circuit("H 0\nM 0")
-    before_seen = set(tracked_seen)
-    for cls in (ConcreteKwargSub, TrackedSub, ConcreteABCSim, MetaSim, ABCMetaSim):
+    rebuilt = [False]
+    orig_get_ab = sc._get_aborted_class
+
+    def _fail_rebuild(_c: Any) -> Any:
+        rebuilt[0] = True
+        raise AssertionError("rebuilt")
+
+    for bad_cls in (MetaSim, ABCMetaSim):
         h = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
-        sim = cls(c, compiled_op_handler=h, batch_size=2, seed=1)
-        sim._record_aborted_call(KeyboardInterrupt("sub-ki"))
-        assert isinstance(sim, cls)
-        with pytest.raises(RuntimeError, match="KeyboardInterrupt"):
-            sim.get_current_circuit_time()
-        sim.clear()
-        assert type(sim) is cls
-        sim._record_engine_failed("MemoryError")
-        assert isinstance(sim, cls)
-        with pytest.raises(RuntimeError, match="MemoryError"):
-            sim.clear()
-    assert tracked_seen == before_seen
+        with pytest.raises(TypeError, match=rf"{bad_cls.__name__}.*not supported"):
+            bad_cls(c, compiled_op_handler=h, batch_size=2, seed=1)
+        sc._get_aborted_class = _fail_rebuild
+        try:
+            h2 = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
+            with pytest.raises(TypeError, match=rf"{bad_cls.__name__}.*not supported"):
+                bad_cls(c, compiled_op_handler=h2, batch_size=2, seed=1)
+        finally:
+            sc._get_aborted_class = orig_get_ab
+        assert not rebuilt[0]
 
 
 def test_r8_r2_latch_class_oom_fallback_preserves_exception(
@@ -784,13 +817,21 @@ def test_r8_r2_latch_class_oom_fallback_preserves_exception(
     h = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
     sim = PlainSub(c, compiled_op_handler=h, batch_size=2, seed=2)
     monkeypatch.setattr(sc, "_get_aborted_class", lambda _c: (_ for _ in ()).throw(MemoryError()))
-    sim._record_aborted_call(KeyboardInterrupt("oom-fallback"))
-    assert type(sim) is sc._AbortedCosetsideSimulator
+    monkeypatch.setattr(sc, "_get_failed_class", lambda _c: (_ for _ in ()).throw(MemoryError()))
+    sim._record_aborted_call(KeyboardInterrupt("no-alloc-abort"))
+    assert type(sim).__name__ == "_AbortedPlainSub"
     sim.clear()
     assert type(sim) is PlainSub
-    monkeypatch.setattr(sc, "_get_failed_class", lambda _c: (_ for _ in ()).throw(MemoryError()))
     sim._record_engine_failed("MemoryError")
-    assert type(sim) is _FailedCosetsideSimulator
+    assert type(sim).__name__ == "_FailedPlainSub"
+
+    class FreshOomSub(CosetsideSimulator):
+        pass
+
+    h2 = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
+    with pytest.raises(MemoryError):
+        FreshOomSub(c, compiled_op_handler=h2, batch_size=2, seed=3)
+    assert FreshOomSub not in sc._SUBCLASS_VERDICTS
 
 
 def test_r8_r2_ephemeral_subclasses_garbage_collected() -> None:
@@ -1140,16 +1181,27 @@ def test_r8_delta_abc_register_does_not_leak_to_latch_class() -> None:
 
 
 def test_r8_delta_latch_class_strong_cache_survives_gc() -> None:
-    class KeepAliveSub(CosetsideSimulator):
-        pass
+    def _run_scoped() -> tuple[weakref.ref[type[Any]], weakref.ref[type[Any]]]:
+        class KeepAliveSub(CosetsideSimulator):
+            pass
 
-    wr_ab = weakref.ref(sc._get_aborted_class(KeepAliveSub))
-    wr_fl = weakref.ref(sc._get_failed_class(KeepAliveSub))
+        c = stim.Circuit("H 0\nM 0")
+        h = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
+        sim = KeepAliveSub(c, compiled_op_handler=h, batch_size=2, seed=1)
+        assert "_stimside_aborted_cls" not in KeepAliveSub.__dict__
+        assert "_stimside_failed_cls" not in KeepAliveSub.__dict__
+        wr_ab = weakref.ref(sc._get_aborted_class(KeepAliveSub))
+        wr_fl = weakref.ref(sc._get_failed_class(KeepAliveSub))
+        gc.collect()
+        assert wr_ab() is not None and wr_fl() is not None
+        assert sc._get_aborted_class(KeepAliveSub) is wr_ab()
+        assert sc._get_failed_class(KeepAliveSub) is wr_fl()
+        assert sim._latch_classes is not None
+        return wr_ab, wr_fl
+
+    wr_ab, wr_fl = _run_scoped()
     gc.collect()
-    assert wr_ab() is not None
-    assert wr_fl() is not None
-    assert sc._get_aborted_class(KeepAliveSub) is wr_ab()
-    assert sc._get_failed_class(KeepAliveSub) is wr_fl()
+    assert wr_ab() is None and wr_fl() is None
 
 
 def test_r8_delta_slotted_subclass_prewarmed_at_init(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1159,16 +1211,19 @@ def test_r8_delta_slotted_subclass_prewarmed_at_init(monkeypatch: pytest.MonkeyP
     c = stim.Circuit("H 0\nM 0")
     h = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
     sim = PlainSlotSub(c, compiled_op_handler=h, batch_size=2, seed=1)
-    ab_cls = PlainSlotSub.__dict__["_stimside_aborted_cls"]
-    fl_cls = PlainSlotSub.__dict__["_stimside_failed_cls"]
+    assert "_stimside_aborted_cls" not in PlainSlotSub.__dict__
+    assert "_stimside_failed_cls" not in PlainSlotSub.__dict__
+    assert sim._latch_classes is not None
+    _, ab_cls, fl_cls = sim._latch_classes
     assert sc._ABORTED_CLASSES[PlainSlotSub]() is ab_cls
     assert sc._FAILED_CLASSES[PlainSlotSub]() is fl_cls
+    assert sc._SUBCLASS_VERDICTS[PlainSlotSub] == ""
 
-    # Confirm cache hits require zero class creation by failing if abc.ABCMeta.__new__ runs.
     def _forbid_new(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("latch class should already be pre-warmed at __init__")
 
-    monkeypatch.setattr(sc.abc.ABCMeta, "__new__", _forbid_new)
+    monkeypatch.setattr(sc, "_get_aborted_class", _forbid_new)
+    monkeypatch.setattr(sc, "_get_failed_class", _forbid_new)
     sim._record_aborted_call(KeyboardInterrupt("prewarm-ab"))
     assert type(sim) is ab_cls
     sim.clear()
@@ -1194,77 +1249,58 @@ class _SealedSlotSim(CosetsideSimulator, metaclass=_StrictMroMeta):
 
 def test_r8_delta_sealed_slot_sim_dict_latch_and_recovery() -> None:
     c = stim.Circuit("X 0\nM 0\nX 0\nM 0")
-    ref = _mk_sim("X 0\nM 0\nX 0\nM 0", batch_size=3, seed=1)
-    ref.run()
-    expected = ref.get_final_measurement_records().tolist()
+    for _ in range(2):
+        h = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=3)
+        with pytest.raises(TypeError, match=r"_SealedSlotSim.*not supported"):
+            _SealedSlotSim(c, compiled_op_handler=h, batch_size=3, seed=1)
 
-    h = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=3)
-    sim = _SealedSlotSim(
-        c, compiled_op_handler=h, batch_size=3, seed=1, record_unleaked_to_leaked=True
-    )
-    def custom_peek(_q: int) -> int:
-        return 12345
+    class BadSwapSub(CosetsideSimulator):
+        @property
+        def __class__(self) -> type[Any]:  # type: ignore[override]
+            return BadSwapSub
 
-    sim.__dict__["peek_z"] = custom_peek
+        @__class__.setter
+        def __class__(self, _val: type[Any]) -> None:
+            raise TypeError("swap refused")
 
-    fired = [False]
-
-    def prof(frame: Any, event: str, _arg: Any) -> None:
-        if not fired[0] and event == "return" and frame.f_code.co_name == "_next_step_meta":
-            fired[0] = True
-            raise KeyboardInterrupt("sealed-abort")
-
-    sys.setprofile(prof)
-    try:
-        with pytest.raises(KeyboardInterrupt, match="sealed-abort"):
-            sim.run()
-    finally:
-        sys.setprofile(None)
-
-    assert type(sim) is _SealedSlotSim and sim.tag == 777
-    assert sim._latched_dict_saved is not None
-    for call in (
-        lambda: sim.run(),
-        lambda: sim.get_current_circuit_time(),
-        lambda: sim.active_shots,
-        lambda: sim.unleaked_to_leaked_records,
-        lambda: sim._do_bare_instruction(stim.Circuit("TICK")[0]),
-        lambda: sim._next_step_meta(stim.Circuit("TICK")[0]),
-        lambda: sim.peek_z(0),
-    ):
-        with pytest.raises(RuntimeError, match=r"clear\(\)"):
-            call()
-
-    sim.clear()
-    assert sim._latched_dict_saved is None
-    assert sim.__dict__["peek_z"] is custom_peek
-    del sim.__dict__["peek_z"]
-    sim.run()
-    assert sim.get_final_measurement_records().tolist() == expected
-    assert isinstance(sim.unleaked_to_leaked_records, list)
-    assert len(sim.active_shots) == 0
+    h2 = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
+    with pytest.raises(TypeError, match=r"BadSwapSub.*not supported"):
+        BadSwapSub(c, compiled_op_handler=h2, batch_size=2, seed=1)
 
 
 def test_r8_delta_sealed_slot_sim_clear_interrupt_recovers() -> None:
     c = stim.Circuit("X 0\nM 0\nX 0\nM 0")
-    for target_hit in range(1, 16):
+    h0 = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
+    with pytest.raises(TypeError, match=r"_SealedSlotSim.*not supported"):
+        _SealedSlotSim(c, compiled_op_handler=h0, batch_size=2, seed=1)
+
+    class SlotRecSub(CosetsideSimulator):
+        __slots__ = ("tag",)
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.tag = 777
+
+    injected = 0
+    prev_trace = sys.gettrace()
+    for target_hit in range(1, 10):
         h = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
-        sim = _SealedSlotSim(
+        sim = SlotRecSub(
             c, compiled_op_handler=h, batch_size=2, seed=1, record_unleaked_to_leaked=True
         )
-        sim._record_aborted_call(KeyboardInterrupt("init-sealed"))
+        sim._record_aborted_call(KeyboardInterrupt("init-slot"))
         hits = [0]
 
         def tracer(
             frame: Any, event: str, _arg: Any, th: int = target_hit, cnt: list[int] = hits
         ) -> Any:
-            if frame.f_code.co_name in ("_clear_aborted_latch", "_restore_dict_latch"):
+            if frame.f_code.co_name == "_clear_aborted_latch":
                 if event == "call":
                     return tracer
                 if event == "line":
                     cnt[0] += 1
                     if cnt[0] == th:
-                        raise KeyboardInterrupt(f"sealed-clear-{th}")
+                        raise KeyboardInterrupt(f"slot-clear-{th}")
             return tracer
 
         sys.settrace(tracer)
@@ -1274,10 +1310,11 @@ def test_r8_delta_sealed_slot_sim_clear_interrupt_recovers() -> None:
         except KeyboardInterrupt:
             caught = True
         finally:
-            sys.settrace(None)
+            sys.settrace(prev_trace)
         if not caught:
-            assert sim._latched_dict_saved is None
+            assert type(sim) is SlotRecSub and sim.tag == 777
             break
+        injected += 1
         with pytest.raises(RuntimeError, match=r"clear\(\)"):
             sim.run()
         with pytest.raises(RuntimeError, match=r"clear\(\)"):
@@ -1287,18 +1324,24 @@ def test_r8_delta_sealed_slot_sim_clear_interrupt_recovers() -> None:
         sim.clear()
         sim.run()
         assert sim.get_final_measurement_records().tolist() == [[True, False], [True, False]]
+    assert injected >= 3
 
 
-def test_r8_delta_sealed_slot_sim_failed_precedence_and_upgrade(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_r8_delta_sealed_slot_sim_failed_precedence_and_upgrade() -> None:
     c = stim.Circuit("X 0\nM 0\nX 0\nM 0")
+    h_bad = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
+    with pytest.raises(TypeError, match=r"_SealedSlotSim.*not supported"):
+        _SealedSlotSim(c, compiled_op_handler=h_bad, batch_size=2, seed=1)
+
+    class SlotPrecedenceSub(CosetsideSimulator):
+        __slots__ = ("extra",)
+
     h2 = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
-    sim_f = _SealedSlotSim(
+    sim_f = SlotPrecedenceSub(
         c, compiled_op_handler=h2, batch_size=2, seed=1, record_unleaked_to_leaked=True
     )
     sim_f._record_aborted_call(KeyboardInterrupt("ab-first"))
-    sim_f._record_engine_failed("MemoryError: sealed-oom")
+    sim_f._record_engine_failed("MemoryError: slot-oom")
     sim_f._record_aborted_call(KeyboardInterrupt("late-ab-ignored"))
     for fn in (
         lambda s: s.clear(),
@@ -1312,22 +1355,6 @@ def test_r8_delta_sealed_slot_sim_failed_precedence_and_upgrade(
     del sim_f
     gc.collect()
     assert wr() is None
-
-    # Upgrading from dict-latched aborted to class-swapped failed removes stale dict entries.
-    class SlotUpgrade(CosetsideSimulator):
-        __slots__ = ("extra",)
-
-    h3 = LeakageUint8Coset().compile_op_handler(circuit=c, batch_size=2)
-    sim_u = SlotUpgrade(c, compiled_op_handler=h3, batch_size=2, seed=1)
-    orig_get_ab = sc._get_aborted_class
-    monkeypatch.setattr(sc, "_get_aborted_class", lambda _c: (_ for _ in ()).throw(MemoryError()))
-    sim_u._record_aborted_call(KeyboardInterrupt("ab-dict"))
-    assert sim_u._latched_dict_saved is not None
-    monkeypatch.setattr(sc, "_get_aborted_class", orig_get_ab)
-    sim_u._record_engine_failed("MemoryError: upgrade")
-    assert sim_u._latched_dict_saved is None
-    with pytest.raises(RuntimeError, match="native engine failed"):
-        sim_u.run()
 
 
 def test_r8_delta_bad_str_and_format_error_do_not_mask_or_unlatch() -> None:
@@ -1383,6 +1410,12 @@ def test_r8_delta_bad_str_and_format_error_do_not_mask_or_unlatch() -> None:
     assert sim4._aborted_call_msg == sc._ABORT_FB
     assert sc._fmt_latch_msg(OomStrError(), sc._FAILED_FB) == sc._FAILED_FB
 
+    class KiStrError(Exception):
+        def __str__(self) -> str:
+            raise KeyboardInterrupt("ki-in-str")
+
+    assert sc._fmt_latch_msg(KiStrError(), sc._ABORT_FB) == sc._ABORT_FB
+
 
 def test_r8_delta_bogus_cached_latch_attr_ignored() -> None:
     class BadCacheInt(CosetsideSimulator):
@@ -1402,3 +1435,485 @@ def test_r8_delta_bogus_cached_latch_attr_ignored() -> None:
             sim.get_current_circuit_time()
         sim.clear()
         assert type(sim) is cls
+
+
+# ---------------------------------------------------------------------------
+# Outer latch calls, rec[-k]/replay boundaries, and seam mutator latches
+# ---------------------------------------------------------------------------
+
+
+def test_outer_latch_run_and_interactive_do_handler_fail_second() -> None:
+    class FailSecondHandler(CompiledOpHandler[Any]):
+        def __init__(self) -> None:
+            self.calls = 0
+            self.armed = True
+
+        def handle_op(self, op: stim.CircuitInstruction, sss: Any) -> None:
+            self.calls += 1
+            if self.armed and self.calls == 2:
+                self.armed = False
+                raise ValueError("second op fails before touching sss")
+            sss._do_bare_instruction(op)
+
+        def clear(self) -> None:
+            self.calls = 0
+
+    c = stim.Circuit("H 0\nX 0\nM 0")
+    for use_ido in (False, True):
+        sim = CosetsideSimulator(c, compiled_op_handler=FailSecondHandler(), batch_size=2, seed=1)
+        with pytest.raises(ValueError, match="second op fails"):
+            if use_ido:
+                sim.interactive_do(stim.Circuit("H 0\nX 0"))
+            else:
+                sim.run()
+        for probe in (
+            lambda s=sim: s.peek_x(0),
+            lambda s=sim: s.get_current_circuit_time(),
+            lambda s=sim: s.active_shots,
+        ):
+            with pytest.raises(RuntimeError, match=r"ValueError.*clear\(\)"):
+                probe()
+        sim.clear()
+        sim.run()
+        assert sim.get_final_measurement_records().shape == (2, 1)
+
+
+def test_outer_latch_run_ctrlc_between_instructions() -> None:
+    sim = _mk_sim("TICK\nX 0\nM 0", batch_size=2, seed=1)
+    fired = [False]
+    prev_prof = sys.getprofile()
+
+    def prof(frame: Any, event: str, _arg: Any) -> None:
+        if not fired[0] and event == "return" and frame.f_code.co_name == "_do_instruction":
+            fired[0] = True
+            raise KeyboardInterrupt("between instructions")
+
+    sys.setprofile(prof)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="between instructions"):
+            sim.run()
+    finally:
+        sys.setprofile(prev_prof)
+    assert fired[0]
+    for probe in (lambda: sim.get_current_circuit_time(), lambda: sim.peek_x(0)):
+        with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
+            probe()
+    sim.clear()
+    sim.run()
+    assert sim.get_final_measurement_records().astype(int).tolist() == [[1], [1]]
+
+
+def test_interactive_do_rec_boundaries() -> None:
+    # rec[-k] after measurement in earlier interactive_do call (accept -1, reject -2 atomically)
+    s1 = _mk_sim("X 0\nM 0\nCX rec[-1] 1\nM 1", batch_size=2, seed=1)
+    s1.interactive_do(stim.Circuit("X 0\nM 0"))
+    s1.interactive_do(stim.Circuit("CX rec[-1] 1\nM 1"))
+    s1.finish_interactive_run()
+    assert s1.get_final_measurement_records().astype(int).tolist() == [[1, 1], [1, 1]]
+
+    s1_bad = _mk_sim("X 0\nM 0", batch_size=2, seed=1)
+    s1_bad.interactive_do(stim.Circuit("X 0\nM 0"))
+    with pytest.raises(IndexError):
+        s1_bad.interactive_do(stim.Circuit("X 0\nCX rec[-2] 0"))
+    assert type(s1_bad) is CosetsideSimulator and s1_bad._circuit_time == 2
+    s1_bad.interactive_do(stim.Circuit("CX rec[-1] 0\nM 0"))
+    s1_bad.finish_interactive_run()
+    assert s1_bad.get_final_measurement_records().astype(int).tolist() == [[1, 0], [1, 0]]
+
+    # mid-circuit start (t0 < n_u) with prior measurement and no trailing circuit measurements
+    sm = _mk_sim("X 0\nM 0\nX 1", batch_size=2, seed=1)
+    sm.interactive_do(stim.Circuit("X 0\nM 0"))
+    sm.interactive_do(stim.Circuit("X 1\nCX rec[-1] 1\nM 1"))
+    sm.finish_interactive_run()
+    assert sm.get_final_measurement_records().astype(int).tolist() == [[1, 0], [1, 0]]
+
+    # construction circuit has M 0; single interactive_do replays M 0 then checks rec past end
+    s1b_ok = _mk_sim("X 0\nX 1\nM 0", batch_size=2, seed=1)
+    s1b_ok.interactive_do(stim.Circuit("X 0\nX 1\nM 0\nCX rec[-1] 1\nM 1"))
+    s1b_ok.finish_interactive_run()
+    assert s1b_ok.get_final_measurement_records().astype(int).tolist() == [[1, 0], [1, 0]]
+
+    s1b_bad = _mk_sim("X 0\nX 1\nM 0", batch_size=2, seed=1)
+    with pytest.raises(IndexError):
+        s1b_bad.interactive_do(stim.Circuit("X 0\nX 1\nM 0\nCX rec[-2] 1"))
+    assert type(s1b_bad) is CosetsideSimulator and s1b_bad._circuit_time == 0
+
+    # multi-target measurement M 0 1 past end (accept -2, reject -3 atomically)
+    s2_ok = _mk_sim("X 0\nI 1\nI 2", batch_size=2, seed=1)
+    s2_ok.interactive_do(stim.Circuit("X 0\nI 1\nI 2\nM 0 1\nCX rec[-2] 2\nM 2"))
+    s2_ok.finish_interactive_run()
+    assert s2_ok.get_final_measurement_records().astype(int).tolist() == [[1, 0, 1], [1, 0, 1]]
+
+    s2_bad = _mk_sim("X 0\nI 1\nI 2", batch_size=2, seed=1)
+    with pytest.raises(IndexError):
+        s2_bad.interactive_do(stim.Circuit("X 0\nI 1\nI 2\nM 0 1\nCX rec[-3] 2"))
+    assert type(s2_bad) is CosetsideSimulator and s2_bad._circuit_time == 0
+
+    # past-end REPEAT 5 { M 0 } exact boundary rec[-5] vs rec[-6]
+    s3_ok = _mk_sim("H 0", batch_size=2, seed=1)
+    s3_ok.interactive_do(stim.Circuit("H 0\nREPEAT 5 {\nM 0\n}\nCX rec[-5] 0\nM 0"))
+    s3_ok.finish_interactive_run()
+    assert s3_ok.get_final_measurement_records().shape == (2, 6)
+
+    s3_bad = _mk_sim("H 0", batch_size=2, seed=1)
+    with pytest.raises(IndexError):
+        s3_bad.interactive_do(stim.Circuit("H 0\nREPEAT 5 {\nM 0\n}\nCX rec[-6] 0"))
+    assert type(s3_bad) is CosetsideSimulator and s3_bad._circuit_time == 0
+
+    # rec[-k] inside a compiled REPEAT block replayed via slow path
+    s6 = _mk_sim("REPEAT 3 {\nM 0\n}\nCX rec[-3] 1\nM 1", batch_size=2, seed=1)
+    s6.interactive_do(s6.circuit)
+    s6.finish_interactive_run()
+    assert s6.get_final_measurement_records().shape == (2, 4)
+
+    # rec[-k] as second operand (CZ 0 rec[-1] accepted, CZ 0 rec[-2] rejected atomically)
+    sa_ok = _mk_sim("H 0", batch_size=2, seed=1)
+    sa_ok.interactive_do(stim.Circuit("H 0\nM 0\nCZ 0 rec[-1]"))
+    sa_bad = _mk_sim("H 0", batch_size=2, seed=1)
+    with pytest.raises(IndexError):
+        sa_bad.interactive_do(stim.Circuit("H 0\nM 0\nCZ 0 rec[-2]"))
+    assert type(sa_bad) is CosetsideSimulator and sa_bad._circuit_time == 0
+
+
+def test_interactive_do_replay_and_custom_handler_repeat() -> None:
+    # custom handler + past-end REPEAT
+    class PlainHandler(CompiledOpHandler[Any]):
+        def handle_op(self, op: stim.CircuitInstruction, sss: Any) -> None:
+            sss._do_bare_instruction(op)
+
+        def clear(self) -> None:
+            pass
+
+    sb = CosetsideSimulator(
+        stim.Circuit("H 0"), compiled_op_handler=PlainHandler(), batch_size=2, seed=1
+    )
+    sb.interactive_do(stim.Circuit("H 0\nREPEAT 3 {\nX 0\n}"))
+    assert sb._circuit_time == 4
+
+    # replay mismatch against steps appended past end by an earlier run + clear()
+    s4 = _mk_sim("H 0", batch_size=2, seed=1)
+    s4.interactive_do(stim.Circuit("H 0\nX 0\nM 0"))
+    s4.clear()
+    with pytest.raises(ValueError, match="interactive_do"):
+        s4.interactive_do(stim.Circuit("H 0\nZ 0\nM 0"))
+    assert type(s4) is CosetsideSimulator and s4._circuit_time == 0 and s4._step_cursor == 0
+
+    s5 = _mk_sim("H 0 1", batch_size=2, seed=1)
+    s5.interactive_do(stim.Circuit("H 0 1\nX 0\nM 0"))
+    s5.clear()
+    with pytest.raises(ValueError, match="interactive_do"):
+        s5.interactive_do(stim.Circuit("H 0 1\nX 1\nM 0"))
+    assert type(s5) is CosetsideSimulator and s5._circuit_time == 0 and s5._step_cursor == 0
+
+
+def test_latch_reentry_and_clear_closers() -> None:
+    # Subclass overriding clear() still blocked on failed engine
+    class CustomClearSub(CosetsideSimulator):
+        def clear(self) -> None:
+            pass
+
+    sim_f = CustomClearSub(
+        stim.Circuit("H 0\nM 0"),
+        compiled_op_handler=LeakageUint8Coset().compile_op_handler(
+            circuit=stim.Circuit("H 0\nM 0"), batch_size=2
+        ),
+        batch_size=2,
+        seed=1,
+    )
+    sim_f._record_engine_failed("MemoryError: custom-clear")
+    with pytest.raises(RuntimeError, match="native engine failed"):
+        sim_f.clear()
+
+    # Python-path re-entrant mutation during active_shots copy
+    sim_py = _mk_sim("H 0 1\nM 0 1", batch_size=2, seed=3, use_cpp=False)
+    hop = stim.CircuitInstruction("H", [0, 1])
+    sim_py.do_conditional_clifford(hop, np.array([[False, True], [True, True]]))
+    fired_py = [False]
+    prev_prof = sys.getprofile()
+
+    def prof_py(frame: Any, event: str, _arg: Any) -> None:
+        if not fired_py[0] and event == "call" and frame.f_code.co_name == "copy":
+            fired_py[0] = True
+            sim_py.do_conditional_clifford(hop, np.array([[True, False], [True, True]]))
+
+    sys.setprofile(prof_py)
+    try:
+        with pytest.raises(RuntimeError, match="changed during active_shots read"):
+            _ = sim_py.active_shots
+    finally:
+        sys.setprofile(prev_prof)
+    assert fired_py[0]
+
+    # Re-entrant mutation during clear() keeps _cpp_dirty True
+    sim_clr = _mk_sim("H 0 1\nM 0 1", batch_size=2, seed=4)
+    fired_clr = [False]
+
+    def prof_clr(frame: Any, event: str, _arg: Any) -> None:
+        if (
+            not fired_clr[0]
+            and event == "call"
+            and frame.f_code.co_name == "data_as"
+            and frame.f_back is not None
+            and frame.f_back.f_code.co_name == "_init_rngs"
+        ):
+            fired_clr[0] = True
+            sim_clr.do_conditional_clifford(hop, np.ones((2, 2), bool))
+
+    sys.setprofile(prof_clr)
+    try:
+        with pytest.raises(RuntimeError, match="changed during clear"):
+            sim_clr.clear()
+    finally:
+        sys.setprofile(prev_prof)
+    assert fired_clr[0] and sim_clr._cpp_dirty is True
+
+
+def test_clear_interrupt_at_entry_preserves_aborted_latch() -> None:
+    # Interrupt at _clear_body entry before epoch bump keeps already-aborted sim latched
+    sim_ab = _mk_sim("H 0\nM 0", batch_size=2, seed=5)
+    sim_ab._record_aborted_call(KeyboardInterrupt("pre-clear"))
+    fired_ab = [False]
+    prev_trace = sys.gettrace()
+
+    def tr_cb(frame: Any, event: str, _arg: Any) -> Any:
+        if frame.f_code.co_name == "_clear_body" and event == "call" and not fired_ab[0]:
+            fired_ab[0] = True
+            raise KeyboardInterrupt("at-clear-body-entry")
+        return tr_cb
+
+    sys.settrace(tr_cb)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="at-clear-body-entry"):
+            sim_ab.clear()
+    finally:
+        sys.settrace(prev_trace)
+    assert fired_ab[0]
+    with pytest.raises(RuntimeError, match=r"clear\(\)"):
+        sim_ab.run()
+
+
+@pytest.mark.parametrize(
+    ("site", "fn_name"),
+    [
+        ("sample_pauli_noise_sync", "_sample_pauli_noise_via_tab_rng"),
+        ("overwrite_measurement_column", "overwrite_measurement_column"),
+        ("finish_interactive_run", "finish_interactive_run"),
+        ("record_u2l", "_record_unleaked_to_leaked_counts"),
+        ("record_leakage_event", "_record_leakage_event"),
+        ("_do_bare_instruction", "_do_bare_instruction"),
+        ("_do_bare_heralded", "_do_bare_instruction"),
+        ("_do_bare_meas", "_do_bare_instruction"),
+        ("record_direct_measurements", "record_direct_measurements"),
+        ("do_copies_on_fused_step", "do_copies_on_fused_step"),
+    ],
+)
+def test_direct_seam_and_mutator_sites_latch_on_interrupt(
+    site: str, fn_name: str
+) -> None:
+    c = (
+        "M 0" if site == "_do_bare_meas"
+        else ("HERALDED_ERASE(0.1) 0" if site == "_do_bare_heralded" else "X 0\nM 0")
+    )
+    sim = _mk_sim(
+        c, batch_size=2, seed=1, sync=(site == "sample_pauli_noise_sync"),
+        record_u2l=(site == "record_u2l"), record_events=(site == "record_leakage_event"),
+    )
+    if site == "overwrite_measurement_column":
+        sim.record_direct_measurements(np.zeros((1, 2), dtype=bool))
+    m0 = sim._mutation_epoch
+    fired = [False]
+    prev_trace = sys.gettrace()
+
+    def tracer(frame: Any, event: str, _arg: Any) -> Any:
+        if frame.f_code.co_name == fn_name:
+            if event == "call":
+                return tracer
+            if event == "line" and not fired[0] and sim._mutation_epoch != m0:
+                fired[0] = True
+                raise KeyboardInterrupt(f"ki-{site}")
+        return tracer
+
+    def call() -> None:
+        if site == "sample_pauli_noise_sync":
+            sim.sample_pauli_noise_sync("X_ERROR", [[0], [0]], [0.1])
+        elif site == "overwrite_measurement_column":
+            sim.overwrite_measurement_column(0, np.ones(2, dtype=bool))
+        elif site == "finish_interactive_run":
+            sim.finish_interactive_run()
+        elif site == "record_u2l":
+            sim.record_u2l_counts(np.array([1, 0], dtype=np.int64), 0)
+        elif site == "record_leakage_event":
+            sim.record_leakage_event(0, 0, 0, 2, 0)
+        elif site == "_do_bare_instruction":
+            sim._do_bare_instruction(stim.CircuitInstruction("MPAD", [0]))
+        elif site == "_do_bare_heralded":
+            sim._do_bare_instruction(stim.CircuitInstruction("HERALDED_ERASE", [0], [0.1]))
+        elif site == "_do_bare_meas":
+            sim._do_bare_instruction(stim.CircuitInstruction("M", [0]))
+        elif site == "record_direct_measurements":
+            sim.record_direct_measurements(np.ones((1, 2), dtype=bool))
+        elif site == "do_copies_on_fused_step":
+            sim._used_interactively = True
+
+            def fail_copy(_op: stim.CircuitInstruction) -> None:
+                fired[0] = True
+                raise KeyboardInterrupt(f"ki-{site}")
+
+            sim.do_copies_on_fused_step(
+                stim.CircuitInstruction("X", [0]),
+                [stim.CircuitInstruction("X", [0])],
+                fail_copy,
+            )
+
+    if site != "do_copies_on_fused_step":
+        sys.settrace(tracer)
+    try:
+        with pytest.raises(KeyboardInterrupt, match=f"ki-{site}"):
+            call()
+    finally:
+        sys.settrace(prev_trace)
+    assert fired[0], f"hook did not fire for {site}"
+    if site == "do_copies_on_fused_step":
+        assert sim._used_interactively is True
+    with pytest.raises(RuntimeError, match=r"KeyboardInterrupt.*clear\(\)"):
+        sim.get_current_circuit_time()
+    sim.clear()
+    assert type(sim) is CosetsideSimulator
+
+
+def test_interactive_do_whole_match_and_repeat_edge_cases() -> None:
+    # Mismatched compiled_ref must be rejected atomically even on whole-circuit replay
+    circ = stim.Circuit("X 0\nY 0")
+    ref = sc.CompiledReferenceCircuit(stim.Circuit("H 0\nZ 0"))
+    h = LeakageUint8Coset().compile_op_handler(circuit=circ, batch_size=2)
+    sim_mm = CosetsideSimulator(
+        circ, compiled_op_handler=h, batch_size=2, seed=1, compiled_ref=ref
+    )
+    with pytest.raises(ValueError, match="interactive_do"):
+        sim_mm.interactive_do(circ)
+    assert type(sim_mm) is CosetsideSimulator and sim_mm._circuit_time == 0
+
+    # Stepping past QUBIT_COORDS updates time=1 (c0 stays 0), then whole-circuit replay rejects
+    s_qc = _mk_sim("QUBIT_COORDS(0, 0) 0\nH 0\nM 0", batch_size=2, seed=1)
+    s_qc.interactive_do(s_qc.circuit[0])
+    assert s_qc._circuit_time == 1
+    with pytest.raises(ValueError, match="interactive_do"):
+        s_qc.interactive_do(s_qc.circuit)
+    assert type(s_qc) is CosetsideSimulator and s_qc._circuit_time == 1
+
+    # Compiled REPEAT followed by non-matching op and past-end extension validates exact count
+    s_rep = _mk_sim("REPEAT 2 {\nH 0\n}\nZ 0", batch_size=2, seed=1)
+    s_rep.interactive_do(stim.Circuit("REPEAT 2 {\nH 0\n}\nZ 0\nM 0"))
+    s_rep.finish_interactive_run()
+    assert s_rep.get_final_measurement_records().shape == (2, 1)
+
+    # Compiled REPEAT of coordinate ops only (t advances, cur unchanged) plus past-end op
+    s_rep_qc = _mk_sim("REPEAT 2 {\nQUBIT_COORDS(0, 0) 0\n}\nH 0\nM 0", batch_size=2, seed=1)
+    s_rep_qc.interactive_do(stim.Circuit("REPEAT 2 {\nQUBIT_COORDS(0, 0) 0\n}\nH 0\nM 0\nX 0"))
+    s_rep_qc.finish_interactive_run()
+    assert s_rep_qc.get_final_measurement_records().shape == (2, 1)
+
+    # Boundary qubit == num_qubits rejected in postselect_z_batch
+    s_ps = _mk_sim("H 0\nM 0", batch_size=2, seed=1)
+    with pytest.raises(ValueError, match="out of range"):
+        s_ps.postselect_z_batch(1, np.ones(2, dtype=bool), np.zeros(2, dtype=np.uint8))
+
+
+def test_group_callback_flags_unwind_and_clear_reset() -> None:
+    circ_s = (
+        "R 0 1 2 3\nH 0 1\nI[LEAKAGE_TRANSITION_1: (0.5, U-->2)] 0 1 2 3\n"
+        "CX[CONDITIONED_ON_PAIR: (U, U)] 0 1 2 3\nM[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0 1\n"
+        "I[LEAKAGE_TRANSITION_1: (0.6, 2-->U)] 0 1 2 3\n"
+        "H[CONDITIONED_ON_SELF: U] 2 3\nMX 0 1 2 3"
+    )
+    op_h = stim.CircuitInstruction("H", [0, 1])
+    ev_lines, ev_start = inspect.getsourcelines(CosetsideSimulator._eval_group_condition)
+    du_lines, du_start = inspect.getsourcelines(CosetsideSimulator._dcc_run_unitary)
+    l_override = next(
+        ev_start + i + 1
+        for i, ln in enumerate(ev_lines)
+        if "self._override_packed_words = pw_before" in ln
+    )
+    l_ov_fin = next(
+        ev_start + i
+        for i, ln in enumerate(ev_lines)
+        if "self._override_packed_words = None" in ln and "finally" in ev_lines[i - 1]
+    )
+    l_cb = [
+        du_start + i + 1
+        for i, ln in enumerate(du_lines)
+        if "self._in_group_callback = True" in ln
+    ][-1]
+    l_cb_fin = [
+        du_start + i for i, ln in enumerate(du_lines) if "self._in_group_callback = prev_cb" in ln
+    ][-1]
+    prev_trace = sys.gettrace()
+    for fn_name, target_line in (
+        ("_eval_group_condition", l_override),
+        ("_eval_group_condition", l_ov_fin),
+        ("_dcc_run_unitary", l_cb),
+        ("_dcc_run_unitary", l_cb_fin),
+    ):
+        sim = _mk_sim(circ_s, batch_size=4, seed=11)
+        sim.interactive_do(sim.circuit)
+        fired = [False]
+
+        def tracer(
+            frame: Any,
+            event: str,
+            _arg: Any,
+            fn: str = fn_name,
+            tl: int = target_line,
+            f: list[bool] = fired,
+        ) -> Any:
+            if frame.f_code.co_name == fn:
+                if event == "line" and frame.f_lineno == tl and not f[0]:
+                    f[0] = True
+                    raise KeyboardInterrupt("flag-window")
+                return tracer
+            return None
+
+        sys.settrace(tracer)
+        try:
+            def _cb(g: int, s: CosetsideSimulator = sim, tl: int = target_line) -> Any:
+                if tl == l_ov_fin:
+                    raise ValueError("cb-err")
+                return s.peek_pauli_batch([g], "Z")[0] == 0
+
+            with pytest.raises(KeyboardInterrupt, match="flag-window"):
+                sim.do_conditional_clifford(op_h, condition_group_fn=_cb)
+        finally:
+            sys.settrace(prev_trace)
+        assert fired[0]
+        assert not sim._in_group_callback and sim._override_packed_words is None
+        sim.clear()
+        sim.run()
+        assert sim.get_final_measurement_records().shape == (4, 6)
+
+    sim_clr = _mk_sim("H 0\nM 0", batch_size=2, seed=1)
+    sim_clr._override_packed_words = sim_clr._compiled_ref._initial_packed_words
+    sim_clr.clear()
+    assert sim_clr._override_packed_words is None
+
+
+@pytest.mark.parametrize("rest_in_one_call", [False, True])
+def test_interactive_do_after_a_direct_step_call_rejects_the_misaligned_replay(
+    rest_in_one_call: bool,
+) -> None:
+    """A direct step call moves the step cursor alone; the next interactive_do must not run
+    the circuit against the wrong reference steps (it raises before anything changes)."""
+    circ = stim.Circuit("R 0 1\nH 0\nCX 0 1\nM 0 1\nH 1\nM 1")
+    ops = list(circ)
+    sim = _mk_sim(str(circ), batch_size=4, seed=3)
+    sim.interactive_do(ops[0])
+    sim.interactive_do(ops[1])
+    sim.do_conditional_clifford(ops[2], np.ones((1, 4), dtype=bool))
+    t0, c0 = sim.get_current_circuit_time(), sim._step_cursor
+    with pytest.raises(ValueError, match="doesn't match"):
+        sim.interactive_do(circ[2:] if rest_in_one_call else ops[2])
+    assert (sim.get_current_circuit_time(), sim._step_cursor) == (t0, c0)
+    assert type(sim) is CosetsideSimulator
+    sim.clear()
+    sim.interactive_do(circ)
+    sim.finish_interactive_run()
+    assert sim.get_final_measurement_records().shape == (4, 3)

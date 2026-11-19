@@ -7,6 +7,7 @@ import stim  # type: ignore[import-untyped]
 from stimside._flip.sync_reference import compute_sync_reference
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
 from stimside.util.circuit import apply_coords_op, check_replay, unroll_circuit
+from stimside.util.circuit_ir import CircuitIR, build_ir
 from stimside.util.known_states import compute_known_states_uint8
 from stimside.util.numpy_types import Bool1DArray, Bool2DArray
 from stimside.util.stim_workarounds import broadcast_pauli_errors
@@ -114,7 +115,13 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
         batch_size = int(batch_size)
 
         self.circuit = circuit
-        self._unrolled_ops: list[stim.CircuitInstruction] = unroll_circuit(circuit)
+        # One IR per simulator, built now for the known states, else on first use (`_ir`).
+        self._ir_cache: CircuitIR | None = build_ir(circuit) if compute_known_states else None
+        self._unrolled_ops: list[stim.CircuitInstruction] = (
+            unroll_circuit(circuit)
+            if self._ir_cache is None
+            else [instr.op for instr in self._ir_cache.instrs]
+        )
         self.num_qubits = circuit.num_qubits
 
         self.seed = seed
@@ -150,7 +157,7 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
 
         if compute_known_states:
             self._known_states_uint8: np.ndarray | None = compute_known_states_uint8(
-                self.circuit, unrolled_ops=self._unrolled_ops
+                self.circuit, ir=self._ir
             )
         else:
             self._known_states_uint8 = None
@@ -158,11 +165,17 @@ class FlipsideSimulator(UnleakedToLeakedRecordsMixin):
         self._circuit_time = 0
         self._used_interactively = False
 
+    @property
+    def _ir(self) -> CircuitIR:
+        if self._ir_cache is None:
+            self._ir_cache = build_ir(self.circuit)
+        return self._ir_cache
+
     def _precompute_sync_reference(self) -> None:
         if self._reference_sample is not None:
             return
         self._reference_sample, self._mpad_ref_z, self._op_ref_z = compute_sync_reference(
-            self.num_qubits, self._unrolled_ops, self.compiled_op_handler
+            self.num_qubits, compiled_op_handler=self.compiled_op_handler, ir=self._ir
         )
 
     @property

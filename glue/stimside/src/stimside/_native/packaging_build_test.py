@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import errno
 import functools
+import importlib.util
 import json
+import math
 import os
 import platform
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
 import tarfile
 import time
+import types
+import warnings
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -237,11 +242,25 @@ def test_sdist_and_wheel_contents_and_wheel_tag(tmp_path: Path) -> None:
     plat = sysconfig.get_platform().replace("-", "_").replace(".", "_")
     _assert_wheel_ok(wheels[0], plat)
 
+    # Refresh one sidecar/mtime to stale values before direct wheel build to verify sync.
+    coset_cpp = pkg_copy / "src" / "stimside" / "_native" / "coset_kernels.cpp"
+    coset_so = pkg_copy / "src" / "stimside" / "_native" / "libcoset_kernels.so"
+    coset_bid = _kernel_loader._build_id_path(coset_so)
+    os.utime(coset_so, ns=(1_000_000_000, 1_000_000_000))
+    coset_bid.write_text(
+        json.dumps({"mode": "native", "source_hash": "0" * 64, "version": 2}) + "\n",
+        encoding="utf-8",
+    )
+
     # Also build a wheel directly from the dirty copy holding all 4 .so and .build_id files.
     _run_uv_build_offline(uv_bin, ["--wheel", "--out-dir", str(dist_direct), str(pkg_copy)], env)
     direct_wheels = list(dist_direct.glob("*.whl"))
     assert len(direct_wheels) == 1
     _assert_wheel_ok(direct_wheels[0], plat)
+    synced_rec = _read_sidecar_json(coset_so)
+    assert synced_rec["version"] == 2 and synced_rec["mode"] == "portable"
+    assert synced_rec["source_hash"] == _kernel_loader._compute_source_hash(coset_cpp)
+    assert coset_so.stat().st_mtime_ns == _kernel_loader._source_mtime_ns(coset_cpp)
 
 
 def test_b2_loader_policy_installed_vs_missing_symbol(
@@ -431,6 +450,28 @@ def test_b4_zero_lock_files_and_multiprocess_concurrency(
     assert list(native.glob("*lock*")) == []
     assert list(native.glob("*.tmp.*")) == []
     assert (native / ".libtiny_c8.build_id").is_file()
+
+
+@pytest.mark.parametrize("umask", [0o022, 0o002])
+def test_loader_built_library_and_record_modes_follow_the_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, umask: int
+) -> None:
+    """Other users must be able to load what the loader builds (temp files are not left 0600)."""
+    _require_cxx()
+    _, _, resolve = _make_source_native(
+        tmp_path, "tiny_mode", 'extern "C" int tiny_mode_v1() { return 1; }\n'
+    )
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    old = os.umask(umask)
+    try:
+        so = resolve()
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(so.stat().st_mode) == 0o777 & ~umask
+    record = _kernel_loader._build_id_path(so)
+    assert stat.S_IMODE(record.stat().st_mode) == 0o666 & ~umask
+    assert list(so.parent.glob("*.tmp.*")) == []
 
 
 def test_b3_same_length_older_mtime_cpp_edit_rebuilds(
@@ -679,7 +720,7 @@ def test_b2_2_stricter_source_checkout_rejects_vendor_layout(
 
 
 def test_b2_3_failed_rebuild_warns_once_on_stderr(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _require_cxx()
     _, cpp, resolve = _make_source_native(
@@ -688,24 +729,28 @@ def test_b2_3_failed_rebuild_warns_once_on_stderr(
     monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
     monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
     so = resolve()
-    capsys.readouterr()
 
     cpp.write_text("#error intentional_b2_3_failure\n", encoding="utf-8")
     newer_ns = so.stat().st_mtime_ns + 5_000_000_000
     os.utime(cpp, ns=(newer_ns, newer_ns))
 
-    assert resolve() == so
-    first_err = capsys.readouterr().err
-    assert "stimside warning: failed to rebuild libtiny_warn.so" in first_err
-    assert "using existing library" in first_err
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        assert resolve() == so
+    assert len(caught) == 1
+    assert issubclass(caught[0].category, RuntimeWarning)
+    first_msg = str(caught[0].message)
+    assert "stimside warning: failed to rebuild libtiny_warn.so" in first_msg
+    assert "using existing library" in first_msg
 
-    assert resolve() == so
-    second_err = capsys.readouterr().err
-    assert "stimside warning: failed to rebuild libtiny_warn.so" not in second_err
+    with warnings.catch_warnings(record=True) as caught_again:
+        warnings.simplefilter("always", RuntimeWarning)
+        assert resolve() == so
+    assert caught_again == []
 
 
 def test_b2_4_bounded_flock_wait_warns_and_builds_lockless(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _require_cxx()
     fcntl = pytest.importorskip("fcntl")
@@ -714,19 +759,27 @@ def test_b2_4_bounded_flock_wait_warns_and_builds_lockless(
     )
     monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
     monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", raising=False)
     monkeypatch.setattr(_kernel_loader, "_LOCK_MAX_RETRIES", 2)
     monkeypatch.setattr(_kernel_loader, "_LOCK_RETRY_DELAY_S", 0.01)
 
     holder_fd = os.open(native, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         fcntl.flock(holder_fd, fcntl.LOCK_EX)
-        capsys.readouterr()
-        so = resolve()
-        err = capsys.readouterr().err
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            so = resolve()
     finally:
         os.close(holder_fd)
 
-    assert err.count("stimside warning: timed out waiting for build lock") == 1
+    matches = [
+        w
+        for w in caught
+        if issubclass(w.category, RuntimeWarning)
+        and "stimside warning: timed out waiting for build lock" in str(w.message)
+    ]
+    assert len(matches) == 1
+    assert len(caught) == 1
     assert _eval_symbol_in_subprocess(so, "tiny_to_val") == 7
     assert list(native.glob("*lock*")) == []
     assert list(native.glob("*.tmp.*")) == []
@@ -882,7 +935,7 @@ def test_r8_r2_acquire_dir_lock_no_double_close_on_os_close_error(
 
 
 def test_r8_delta_acquire_dir_lock_timeout_no_double_close(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fcntl = pytest.importorskip("fcntl")
     native = tmp_path / "src" / "stimside" / "_native"
@@ -902,10 +955,511 @@ def test_r8_delta_acquire_dir_lock_timeout_no_double_close(
 
     monkeypatch.setattr(fcntl, "flock", busy_flock)
     monkeypatch.setattr(time, "sleep", lambda _s: None)
+    monkeypatch.delenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", raising=False)
     monkeypatch.setattr(_kernel_loader, "_LOCK_MAX_RETRIES", 1)
     monkeypatch.setattr(os, "close", fail_close)
-    capsys.readouterr()
-    assert _kernel_loader._acquire_dir_lock(native) is None
-    err = capsys.readouterr().err
-    assert "timed out waiting for build lock" in err
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        assert _kernel_loader._acquire_dir_lock(native) is None
+    assert len(caught) == 1
+    assert issubclass(caught[0].category, RuntimeWarning)
+    assert "timed out waiting for build lock" in str(caught[0].message)
     assert len(closed_calls) == 1
+
+
+def _make_stub_package(root: Path, pkg_root: Path) -> Path:
+    for fname in ("LICENSE", "README.md", "CHANGELOG.md", "pyproject.toml", "setup.py"):
+        shutil.copy2(pkg_root / fname, root / fname)
+    shutil.copy2(pkg_root / "MANIFEST.in", root / "MANIFEST.in")
+    pkg = root / "src" / "stimside"
+    native = pkg / "_native"
+    native.mkdir(parents=True)
+    (pkg / "__init__.py").write_text('__version__ = "0.1.0"\n', encoding="utf-8")
+    (pkg / "golden_digests.json").write_text("{}\n", encoding="utf-8")
+    (native / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(
+        pkg_root / "src" / "stimside" / "_native" / "_kernel_loader.py",
+        native / "_kernel_loader.py",
+    )
+    for hpp in _HPP_NAMES:
+        (native / hpp).write_text("// stub header\n", encoding="utf-8")
+    for kname in _KERNEL_NAMES:
+        (native / f"{kname}.cpp").write_text(
+            f'extern "C" int {kname}_stub() {{ return 1; }}\n',
+            encoding="utf-8",
+        )
+    return native
+
+
+def test_sdist_and_wheel_native_build_syncs_cpu_identity(tmp_path: Path) -> None:
+    pkg_root = _source_pkg_root()
+    if pkg_root is None:
+        pytest.skip("packaging build test requires a source checkout")
+    uv_bin = _find_uv()
+    if uv_bin is None:
+        pytest.skip("uv binary not available for offline sdist/wheel build")
+    _require_cxx()
+    stub_pkg = tmp_path / "stub_pkg"
+    stub_pkg.mkdir()
+    native = _make_stub_package(stub_pkg, pkg_root)
+    dist_dir, tmp_dir = tmp_path / "dist", tmp_path / "tmp"
+    tmp_dir.mkdir()
+    env = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": str(tmp_dir),
+        "STIMSIDE_NATIVE_BUILD": "1",
+    }
+    env.pop("STIMSIDE_PORTABLE_BUILD", None)
+    _run_uv_build_offline(uv_bin, ["--wheel", "--out-dir", str(dist_dir), str(stub_pkg)], env)
+    assert len(list(dist_dir.glob("*.whl"))) == 1
+    expected_machine = _kernel_loader._current_machine()
+    expected_flags = _kernel_loader._cpu_flags_digest()
+    for kname in _KERNEL_NAMES:
+        cpp = native / f"{kname}.cpp"
+        so = native / f"lib{kname}.so"
+        rec = _read_sidecar_json(so)
+        assert rec["version"] == 2
+        assert rec["mode"] == "native"
+        assert rec["source_hash"] == _kernel_loader._compute_source_hash(cpp)
+        assert rec["machine"] == expected_machine
+        assert rec["cpu_flags"] == expected_flags
+        assert so.stat().st_mtime_ns == _kernel_loader._source_mtime_ns(cpp)
+    with mock.patch.object(subprocess, "run") as mock_run:
+        for kname in _KERNEL_NAMES:
+            resolved = _kernel_loader.resolve_so(str(native / f"{kname}.py"), kname)
+            assert resolved == native / f"lib{kname}.so"
+    mock_run.assert_not_called()
+
+
+def test_setup_sync_extensions_inplace_vs_non_inplace_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pkg_root = _source_pkg_root()
+    if pkg_root is None:
+        pytest.skip("setup sync test requires a source checkout")
+    setup_copy = tmp_path / "setup.py"
+    shutil.copy2(pkg_root / "setup.py", setup_copy)
+    native = tmp_path / "src" / "stimside" / "_native"
+    native.mkdir(parents=True)
+    shutil.copy2(
+        pkg_root / "src" / "stimside" / "_native" / "_kernel_loader.py",
+        native / "_kernel_loader.py",
+    )
+    cpp = native / "tiny_sync.cpp"
+    cpp.write_text('extern "C" int tiny_sync_val() { return 1; }\n', encoding="utf-8")
+
+    st_mod = types.ModuleType("setuptools")
+    cmd_mod = types.ModuleType("setuptools.command")
+    bw_mod = types.ModuleType("setuptools.command.bdist_wheel")
+    be_mod = types.ModuleType("setuptools.command.build_ext")
+
+    class _FakeExt:
+        def __init__(self, name: str, sources: list[str], **_kw: object) -> None:
+            self.name = name
+            self.sources = sources
+
+    class _FakeBdistWheel:
+        def get_tag(self) -> tuple[str, str, str]:
+            return ("cp313", "cp313", "linux_x86_64")
+
+    class _FakeBuildExt:
+        pass
+
+    st_mod.Extension = _FakeExt  # type: ignore[attr-defined]
+    st_mod.setup = lambda **_kw: None  # type: ignore[attr-defined]
+    bw_mod.bdist_wheel = _FakeBdistWheel  # type: ignore[attr-defined]
+    be_mod.build_ext = _FakeBuildExt  # type: ignore[attr-defined]
+    fake_mods = {
+        "setuptools": st_mod,
+        "setuptools.command": cmd_mod,
+        "setuptools.command.bdist_wheel": bw_mod,
+        "setuptools.command.build_ext": be_mod,
+    }
+    mod_name = "_test_stimside_setup_sync"
+    with mock.patch.dict(sys.modules, fake_mods):
+        spec = importlib.util.spec_from_file_location(mod_name, setup_copy)
+        assert spec is not None and spec.loader is not None
+        setup_mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(setup_mod)
+        finally:
+            sys.modules.pop(mod_name, None)
+            sys.modules.pop("_stimside_kernel_loader", None)
+
+    build_lib = tmp_path / "build_lib"
+    built_so = build_lib / "stimside" / "_native" / "libtiny_sync.so"
+    built_so.parent.mkdir(parents=True)
+    built_so.write_bytes(b"fake-so")
+    ext = setup_mod.StimsideBuildExt.__new__(setup_mod.StimsideBuildExt)
+    ext.build_lib = str(build_lib)
+    ext.distribution = types.SimpleNamespace(package_dir={"": "src"})
+    ext.extensions = [
+        _FakeExt("stimside._native.libtiny_sync", ["src/stimside/_native/tiny_sync.cpp"])
+    ]
+
+    monkeypatch.setattr(os, "replace", mock.Mock(side_effect=OSError("disk full")))
+    ext.inplace = True
+    with pytest.raises(OSError, match="disk full"):
+        ext._sync_extensions_to_source_dir()
+    ext.inplace = False
+    ext._sync_extensions_to_source_dir()
+
+
+@pytest.mark.parametrize(
+    "make_payload",
+    [
+        lambda h: json.dumps({"version": 3, "source_hash": h, "mode": "portable"}).encode(),
+        lambda h: json.dumps({"version": 1, "source_hash": h, "mode": "portable"}).encode(),
+        lambda h: json.dumps({"version": 2, "source_hash": h, "mode": "bogus"}).encode(),
+        lambda _h: b"[1, 2, 3]",
+        lambda h: json.dumps(
+            {"version": 2, "source_hash": h, "mode": "native", "machine": 123}
+        ).encode(),
+        lambda h: json.dumps(
+            {"version": 2, "source_hash": h, "mode": "native", "cpu_flags": ["avx2"]}
+        ).encode(),
+        lambda _h: (
+            b"[" * max(20_000, sys.getrecursionlimit() + 500)
+            + b"1"
+            + b"]" * max(20_000, sys.getrecursionlimit() + 500)
+        ),
+        lambda _h: (
+            b'{"a":' * max(20_000, sys.getrecursionlimit() + 500)
+            + b"1"
+            + b"}" * max(20_000, sys.getrecursionlimit() + 500)
+        ),
+    ],
+    ids=[
+        "version_3",
+        "version_1",
+        "bad_mode",
+        "json_list",
+        "bad_machine_type",
+        "bad_cpu_flags_type",
+        "deep_list_recursion",
+        "deep_dict_recursion",
+    ],
+)
+def test_invalid_and_deeply_nested_build_records_adopted_as_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_payload: object
+) -> None:
+    _require_cxx()
+    _, cpp, resolve = _make_source_native(
+        tmp_path, "tiny_badrec", 'extern "C" int tiny_badrec_val() { return 11; }\n'
+    )
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    so = resolve()
+    good_hash = _kernel_loader._compute_source_hash(cpp)
+    sidecar = _kernel_loader._build_id_path(so)
+    sidecar.write_bytes(make_payload(good_hash))  # type: ignore[operator]
+    with mock.patch.object(subprocess, "run") as mock_run:
+        assert resolve() == so
+    mock_run.assert_not_called()
+    adopted = _read_sidecar_json(so)
+    assert adopted == {"version": 2, "mode": "unknown", "source_hash": good_hash}
+
+
+def test_non_checkout_layouts_and_dist_info_never_compile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cxx = _require_cxx()
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+
+    layouts = [
+        ("no_setup", False, None),
+        ("site-packages/repo", True, None),
+        ("dist-packages/repo", True, None),
+        ("target_proj", True, "stimside-0.1.0.dist-info"),
+    ]
+    for rel_root, create_setup, meta_dir in layouts:
+        root = tmp_path / rel_root
+        native = root / "src" / "stimside" / "_native"
+        native.mkdir(parents=True)
+        if create_setup:
+            (root / "setup.py").write_text("# setup\n", encoding="utf-8")
+        if meta_dir is not None:
+            (root / "src" / meta_dir).mkdir()
+        cpp = native / "tiny_nc.cpp"
+        so = native / "libtiny_nc.so"
+        cpp.write_text('extern "C" int tiny_nc_val() { return 1; }\n', encoding="utf-8")
+        subprocess.run([*cxx, "-shared", "-fPIC", str(cpp), "-o", str(so)], check=True)
+        cpp.write_text('extern "C" int tiny_nc_val() { return 2; }\n', encoding="utf-8")
+        newer_ns = so.stat().st_mtime_ns + 5_000_000_000
+        os.utime(cpp, ns=(newer_ns, newer_ns))
+        resolve = functools.partial(
+            _kernel_loader.resolve_so, str(native / "tiny_nc.py"), "tiny_nc"
+        )
+        with mock.patch.object(subprocess, "run") as mock_run:
+            assert resolve() == so
+            monkeypatch.setenv("STIMSIDE_NATIVE_BUILD", "1")
+            assert resolve() == so
+            monkeypatch.delenv("STIMSIDE_NATIVE_BUILD")
+        mock_run.assert_not_called()
+        assert not _kernel_loader._build_id_path(so).exists()
+
+    # Positive control: editable checkout with .egg-info in src/ still rebuilds as a checkout.
+    ed_root = tmp_path / "editable_proj"
+    ed_native = ed_root / "src" / "stimside" / "_native"
+    ed_native.mkdir(parents=True)
+    (ed_root / "setup.py").write_text("# setup\n", encoding="utf-8")
+    (ed_root / "src" / "stimside.egg-info").mkdir()
+    ed_cpp = ed_native / "tiny_ed.cpp"
+    ed_so = ed_native / "libtiny_ed.so"
+    ed_cpp.write_text('extern "C" int tiny_ed_val() { return 1; }\n', encoding="utf-8")
+    subprocess.run([*cxx, "-shared", "-fPIC", str(ed_cpp), "-o", str(ed_so)], check=True)
+    ed_cpp.write_text('extern "C" int tiny_ed_val() { return 2; }\n', encoding="utf-8")
+    newer_ns = ed_so.stat().st_mtime_ns + 5_000_000_000
+    os.utime(ed_cpp, ns=(newer_ns, newer_ns))
+    ed_res = functools.partial(_kernel_loader.resolve_so, str(ed_native / "tiny_ed.py"), "tiny_ed")
+    assert ed_res() == ed_so
+    assert _eval_symbol_in_subprocess(ed_so, "tiny_ed_val") == 2
+    assert _read_sidecar_json(ed_so)["mode"] == "portable"
+
+
+def test_installed_forced_recompile_ignores_build_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cxx = _require_cxx()
+    site = tmp_path / "site-packages" / "stimside" / "_native"
+    site.mkdir(parents=True)
+    cpp = site / "tiny_inst.cpp"
+    so = site / "libtiny_inst.so"
+    cpp.write_text('extern "C" int tiny_inst_val() { return 4; }\n', encoding="utf-8")
+    subprocess.run([*cxx, "-shared", "-fPIC", str(cpp), "-o", str(so)], check=True)
+    _kernel_loader._build_id_path(so).write_text(
+        json.dumps({"version": 2, "source_hash": "0" * 64, "mode": "native"}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    cmds: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy_run(cmd: list[str], *a: object, **kw: object) -> subprocess.CompletedProcess[object]:
+        cmds.append(list(cmd))
+        return real_run(cmd, *a, **kw)  # type: ignore[arg-type]
+
+    with mock.patch.object(subprocess, "run", side_effect=spy_run):
+        rebuilt = _kernel_loader.resolve_so(
+            str(site / "tiny_inst.py"), "tiny_inst", force_recompile=True
+        )
+    assert rebuilt == so
+    assert len(cmds) == 1
+    assert "-march=native" not in cmds[0]
+
+
+def test_adoption_write_oserror_is_swallowed_and_never_replaces_valid_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_cxx()
+    native, cpp, resolve = _make_source_native(
+        tmp_path, "tiny_adopt_safe", 'extern "C" int tiny_adopt_safe_val() { return 6; }\n'
+    )
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    so = resolve()
+    sidecar = _kernel_loader._build_id_path(so)
+    src_hash = _kernel_loader._compute_source_hash(cpp)
+
+    # Adoption write OSError (e.g. .build_id is a directory) must not fail resolve_so.
+    sidecar.unlink()
+    sidecar.mkdir()
+    assert resolve() == so
+    assert list(native.glob("*.tmp.*")) == []
+    sidecar.rmdir()
+
+    # Existing valid v2 native record must never be overwritten by _adopt_build_record.
+    monkeypatch.setenv("STIMSIDE_NATIVE_BUILD", "1")
+    resolve()
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD")
+    assert _read_sidecar_json(so)["mode"] == "native"
+    _kernel_loader._adopt_build_record(so, src_hash)
+    assert _read_sidecar_json(so)["mode"] == "native"
+    assert list(native.glob("*.tmp.*")) == []
+
+    # Legacy v1 plain-hex record is still upgraded by _adopt_build_record.
+    sidecar.write_text("a" * 64 + "\n", encoding="utf-8")
+    _kernel_loader._adopt_build_record(so, src_hash)
+    assert _read_sidecar_json(so)["mode"] == "unknown"
+
+    # Simulated race: unlocked check sees missing record, concurrent native builder writes record.
+    sidecar.unlink()
+    orig_read = _kernel_loader._read_build_record
+    calls = 0
+
+    def racing_read(path: Path) -> tuple[str, str, str | None, str | None] | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            _kernel_loader._write_build_record(so, src_hash, "native")
+            return None
+        return orig_read(path)
+
+    monkeypatch.setattr(_kernel_loader, "_read_build_record", racing_read)
+    assert resolve() == so
+    assert calls == 2
+    assert _read_sidecar_json(so)["mode"] == "native"
+
+
+def test_failed_compile_removes_temp_so_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, _, resolve = _make_source_native(
+        tmp_path, "tiny_cleanup", 'extern "C" int tiny_cleanup_val() { return 1; }\n'
+    )
+    failing_cxx = tmp_path / "fail_cxx.sh"
+    failing_cxx.write_text(
+        '#!/bin/sh\nout=""; prev=""\n'
+        'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
+        'printf "partial" > "$out"\nexit 1\n',
+        encoding="utf-8",
+    )
+    failing_cxx.chmod(0o755)
+    monkeypatch.setenv("CXX", str(failing_cxx))
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    with pytest.raises(RuntimeError, match="Failed to compile"):
+        resolve()
+    assert list(native.glob("*.tmp.*")) == []
+
+
+def test_lock_timeout_default_600s_env_override_and_warning_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_cxx()
+    fcntl = pytest.importorskip("fcntl")
+    assert _kernel_loader._LOCK_MAX_RETRIES == 12000
+    assert _kernel_loader._LOCK_MAX_RETRIES * _kernel_loader._LOCK_RETRY_DELAY_S == pytest.approx(
+        600.0
+    )
+    monkeypatch.delenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", raising=False)
+    assert _kernel_loader._lock_max_retries() == 12000
+
+    native, cpp, resolve = _make_source_native(
+        tmp_path, "tiny_env_to", 'extern "C" int tiny_env_to_val() { return 8; }\n'
+    )
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+
+    # Invalid timeout env values emit RuntimeWarning and fall back to default.
+    for bad_val in ("-1", "abc", "nan", "inf", "1e308"):
+        monkeypatch.setenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", bad_val)
+        with warnings.catch_warnings(record=True) as caught_bad:
+            warnings.simplefilter("always", RuntimeWarning)
+            assert _kernel_loader._lock_max_retries() == 12000
+        assert len(caught_bad) == 1
+        assert issubclass(caught_bad[0].category, RuntimeWarning)
+
+    # Zero timeout breaks immediately without sleeping.
+    monkeypatch.setenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", "0")
+    sleeps = 0
+
+    def count_sleep(_s: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+
+    monkeypatch.setattr(time, "sleep", count_sleep)
+    holder_fd = os.open(native, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fcntl.flock(holder_fd, fcntl.LOCK_EX)
+        with warnings.catch_warnings(record=True) as caught_zero:
+            warnings.simplefilter("always", RuntimeWarning)
+            assert _kernel_loader._acquire_dir_lock(native) is None
+        assert sleeps == 0
+        assert len(caught_zero) == 1
+
+        # Positive short timeout via env overrides the 600s default.
+        monkeypatch.undo()
+        monkeypatch.setenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", "0.05")
+        monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+        monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+        with warnings.catch_warnings(record=True) as caught_short:
+            warnings.simplefilter("always", RuntimeWarning)
+            so = resolve()
+        assert len(caught_short) == 1
+        assert math.isclose(_kernel_loader._LOCK_RETRY_DELAY_S, 0.05)
+        assert _eval_symbol_in_subprocess(so, "tiny_env_to_val") == 8
+    finally:
+        os.close(holder_fd)
+
+    # PYTHONWARNINGS=ignore suppresses failed-rebuild warnings in a fresh subprocess.
+    cpp.write_text("#error intentional_filter_check\n", encoding="utf-8")
+    newer_ns = so.stat().st_mtime_ns + 5_000_000_000
+    os.utime(cpp, ns=(newer_ns, newer_ns))
+    src_root = str(Path(stimside.__file__).resolve().parents[1])
+    code = (
+        "from stimside._native import _kernel_loader\n"
+        f"_kernel_loader.resolve_so({str(native / 'tiny_env_to.py')!r}, 'tiny_env_to')\n"
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": src_root,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONWARNINGS": "ignore",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        capture_output=True, text=True, env=env, timeout=30, check=False,
+    )
+    assert proc.returncode == 0
+    assert "stimside warning:" not in proc.stderr
+
+
+def test_native_build_records_and_checks_machine_and_cpu_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_cxx()
+    _, _, resolve = _make_source_native(
+        tmp_path, "tiny_cpu", 'extern "C" int tiny_cpu_val() { return 12; }\n'
+    )
+    monkeypatch.setenv("STIMSIDE_NATIVE_BUILD", "1")
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    so = resolve()
+    rec = _read_sidecar_json(so)
+    assert rec["mode"] == "native"
+    assert rec["machine"] == _kernel_loader._current_machine()
+    assert rec["cpu_flags"] == _kernel_loader._cpu_flags_digest()
+
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD")
+    with mock.patch.object(subprocess, "run") as mock_run:
+        assert resolve() == so
+    mock_run.assert_not_called()
+
+    # Changing CPU flags triggers a native rebuild even with env vars unset.
+    real_run = subprocess.run
+    cmds: list[list[str]] = []
+
+    def spy_run(cmd: list[str], *a: object, **kw: object) -> subprocess.CompletedProcess[object]:
+        cmds.append(list(cmd))
+        return real_run(cmd, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_kernel_loader, "_cpu_flags_digest", lambda: "deadbeef01234567")
+    with mock.patch.object(subprocess, "run", side_effect=spy_run):
+        assert resolve() == so
+    assert len(cmds) == 1
+    if _kernel_loader._arch_supports_march_native():
+        assert "-march=native" in cmds[0]
+    rec2 = _read_sidecar_json(so)
+    assert rec2["mode"] == "native" and rec2["cpu_flags"] == "deadbeef01234567"
+
+    # Changing machine architecture also triggers a native rebuild.
+    other_arch = "aarch64" if _kernel_loader._current_machine() != "aarch64" else "x86_64"
+    monkeypatch.setattr(platform, "machine", lambda: other_arch)
+    with mock.patch.object(subprocess, "run", side_effect=spy_run):
+        assert resolve() == so
+    assert len(cmds) == 2
+    assert "-march=native" in cmds[1]
+    assert _read_sidecar_json(so)["machine"] == other_arch
+
+    # Unit check of _cpu_flags_digest order-independence and missing-file handling.
+    monkeypatch.undo()
+    monkeypatch.setattr(Path, "read_text", lambda self, **_kw: "flags : sse2 avx2\n")
+    d1 = _kernel_loader._cpu_flags_digest()
+    monkeypatch.setattr(Path, "read_text", lambda self, **_kw: "Features : avx2 sse2 sse2\n")
+    assert _kernel_loader._cpu_flags_digest() == d1 and len(d1) == 16
+    monkeypatch.setattr(Path, "read_text", mock.Mock(side_effect=OSError("no procfs")))
+    assert _kernel_loader._cpu_flags_digest() == ""
