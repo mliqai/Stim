@@ -16,6 +16,9 @@ from stimside._magic.phase_qfe import (
     OMEGA_POWERS,
 )
 from stimside.op_handlers.leakage_handlers.common_parsing import split_arguments
+from stimside.util.circuit_ir import CircuitIR, build_ir
+
+_IDENTITY_OP = stim.CircuitInstruction("I", [], [])
 
 PAU_ABK: dict[str, tuple[int, int, int]] = {"I": (0, 0, 0), "X": (1, 0, 0), "Z": (0, 1, 0), "Y": (1, 1, 1)}
 
@@ -377,27 +380,31 @@ def parse_clifford_fault_instruction(
     return channels
 
 
+def extract_inline_faults_from_ir(ir: CircuitIR) -> tuple[CliffordFaultChannel, ...]:
+    """Extract inline ``CLIFFORD_FAULT`` channels from a pre-built ``CircuitIR``."""
+    inline_faults: list[CliffordFaultChannel] = []
+    for ins in ir.instrs:
+        if ins.tag.startswith("CLIFFORD_FAULT"):
+            inline_faults.extend(
+                parse_clifford_fault_instruction(ins.op, ins.unrolled_index)
+            )
+    return tuple(inline_faults)
+
+
 def extract_circuit_faults(
     circuit: stim.Circuit,
+    *,
+    ir: CircuitIR | None = None,
 ) -> tuple[list[stim.CircuitInstruction], tuple[CliffordFaultChannel, ...]]:
-    """Flatten `REPEAT` blocks and extract inline `CLIFFORD_FAULT` tagged instructions."""
-    flat_ops: list[stim.CircuitInstruction] = []
-    inline_faults: list[CliffordFaultChannel] = []
-
-    def _walk(blk: stim.Circuit) -> None:
-        for item in blk:
-            if isinstance(item, stim.CircuitRepeatBlock):
-                body = item.body_copy()
-                for _ in range(item.repeat_count):
-                    _walk(body)
-            elif item.tag.startswith("CLIFFORD_FAULT"):
-                inline_faults.extend(parse_clifford_fault_instruction(item, len(flat_ops)))
-                flat_ops.append(stim.CircuitInstruction("I", [], []))
-            else:
-                flat_ops.append(item)
-
-    _walk(circuit)
-    return flat_ops, tuple(inline_faults)
+    """Unroll ``circuit`` via ``CircuitIR`` and extract inline ``CLIFFORD_FAULT`` ops."""
+    cir = build_ir(circuit) if ir is None else ir
+    inline_faults = extract_inline_faults_from_ir(cir)
+    fault_steps = {ch.step_index for ch in inline_faults}
+    flat_ops = [
+        _IDENTITY_OP if ins.unrolled_index in fault_steps else ins.op
+        for ins in cir.instrs
+    ]
+    return flat_ops, inline_faults
 
 
 def merge_and_validate_fault_channels(

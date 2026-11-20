@@ -9,13 +9,9 @@ import numpy as np
 import stim  # type: ignore[import-untyped]
 from numpy.typing import NDArray
 
+from stimside.util import circuit_ir as _cir
 from stimside.util.circuit import reduce_hermitian_pauli_product
-from stimside.util.circuit_ir import (
-    Category,
-    CircuitIR,
-    build_ir,
-    classify_category,
-)
+from stimside.util.circuit_ir import Category, CircuitIR, IRInstr, build_ir
 from stimside.util.reference_chp import (
     DetMeasMeta,
     PackedSymplecticTables,
@@ -39,9 +35,7 @@ RawFactor = (
 )
 
 _GATE_MRQF_FACTORS_CACHE: dict[str, tuple[RawFactor, ...]] = {}
-_MEAS_CATEGORIES = frozenset(
-    {Category.MEASURE, Category.MEASURE_RESET, Category.RESET}
-)
+_MEAS_CATEGORIES = frozenset({Category.MEASURE, Category.MEASURE_RESET, Category.RESET})
 
 # Elementary local decompositions for E = U_gate^dagger in application order (rightmost factor first).
 # Entries are either:
@@ -227,7 +221,7 @@ class UnitaryStepMeta(_StepWordsMixin):
         if self._cpp_cocycle_arrays is not None:
             return self._cpp_cocycle_arrays
         num_g = len(self.target_groups)
-        arity = 2 if stim.gate_data(self.gate_name).is_two_qubit_gate else 1
+        arity = _cir.classify_arity(self.gate_name) or 1
         raw_factors = get_inverse_clifford_mrqf_factors(self.gate_name)
         n_fac = len(raw_factors)
         t_groups = (
@@ -313,7 +307,6 @@ class UnitaryStepMeta(_StepWordsMixin):
                 f_k1[:, f_i] = kap
         self._cpp_cocycle_arrays = (num_g, arity, n_fac, t_groups, f_arrs)
         return self._cpp_cocycle_arrays
-
 
 
 @dataclasses.dataclass
@@ -412,12 +405,7 @@ class CompiledReferenceCircuit:
             cat = instr.category
             if cat is Category.ANNOTATION and op.name in ("QUBIT_COORDS", "SHIFT_COORDS"):
                 continue
-            step, next_snap = self._compile_on(
-                op,
-                self.ref_chp,
-                self._last_packed_snapshot,
-                category=cat,
-            )
+            step, next_snap = self._compile_on(op, self.ref_chp, self._last_packed_snapshot, instr)
             self._last_packed_snapshot = next_snap
             self.steps.append(step)
 
@@ -515,13 +503,20 @@ class CompiledReferenceCircuit:
         cat: Category,
         chp: ReferenceCHPTableau,
         last_snap: PackedSymplecticTables,
+        instr: IRInstr | None = None,
     ) -> tuple[MeasStepMeta, PackedSymplecticTables]:
         name = op.name
         produces_meas = cat is not Category.RESET
         is_reset = cat is not Category.MEASURE
+        basis = instr.basis if instr is not None else _cir.classify_basis(name)
+        is_pm = (
+            instr.is_product_measurement
+            if instr is not None
+            else _cir.classify_is_product_measurement(name)
+        )
         substeps: list[MeasSubStepMeta] = []
         raw_targets = op.targets_copy()
-        if name == "MPP":
+        if is_pm and basis is None:
             idx = 0
             while idx < len(raw_targets):
                 term = [raw_targets[idx]]
@@ -530,17 +525,15 @@ class CompiledReferenceCircuit:
                     term.append(raw_targets[idx + 1])
                     idx += 2
                 substeps.append(self._compile_mpp_term(term, chp))
-        elif name in ("MXX", "MYY", "MZZ"):
-            basis_pair = name[-1]
+        elif is_pm:
             for i in range(0, len(raw_targets), 2):
                 gt0, gt1 = raw_targets[i], raw_targets[i + 1]
                 q0, q1 = gt0.qubit_value, gt1.qubit_value
                 inv = bool(gt0.is_inverted_result_target ^ gt1.is_inverted_result_target)
                 pre_ops: list[stim.CircuitInstruction] = []
                 post_ops: list[stim.CircuitInstruction] = []
-                if basis_pair in ("X", "Y"):
-                    g = "H" if basis_pair == "X" else "H_YZ"
-                    b_op = stim.CircuitInstruction(g, [q0, q1])
+                if basis in ("X", "Y"):
+                    b_op = stim.CircuitInstruction("H" if basis == "X" else "H_YZ", [q0, q1])
                     pre_ops.append(b_op)
                     post_ops.append(b_op)
                 cx_op = stim.CircuitInstruction("CX", [q1, q0])
@@ -548,7 +541,7 @@ class CompiledReferenceCircuit:
                 post_ops.insert(0, cx_op)
                 substeps.append(self._run_meas_substep(chp, q0, inv, pre_ops, post_ops))
         else:
-            bg = "H" if name.endswith("X") else ("H_YZ" if name.endswith("Y") else None)
+            bg = "H" if basis == "X" else ("H_YZ" if basis == "Y" else None)
             for gt in raw_targets:
                 q = gt.qubit_value
                 ops = [stim.CircuitInstruction(bg, [q])] if bg else []
@@ -571,6 +564,7 @@ class CompiledReferenceCircuit:
         op: stim.CircuitInstruction,
         chp: ReferenceCHPTableau,
         last_snap: PackedSymplecticTables,
+        instr: IRInstr | None = None,
     ) -> tuple[UnitaryStepMeta | NoopStepMeta, PackedSymplecticTables]:
         name = op.name
         if name in ("SPP", "SPP_DAG"):
@@ -579,9 +573,12 @@ class CompiledReferenceCircuit:
                 "Rewrite them with single- and two-qubit Clifford gates, or use "
                 "TablesideSimulator or FlipsideSimulator."
             )
-        gd = stim.gate_data(name)
         raw_t = op.targets_copy()
-        is_mixed = gd.is_two_qubit_gate and any(t.qubit_value is None for t in raw_t)
+        is_mixed = (
+            instr.has_classical_control
+            if instr is not None
+            else _cir.op_has_classical_control(op)
+        )
         if is_mixed:
             quantum_targets: list[int] = []
             for i in range(0, len(raw_t), 2):
@@ -596,7 +593,7 @@ class CompiledReferenceCircuit:
             targets = [t.qubit_value for t in raw_t]
             quantum_op = op
         in_bounds = all(0 <= q < self.num_qubits for q in targets)
-        arity = 2 if gd.is_two_qubit_gate else 1
+        arity = (instr.arity if instr is not None else _cir.classify_arity(name)) or 1
         groups = [tuple(targets[i : i + arity]) for i in range(0, len(targets), arity)]
         is_disjoint = len(set(targets)) == len(targets)
         if is_disjoint:
@@ -627,14 +624,13 @@ class CompiledReferenceCircuit:
         op: stim.CircuitInstruction,
         chp: ReferenceCHPTableau,
         last_snap: PackedSymplecticTables,
-        *,
-        category: Category | None = None,
+        instr: IRInstr | None = None,
     ) -> tuple[StepMeta, PackedSymplecticTables]:
-        cat = category if category is not None else classify_category(op.name)
+        cat = instr.category if instr is not None else _cir.classify_category(op.name)
         if cat in _MEAS_CATEGORIES:
-            return self._compile_meas_step(op, cat, chp, last_snap)
+            return self._compile_meas_step(op, cat, chp, last_snap, instr)
         if cat is Category.UNITARY:
-            return self._compile_unitary_step(op, chp, last_snap)
+            return self._compile_unitary_step(op, chp, last_snap, instr)
         return self._make_noop(op, last_snap), last_snap
 
     def compile_instruction(

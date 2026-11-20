@@ -12,6 +12,8 @@ import collections
 import copy
 import json
 import math
+import threading
+import types
 from typing import Any
 
 import numpy as np
@@ -22,8 +24,10 @@ import stimside
 import stimside._native.magic_engine as me
 import stimside.simulator_magic as sm
 from stimside import golden_test
+from stimside._magic.gates import CliffordFaultChannel, FaultBranch
 from stimside._magic.live_store import LiveExpansions
 from stimside._magic.phase_qfe import ShotExpansion
+from stimside._magic.query import QueryBudget, QueryBudgetExceededError
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler
 from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic
 from stimside.simulator_magic import MagicsideSimulator
@@ -796,3 +800,405 @@ def test_copy_copy_leakage_subclasses(monkeypatch: Any, engine: bool, cls_name: 
     tc = copy.copy(MagicsideSimulator(circ, compiled_op_handler=_SubCopy(), batch_size=3))
     tc.run()
     assert getattr(tc.compiled_op_handler, "hook", False)
+
+
+@pytest.mark.parametrize("engine", [False, True])
+@pytest.mark.parametrize("kind", ["tableau", "lock", "generator"])
+def test_copy_undeepcopyable_handler_raises_clear_type_error(
+    monkeypatch: pytest.MonkeyPatch, engine: bool, kind: str
+) -> None:
+    class _UncopyableUserHandler(CompiledOpHandler[Any]):
+        def __init__(self, payload: Any) -> None:
+            self.payload = payload
+
+        def handle_op(self, op: stim.CircuitInstruction, sss: Any) -> None:
+            sss._do_bare_instruction(op)
+
+        def clear(self) -> None:
+            return
+
+    monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", engine)
+    payload: Any
+    if kind == "tableau":
+        payload = stim.TableauSimulator()
+    elif kind == "lock":
+        payload = threading.Lock()
+    else:
+        payload = (i for i in range(2))
+    circ = stim.Circuit("H 0\nM 0")
+    sim = MagicsideSimulator(
+        circ, compiled_op_handler=_UncopyableUserHandler(payload), batch_size=2, seed=5
+    )
+    with pytest.raises(TypeError) as exc_info:
+        copy.copy(sim)
+    msg = str(exc_info.value)
+    assert "_UncopyableUserHandler" in msg
+    assert "__copy__" in msg
+    assert "__deepcopy__" in msg
+    assert exc_info.value.__cause__ is not None
+
+
+@pytest.mark.parametrize("engine", [False, True])
+def test_copy_remaps_handler_back_references_in_both_engine_modes(
+    monkeypatch: pytest.MonkeyPatch, engine: bool
+) -> None:
+    class _BackRefHandler(CompiledOpHandler[Any]):
+        def __init__(self) -> None:
+            self.sim: Any = None
+            self.cb: Any = None
+            self.nested: list[Any] = []
+            self.seen = 0
+
+        def handle_op(self, op: stim.CircuitInstruction, sss: Any) -> None:
+            if self.sim is None:
+                self.sim = sss
+                self.cb = sss.apply_pauli
+                self.nested = [sss]
+            self.seen += 1
+            sss._do_bare_instruction(op)
+
+        def clear(self) -> None:
+            self.seen = 0
+
+    monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", engine)
+    circ = stim.Circuit("R 0 1\nH 0\nI[T] 0\nCX 0 1\nM 0 1\nDETECTOR rec[-1]")
+    sim = MagicsideSimulator(
+        circ, compiled_op_handler=_BackRefHandler(), batch_size=8, seed=11
+    )
+    sim.interactive_do(circ[:3])
+    twin = copy.copy(sim)
+    sh, th = sim.compiled_op_handler, twin.compiled_op_handler
+    assert isinstance(sh, _BackRefHandler) and isinstance(th, _BackRefHandler)
+    assert th is not sh
+    assert th.sim is twin and th.sim is not sim
+    assert th.cb.__self__ is twin
+    assert th.nested[0] is twin
+    assert sh.sim is sim
+
+    sim.interactive_do(circ[3:])
+    sim.finish_interactive_run()
+    twin.interactive_do(circ[3:])
+    twin.finish_interactive_run()
+
+    ref = MagicsideSimulator(
+        circ, compiled_op_handler=_BackRefHandler(), batch_size=8, seed=11
+    )
+    ref.run()
+    np.testing.assert_array_equal(
+        sim.get_final_measurement_records(), ref.get_final_measurement_records()
+    )
+    np.testing.assert_array_equal(
+        twin.get_final_measurement_records(), ref.get_final_measurement_records()
+    )
+    np.testing.assert_array_equal(sim.get_detector_flips(), ref.get_detector_flips())
+    np.testing.assert_array_equal(twin.get_detector_flips(), ref.get_detector_flips())
+
+
+_STRUCTURAL_IMMUTABLE_TYPES = (
+    int,
+    float,
+    complex,
+    str,
+    bytes,
+    bool,
+    type(None),
+    frozenset,
+    types.FunctionType,
+    type,
+    np.generic,
+    stim.CircuitInstruction,
+    stim.GateTarget,
+    stim.CircuitRepeatBlock,
+)
+
+_ALLOWED_SHARED_TOP_LEVEL = frozenset({
+    "circuit",
+    "_unrolled_ops",
+    "_prog_faults",
+    "_inline_faults",
+    "_all_fault_channels",
+    "_user_fault_channels",
+    "_norm_reals",
+    "_sweep_mat",
+    "_explicit_ref_sample",
+    "_compiled_stream_plan",
+    "_compiled_query_plan",
+    "_active_plan",
+    "_m2d_skip_conv",
+    "_m2d_stim_conv",
+    "query_budget",
+})
+
+_ALLOWED_SHARED_CONTAINER_ITEMS = frozenset({
+    "_live_frame_events",
+    "_pending_magic",
+    "_ref_sample_cache",
+    "handler.ops_to_params",
+})
+
+_ALLOWED_MISSING_REF_TAB_KEYS = frozenset({"_sid", "_memo_ref", "_in_memo"})
+
+
+def _is_structural_immutable(val: Any) -> bool:
+    if isinstance(val, _STRUCTURAL_IMMUTABLE_TYPES):
+        return True
+    if isinstance(val, tuple):
+        return all(_is_structural_immutable(item) for item in val)
+    return False
+
+
+def _collect_shared_members(
+    a_dict: dict[str, Any], b_dict: dict[str, Any], prefix: str = ""
+) -> list[tuple[str, str]]:
+    findings: list[tuple[str, str]] = []
+    for k, v in a_dict.items():
+        name = prefix + k
+        if k not in b_dict:
+            findings.append((name, "missing"))
+            continue
+        tv = b_dict[k]
+        if tv is v:
+            if not _is_structural_immutable(v):
+                findings.append((name, "same_object"))
+            continue
+        if isinstance(v, np.ndarray) and isinstance(tv, np.ndarray) and np.shares_memory(v, tv):
+            findings.append((name, "shares_memory"))
+        if isinstance(v, (list, tuple)) and isinstance(tv, (list, tuple)):
+            if any(x is y and not _is_structural_immutable(x) for x, y in zip(v, tv)):
+                findings.append((name, "item_same_object"))
+        elif (
+            isinstance(v, dict)
+            and isinstance(tv, dict)
+            and any(
+                kk in tv and v[kk] is tv[kk] and not _is_structural_immutable(v[kk])
+                for kk in v
+            )
+        ):
+            findings.append((name, "value_same_object"))
+    for k in b_dict:
+        if k not in a_dict:
+            findings.append((prefix + k, "only_in_twin"))
+    return findings
+
+
+def _build_copy_member_states(engine: bool) -> list[tuple[str, MagicsideSimulator]]:
+    plain = stim.Circuit(
+        "QUBIT_COORDS(0, 1) 0\nR 0 1 2 3\nH 0 1 2 3\nI[T] 0\nCX 0 1\nM 1\n"
+        "CX rec[-1] 2\nI[T] 2\nDEPOLARIZE1(0.2) 0 1\nI[CCZ] 0 2 3\n"
+        "SHIFT_COORDS(1)\nM 0 1 2 3\nDETECTOR rec[-1] rec[-2]\nOBSERVABLE_INCLUDE(0) rec[-3]\n"
+    )
+    leak = stim.Circuit(
+        "QUBIT_COORDS(0, 1) 0\nR 0 1 2 3\nH 0 1 2 3\nI[T] 0\n"
+        "I[LEAKAGE_TRANSITION_1: (0.5, U-->2) (0.4, 2-->U)] 1\n"
+        "CX[CONDITIONED_ON_PAIR: (U, U)] 0 1\nM[LEAKAGE_PROJECTION_Z: (1.0, 2)] 1\n"
+        "CX rec[-1] 2\nI[T] 2\nE(0.3) X1\nELSE_CORRELATED_ERROR(0.3) Z2\nI[CCZ] 0 2 3\n"
+        "SHIFT_COORDS(1)\nM 0 1 2 3\nDETECTOR rec[-1] rec[-2]\nOBSERVABLE_INCLUDE(0) rec[-3]\n"
+    )
+    out: list[tuple[str, MagicsideSimulator]] = []
+    out.append(("fresh", MagicsideSimulator(plain, batch_size=5, seed=1)))
+    s = MagicsideSimulator(plain, batch_size=5, seed=1)
+    s.interactive_do(plain[:9])
+    out.append(("mid_pending_t", s))
+    s = MagicsideSimulator(
+        leak, op_handler=LeakageUint8Magic(), batch_size=5, seed=1,
+        sync_tableside_rng=True, record_unleaked_to_leaked=True, record_leakage_events=True,
+    )
+    s.interactive_do(leak[:9])
+    out.append(("leak_sync_mid", s))
+    s = MagicsideSimulator(
+        leak, op_handler=LeakageUint8Magic(), batch_size=5, seed=1,
+        record_unleaked_to_leaked=True, record_leakage_events=True,
+    )
+    s.run()
+    s.get_detector_flips()
+    out.append(("leak_finished", s))
+    s = MagicsideSimulator(plain, batch_size=5, seed=1, m2d_reference_mode="stim")
+    s.run()
+    s.get_detector_flips()
+    out.append(("stim_m2d_finished", s))
+    ch = CliffordFaultChannel(step_index=2, branches=(FaultBranch(0.2, "X", (0,)),))
+    s = MagicsideSimulator(
+        plain, batch_size=5, seed=1, fault_channels=(ch,), query_budget=QueryBudget()
+    )
+    s.interactive_do(plain[:5])
+    out.append(("fault_channel_mid", s))
+    for label, kw in (
+        ("query", {"backend": "QUERY"}),
+        ("selector", {"fault_mode": "SELECTOR"}),
+        ("query_selector", {"backend": "QUERY", "fault_mode": "SELECTOR"}),
+        ("fault_reals", {"fault_realizations": {"sweep_bits": [True]}}),
+    ):
+        s = MagicsideSimulator(plain, batch_size=5, seed=1, **kw)
+        s.run()
+        s.get_detector_flips()
+        out.append((f"compiled_{label}", s))
+    s = MagicsideSimulator(
+        plain, batch_size=5, seed=1,
+        reference_sample=np.zeros(plain.num_measurements, dtype=bool),
+    )
+    s.run()
+    s.get_detector_flips()
+    out.append(("explicit_ref", s))
+    assert isinstance(engine, bool)
+    return out
+
+
+@pytest.mark.parametrize("engine", [False, True])
+def test_copy_has_no_unexpected_shared_mutable_members(
+    monkeypatch: pytest.MonkeyPatch, engine: bool
+) -> None:
+    monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", engine)
+    for label, sim in _build_copy_member_states(engine):
+        twin = copy.copy(sim)
+        assert twin.__dict__.keys() == sim.__dict__.keys(), label
+        if sm._SIM_MEMOS.get(sim) is not None:
+            assert sm._SIM_MEMOS.get(twin) is not sm._SIM_MEMOS.get(sim), label
+        findings = _collect_shared_members(sim.__dict__, twin.__dict__)
+        h, th = sim.compiled_op_handler, twin.compiled_op_handler
+        if h is not th and hasattr(h, "__dict__"):
+            findings.extend(_collect_shared_members(h.__dict__, th.__dict__, prefix="handler."))
+        tab, ttab = sim._live_ref_tab, twin._live_ref_tab
+        assert tab is not ttab, label
+        tab_findings = _collect_shared_members(tab.__dict__, ttab.__dict__, prefix="_live_ref_tab.")
+        unexpected: list[tuple[str, str]] = []
+        for name, kind in findings:
+            if kind == "same_object" and name in _ALLOWED_SHARED_TOP_LEVEL:
+                continue
+            if kind in ("item_same_object", "value_same_object") and (
+                name in _ALLOWED_SHARED_CONTAINER_ITEMS
+            ):
+                continue
+            unexpected.append((name, kind))
+        for name, kind in tab_findings:
+            short = name.removeprefix("_live_ref_tab.")
+            if kind == "missing" and short in _ALLOWED_MISSING_REF_TAB_KEYS:
+                continue
+            unexpected.append((name, kind))
+        assert unexpected == [], f"engine={engine} state={label} unexpected={unexpected}"
+
+
+@pytest.mark.parametrize("engine", [False, True])
+def test_copy_isolates_tab_rngs_x(monkeypatch: pytest.MonkeyPatch, engine: bool) -> None:
+    monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", engine)
+    circ = stim.Circuit(
+        "R 0 1 2\nH 0 1 2\nZ_ERROR(0.5) 0 1 2\nDEPOLARIZE1(0.5) 0 1 2\nMX 0 1 2\n"
+    )
+    sim = MagicsideSimulator(
+        circ, op_handler=LeakageUint8Magic(), batch_size=16, seed=7, sync_tableside_rng=True
+    )
+    sim.interactive_do(circ[:2])
+    twin = copy.copy(sim)
+    assert sim._tab_rngs_x is not None and twin._tab_rngs_x is not None
+    assert len(sim._tab_rngs_x) == len(twin._tab_rngs_x) == 16
+    for s_rng, t_rng in zip(sim._tab_rngs_x, twin._tab_rngs_x):
+        assert t_rng is not s_rng
+    sim.interactive_do(circ[2:])
+    sim.finish_interactive_run()
+    twin.interactive_do(circ[2:])
+    twin.finish_interactive_run()
+    ref = MagicsideSimulator(
+        circ, op_handler=LeakageUint8Magic(), batch_size=16, seed=7, sync_tableside_rng=True
+    )
+    ref.run()
+    np.testing.assert_array_equal(
+        sim.get_final_measurement_records(), ref.get_final_measurement_records()
+    )
+    np.testing.assert_array_equal(
+        twin.get_final_measurement_records(), ref.get_final_measurement_records()
+    )
+
+
+@pytest.mark.parametrize("engine", [False, True])
+def test_copy_isolates_qubit_tags(monkeypatch: pytest.MonkeyPatch, engine: bool) -> None:
+    monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", engine)
+    circ = stim.Circuit("QUBIT_COORDS[a](0, 0) 0\nH 0\nQUBIT_COORDS[b](1, 1) 1\nM 0 1\n")
+    sim = MagicsideSimulator(circ, batch_size=4, seed=3)
+    sim.interactive_do(circ[:2])
+    twin = copy.copy(sim)
+    sim.interactive_do(circ[2:3])
+    assert twin.qubit_tags == {0: "a"}
+    assert sim.qubit_tags == {0: "a", 1: "b"}
+
+
+@pytest.mark.parametrize("engine", [False, True])
+def test_copy_isolates_measurement_columns_arrays(
+    monkeypatch: pytest.MonkeyPatch, engine: bool
+) -> None:
+    monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", engine)
+    circ = stim.Circuit("X 0\nM 0\nM 0\n")
+    sim = MagicsideSimulator(circ, batch_size=4, seed=3)
+    sim.interactive_do(circ[:2])
+    twin = copy.copy(sim)
+    sim.overwrite_measurement_column(0, np.zeros(4, dtype=bool))
+    assert twin.measurement_column(0).all()
+    assert not sim.measurement_column(0).any()
+    assert not np.shares_memory(twin.measurement_column(0), sim.measurement_column(0))
+
+
+@pytest.mark.parametrize("engine", [False, True])
+@pytest.mark.parametrize("mode", ["query", "selector", "direct_reals", "live"])
+def test_failed_run_blocks_retries_and_copies_across_all_execution_paths(
+    monkeypatch: pytest.MonkeyPatch, engine: bool, mode: str
+) -> None:
+    class _FailFirstLiveHandler(CompiledOpHandler[Any]):
+        def __init__(self) -> None:
+            self.fail = True
+
+        def handle_op(self, op: stim.CircuitInstruction, sss: Any) -> None:
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("boom on live op 0")
+            sss._do_bare_instruction(op)
+
+        def clear(self) -> None:
+            return
+
+    monkeypatch.setattr(sm, "_LIVE_STORE_ENGINE", engine)
+    circ = stim.Circuit("H 0 1\nI[T] 0 1\nM 0 1")
+    expected_exc: type[Exception] = QueryBudgetExceededError
+    if mode == "query":
+        sim = MagicsideSimulator(
+            circ, batch_size=2, seed=3, backend="QUERY",
+            query_budget=QueryBudget(max_terms=1, on_budget_exceeded="raise"),
+        )
+    elif mode == "selector":
+        sim = MagicsideSimulator(
+            circ, batch_size=2, seed=3, fault_mode="SELECTOR",
+            max_components=1, on_budget_exceeded="raise",
+        )
+    elif mode == "direct_reals":
+        sim = MagicsideSimulator(
+            circ, batch_size=2, seed=3, fault_realizations={"sweep_bits": [True]},
+            max_components=1, on_budget_exceeded="raise",
+        )
+    else:
+        expected_exc = RuntimeError
+        sim = MagicsideSimulator(
+            stim.Circuit("H 0\nM 0"), compiled_op_handler=_FailFirstLiveHandler(),
+            batch_size=2, seed=3,
+        )
+
+    with pytest.raises(expected_exc):
+        sim.run()
+    with pytest.raises(ValueError, match="not clean.*clear"):
+        sim.run()
+    twin = copy.copy(sim)
+    with pytest.raises(ValueError, match="not clean.*clear"):
+        twin.run()
+    if mode == "live":
+        with pytest.raises(ValueError, match="not clean.*clear"):
+            twin.interactive_do(stim.Circuit("H 0\nM 0"))
+        with pytest.raises(ValueError, match="not clean.*clear"):
+            twin.finish_interactive_run()
+
+    twin.clear()
+    if mode == "query":
+        with pytest.raises(QueryBudgetExceededError):
+            twin.run()
+    else:
+        if mode in ("selector", "direct_reals"):
+            twin.max_components = 1024
+        twin.run()
+        assert twin.get_final_measurement_records().shape[0] == 2
+    with pytest.raises(ValueError, match="not clean.*clear"):
+        sim.run()

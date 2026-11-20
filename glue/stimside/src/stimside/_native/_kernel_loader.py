@@ -12,26 +12,33 @@ Loader policy:
 - Writable source checkout (``.../src/stimside/_native`` with ``setup.py`` and no
   ``stimside*.dist-info``): rebuilds only when ``lib<name>.so`` is missing, older than
   ``<name>.cpp`` or regular non-symlink ``*.hpp`` headers, mismatched against the source hash in
-  ``.lib<name>.build_id``, mismatched against recorded ``"machine"`` or ``/proc/cpuinfo``
+  ``.lib<name>.build_id``, mismatched against recorded ``"machine"`` or instruction-set
   ``"cpu_flags"`` digest in ``"native"`` mode, or when ``STIMSIDE_NATIVE_BUILD=1`` /
   ``STIMSIDE_PORTABLE_BUILD=1`` explicitly requests the opposite mode. With no flag set, flags
   never trigger a rebuild and source-triggered rebuilds keep the recorded mode (defaulting to
-  ``"portable"``). Missing or invalid/legacy ``.lib<name>.build_id`` sidecars are adopted under
-  the directory lock via ``os.link`` as ``"unknown"`` without overwriting valid v2 records or
-  rebuilding; ``RecursionError`` during JSON parsing falls back cleanly.
+  ``"portable"``). In a read-only source checkout holding a ``"native"`` library built for a
+  different CPU, loading succeeds and emits a once-per-library ``RuntimeWarning``. Missing or
+  invalid/legacy ``.lib<name>.build_id`` sidecars are adopted locklessly via ``os.link`` as
+  ``"unknown"`` without overwriting valid v2 records or rebuilding; ``RecursionError`` during JSON
+  parsing falls back cleanly.
 - Concurrency and failure safety: builds acquire a bounded non-blocking ``flock`` on ``_native``
-  waiting up to ``600`` s by default (configurable via ``STIMSIDE_BUILD_LOCK_TIMEOUT_S``, falling
-  back with ``RuntimeWarning`` on invalid values). Lock timeouts and once-per-library failed
-  rebuild fallbacks to an existing ``lib<name>.so`` emit ``RuntimeWarning`` via
-  ``warnings.warn``; temp library and sidecar files get unique random names inside ``_native``
-  (mode subject to the umask, as compiler output) and are atomically ``os.replace``d (only
-  failed sidecar writes after a rebuild warn once per library on ``stderr``).
+  waiting up to ``600`` s by default across libraries in the same directory per process
+  (configurable via ``STIMSIDE_BUILD_LOCK_TIMEOUT_S``, accepting non-negative seconds, ``0``, or
+  ``inf``, and falling back with ``RuntimeWarning`` on invalid values). After about ``10`` s of
+  waiting on the lock, one progress notice is printed to ``stderr``. Under the held lock before
+  compiling, stale temp files older than the lock wait limit are removed. Lock timeouts,
+  read-only foreign-CPU loads, and once-per-library failed rebuild fallbacks emit
+  ``RuntimeWarning`` via ``warnings.warn`` (setting once-only guards only after ``warnings.warn``
+  returns so ``-W error`` stays effective); temp library and sidecar files get unique random names
+  inside ``_native`` (mode subject to the umask, as compiler output) and are atomically
+  ``os.replace``d (failed sidecar writes after a rebuild warn once per library on ``stderr``).
 """
 
 from __future__ import annotations
 
 import _ctypes
 from collections.abc import Callable, Sequence
+import contextlib
 import ctypes
 import errno
 import hashlib
@@ -86,8 +93,32 @@ _VALID_BUILD_MODES = frozenset({"portable", "native", "unknown"})
 _SOURCE_CHECKOUT_SUFFIX = Path("src/stimside/_native").parts
 _LOCK_MAX_RETRIES: int = 12000
 _LOCK_RETRY_DELAY_S: float = 0.05
+_LOCK_NOTICE_DELAY_S: float = 10.0
+_LOCK_WAIT_SPENT_S: dict[Path, float] = {}
 _WARNED_FAILED_REBUILDS: set[Path] = set()
 _WARNED_FAILED_BUILD_IDS: set[Path] = set()
+_WARNED_CPU_MISMATCHES: set[Path] = set()
+
+_ISA_FLAGS: frozenset[str] = frozenset({
+    # x86 / x86_64 instruction-set extensions
+    "cmov", "cx8", "cx16", "mmx", "mmxext", "fxsr", "sse", "sse2", "pni",
+    "ssse3", "sse4_1", "sse4_2", "sse4a", "popcnt", "lahf_lm", "abm", "lzcnt",
+    "movbe", "sahf", "avx", "avx2", "fma", "fma4", "f16c", "bmi1", "bmi2",
+    "adx", "aes", "vaes", "pclmulqdq", "vpclmulqdq", "sha_ni", "rdrand",
+    "rdseed", "xop", "tbm", "lwp", "3dnow", "3dnowext", "3dnowprefetch",
+    "prfchw", "gfni", "rdpid", "clflushopt", "clwb", "clzero", "movdiri",
+    "movdir64b", "waitpkg", "serialize", "tsxldtrk", "uintr", "hreset",
+    "kl", "widekl", "apx_f", "sha512", "sm3", "sm4", "cmpccxadd", "raoint",
+    "fred",
+    # ARM64 / AArch64 instruction-set extensions
+    "fp", "pmull", "sha1", "sha2", "sha3", "crc32", "atomics", "fphp",
+    "jscvt", "fcma", "lrcpc", "dcpop", "uscat", "ilrcpc", "flagm", "flagm2",
+    "paca", "pacg", "dcpodp", "frint", "i8mm", "bf16", "rng", "bti", "mte",
+    "ecv", "afp", "rpres", "wfxt", "sme",
+})
+_ISA_FLAG_PREFIXES: tuple[str, ...] = (
+    "avx512", "avx_", "avx10", "amx_", "sve", "sme2", "sme_", "asimd",
+)
 
 
 def _requested_build_mode() -> str | None:
@@ -118,21 +149,26 @@ def _mkstemp_with_umask_mode(so_path: Path, suffix: str, mode: int) -> Path:
     raise FileExistsError(errno.EEXIST, "no unique temporary file name found", str(so_path))
 
 
+def _is_isa_flag(tok: str) -> bool:
+    return tok in _ISA_FLAGS or tok.startswith(_ISA_FLAG_PREFIXES)
+
+
 def _cpu_flags_digest() -> str:
+    """Hash instruction-set flags common to all CPUs in ``/proc/cpuinfo``."""
     try:
         text = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+    common: set[str] | None = None
     for line in text.splitlines():
         key, sep, val = line.partition(":")
-        if not sep:
+        if not sep or key.strip().lower() not in ("flags", "features"):
             continue
-        if key.strip().lower() in ("flags", "features"):
-            tokens = sorted(set(val.split()))
-            if tokens:
-                return hashlib.sha256(" ".join(tokens).encode("utf-8")).hexdigest()[:16]
-            return ""
-    return ""
+        isa_tokens = {tok for raw in val.split() if _is_isa_flag(tok := raw.lower())}
+        common = isa_tokens if common is None else common & isa_tokens
+    if not common:
+        return ""
+    return hashlib.sha256(" ".join(sorted(common)).encode("utf-8")).hexdigest()[:16]
 
 
 def _arch_supports_march_native() -> bool:
@@ -287,6 +323,16 @@ def _is_source_checkout(here: Path) -> bool:
     )
 
 
+def _is_native_cpu_mismatch(
+    rec: tuple[str, str, str | None, str | None] | None,
+) -> bool:
+    return (
+        rec is not None
+        and rec[1] == "native"
+        and (rec[2] != _current_machine() or rec[3] != _cpu_flags_digest())
+    )
+
+
 def _plan_source_build(
     so_path: Path,
     cpp_path: Path,
@@ -314,36 +360,115 @@ def _plan_source_build(
         return True, False, effective_mode, None
     if requested_mode is not None and requested_mode != rec_mode:
         return True, False, requested_mode, None
-    if rec_mode == "native" and (rec[2] != _current_machine() or rec[3] != _cpu_flags_digest()):
+    if _is_native_cpu_mismatch(rec):
         return True, False, effective_mode, None
     return False, False, rec_mode or "portable", None
 
 
-def _lock_max_retries() -> int:
+def _default_lock_timeout_s() -> float:
+    retries = max(0, _LOCK_MAX_RETRIES)
+    delay = _LOCK_RETRY_DELAY_S
+    if retries == 0 or not math.isfinite(delay) or delay <= 0.0:
+        return 0.0
+    return retries * delay
+
+
+def _parse_lock_timeout(stacklevel: int = 2) -> tuple[float, int | None]:
+    """Parse ``STIMSIDE_BUILD_LOCK_TIMEOUT_S`` into ``(timeout_s, max_retries_or_None)``."""
     raw = os.environ.get("STIMSIDE_BUILD_LOCK_TIMEOUT_S", "").strip()
     if not raw:
-        return max(0, _LOCK_MAX_RETRIES)
+        return _default_lock_timeout_s(), max(0, _LOCK_MAX_RETRIES)
     delay = _LOCK_RETRY_DELAY_S
     try:
         timeout_s = float(raw)
-        if not math.isfinite(timeout_s) or timeout_s < 0.0:
-            raise ValueError("must be finite and non-negative")
+        if math.isnan(timeout_s) or timeout_s < 0.0:
+            raise ValueError("must be non-negative")
+        if math.isinf(timeout_s):
+            return math.inf, None
         if timeout_s == 0.0:
-            return 0
+            return 0.0, 0
         if not math.isfinite(delay) or delay <= 0.0:
             raise ValueError("retry delay must be positive")
-        return math.ceil(timeout_s / delay)
+        return timeout_s, math.ceil(timeout_s / delay)
     except (ValueError, OverflowError):
         warnings.warn(
             f"stimside warning: invalid STIMSIDE_BUILD_LOCK_TIMEOUT_S={raw!r}; "
             "using default build lock timeout",
             RuntimeWarning,
-            stacklevel=3,
+            stacklevel=stacklevel,
         )
-        return max(0, _LOCK_MAX_RETRIES)
+        return _default_lock_timeout_s(), max(0, _LOCK_MAX_RETRIES)
 
 
-def _acquire_dir_lock(here: Path) -> int | None:
+def _lock_max_retries() -> int | None:
+    return _parse_lock_timeout(stacklevel=3)[1]
+
+
+def _wait_for_flock(
+    lock_fd: int,
+    here: Path,
+    lock_uid: int,
+    timeout_s: float,
+    max_retries: int | None,
+    fcntl_mod: Any,
+) -> bool:
+    """Poll non-blocking ``flock`` within the shared per-directory process wait budget."""
+    key = here.resolve()
+    already_spent = _LOCK_WAIT_SPENT_S.get(key, 0.0)
+    if math.isinf(timeout_s):
+        remaining_s = math.inf
+        eff_retries: int | None = None
+    else:
+        remaining_s = max(0.0, timeout_s - already_spent)
+        delay = _LOCK_RETRY_DELAY_S
+        if max_retries is None:
+            eff_retries = None
+        elif remaining_s == 0.0:
+            eff_retries = 0
+        elif math.isfinite(delay) and delay > 0.0:
+            eff_retries = min(max_retries, math.ceil(remaining_s / delay))
+        else:
+            eff_retries = max_retries
+    start_mono = time.monotonic()
+    noticed = False
+    attempt = 0
+    while True:
+        try:
+            fcntl_mod.flock(lock_fd, fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
+            if attempt > 0:
+                _LOCK_WAIT_SPENT_S[key] = already_spent + (time.monotonic() - start_mono)
+            return True
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
+            elapsed = time.monotonic() - start_mono
+            timed_out = (eff_retries is not None and attempt >= eff_retries) or (
+                not math.isinf(remaining_s) and attempt > 0 and elapsed >= remaining_s
+            )
+            if timed_out:
+                if attempt > 0 and not math.isinf(timeout_s):
+                    _LOCK_WAIT_SPENT_S[key] = max(already_spent + elapsed, timeout_s)
+                return False
+            if not noticed and elapsed >= _LOCK_NOTICE_DELAY_S:
+                noticed = True
+                # Best effort: stderr may be None, closed, or a broken pipe.
+                with contextlib.suppress(AttributeError, OSError, ValueError):
+                    sys.stderr.write(
+                        f"stimside: waiting for build lock on {here} (owned by uid {lock_uid}); "
+                        "set STIMSIDE_BUILD_LOCK_TIMEOUT_S to shorten the wait\n"
+                    )
+                    sys.stderr.flush()
+            time.sleep(_LOCK_RETRY_DELAY_S)
+            attempt += 1
+
+
+def _acquire_dir_lock(
+    here: Path,
+    *,
+    timeout_s: float | None = None,
+    max_retries: int | None = None,
+    warn_stacklevel: int = 2,
+) -> int | None:
     """Lock ``here`` with bounded non-blocking ``flock``; return fd or None to build lockless.
 
     When the lock is skipped (missing ``fcntl``, foreign owner, unsupported filesystem such as
@@ -361,29 +486,24 @@ def _acquire_dir_lock(here: Path) -> int | None:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         lock_fd = os.open(here, dir_flags)
-        if os.fstat(lock_fd).st_uid != uid:  # Never wait on another user's lock.
+        lock_uid = os.fstat(lock_fd).st_uid
+        if lock_uid != uid:  # Never wait on another user's lock.
             fd, lock_fd = lock_fd, None
             os.close(fd)
             return None
-        max_retries = _lock_max_retries()
-        for attempt in range(max_retries + 1):
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return lock_fd
-            except OSError as exc:
-                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    raise
-                if attempt == max_retries:
-                    warnings.warn(
-                        f"stimside warning: timed out waiting for build lock on {here}; "
-                        "proceeding to build without cross-process lock",
-                        RuntimeWarning,
-                        stacklevel=3,
-                    )
-                    fd, lock_fd = lock_fd, None
-                    os.close(fd)
-                    return None
-                time.sleep(_LOCK_RETRY_DELAY_S)
+        if timeout_s is None:
+            timeout_s, max_retries = _parse_lock_timeout(stacklevel=warn_stacklevel + 1)
+        if _wait_for_flock(lock_fd, here, lock_uid, timeout_s, max_retries, fcntl):
+            return lock_fd
+        warnings.warn(
+            f"stimside warning: timed out waiting for build lock on {here}; "
+            "proceeding to build without cross-process lock",
+            RuntimeWarning,
+            stacklevel=warn_stacklevel,
+        )
+        fd, lock_fd = lock_fd, None
+        os.close(fd)
+        return None
     except (ImportError, OSError):
         if lock_fd is not None:
             fd, lock_fd = lock_fd, None
@@ -400,16 +520,36 @@ def _acquire_dir_lock(here: Path) -> int | None:
             except OSError:
                 pass
         raise
-    return lock_fd
 
 
 def _warn_failed_build_id_once(so_path: Path, exc: Exception) -> None:
     if so_path not in _WARNED_FAILED_BUILD_IDS:
+        with contextlib.suppress(AttributeError, OSError, ValueError):  # best effort, as above
+            sys.stderr.write(
+                f"stimside warning: failed to write build record for {so_path.name} ({exc}); "
+                f"using newly built library {so_path}\n"
+            )
         _WARNED_FAILED_BUILD_IDS.add(so_path)
-        sys.stderr.write(
-            f"stimside warning: failed to write build record for {so_path.name} ({exc}); "
-            f"using newly built library {so_path}\n"
-        )
+
+
+def _cleanup_stale_temp_files(so_path: Path, max_age_s: float) -> None:
+    """Remove leftover regular temp files for ``so_path`` older than the lock wait limit."""
+    age_limit = (
+        max_age_s
+        if math.isfinite(max_age_s) and max_age_s > 0.0
+        else _default_lock_timeout_s()
+    )
+    if age_limit <= 0.0:
+        return
+    cutoff = time.time() - age_limit
+    for pat in (f".{so_path.stem}.*.tmp.so", f".{so_path.stem}.*.tmp.build_id"):
+        for tmp in so_path.parent.glob(pat):
+            try:
+                st = tmp.lstat()
+                if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                    tmp.unlink(missing_ok=True)
+            except OSError:
+                continue
 
 
 def _compile_so_variants(
@@ -458,13 +598,24 @@ def _compile_so_variants(
 
 def _warn_failed_rebuild_once(so_path: Path, exc: Exception) -> None:
     if so_path not in _WARNED_FAILED_REBUILDS:
-        _WARNED_FAILED_REBUILDS.add(so_path)
         warnings.warn(
             f"stimside warning: failed to rebuild {so_path.name} ({exc}); "
             f"using existing library {so_path}",
             RuntimeWarning,
             stacklevel=3,
         )
+        _WARNED_FAILED_REBUILDS.add(so_path)
+
+
+def _warn_readonly_cpu_mismatch_once(so_path: Path) -> None:
+    if so_path not in _WARNED_CPU_MISMATCHES:
+        warnings.warn(
+            f"stimside warning: {so_path.name} in read-only directory {so_path.parent} "
+            "was built for a different CPU; loading existing library without rebuilding",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        _WARNED_CPU_MISMATCHES.add(so_path)
 
 
 def resolve_so(
@@ -478,24 +629,34 @@ def resolve_so(
     so_path = here / f"lib{name}.so"
     in_source_tree = _is_source_checkout(here)
     requested_mode = _requested_build_mode()
-    needs_build, needs_adopt, _, _ = _plan_source_build(
+    needs_build, needs_adopt, _, src_hash = _plan_source_build(
         so_path, cpp_path, in_source_tree, requested_mode, force_recompile
     )
-    if not needs_build and not needs_adopt:
+    if not needs_build:
+        if needs_adopt and src_hash is not None:
+            _adopt_build_record(so_path, src_hash)
+        elif (
+            in_source_tree
+            and not os.access(here, os.W_OK)
+            and _is_native_cpu_mismatch(_read_build_record(so_path))
+        ):
+            _warn_readonly_cpu_mismatch_once(so_path)
         return so_path
-    if needs_build:
-        if not cpp_path.exists():
-            raise FileNotFoundError(
-                f"Compiled shared library '{so_path.name}' not found in {here} "
-                f"and source '{cpp_path.name}' is missing. "
-                f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
-            )
-        if not os.access(here, os.W_OK):
-            raise PermissionError(
-                f"Cannot compile '{so_path.name}' into read-only directory {here}. "
-                f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
-            )
-    lock_fd = _acquire_dir_lock(here)
+    if not cpp_path.exists():
+        raise FileNotFoundError(
+            f"Compiled shared library '{so_path.name}' not found in {here} "
+            f"and source '{cpp_path.name}' is missing. "
+            f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
+        )
+    if not os.access(here, os.W_OK):
+        raise PermissionError(
+            f"Cannot compile '{so_path.name}' into read-only directory {here}. "
+            f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
+        )
+    timeout_s, max_retries = _parse_lock_timeout(stacklevel=3)
+    lock_fd = _acquire_dir_lock(
+        here, timeout_s=timeout_s, max_retries=max_retries, warn_stacklevel=3
+    )
     last_exc: Exception | None = None
     primary_cmd: list[str] = []
     try:
@@ -517,6 +678,8 @@ def resolve_so(
                 f"Cannot compile '{so_path.name}' into read-only directory {here}. "
                 f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
             )
+        if lock_fd is not None:
+            _cleanup_stale_temp_files(so_path, timeout_s)
         last_exc, primary_cmd = _compile_so_variants(
             cpp_path, so_path, in_source_tree, effective_mode
         )

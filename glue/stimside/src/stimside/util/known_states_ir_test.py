@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -53,10 +52,10 @@ def test_known_states_ir_and_unrolled_ops_parity() -> None:
         known_states.compute_known_states_uint8(circ, unrolled_ops=uops, ir=ir_uc_false)
 
 
-def test_known_states_single_ir_and_no_lazy_alignment(
+def test_known_states_builds_at_most_one_ir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """compute_known_states_uint8 builds at most one IR and never forces lazy flat alignment."""
+    """compute_known_states_uint8 builds at most one IR per call."""
     circ = stim.Circuit("R 0\nREPEAT 3 {\n  H 0\n}\nM 0\n")
     build_calls = 0
     orig_build = circuit_ir.build_ir
@@ -66,13 +65,7 @@ def test_known_states_single_ir_and_no_lazy_alignment(
         build_calls += 1
         return orig_build(*args, **kwargs)
 
-    def boom_align(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("known_states must not trigger lazy flat alignment")
-
     monkeypatch.setattr(known_states, "build_ir", spy_build)
-    monkeypatch.setattr(circuit_ir, "_align_flat_ops", boom_align)
-    monkeypatch.setattr(circuit_ir._FlatAlignment, "get_where", boom_align)
-    monkeypatch.setattr(circuit_ir._FlatAlignment, "get_flat_ops", boom_align)
 
     want = known_states.compute_known_states_uint8(circ)
     assert build_calls == 1
@@ -134,45 +127,20 @@ def test_known_states_backprop_conflict_and_duplicate_bwd_unitary() -> None:
         known_states.compute_known_states_uint8(stim.Circuit("R 0\nM 0\n"), unrolled_ops=bad_ops)
 
 
-def test_known_states_noisy_measure_reset_and_arity_cache(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Noisy MR* strips args in reference measurements and arity cache respects monkeypatching."""
+def test_known_states_noisy_measure_reset_and_unitary_arity() -> None:
+    """Noisy MR* strips args in reference measurements and arity separates 1q from multi-qubit."""
     assert known_states.compute_known_measurements(stim.Circuit("R 0\nMR(0.1) 0\n")) == [False]
-    real_gate_data = stim.gate_data
-    known_states._IS_1Q_GATE_CACHE.clear()
-    h_circ = stim.Circuit("R 0\nH 0\n")
-    assert known_states.compute_known_states_uint8(h_circ).tolist() == [[5], [5], [1]]
-    assert known_states._IS_1Q_GATE_CACHE["H"] is True
-
-    assert known_states._is_single_qubit_gate("H") is True
-    assert known_states._is_single_qubit_gate("H") is True
-    assert known_states._is_single_qubit_gate("CX") is False
-    assert known_states._is_single_qubit_gate("CX") is False
-    assert known_states._IS_1Q_GATE_CACHE["H"] is True
-    assert known_states._IS_1Q_GATE_CACHE["CX"] is False
-
-    def fake_gate_data(name: str) -> Any:
-        gd = real_gate_data(name)
-        return SimpleNamespace(
-            name=gd.name,
-            produces_measurements=gd.produces_measurements,
-            is_reset=gd.is_reset,
-            is_unitary=gd.is_unitary,
-            is_noisy_gate=gd.is_noisy_gate,
-            is_single_qubit_gate=False if gd.name == "H" else gd.is_single_qubit_gate,
-            is_two_qubit_gate=gd.is_two_qubit_gate,
-        )
-
-    with monkeypatch.context() as ctx:
-        ctx.setattr(stim, "gate_data", fake_gate_data)
-        assert known_states.compute_known_states_uint8(h_circ).tolist() == [[5], [5], [0]]
-    assert known_states.compute_known_states_uint8(h_circ).tolist() == [[5], [5], [1]]
-
-    monkeypatch.setattr(stim, "gate_data", lambda _n: SimpleNamespace(is_single_qubit_gate=False))
-    assert known_states._is_single_qubit_gate("H") is False
-    monkeypatch.setattr(stim, "gate_data", lambda _n: SimpleNamespace(is_single_qubit_gate=True))
-    assert known_states._is_single_qubit_gate("CX") is True
+    assert known_states.compute_known_states_uint8(stim.Circuit("R 0\nH 0\n")).tolist() == [
+        [5],
+        [5],
+        [1],
+    ]
+    assert known_states.compute_known_states_uint8(
+        stim.Circuit("R 0 1\nCX 0 1\n")
+    ).tolist() == [[5, 5], [5, 5], [0, 0]]
+    assert known_states.compute_known_states_uint8(
+        stim.Circuit("R 0\nSPP X0\n")
+    ).tolist() == [[5], [5], [0]]
 
 
 def test_without_noise_preserving_heralds_and_states() -> None:

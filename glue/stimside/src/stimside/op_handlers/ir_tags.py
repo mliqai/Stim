@@ -1,4 +1,4 @@
-"""Per-consumer lazy tag-parse memo for WP-27.
+"""Per-consumer lazy tag-parse memo.
 
 Consumers parse instruction tags under distinct caching policies:
 - The DEM builder parses each ``(op.name, op.tag)`` once (first parse wins) and

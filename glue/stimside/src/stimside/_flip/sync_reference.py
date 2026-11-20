@@ -12,8 +12,6 @@ from stimside.util.circuit_ir import Category, CircuitIR, IRInstr, build_ir
 from stimside.util.stim_workarounds import split_fused_instruction
 
 _SKIP_CATS = frozenset({Category.ANNOTATION, Category.NOISE, Category.OTHER})
-_PRODUCT_MEAS = ("MXX", "MYY", "MZZ", "MPP")
-_CONTROLLED_PAULI = ("CX", "CY", "CZ", "XCZ", "YCZ")
 
 
 def _record_op_ref_z(
@@ -72,7 +70,7 @@ def _step_product_meas(
     ref_ts: stim.TableauSimulator,
     num_qubits: int,
     op: stim.CircuitInstruction,
-    name: str,
+    basis: str | None,
     ref_bits: list[bool],
 ) -> None:
     for term in op.target_groups():
@@ -82,7 +80,7 @@ def _step_product_meas(
             q_r = gt.qubit_value
             assert q_r is not None
             inv_res ^= bool(gt.is_inverted_result_target)
-            p_str = gt.pauli_type if name == "MPP" else name[-1]
+            p_str = gt.pauli_type if basis is None else basis
             term_paulis.append((q_r, p_str))
         if len({q_r for q_r, _ in term_paulis}) < len(term_paulis):
             ps = stim.PauliString(num_qubits)
@@ -175,7 +173,6 @@ def compute_sync_reference(
     # targets; reset-only qubits are not (only shots that reset them collapse), so superposed
     # ones get None.
     op_z_targets = getattr(compiled_op_handler, "op_z_collapse_targets", None)
-    fb_cache: dict[stim.CircuitInstruction, bool] = {}
 
     for instr in ir.instrs:
         op = instr.op
@@ -191,10 +188,11 @@ def compute_sync_reference(
             _step_mpad(ref_ts, instr, mpad_z_targets, mpad_ref_z, ref_bits)
         elif cat is Category.HERALD:
             ref_bits.extend([False] * instr.num_measurements)
-        elif name in _PRODUCT_MEAS:
-            _step_product_meas(ref_ts, num_qubits, op, name, ref_bits)
+        elif instr.is_product_measurement:
+            _step_product_meas(ref_ts, num_qubits, op, instr.basis, ref_bits)
         elif cat in (Category.MEASURE, Category.MEASURE_RESET, Category.RESET):
-            is_x, is_y = "X" in name, "Y" in name
+            basis = instr.basis
+            is_x, is_y = basis == "X", basis == "Y"
             is_rst = cat is not Category.MEASURE
             is_meas = cat is not Category.RESET
             for gt in op.targets_copy():
@@ -214,16 +212,9 @@ def compute_sync_reference(
                 if is_meas:
                     ref_bits.append(bool(m_val) ^ bool(gt.is_inverted_result_target))
         elif cat is Category.UNITARY and name not in ("I", "II"):
-            if name in _CONTROLLED_PAULI:
-                fb = fb_cache.get(op)
-                if fb is None:
-                    op_s = str(op)
-                    fb = "rec[" in op_s or "sweep[" in op_s
-                    if len(fb_cache) < 4096:
-                        fb_cache[op] = fb
-                if fb:
-                    _step_controlled_pauli(ref_ts, op, name, ref_bits)
-                    continue
+            if instr.has_classical_control:
+                _step_controlled_pauli(ref_ts, op, name, ref_bits)
+                continue
             ref_ts.do(op)
     ref_sample = np.asarray(ref_bits, dtype=np.bool_)
     return ref_sample, mpad_ref_z, op_ref_z_map

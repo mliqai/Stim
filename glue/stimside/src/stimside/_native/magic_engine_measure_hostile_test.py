@@ -18,7 +18,6 @@ from __future__ import annotations
 import ctypes
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -532,8 +531,8 @@ def fi_so(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 _skip_sanitized = pytest.mark.skipif(
-    _under_tsan() or shutil.which("c++") is None,
-    reason="needs a C++ compiler and no TSan runtime (TSan owns operator new)",
+    _under_tsan(),
+    reason="TSan owns operator new",
 )
 
 

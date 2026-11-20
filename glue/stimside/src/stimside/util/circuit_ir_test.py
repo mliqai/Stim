@@ -10,12 +10,15 @@ direct R-f field/pass coverage for ``util/circuit_ir.py`` and
 from __future__ import annotations
 
 import ast
+import copy
 import dataclasses
 import inspect
 import itertools
+import operator
+import sys
 import time
 import types
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -1447,18 +1450,39 @@ def test_i19_build_ir_linear_complexity() -> None:
 # ---- Direct R-f field, error-path, and export coverage -----------------------
 
 
-def test_rf_build_ir_flattened_too_few_ops_raises(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Direct error-branch test for alignment when flat_ops runs out (also kills G151)."""
-    circ = stim.Circuit("H 0\n")
+def _bad_flat_circuit(
+    unrolled_ops: Sequence[stim.CircuitInstruction],
+    flat_source: stim.Circuit,
+) -> stim.Circuit:
+    """Build a stim.Circuit that unrolls to ``unrolled_ops`` with spoofed ``flattened()``."""
+
+    class _SpoofedFlatCircuit(stim.Circuit):
+        def copy(self) -> stim.Circuit:
+            return self
+
+        def flattened(self) -> stim.Circuit:
+            return flat_source.flattened()
+
+    circ = _SpoofedFlatCircuit()
+    for op in unrolled_ops:
+        sub = stim.Circuit()
+        sub.append(op)
+        circ.append(stim.CircuitRepeatBlock(1, sub))
+    return circ
+
+
+def test_rf_build_ir_flattened_too_few_ops_raises() -> None:
+    """Direct error-branch test for alignment when flat_ops runs out."""
+    flat_src = stim.Circuit("H 0\n")
     for extra_ops in (
         [stim.Circuit("H 0")[0], stim.Circuit("X 0")[0]],
         [stim.Circuit("H 0")[0], stim.Circuit("H 1")[0]],
     ):
-        monkeypatch.setattr(circuit_ir, "unroll_circuit", lambda _c, e=extra_ops: list(e))
+        bad = _bad_flat_circuit(extra_ops, flat_src)
+        ir = circuit_ir.build_ir(bad)
+        assert [i.op for i in ir.instrs] == extra_ops
         try:
-            circuit_ir.unrolled_to_flat(circuit_ir.build_ir(circ))
+            circuit_ir.unrolled_to_flat(ir)
         except ValueError as exc:
             assert "too few for the unrolled circuit" in str(exc)
         except IndexError as exc:
@@ -1543,6 +1567,10 @@ def test_rf_direct_fields_enums_and_empty_circuit() -> None:
         "untagged_filter",
         "num_measurements",
         "first_measurement",
+        "basis",
+        "is_product_measurement",
+        "arity",
+        "has_classical_control",
         "_flat",
     )
     assert tuple(f.name for f in dataclasses.fields(circuit_ir.CircuitIR)) == (
@@ -1855,7 +1883,7 @@ def test_zero_target_fusion_all_80_gates() -> None:
     ]
 
 
-def test_build_ir_alignment_validation_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_ir_alignment_validation_errors() -> None:
     """Verify loud ValueError on every alignment mismatch, overshoot, and extra flat_op."""
     inst = stim.CircuitInstruction
     cases: tuple[tuple[str, str, list[stim.CircuitInstruction]], ...] = (
@@ -1920,10 +1948,11 @@ def test_build_ir_alignment_validation_errors(monkeypatch: pytest.MonkeyPatch) -
         ("empty_flat_nonempty_ops", "", [inst("H", [])]),
     )
     for label, text, fake_unrolled in cases:
-        circ = stim.Circuit(text)
-        monkeypatch.setattr(circuit_ir, "unroll_circuit", lambda _c, u=fake_unrolled: list(u))
+        bad = _bad_flat_circuit(fake_unrolled, stim.Circuit(text))
+        ir = circuit_ir.build_ir(bad)
+        assert [i.op for i in ir.instrs] == fake_unrolled, label
         with pytest.raises(ValueError):
-            circuit_ir.unrolled_to_flat(circuit_ir.build_ir(circ))
+            circuit_ir.unrolled_to_flat(ir)
 
     # Mocked unfused duplicate flat_ops ([H 0, H]) vs [H 0, H]: trailing check catches it.
     h0 = inst("H", [0])
@@ -1969,7 +1998,7 @@ def test_known_measurements_herald_inversion_kills_ks22() -> None:
 
 
 def test_lazy_alignment_snapshot_and_cross_circuit_equality() -> None:
-    """Mutating source post-build and comparing equal ops with distinct flat coords."""
+    """Mutating source post-build and identity equality/hashing across circuits."""
     c_mut = stim.Circuit("H 0\nM 0\n")
     ir_mut = circuit_ir.build_ir(c_mut, uc=True)
     c_mut.append("X", [0])
@@ -1981,14 +2010,20 @@ def test_lazy_alignment_snapshot_and_cross_circuit_equality() -> None:
     ir1a = circuit_ir.build_ir(c1, uc=True)
     ir1b = circuit_ir.build_ir(c1, uc=True)
     ir2 = circuit_ir.build_ir(c2, uc=True)
-    assert ir1a == ir1b
-    assert hash(ir1a) == hash(ir1b)
-    assert ir1a.instrs[2] == ir1b.instrs[2]
-    assert hash(ir1a.instrs[2]) == hash(ir1b.instrs[2])
-    assert ir1a.instrs[2].flat_index == 0 and ir1a.instrs[2].flat_offset == 1
-    assert ir2.instrs[2].flat_index == 1 and ir2.instrs[2].flat_offset == 0
-    assert ir1a.instrs[2] != ir2.instrs[2]
+    # CircuitIR and IRInstr use identity equality and hashing without forcing alignment.
+    ir1a_ref = ir1a
+    instr2_ref = ir1a.instrs[2]
+    assert ir1a == ir1a_ref
+    assert ir1a != ir1b
     assert ir1a != ir2
+    assert ir1a.instrs[2] == instr2_ref
+    assert ir1a.instrs[2] != ir1b.instrs[2]
+    assert ir1a.instrs[2] != ir2.instrs[2]
+    assert {ir1a: "a", ir1b: "b"}[ir1a] == "a"
+    assert {ir1a.instrs[2]: "a", ir1b.instrs[2]: "b"}[ir1b.instrs[2]] == "b"
+    assert ir1a.instrs[2].flat_index == 0 and ir1a.instrs[2].flat_offset == 1
+    assert ir1b.instrs[2].flat_index == 0 and ir1b.instrs[2].flat_offset == 1
+    assert ir2.instrs[2].flat_index == 1 and ir2.instrs[2].flat_offset == 0
 
     # Direct construction without _flat defaults to -1/0/() and remains frozen/hashable.
     direct = circuit_ir.IRInstr(
@@ -2076,10 +2111,55 @@ def test_rf_oplist_uc_generator_and_aliasing() -> None:
         circuit_ir.UntaggedFilter.PAULI_TERMS,
         circuit_ir.UntaggedFilter.NONE,
     ]
-    # Single-pass generator input (kills F04 skipping list(src)).
+    # Single-pass generator input must produce structurally identical IR fields.
     gen_src: Any = (op for op in ops)
     ir_gen = circuit_ir.build_ir(gen_src, uc=True)
-    assert ir_gen == ir_uc
+    assert (
+        ir_gen.num_qubits,
+        ir_gen.num_measurements,
+        ir_gen.has_repeat,
+        ir_gen.uc,
+        ir_gen.from_op_list,
+        ir_gen.flat_ops,
+    ) == (
+        ir_uc.num_qubits,
+        ir_uc.num_measurements,
+        ir_uc.has_repeat,
+        ir_uc.uc,
+        ir_uc.from_op_list,
+        ir_uc.flat_ops,
+    )
+    assert len(ir_gen.instrs) == len(ir_uc.instrs)
+    for g_ins, u_ins in zip(ir_gen.instrs, ir_uc.instrs, strict=True):
+        assert (
+            g_ins.unrolled_index,
+            g_ins.op,
+            g_ins.tag,
+            g_ins.category,
+            g_ins.untagged_filter,
+            g_ins.num_measurements,
+            g_ins.first_measurement,
+            g_ins.basis,
+            g_ins.is_product_measurement,
+            g_ins.arity,
+            g_ins.has_classical_control,
+            g_ins.flat_index,
+            g_ins.flat_offset,
+        ) == (
+            u_ins.unrolled_index,
+            u_ins.op,
+            u_ins.tag,
+            u_ins.category,
+            u_ins.untagged_filter,
+            u_ins.num_measurements,
+            u_ins.first_measurement,
+            u_ins.basis,
+            u_ins.is_product_measurement,
+            u_ins.arity,
+            u_ins.has_classical_control,
+            u_ins.flat_index,
+            u_ins.flat_offset,
+        )
     # Mutating caller's list after build_ir must not alter the built IR.
     ops.clear()
     assert len(ir_uc.instrs) == 5
@@ -2157,3 +2237,462 @@ def test_rf_tag_memo_falsy_values_and_value_key_targets() -> None:
     assert memo_v.params(op_x1) == "X 1"
     assert memo_v.params(op_x0) == "X 0"
     assert vk_calls == ["X 0", "X 1"]
+
+
+def test_shared_fields_all_93_stim_spellings() -> None:
+    """Verify basis, is_product_measurement, arity, and classical control on all 93 spellings."""
+    expected_x = frozenset({"MX", "MRX", "RX", "MXX"})
+    expected_y = frozenset({"MY", "MRY", "RY", "MYY"})
+    expected_z = frozenset({"M", "MZ", "MR", "MRZ", "R", "RZ", "MZZ"})
+    expected_pm = frozenset({"MPP", "MXX", "MYY", "MZZ"})
+    expected_cc_gates = frozenset({"CX", "CNOT", "ZCX", "CY", "ZCY", "CZ", "ZCZ", "XCZ", "YCZ"})
+
+    all_spellings: list[tuple[str, Any]] = []
+    for _canon, gd in sorted(stim.gate_data().items()):
+        for alias in sorted(gd.aliases):
+            all_spellings.append((alias, gd))
+    assert len(all_spellings) == 93
+
+    basis_counts: dict[str | None, int] = {"X": 0, "Y": 0, "Z": 0, None: 0}
+    pm_true = 0
+    arity_counts: dict[int | None, int] = {1: 0, 2: 0, None: 0}
+    cc_gates_seen: set[str] = set()
+
+    for spelling, gd in all_spellings:
+        exp_basis = (
+            "X"
+            if spelling in expected_x
+            else "Y"
+            if spelling in expected_y
+            else "Z"
+            if spelling in expected_z
+            else None
+        )
+        exp_pm = spelling in expected_pm
+        exp_arity = (
+            1
+            if (gd.is_unitary and gd.is_single_qubit_gate)
+            else 2
+            if (gd.is_unitary and gd.is_two_qubit_gate)
+            else None
+        )
+        for variant in (spelling, spelling.lower(), spelling.title()):
+            assert circuit_ir.classify_basis(variant) == exp_basis, variant
+            assert circuit_ir.classify_is_product_measurement(variant) is exp_pm, variant
+            assert circuit_ir.classify_arity(variant) == exp_arity, variant
+
+        basis_counts[exp_basis] += 1
+        if exp_pm:
+            pm_true += 1
+        arity_counts[exp_arity] += 1
+
+        if gd.is_two_qubit_gate and gd.takes_measurement_record_targets:
+            cc_gates_seen.add(spelling)
+            assert not circuit_ir.op_has_classical_control(
+                stim.CircuitInstruction(spelling, [0, 1])
+            )
+            assert not circuit_ir.op_has_classical_control(
+                stim.CircuitInstruction(spelling, [0, 1], tag="rec[0]")
+            )
+            if spelling in ("XCZ", "YCZ"):
+                rec_op = stim.CircuitInstruction(spelling, [0, stim.target_rec(-1)])
+                swp_op = stim.CircuitInstruction(spelling, [0, stim.target_sweep_bit(0)])
+            else:
+                rec_op = stim.CircuitInstruction(spelling, [stim.target_rec(-1), 1])
+                swp_op = stim.CircuitInstruction(spelling, [stim.target_sweep_bit(0), 1])
+            assert circuit_ir.op_has_classical_control(rec_op), spelling
+            assert circuit_ir.op_has_classical_control(swp_op), spelling
+
+    assert basis_counts == {"X": 4, "Y": 4, "Z": 7, None: 78}
+    assert pm_true == 4
+    assert arity_counts == {1: 27, 2: 27, None: 39}
+    assert cc_gates_seen == expected_cc_gates
+    assert circuit_ir.classify_arity("SPP") is None
+    assert circuit_ir.classify_arity("SPP_DAG") is None
+
+    for fn in (
+        circuit_ir.classify_basis,
+        circuit_ir.classify_is_product_measurement,
+        circuit_ir.classify_arity,
+    ):
+        with pytest.raises(IndexError):
+            fn("NOT_A_REAL_STIM_GATE")
+
+
+def test_shared_fields_build_ir_circuit_repeat_and_oplist_parity() -> None:
+    """Verify all 4 shared fields match across circuit, REPEAT, and op-list IR builds."""
+    circ = stim.Circuit(
+        "R 0 1\nRX 0\nRY 1\nH 0\nCX 0 1\nCX[rec[0\\C] 0 1\nSPP X0*Z1\n"
+        "DEPOLARIZE2(0.01) 0 1\nSWAP 0 1\nM 0\nMX 0\nMY 1\nMR 0\nMRX 0\nMRY 1\n"
+        "MXX 0 1\nMYY 0 1\nMZZ 0 1\nMPP X0*Z1\nMPAD 0\nHERALDED_ERASE(0.01) 0\n"
+        "DETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]\n"
+        "REPEAT 2 {\n"
+        "  CX rec[-1] 1\n"
+        "  CY sweep[0] 1\n"
+        "  XCZ 0 rec[-1]\n"
+        "  YCZ 0 sweep[0]\n"
+        "  CZ rec[-1] 1\n"
+        "  CX[sweep[0\\C] 0 1\n"
+        "}\n"
+    )
+    ir_c = circuit_ir.build_ir(circ, uc=True)
+    ir_l = circuit_ir.build_ir([i.op for i in ir_c.instrs], uc=True)
+    assert len(ir_c.instrs) == len(ir_l.instrs)
+    for ic, il in zip(ir_c.instrs, ir_l.instrs, strict=True):
+        name = ic.op.name
+        assert ic.basis == il.basis == circuit_ir.classify_basis(name), name
+        assert (
+            ic.is_product_measurement
+            == il.is_product_measurement
+            == circuit_ir.classify_is_product_measurement(name)
+        ), name
+        assert ic.arity == il.arity == circuit_ir.classify_arity(name), name
+        assert (
+            ic.has_classical_control
+            == il.has_classical_control
+            == circuit_ir.op_has_classical_control(ic.op)
+        ), str(ic.op)
+
+    tagged_cx = [i for i in ir_c.instrs if i.op.name == "CX" and i.tag in ("rec[0]", "sweep[0]")]
+    assert len(tagged_cx) == 3
+    assert all(not i.has_classical_control for i in tagged_cx)
+    for ins in ir_c.instrs:
+        if ins.op.name in ("DETECTOR", "OBSERVABLE_INCLUDE", "SWAP", "DEPOLARIZE2"):
+            assert ins.has_classical_control is False, ins.op.name
+
+
+def test_shared_fields_immutability_replace_and_deferred_alignment() -> None:
+    """Verify FrozenInstanceError on new fields, dataclasses.replace, and lazy _FlatAlignment."""
+    circ = stim.Circuit("R 0\nREPEAT 2 {\n  H 0\n}\nM 0\n")
+    ir_c = circuit_ir.build_ir(circ, uc=True)
+    # Alignment helper must not be instantiated eagerly during build_ir.
+    assert ir_c._flat is not None and ir_c._flat[1] is None
+
+    sample = ir_c.instrs[0]
+    for attr_name, val in (
+        ("basis", "X"),
+        ("is_product_measurement", True),
+        ("arity", 1),
+        ("has_classical_control", True),
+    ):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(sample, attr_name, val)
+    replaced = dataclasses.replace(sample, category=circuit_ir.Category.OTHER, basis="X")
+    assert replaced.category is circuit_ir.Category.OTHER and replaced.basis == "X"
+
+    # First flat_ops access creates _FlatAlignment; alignment releases circuit snapshot.
+    assert len(ir_c.flat_ops) > 0
+    assert ir_c._flat[1] is not None and ir_c._flat[0] is None
+    assert len(circuit_ir.unrolled_to_flat(ir_c)) == len(ir_c.instrs)
+    assert ir_c._flat[1]._circuit is None
+
+
+def test_u2f_zero_target_fusion_all_conditions() -> None:
+    """Compare unrolled_to_flattened_indices and IR unrolled_to_flat on zero-target fusion."""
+    witnesses: tuple[tuple[str, str, list[int]], ...] = (
+        ("same_gate_fuses", "H 0\nSHIFT_COORDS(1)\nH\n", [0, -1, 0]),
+        ("diff_tag_no_fuse", "H[a] 0\nSHIFT_COORDS(1)\nH[b]\n", [0, -1, 1]),
+        (
+            "diff_args_no_fuse",
+            "X_ERROR(0.1) 0\nSHIFT_COORDS(1)\nX_ERROR(0.2)\n",
+            [0, -1, 1],
+        ),
+        ("diff_name_no_fuse", "H 0\nSHIFT_COORDS(1)\nX\n", [0, -1, 1]),
+        ("nonfusing_tick", "TICK\nSHIFT_COORDS(1)\nTICK\n", [0, -1, 1]),
+        ("nonfusing_detector", "DETECTOR\nSHIFT_COORDS(1)\nDETECTOR\n", [0, -1, 1]),
+        (
+            "nonfusing_obs",
+            "OBSERVABLE_INCLUDE(0)\nSHIFT_COORDS(1)\nOBSERVABLE_INCLUDE(0)\n",
+            [0, -1, 1],
+        ),
+        (
+            "nonfusing_qcoords",
+            "QUBIT_COORDS(0)\nSHIFT_COORDS(1)\nQUBIT_COORDS(0)\n",
+            [0, -1, 1],
+        ),
+        ("nonfusing_e", "E(0.1)\nSHIFT_COORDS(1)\nE(0.1)\n", [0, -1, 1]),
+        (
+            "nonfusing_else_e",
+            (
+                "E(0.1) X0\nELSE_CORRELATED_ERROR(0.1)\nSHIFT_COORDS(1)\n"
+                "ELSE_CORRELATED_ERROR(0.1)\n"
+            ),
+            [0, 1, -1, 2],
+        ),
+    )
+    for label, text, expected in witnesses:
+        circ = stim.Circuit(text)
+        ir_u2f = circuit_ir.unrolled_to_flat(circuit_ir.build_ir(circ))
+        legacy_val = unrolled_to_flattened_indices(circ, validate=True).tolist()
+        legacy_noval = unrolled_to_flattened_indices(circ, validate=False).tolist()
+        assert ir_u2f == expected, label
+        assert legacy_val == expected, label
+        assert legacy_noval == expected, label
+
+
+def test_ir_instr_copy_deepcopy_equality_ordering_and_repr() -> None:
+    """Pin copy, deepcopy with Stim memo, simulator copy, tuple eq, ordering, and repr tag."""
+    from stimside.op_handlers.abstract_op_handler import CompiledOpHandler
+    from stimside.simulator_magic import MagicsideSimulator, _stim_deepcopy_memo
+
+    circ = stim.Circuit("H[my_tag] 0\nCX rec[-1] 1\nM 0 1\n")
+    ir1 = circuit_ir.build_ir(circ, uc=True)
+    ir2 = circuit_ir.build_ir(circ, uc=True)
+    ins1, ins2 = ir1.instrs[0], ir2.instrs[0]
+
+    assert copy.copy(ins1) is ins1
+    ins_dc = copy.deepcopy(ins1, _stim_deepcopy_memo(ins1))
+    assert isinstance(ins_dc, circuit_ir.IRInstr)
+    assert ins_dc.op == ins1.op and ins_dc.tag == ins1.tag and ins_dc.arity == ins1.arity
+
+    # Deepcopy CircuitIR both before and after lazy alignment; _flat stays shared inside copy.
+    for src_ir in (ir1, ir2):
+        if src_ir is ir2:
+            assert len(src_ir.flat_ops) > 0 and src_ir.instrs[0].flat_index == 0
+        ir_dc = copy.deepcopy(src_ir, _stim_deepcopy_memo(src_ir))
+        assert isinstance(ir_dc, circuit_ir.CircuitIR) and ir_dc is not src_ir
+        assert ir_dc._flat is not None and ir_dc._flat is not src_ir._flat
+        assert ir_dc._flat is ir_dc.instrs[0]._flat
+        assert ir_dc.flat_ops == src_ir.flat_ops
+        assert circuit_ir.unrolled_to_flat(ir_dc) == circuit_ir.unrolled_to_flat(src_ir)
+
+    class _IRHoldingHandler(CompiledOpHandler[Any]):
+        def __init__(self, held_ir: circuit_ir.CircuitIR) -> None:
+            self.ir = held_ir
+
+        def handle_op(self, op: stim.CircuitInstruction, sss: Any) -> None:
+            sss._do_bare_instruction(op)
+
+        def clear(self) -> None:
+            return
+
+    simple_circ = stim.Circuit("R 0\nH 0\nM 0\n")
+    sim = MagicsideSimulator(
+        circuit=simple_circ,
+        compiled_op_handler=_IRHoldingHandler(circuit_ir.build_ir(simple_circ, uc=True)),
+    )
+    sim_copy = copy.copy(sim)
+    copied_ir = sim_copy.compiled_op_handler.ir
+    assert isinstance(copied_ir, circuit_ir.CircuitIR)
+    assert copied_ir is not sim.compiled_op_handler.ir
+    assert copied_ir._flat is copied_ir.instrs[0]._flat
+
+    # Identity equality without tuple-reflection leaks.
+    raw = tuple(ins1)
+    same = ins1
+    assert (ins1 == same) is True and (ins1 != same) is False
+    assert (ins1 == ins2) is False and (ins1 != ins2) is True
+    assert (ins1 == raw) is False and (raw == ins1) is False
+    assert (ins1 != raw) is True and (raw != ins1) is True
+
+    # Rich ordering is blocked both between IRInstrs and against plain tuples.
+    for op_fn in (operator.lt, operator.le, operator.gt, operator.ge):
+        for lhs, rhs in ((ins1, ins2), (ins1, raw), (raw, ins1)):
+            with pytest.raises(TypeError):
+                op_fn(lhs, rhs)
+
+    custom = dataclasses.replace(ins1, tag="DIFFERENT_TAG")
+    assert "tag='DIFFERENT_TAG'" in repr(custom)
+
+
+def _make_sized_flat_circuit(target_len: int) -> stim.Circuit:
+    """Build a flat stim.Circuit with exact top-level length ``target_len``."""
+    head = [
+        stim.CircuitInstruction("R", [0, 1, 2]),
+        stim.CircuitInstruction("H", [0], [], tag="my_tag"),
+        stim.CircuitInstruction("CX", [0, 1]),
+        stim.CircuitInstruction("M", [0, 1]),
+        stim.CircuitInstruction("MXX", [0, 1]),
+        stim.CircuitInstruction(
+            "MPP", [stim.target_x(0), stim.target_combiner(), stim.target_z(1)]
+        ),
+        stim.CircuitInstruction("CX", [stim.target_rec(-1), 2]),
+        stim.CircuitInstruction("MRY", [1, 2]),
+        stim.CircuitInstruction("CZ", [2, stim.target_sweep_bit(0)]),
+        stim.CircuitInstruction("MPAD", [0, 1]),
+    ]
+    c = stim.Circuit()
+    for i in range(min(target_len, len(head))):
+        c.append(head[i])
+    alt = (
+        stim.CircuitInstruction("H", [0]),
+        stim.CircuitInstruction("X", [1]),
+        stim.CircuitInstruction("TICK", []),
+    )
+    for i in range(len(head), target_len):
+        c.append(alt[i % 3])
+    assert len(c) == target_len
+    return c
+
+
+def _assert_ir_fields_parity(circ: stim.Circuit, uc: bool) -> circuit_ir.CircuitIR:
+    """Verify full field, measurement, and lazy-alignment parity for ``build_ir``."""
+    ir = circuit_ir.build_ir(circ, uc=uc)
+    unrolled = unroll_circuit(circ)
+    ir_list = circuit_ir.build_ir(unrolled, uc=uc)
+    has_rep = any(isinstance(item, stim.CircuitRepeatBlock) for item in circ)
+    assert ir.num_qubits == circ.num_qubits
+    assert ir.num_measurements == circ.num_measurements == ir_list.num_measurements
+    assert ir.has_repeat is has_rep
+    assert ir.uc is uc
+    assert ir.from_op_list is False
+    assert len(ir.instrs) == len(unrolled) == len(ir_list.instrs)
+
+    running_m = 0
+    for idx, (ins, ref) in enumerate(zip(ir.instrs, ir_list.instrs, strict=True)):
+        assert ins.unrolled_index == idx == ref.unrolled_index
+        assert ins.op == unrolled[idx] == ref.op
+        assert ins.tag == ref.tag
+        assert ins.category is ref.category
+        assert ins.untagged_filter is ref.untagged_filter
+        assert ins.num_measurements == ref.num_measurements
+        assert ins.first_measurement == running_m == ref.first_measurement
+        assert ins.basis == ref.basis
+        assert ins.is_product_measurement is ref.is_product_measurement
+        assert ins.arity == ref.arity
+        assert ins.has_classical_control is ref.has_classical_control
+        running_m += ins.num_measurements
+    assert running_m == circ.num_measurements
+
+    want_flat = tuple(circ.flattened())
+    assert ir.flat_ops == want_flat
+    u2f = circuit_ir.unrolled_to_flat(ir)
+    assert u2f == unrolled_to_flattened_indices(circ, validate=True).tolist()
+    for ins, fi in zip(ir.instrs, u2f, strict=True):
+        assert ins.flat_index == fi
+        if fi == -1:
+            assert ins.flat_offset == 0
+        else:
+            assert 0 <= ins.flat_offset <= len(want_flat[fi].targets_copy())
+    return ir
+
+
+def test_build_ir_small_large_threshold_parity() -> None:
+    """Verify exact IR parity across the 1000-op threshold and small REPEATs."""
+    small_prefix_repeat = stim.Circuit(
+        "R 0 1\nH[t1] 0\nM 0\n"
+        "REPEAT 3 {\n  CX rec[-1] 1\n  MXX 0 1\n  SHIFT_COORDS(1)\n  H 0\n}\n"
+        "H 0\nM 1\n"
+    )
+    small_nested_repeat = stim.Circuit(
+        "R 0 1 2\n"
+        "REPEAT 2 {\n"
+        "  H 0\n"
+        "  REPEAT 3 {\n    CX 0 1\n    MPP X0*Z1\n  }\n"
+        "  REPEAT 2 {\n  }\n"
+        "  M 2\n"
+        "}\n"
+        "CZ sweep[0] 2\n"
+    )
+    large_with_repeat = _make_sized_flat_circuit(1000)
+    large_with_repeat.append(stim.CircuitRepeatBlock(2, stim.Circuit("H 0\nM 0\n")))
+
+    cases = (
+        ("empty", stim.Circuit()),
+        ("flat_1", _make_sized_flat_circuit(1)),
+        ("flat_150", _make_sized_flat_circuit(150)),
+        ("flat_999", _make_sized_flat_circuit(999)),
+        ("flat_1000", _make_sized_flat_circuit(1000)),
+        ("flat_1001", _make_sized_flat_circuit(1001)),
+        ("small_prefix_repeat", small_prefix_repeat),
+        ("small_nested_repeat", small_nested_repeat),
+        ("large_with_repeat", large_with_repeat),
+    )
+    for uc in (False, True):
+        for label, circ in cases:
+            ir = _assert_ir_fields_parity(circ, uc=uc)
+            if label in ("flat_999", "flat_1000", "flat_1001"):
+                # Tagged H at index 1 stays ONE_QUBIT when uc=True; MXX/MPP count 1 meas.
+                want_uf = (
+                    circuit_ir.UntaggedFilter.ONE_QUBIT
+                    if uc
+                    else circuit_ir.UntaggedFilter.NONE
+                )
+                assert ir.instrs[1].untagged_filter is want_uf, label
+                assert ir.instrs[4].num_measurements == 1, label
+                assert ir.instrs[5].num_measurements == 1, label
+                assert ir.instrs[7].first_measurement == 4, label
+
+
+def test_build_ir_preserves_gc_state_across_threshold() -> None:
+    """Verify build_ir leaves gc.isenabled() unchanged for both < 1000 and >= 1000 ops."""
+    import gc
+
+    circs = (
+        stim.Circuit(),
+        _make_sized_flat_circuit(200),
+        _make_sized_flat_circuit(1000),
+        stim.Circuit("R 0\nREPEAT 3 {\n  H 0\n  M 0\n}\n"),
+    )
+    orig = gc.isenabled()
+    try:
+        for desired in (True, False):
+            if desired:
+                gc.enable()
+            else:
+                gc.disable()
+            for circ in circs:
+                circuit_ir.build_ir(circ, uc=True)
+                assert gc.isenabled() is desired
+    finally:
+        if orig:
+            gc.enable()
+        else:
+            gc.disable()
+
+
+def _count_c_calls(name: str, fn: Callable[[], Any]) -> int:
+    """Count the calls of the C-implemented function ``name`` made while ``fn`` runs."""
+    calls = 0
+
+    def _profile(_frame: types.FrameType, event: str, arg: Any) -> None:
+        nonlocal calls
+        if event == "c_call" and getattr(arg, "__name__", "") == name:
+            calls += 1
+
+    previous = sys.getprofile()
+    sys.setprofile(_profile)
+    try:
+        fn()
+    finally:
+        sys.setprofile(previous)
+    return calls
+
+
+def test_build_ir_builds_a_large_circuit_with_repeat_in_one_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1000 or more top-level items plus a REPEAT block: every IRInstr is created once."""
+    circ = _make_sized_flat_circuit(1200)
+    circ.append(stim.CircuitRepeatBlock(3, stim.Circuit("H 0\nM 0\n")))
+    created = 0
+    real_instr = circuit_ir.IRInstr
+
+    def _counting_instr(*args: Any, **kwargs: Any) -> circuit_ir.IRInstr:
+        nonlocal created
+        created += 1
+        return real_instr(*args, **kwargs)
+
+    monkeypatch.setattr(circuit_ir, "IRInstr", _counting_instr)
+    ir = circuit_ir.build_ir(circ, uc=True)
+    assert ir.has_repeat
+    assert created == len(ir.instrs) == len(unroll_circuit(circ))
+
+
+def test_build_ir_checks_classical_control_without_copying_targets() -> None:
+    """No rec[...] or sweep[...] in an instruction's text: its target list is not copied."""
+    plain = stim.Circuit()
+    for i in range(200):
+        plain.append("CX", [i % 7, 7 + i % 5])
+        plain.append("CZ", [i % 5, 5 + i % 7])
+        plain.append("H", [i % 7])
+    assert _count_c_calls("targets_copy", lambda: circuit_ir.build_ir(plain)) == 0
+    assert not any(ins.has_classical_control for ins in circuit_ir.build_ir(plain).instrs)
+
+    # A tag that contains "rec[" only sends the instruction to the exact check.
+    feedback = stim.Circuit(
+        "M 0 1\nCX rec[-1] 1\nCX[rec[0] 0 1\nCZ 0 sweep[2]\nCX 0 1\nCY rec[-2] 1\n"
+        "CZ sweep[10] 0\nREPEAT 2 {\n  CY rec[-1] 1\n  H 0\n}\n"
+    )
+    flags = [ins.has_classical_control for ins in circuit_ir.build_ir(feedback).instrs]
+    assert flags == [False, True, False, True, False, True, True, True, False, True, False]

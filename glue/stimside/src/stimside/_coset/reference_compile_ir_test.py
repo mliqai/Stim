@@ -20,10 +20,10 @@ from stimside.util.circuit import unroll_circuit
 from stimside.util.reference_chp import DetMeasMeta
 
 
-def test_compile_reference_single_ir_and_no_lazy_alignment(
+def test_compile_reference_builds_at_most_one_ir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Build at most one CircuitIR per circuit and never trigger lazy alignment."""
+    """Build at most one CircuitIR per circuit and reuse supplied IRs."""
     circ = stim.Circuit(
         "QUBIT_COORDS(0, 0) 0\n"
         "R 0 1\n"
@@ -52,17 +52,7 @@ def test_compile_reference_single_ir_and_no_lazy_alignment(
         build_calls += 1
         return orig_build(*args, **kwargs)
 
-    def boom_align(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("reference compilation must not trigger lazy alignment")
-
-    def boom_classify(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("CompiledReferenceCircuit.__init__ must reuse ir.instrs categories")
-
     monkeypatch.setattr(reference_compile, "build_ir", spy_build)
-    monkeypatch.setattr(reference_compile, "classify_category", boom_classify)
-    monkeypatch.setattr(circuit_ir, "_align_flat_ops", boom_align)
-    monkeypatch.setattr(circuit_ir._FlatAlignment, "get_where", boom_align)
-    monkeypatch.setattr(circuit_ir._FlatAlignment, "get_flat_ops", boom_align)
 
     want = CompiledReferenceCircuit(circ)
     assert build_calls == 1
@@ -73,7 +63,6 @@ def test_compile_reference_single_ir_and_no_lazy_alignment(
     ir_uc_false = orig_build(circ, uc=False)
     ir_uc_true = orig_build(circ, uc=True)
     ir_oplist = orig_build(unroll_circuit(circ))
-    monkeypatch.setattr(circuit_ir, "unroll_circuit", boom_align)
 
     want_snap = want.ref_chp.snapshot_packed()
     for supplied_ir in (ir_uc_false, ir_uc_true, ir_oplist):
@@ -496,3 +485,98 @@ def test_compile_reference_unitary_cocycle_cache_invalidation() -> None:
     rebuilt = u.get_cpp_cocycle_arrays(ref.n_words)
     assert rebuilt is not cached
     assert u._cpp_cocycle_arrays is rebuilt
+
+
+def test_compile_instruction_fallback_single_qubit_and_product_meas() -> None:
+    """Direct compile_instruction (instr=None) covers X/Y/Z meas/reset and product meas."""
+    ref = CompiledReferenceCircuit(stim.Circuit("R 0 1 2\nH 0\nH_YZ 1\n"))
+    single_cases: tuple[tuple[str, int, list[str], bool, bool], ...] = (
+        ("MX", 0, ["H 0"], True, False),
+        ("MY", 1, ["H_YZ 1"], True, False),
+        ("MZ", 2, [], True, False),
+        ("MRX", 0, ["H 0"], True, True),
+        ("MRY", 1, ["H_YZ 1"], True, True),
+        ("MR", 2, [], True, True),
+        ("RX", 0, ["H 0"], False, True),
+        ("RY", 1, ["H_YZ 1"], False, True),
+        ("R", 2, [], False, True),
+    )
+    for gate, q, want_ops, want_prod, want_reset in single_cases:
+        st, _, _ = ref.compile_instruction(stim.CircuitInstruction(gate, [q]))
+        assert isinstance(st, MeasStepMeta), gate
+        assert st.produces_measurements is want_prod, gate
+        assert st.is_reset is want_reset, gate
+        sub = st.substeps[0]
+        assert [str(op) for op in sub.pre_ops] == want_ops, gate
+        assert [str(op) for op in sub.post_ops] == want_ops, gate
+        assert sub.meta.is_random is False, gate
+        assert sub.meta.m_ref == 0, gate
+
+    bell_ref = CompiledReferenceCircuit(stim.Circuit("R 0 1 2\nH 0\nCX 0 1\nH 2\n"))
+    prod_cases: tuple[tuple[stim.CircuitInstruction, list[str], list[str], int], ...] = (
+        (
+            stim.CircuitInstruction("MXX", [0, 1]),
+            ["H 0 1", "CX 1 0"],
+            ["CX 1 0", "H 0 1"],
+            0,
+        ),
+        (
+            stim.CircuitInstruction("MYY", [0, 1]),
+            ["H_YZ 0 1", "CX 1 0"],
+            ["CX 1 0", "H_YZ 0 1"],
+            1,
+        ),
+        (
+            stim.CircuitInstruction("MZZ", [0, 1]),
+            ["CX 1 0"],
+            ["CX 1 0"],
+            0,
+        ),
+        (
+            stim.Circuit("MPP X0*X1*X2")[0],
+            ["H 0", "H 1", "H 2", "CX 1 0", "CX 2 0"],
+            ["CX 2 0", "CX 1 0", "H 2", "H 1", "H 0"],
+            0,
+        ),
+    )
+    for op, want_pre, want_post, want_ref in prod_cases:
+        st, _, _ = bell_ref.compile_instruction(op)
+        assert isinstance(st, MeasStepMeta), op.name
+        assert st.produces_measurements is True and st.is_reset is False
+        sub = st.substeps[0]
+        assert [str(p) for p in sub.pre_ops] == want_pre, op.name
+        assert [str(p) for p in sub.post_ops] == want_post, op.name
+        assert sub.meta.is_random is False, op.name
+        assert sub.meta.m_ref == want_ref, op.name
+
+
+def test_compile_instruction_fallback_two_qubit_arity_and_classical_control() -> None:
+    """Direct compile_instruction (instr=None) covers 2q arity and classical control."""
+    ref = CompiledReferenceCircuit(stim.Circuit("R 0 1 2\nM 0\n"))
+
+    cx_op = stim.CircuitInstruction("CX", [0, 1])
+    st_cx, _, _ = ref.compile_instruction(cx_op)
+    assert isinstance(st_cx, UnitaryStepMeta)
+    assert st_cx._is_mixed is False
+    assert st_cx.target_groups == [(0, 1)]
+    assert st_cx.are_groups_disjoint is True
+    num_g, arity, n_fac, t_groups, f_arrs = st_cx.get_cpp_cocycle_arrays(ref.n_words)
+    assert num_g == 1 and arity == 2 and n_fac > 0
+    assert t_groups.shape == (1, 2) and len(f_arrs) == 11
+
+    for pure_cc in (
+        stim.Circuit("CX rec[-1] 0")[0],
+        stim.Circuit("CX sweep[0] 0")[0],
+    ):
+        st_noop, _, _ = ref.compile_instruction(pure_cc)
+        assert isinstance(st_noop, NoopStepMeta), str(pure_cc)
+
+    for mixed_cc in (
+        stim.Circuit("CX rec[-1] 0 1 2")[0],
+        stim.Circuit("CX sweep[0] 0 1 2")[0],
+    ):
+        st_mix, _, _ = ref.compile_instruction(mixed_cc)
+        assert isinstance(st_mix, UnitaryStepMeta), str(mixed_cc)
+        assert st_mix._is_mixed is True
+        assert st_mix.target_groups == [(1, 2)]
+        assert st_mix.quantum_op == stim.CircuitInstruction("CX", [1, 2])

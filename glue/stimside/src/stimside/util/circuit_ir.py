@@ -1,27 +1,37 @@
-"""Tag-agnostic circuit intermediate representation (IR) for WP-27.
+"""Tag-agnostic circuit intermediate representation (IR).
 
-Implements the RFC section 3 design rules:
+Design and behaviour:
 - Imports only stdlib, ``stim``, and sibling ``util`` helpers; carries no tag
-  literals, no native-ABI names, and no engine-specific constants.
+  literals, native-ABI names, or engine-specific constants.
 - Never inspects or parses instruction tags: ``op.tag`` is copied verbatim into
-  ``IRInstr`` as a plain string.
-- Uses one fixed unrolled-index definition (``unroll_circuit``) alongside
-  explicit ``flat_index`` and ``flat_offset`` mappings into ``flattened()``.
+  ``IRInstr`` as a plain string. Per-consumer lazy tag parsing lives outside
+  this module (see ``ir_tags.py``).
+- Unrolled instructions follow ``unroll_circuit`` order. ``flat_ops``,
+  ``flat_index``, and ``flat_offset`` are computed lazily on first request from
+  a snapshot of the input circuit; the first alignment runs in O(N) time and
+  raises ``ValueError`` if ``flattened()`` disagrees with unrolling.
+- ``IRInstr`` and ``CircuitIR`` are immutable (frozen) and use identity
+  equality and hashing.
 - Derived passes (``step_map``, ``tableau_step_layout``, ``split_copies``,
   ``unrolled_to_flat``) are pure functions over ``CircuitIR``, not IR fields.
-- Per-consumer lazy tag parsing lives outside this module (see ``ir_tags.py``).
 """
 
 from __future__ import annotations
 
+import gc
+import operator
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any, Literal, Self
 
 import stim
 
 from stimside.util.circuit import unroll_circuit
 from stimside.util.stim_workarounds import split_fused_instruction
+
+PauliBasis = Literal["X", "Y", "Z"]
+UnitaryArity = Literal[1, 2]
 
 _ANNOTATION = frozenset(
     {"DETECTOR", "TICK", "OBSERVABLE_INCLUDE", "QUBIT_COORDS", "SHIFT_COORDS"}
@@ -29,6 +39,21 @@ _ANNOTATION = frozenset(
 _HERALDED = frozenset({"HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"})
 _CORRELATED = frozenset({"E", "ELSE_CORRELATED_ERROR"})
 _PAULI_TERMS = frozenset({"SPP", "SPP_DAG"})
+_PRODUCT_MEAS = frozenset({"MPP", "MXX", "MYY", "MZZ"})
+_BASIS_BY_CANONICAL: dict[str, PauliBasis] = {
+    "MX": "X",
+    "MRX": "X",
+    "RX": "X",
+    "MXX": "X",
+    "MY": "Y",
+    "MRY": "Y",
+    "RY": "Y",
+    "MYY": "Y",
+    "M": "Z",
+    "MR": "Z",
+    "R": "Z",
+    "MZZ": "Z",
+}
 _NON_FUSING = frozenset(
     {
         "DETECTOR",
@@ -41,9 +66,6 @@ _NON_FUSING = frozenset(
     }
 )
 _SHIFTED_ARGS_GATES = frozenset({"DETECTOR", "QUBIT_COORDS"})
-_REAL_GATE_DATA = stim.gate_data
-_CATEGORY_CACHE: dict[str, Category] = {}
-_UNTAGGED_CACHE: dict[tuple[str, bool], UntaggedFilter] = {}
 
 
 class Category(str, Enum):
@@ -61,7 +83,7 @@ class Category(str, Enum):
 
 
 class UntaggedFilter(str, Enum):
-    """Untagged-instruction filter class (rule R1) when ``uc=True``."""
+    """Untagged-instruction filter class when ``uc=True``."""
 
     NONE = "none"
     ONE_QUBIT = "one_qubit"
@@ -70,8 +92,18 @@ class UntaggedFilter(str, Enum):
     PAULI_TERMS = "pauli_terms"
 
 
-def _classify_category_uncached(name: str) -> Category:
-    gd = stim.gate_data(name)
+_GateMeta = tuple[
+    Category,
+    UntaggedFilter,
+    PauliBasis | None,
+    bool,
+    UnitaryArity | None,
+    bool,
+    bool,
+]
+
+
+def _classify_category_from_gd(gd: Any) -> Category:
     name = gd.name
     if name in _ANNOTATION:
         return Category.ANNOTATION
@@ -92,23 +124,7 @@ def _classify_category_uncached(name: str) -> Category:
     return Category.OTHER
 
 
-def classify_category(name: str) -> Category:
-    """Classify a Stim gate/instruction name into its coarse ``Category``."""
-    if stim.gate_data is _REAL_GATE_DATA:
-        cached = _CATEGORY_CACHE.get(name)
-        if cached is not None:
-            return cached
-        res = _classify_category_uncached(name)
-        if len(_CATEGORY_CACHE) < 4096:
-            _CATEGORY_CACHE[name] = res
-        return res
-    return _classify_category_uncached(name)
-
-
-def _classify_untagged_uncached(name: str, *, uc: bool) -> UntaggedFilter:
-    if not uc:
-        return UntaggedFilter.NONE
-    gd = stim.gate_data(name)
+def _classify_untagged_from_gd(gd: Any) -> UntaggedFilter:
     name = gd.name
     if gd.produces_measurements or not (gd.is_noisy_gate or gd.is_unitary):
         return UntaggedFilter.NONE
@@ -123,115 +139,341 @@ def _classify_untagged_uncached(name: str, *, uc: bool) -> UntaggedFilter:
     return UntaggedFilter.NONE
 
 
+def _classify_arity_from_gd(gd: Any) -> UnitaryArity | None:
+    if not gd.is_unitary:
+        return None
+    if gd.is_single_qubit_gate:
+        return 1
+    if gd.is_two_qubit_gate:
+        return 2
+    return None
+
+
+def _meta_from_gd(gd: Any) -> _GateMeta:
+    canon = gd.name
+    cat = _classify_category_from_gd(gd)
+    uf_uc = _classify_untagged_from_gd(gd)
+    basis = _BASIS_BY_CANONICAL.get(canon)
+    is_pm = canon in _PRODUCT_MEAS
+    arity = _classify_arity_from_gd(gd)
+    can_cc = bool(gd.is_two_qubit_gate and gd.takes_measurement_record_targets)
+    prod_m = bool(gd.produces_measurements)
+    return (cat, uf_uc, basis, is_pm, arity, can_cc, prod_m)
+
+
+def _build_gate_meta_tables() -> tuple[dict[str, _GateMeta], dict[str, _GateMeta]]:
+    meta_uc: dict[str, _GateMeta] = {}
+    meta_no_uc: dict[str, _GateMeta] = {}
+    none_uf = UntaggedFilter.NONE
+    for gd in stim.gate_data().values():
+        entry_uc = _meta_from_gd(gd)
+        entry_no_uc: _GateMeta = (
+            entry_uc[0],
+            none_uf,
+            entry_uc[2],
+            entry_uc[3],
+            entry_uc[4],
+            entry_uc[5],
+            entry_uc[6],
+        )
+        for alias in gd.aliases:
+            meta_uc[alias] = entry_uc
+            meta_no_uc[alias] = entry_no_uc
+        meta_uc[gd.name] = entry_uc
+        meta_no_uc[gd.name] = entry_no_uc
+    return meta_uc, meta_no_uc
+
+
+_GATE_META, _GATE_META_NO_UC = _build_gate_meta_tables()
+
+
+def _gate_meta(name: str, *, uc: bool = True) -> _GateMeta:
+    table = _GATE_META if uc else _GATE_META_NO_UC
+    meta = table.get(name)
+    if meta is not None:
+        return meta
+    meta = table.get(name.upper())
+    if meta is not None:
+        return meta
+    entry = _meta_from_gd(stim.gate_data(name))
+    if not uc:
+        return (
+            entry[0],
+            UntaggedFilter.NONE,
+            entry[2],
+            entry[3],
+            entry[4],
+            entry[5],
+            entry[6],
+        )
+    return entry
+
+
+def classify_category(name: str) -> Category:
+    """Classify a Stim gate or instruction name into its coarse ``Category``."""
+    meta = _GATE_META.get(name)
+    if meta is not None:
+        return meta[0]
+    meta = _GATE_META.get(name.upper())
+    if meta is not None:
+        return meta[0]
+    return _classify_category_from_gd(stim.gate_data(name))
+
+
 def classify_untagged(name: str, *, uc: bool) -> UntaggedFilter:
-    """Rule R1 for an op not claimed by a tag (the caller decides 'claimed')."""
-    if stim.gate_data is _REAL_GATE_DATA:
-        key = (name, uc)
-        cached = _UNTAGGED_CACHE.get(key)
-        if cached is not None:
-            return cached
-        res = _classify_untagged_uncached(name, uc=uc)
-        if len(_UNTAGGED_CACHE) < 4096:
-            _UNTAGGED_CACHE[key] = res
-        return res
-    return _classify_untagged_uncached(name, uc=uc)
+    """Classify an untagged gate when conditioning on the unleaked subspace."""
+    if not uc:
+        return UntaggedFilter.NONE
+    meta = _GATE_META.get(name)
+    if meta is not None:
+        return meta[1]
+    meta = _GATE_META.get(name.upper())
+    if meta is not None:
+        return meta[1]
+    return _classify_untagged_from_gd(stim.gate_data(name))
+
+
+def classify_basis(name: str) -> PauliBasis | None:
+    """Return the Pauli basis (``'X'``, ``'Y'``, ``'Z'``) for basis gates, else ``None``."""
+    meta = _GATE_META.get(name)
+    if meta is not None:
+        return meta[2]
+    meta = _GATE_META.get(name.upper())
+    if meta is not None:
+        return meta[2]
+    return _BASIS_BY_CANONICAL.get(stim.gate_data(name).name)
+
+
+def classify_is_product_measurement(name: str) -> bool:
+    """Return True iff ``name`` is a multi-qubit product measurement (MPP/MXX/MYY/MZZ)."""
+    meta = _GATE_META.get(name)
+    if meta is not None:
+        return meta[3]
+    meta = _GATE_META.get(name.upper())
+    if meta is not None:
+        return meta[3]
+    return stim.gate_data(name).name in _PRODUCT_MEAS
+
+
+def classify_arity(name: str) -> UnitaryArity | None:
+    """Return ``1`` or ``2`` for fixed-arity unitary gates, else ``None``."""
+    meta = _GATE_META.get(name)
+    if meta is not None:
+        return meta[4]
+    meta = _GATE_META.get(name.upper())
+    if meta is not None:
+        return meta[4]
+    return _classify_arity_from_gd(stim.gate_data(name))
+
+
+def op_has_classical_control(op: stim.CircuitInstruction) -> bool:
+    """Return True iff ``op`` is a 2-qubit controlled-Pauli op with a rec/sweep target."""
+    name = op.name
+    meta = _GATE_META.get(name)
+    if meta is None:
+        meta = _GATE_META.get(name.upper())
+    if meta is not None:
+        can_cc = meta[5]
+    else:
+        gd = stim.gate_data(name)
+        can_cc = bool(gd.is_two_qubit_gate and gd.takes_measurement_record_targets)
+    if not can_cc:
+        return False
+    return any(t.qubit_value is None for t in op.targets_copy())
 
 
 class _FlatAlignment:
     """Lazy cache for ``flattened()`` ops and unrolled-to-flat target alignment."""
 
-    __slots__ = ("_circuit", "_flat_ops", "_ops", "_where")
+    __slots__ = ("_circuit", "_flat_ops", "_where")
 
-    def __init__(
-        self,
-        circuit: stim.Circuit,
-        ops: tuple[stim.CircuitInstruction, ...],
-    ) -> None:
+    def __init__(self, circuit: stim.Circuit) -> None:
         self._circuit: stim.Circuit | None = circuit
-        self._ops: tuple[stim.CircuitInstruction, ...] = ops
         self._flat_ops: tuple[stim.CircuitInstruction, ...] | None = None
         self._where: list[tuple[int, int]] | None = None
 
     def get_flat_ops(self) -> tuple[stim.CircuitInstruction, ...]:
-        if self._flat_ops is None:
-            assert self._circuit is not None
-            self._flat_ops = tuple(self._circuit.flattened())
-        return self._flat_ops
+        circ = self._circuit
+        flat_ops = self._flat_ops
+        if flat_ops is None:
+            assert circ is not None
+            flat_ops = tuple(circ.flattened())
+            self._flat_ops = flat_ops
+        return flat_ops
 
-    def get_where(self) -> list[tuple[int, int]]:
-        if self._where is None:
+    def get_where(
+        self,
+        ops: Sequence[stim.CircuitInstruction] | None = None,
+    ) -> list[tuple[int, int]]:
+        circ = self._circuit
+        where = self._where
+        if where is None:
             flat_ops = self.get_flat_ops()
-            self._where = _align_flat_ops(self._ops, flat_ops)
+            if ops is None:
+                assert circ is not None
+                ops = unroll_circuit(circ)
+            where = _align_flat_ops(ops, flat_ops)
+            self._where = where
             self._circuit = None
-            self._ops = ()
-        return self._where
+        return where
 
 
-@dataclass(frozen=True, eq=False)
-class IRInstr:
-    """Single unrolled instruction record in ``CircuitIR``."""
+def _ensure_flat_alignment(box: list[Any]) -> _FlatAlignment:
+    circ: stim.Circuit | None = box[0]
+    align: _FlatAlignment | None = box[1]
+    if align is None:
+        assert circ is not None
+        align = _FlatAlignment(circ)
+        box[1] = align
+        box[0] = None
+    return align
 
-    unrolled_index: int
-    op: stim.CircuitInstruction
-    tag: str
-    category: Category
-    untagged_filter: UntaggedFilter
-    num_measurements: int
-    first_measurement: int
-    _flat: _FlatAlignment | None = field(default=None, repr=False, compare=False)
+
+_TUPLE_NEW = tuple.__new__
+
+
+class _IRInstrBase(tuple[Any, ...]):
+    """Tuple-backed storage with C-level itemgetter accessors for ``IRInstr``."""
+
+    __slots__ = ()
+    __hash__ = object.__hash__  # type: ignore[assignment]
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    def __ne__(self, other: object) -> bool:
+        return self is not other
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __reduce_ex__(self, protocol: Any) -> tuple[Any, ...]:
+        return (type(self), tuple(self))
+
+    def _reject_order(self, other: object, symbol: str) -> Any:
+        if isinstance(other, tuple):
+            raise TypeError(
+                f"'{symbol}' not supported between instances of "
+                f"'{type(self).__name__}' and '{type(other).__name__}'"
+            )
+        return NotImplemented
+
+    def __lt__(self, other: object) -> Any:
+        return self._reject_order(other, "<")
+
+    def __le__(self, other: object) -> Any:
+        return self._reject_order(other, "<=")
+
+    def __gt__(self, other: object) -> Any:
+        return self._reject_order(other, ">")
+
+    def __ge__(self, other: object) -> Any:
+        return self._reject_order(other, ">=")
+
+    unrolled_index = property(operator.itemgetter(0))
+    op = property(operator.itemgetter(1))
+    tag = property(operator.itemgetter(2))
+    category = property(operator.itemgetter(3))
+    untagged_filter = property(operator.itemgetter(4))
+    num_measurements = property(operator.itemgetter(5))
+    first_measurement = property(operator.itemgetter(6))
+    basis = property(operator.itemgetter(7))
+    is_product_measurement = property(operator.itemgetter(8))
+    arity = property(operator.itemgetter(9))
+    has_classical_control = property(operator.itemgetter(10))
+    _flat = property(operator.itemgetter(11))
+
+
+@dataclass(frozen=True, eq=False, init=False, repr=False)
+class IRInstr(_IRInstrBase):
+    """Single unrolled instruction record in ``CircuitIR``.
+
+    Instances use immutable tuple-backed storage with identity equality and
+    hashing; ``flat_index`` and ``flat_offset`` are resolved lazily on first
+    access.
+    """
+
+    __slots__ = ()
+
+    unrolled_index: int  # type: ignore[assignment]
+    op: stim.CircuitInstruction  # type: ignore[assignment]
+    tag: str  # type: ignore[assignment]
+    category: Category  # type: ignore[assignment]
+    untagged_filter: UntaggedFilter  # type: ignore[assignment]
+    num_measurements: int  # type: ignore[assignment]
+    first_measurement: int  # type: ignore[assignment]
+    basis: PauliBasis | None  # type: ignore[assignment]
+    is_product_measurement: bool  # type: ignore[assignment]
+    arity: UnitaryArity | None  # type: ignore[assignment]
+    has_classical_control: bool  # type: ignore[assignment]
+    _flat: list[Any] | None  # type: ignore[assignment]
+
+    def __new__(
+        cls,
+        unrolled_index: int,
+        op: stim.CircuitInstruction,
+        tag: str,
+        category: Category,
+        untagged_filter: UntaggedFilter,
+        num_measurements: int,
+        first_measurement: int,
+        basis: PauliBasis | None = None,
+        is_product_measurement: bool = False,
+        arity: UnitaryArity | None = None,
+        has_classical_control: bool = False,
+        _flat: list[Any] | None = None,
+    ) -> Self:
+        return _TUPLE_NEW(
+            cls,
+            (
+                unrolled_index,
+                op,
+                tag,
+                category,
+                untagged_filter,
+                num_measurements,
+                first_measurement,
+                basis,
+                is_product_measurement,
+                arity,
+                has_classical_control,
+                _flat,
+            ),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"IRInstr(unrolled_index={self.unrolled_index!r}, op={self.op!r}, "
+            f"tag={self[2]!r}, category={self.category!r}, "
+            f"untagged_filter={self.untagged_filter!r}, "
+            f"num_measurements={self.num_measurements!r}, "
+            f"first_measurement={self.first_measurement!r}, basis={self.basis!r}, "
+            f"is_product_measurement={self.is_product_measurement!r}, "
+            f"arity={self.arity!r}, has_classical_control={self.has_classical_control!r})"
+        )
 
     @property
     def flat_index(self) -> int:
         """Index in ``flattened()``, or -1 for ``SHIFT_COORDS`` / op lists."""
         if self._flat is None:
             return -1
-        return self._flat.get_where()[self.unrolled_index][0]
+        return _ensure_flat_alignment(self._flat).get_where()[self.unrolled_index][0]
 
     @property
     def flat_offset(self) -> int:
         """First target index inside the corresponding flattened instruction."""
         if self._flat is None:
             return 0
-        return self._flat.get_where()[self.unrolled_index][1]
-
-    def __eq__(self, other: object) -> bool:
-        if self is other:
-            return True
-        if not isinstance(other, IRInstr):
-            return NotImplemented
-        if (
-            self.unrolled_index != other.unrolled_index
-            or self.num_measurements != other.num_measurements
-            or self.first_measurement != other.first_measurement
-            or self.category != other.category
-            or self.untagged_filter != other.untagged_filter
-            or not (self.tag == other.tag)
-            or self.op != other.op
-        ):
-            return False
-        if self._flat is other._flat:
-            return True
-        return (
-            self.flat_index == other.flat_index
-            and self.flat_offset == other.flat_offset
-        )
-
-    def __hash__(self) -> int:
-        return hash(
-            (
-                self.unrolled_index,
-                self.op,
-                self.category,
-                self.untagged_filter,
-                self.num_measurements,
-                self.first_measurement,
-            )
-        )
+        return _ensure_flat_alignment(self._flat).get_where()[self.unrolled_index][1]
 
 
 @dataclass(frozen=True, eq=False)
 class CircuitIR:
-    """Immutable, hashable circuit IR built from a circuit or op sequence."""
+    """Immutable circuit IR built from a ``stim.Circuit`` or an op sequence.
+
+    Uses identity equality and hashing. ``flat_ops`` is computed lazily on
+    first access from a snapshot of the input circuit.
+    """
 
     instrs: tuple[IRInstr, ...]
     num_qubits: int
@@ -239,44 +481,14 @@ class CircuitIR:
     has_repeat: bool
     uc: bool
     from_op_list: bool
-    _flat: _FlatAlignment | None = field(default=None, repr=False, compare=False)
+    _flat: list[Any] | None = field(default=None, repr=False, compare=False)
 
     @property
     def flat_ops(self) -> tuple[stim.CircuitInstruction, ...]:
         """Flattened instruction tuple (``()`` for an op-list source)."""
         if self._flat is None:
             return ()
-        return self._flat.get_flat_ops()
-
-    def __eq__(self, other: object) -> bool:
-        if self is other:
-            return True
-        if not isinstance(other, CircuitIR):
-            return NotImplemented
-        if (
-            self.num_qubits != other.num_qubits
-            or self.num_measurements != other.num_measurements
-            or self.has_repeat != other.has_repeat
-            or self.uc != other.uc
-            or self.from_op_list != other.from_op_list
-            or self.instrs != other.instrs
-        ):
-            return False
-        if self._flat is other._flat:
-            return True
-        return self.flat_ops == other.flat_ops
-
-    def __hash__(self) -> int:
-        return hash(
-            (
-                self.instrs,
-                self.num_qubits,
-                self.num_measurements,
-                self.has_repeat,
-                self.uc,
-                self.from_op_list,
-            )
-        )
+        return _ensure_flat_alignment(self._flat).get_flat_ops()
 
 
 def _op_matches_flat(
@@ -381,31 +593,136 @@ def _align_flat_ops(
     return where
 
 
-def _build_circuit_instrs(
-    ops: list[stim.CircuitInstruction],
+def _has_cc_cached(
+    op: stim.CircuitInstruction,
+    cc_memo: dict[stim.CircuitInstruction, bool],
+) -> bool:
+    # Only for a gate that can take classical control (elsewhere a combiner has no qubit value
+    # either). A rec[...] or sweep[...] target always shows in the instruction's text. Most
+    # instructions have none, and this test costs less than hashing the instruction for the memo.
+    # A tag with the same characters only sends the instruction on to the exact check.
+    text = str(op)
+    if "rec[" not in text and "sweep[" not in text:
+        return False
+    cached = cc_memo.get(op)
+    if cached is not None:
+        return cached
+    res = any(t.qubit_value is None for t in op.targets_copy())
+    if len(cc_memo) < 4096:
+        cc_memo[op] = res
+    return res
+
+
+def _append_repeat_body(
+    body: list[stim.CircuitInstruction],
+    repeat_count: int,
     uc: bool,
-    flat: _FlatAlignment,
-) -> tuple[IRInstr, ...]:
+    flat_box: list[Any],
+    cc_memo: dict[stim.CircuitInstruction, bool],
+    instrs: list[IRInstr],
+    idx: int,
+    first: int,
+) -> tuple[int, int]:
+    append = instrs.append
+    gate_meta_get = (_GATE_META if uc else _GATE_META_NO_UC).get
+    body_meta: list[
+        tuple[
+            stim.CircuitInstruction,
+            Category,
+            UntaggedFilter,
+            int,
+            PauliBasis | None,
+            bool,
+            UnitaryArity | None,
+            bool,
+        ]
+    ] = []
+    for op in body:
+        meta = gate_meta_get(op.name)
+        if meta is None:
+            meta = _gate_meta(op.name, uc=uc)
+        cat, uf, basis, is_pm, arity, can_cc, prod_m = meta
+        k = op.num_measurements if prod_m else 0
+        has_cc = _has_cc_cached(op, cc_memo) if can_cc else False
+        body_meta.append((op, cat, uf, k, basis, is_pm, arity, has_cc))
+    for _ in range(repeat_count):
+        for op, cat, uf, k, basis, is_pm, arity, has_cc in body_meta:
+            append(
+                IRInstr(
+                    idx,
+                    op,
+                    op.tag,
+                    cat,
+                    uf,
+                    k,
+                    first,
+                    basis,
+                    is_pm,
+                    arity,
+                    has_cc,
+                    flat_box,
+                )
+            )
+            idx += 1
+            first += k
+    return idx, first
+
+
+def _build_circuit_instrs(
+    src: stim.Circuit,
+    uc: bool,
+    flat_box: list[Any],
+) -> tuple[tuple[IRInstr, ...], bool]:
+    repeat_cls = stim.CircuitRepeatBlock
     instrs: list[IRInstr] = []
     append = instrs.append
+    gate_meta_get = (_GATE_META if uc else _GATE_META_NO_UC).get
+    cc_memo: dict[stim.CircuitInstruction, bool] = {}
+    idx = 0
     first = 0
-    for i, op in enumerate(ops):
-        name = op.name
-        k = op.num_measurements
-        append(
-            IRInstr(
-                i,
-                op,
-                op.tag,
-                classify_category(name),
-                classify_untagged(name, uc=uc),
-                k,
-                first,
-                flat,
+    has_repeat = False
+    was_gc = len(src) >= 1000 and gc.isenabled()
+    if was_gc:
+        gc.disable()
+    try:
+        for item in src:
+            if isinstance(item, repeat_cls):
+                has_repeat = True
+                body = unroll_circuit(item.body_copy())
+                if not body:
+                    continue
+                idx, first = _append_repeat_body(
+                    body, item.repeat_count, uc, flat_box, cc_memo, instrs, idx, first
+                )
+                continue
+            meta = gate_meta_get(item.name)
+            if meta is None:
+                meta = _gate_meta(item.name, uc=uc)
+            cat, uf, basis, is_pm, arity, can_cc, prod_m = meta
+            k = item.num_measurements if prod_m else 0
+            has_cc = _has_cc_cached(item, cc_memo) if can_cc else False
+            append(
+                IRInstr(
+                    idx,
+                    item,
+                    item.tag,
+                    cat,
+                    uf,
+                    k,
+                    first,
+                    basis,
+                    is_pm,
+                    arity,
+                    has_cc,
+                    flat_box,
+                )
             )
-        )
-        first += k
-    return tuple(instrs)
+            idx += 1
+            first += k
+    finally:
+        if was_gc:
+            gc.enable()
+    return tuple(instrs), has_repeat
 
 
 def _build_oplist_instrs(
@@ -414,8 +731,19 @@ def _build_oplist_instrs(
 ) -> tuple[tuple[IRInstr, ...], int, int]:
     instrs: list[IRInstr] = []
     append = instrs.append
+    gate_meta_get = (_GATE_META if uc else _GATE_META_NO_UC).get
     op_memo: dict[
-        stim.CircuitInstruction, tuple[Category, UntaggedFilter, int, int]
+        stim.CircuitInstruction,
+        tuple[
+            Category,
+            UntaggedFilter,
+            int,
+            int,
+            PauliBasis | None,
+            bool,
+            UnitaryArity | None,
+            bool,
+        ],
     ] = {}
     max_q = -1
     first = 0
@@ -427,21 +755,41 @@ def _build_oplist_instrs(
             )
         entry = op_memo.get(op)
         if entry is None:
-            cat = classify_category(op.name)
-            uf = classify_untagged(op.name, uc=uc)
+            meta = gate_meta_get(op.name)
+            if meta is None:
+                meta = _gate_meta(op.name, uc=uc)
+            cat, uf, basis, is_pm, arity, can_cc, prod_m = meta
             omq = -1
+            has_non_qubit = False
             for t in op.targets_copy():
                 qv = t.qubit_value
-                if qv is not None and qv > omq:
+                if qv is None:
+                    has_non_qubit = True
+                elif qv > omq:
                     omq = qv
-            nm = op.num_measurements
-            entry = (cat, uf, omq, nm)
+            nm = op.num_measurements if prod_m else 0
+            has_cc = can_cc and has_non_qubit
+            entry = (cat, uf, omq, nm, basis, is_pm, arity, has_cc)
             if len(op_memo) < 4096:
                 op_memo[op] = entry
         else:
-            cat, uf, omq, nm = entry
+            cat, uf, omq, nm, basis, is_pm, arity, has_cc = entry
         max_q = max(max_q, omq)
-        append(IRInstr(i, op, op.tag, cat, uf, nm, first))
+        append(
+            IRInstr(
+                i,
+                op,
+                op.tag,
+                cat,
+                uf,
+                nm,
+                first,
+                basis,
+                is_pm,
+                arity,
+                has_cc,
+            )
+        )
         first += nm
     num_qubits = 1 + max_q if max_q >= 0 else 0
     return tuple(instrs), num_qubits, first
@@ -454,10 +802,8 @@ def build_ir(
 ) -> CircuitIR:
     """Build a ``CircuitIR`` from a ``stim.Circuit`` or an explicit op list."""
     if isinstance(src, stim.Circuit):
-        ops = unroll_circuit(src)
-        has_repeat = any(isinstance(i, stim.CircuitRepeatBlock) for i in src)
-        flat = _FlatAlignment(src.copy(), tuple(ops))
-        instrs = _build_circuit_instrs(ops, uc, flat)
+        flat_box: list[Any] = [src.copy(), None]
+        instrs, has_repeat = _build_circuit_instrs(src, uc, flat_box)
         return CircuitIR(
             instrs,
             src.num_qubits,
@@ -465,7 +811,7 @@ def build_ir(
             has_repeat,
             uc,
             False,
-            flat,
+            flat_box,
         )
     ops = list(src)
     instrs, num_qubits, num_meas = _build_oplist_instrs(ops, uc)
@@ -559,4 +905,9 @@ def unrolled_to_flat(ir: CircuitIR) -> list[int]:
     """Return ``flat_index`` for every unrolled instruction in ``ir``."""
     if ir._flat is None:
         return [-1] * len(ir.instrs)
-    return [f for f, _off in ir._flat.get_where()]
+    align = _ensure_flat_alignment(ir._flat)
+    if align._where is None:
+        where = align.get_where([i.op for i in ir.instrs])
+    else:
+        where = align.get_where()
+    return [f for f, _off in where]

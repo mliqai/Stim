@@ -42,12 +42,9 @@ from stimside._magic.gates import (
     CONTROLLED_PAULI_2Q_AXES,
     CliffordFaultChannel,
     CompiledPauliAxis,
-    DECOMP_1Q,
-    DECOMP_2Q,
     FaultBranch,
-    canonical_gate_data,
     decompose_clifford_exact,
-    extract_circuit_faults,
+    extract_inline_faults_from_ir,
     merge_and_validate_fault_channels,
     plain_qubits,
     spec_terms,
@@ -70,11 +67,9 @@ from stimside.util.bitwords import (
     tail_mask,
     word_dot_parity,
 )
+from stimside.util.circuit_ir import Category, CircuitIR, IRInstr, build_ir
 from stimside.util.reference_chp import ReferenceCHPTableau
 
-_ANNOTATION_GATES: frozenset[str] = frozenset(
-    {"TICK", "QUBIT_COORDS", "SHIFT_COORDS", "DETECTOR", "OBSERVABLE_INCLUDE"}
-)
 _CAT_NOISE_META: dict[str, tuple[int, int]] = {
     "X_ERROR": (1, 1), "Y_ERROR": (1, 1), "Z_ERROR": (1, 1),
     "DEPOLARIZE1": (1, 3), "PAULI_CHANNEL_1": (1, 3),
@@ -86,32 +81,22 @@ _CAT_NOISE_META: dict[str, tuple[int, int]] = {
 _C2_MAX_RANK = 12
 
 
-def _instruction_num_measurements(op: stim.CircuitInstruction, canon_name: str) -> int:
-    if not canonical_gate_data(canon_name).produces_measurements:
-        return 0
-    if canon_name == "MPP":
-        return len(split_pauli_product_targets(op))
-    n_t = len(op.targets_copy())
-    return (n_t // 2) if canon_name in ("MXX", "MYY", "MZZ") else n_t
-
-
 def _validate_and_emit_non_magic_tagged_op(
-    op: stim.CircuitInstruction,
+    ins: IRInstr,
     num_qubits: int,
     next_meas_idx: int,
     out_records: list[CompiledRecord],
 ) -> int:
-    """Validate a registered leakage tag (emitting `LeakageBarrierRecord`) or reject unknown tags."""
-    tag = op.tag
+    """Validate a registered leakage tag (emitting ``LeakageBarrierRecord``) or reject."""
+    op = ins.op
+    tag = ins.tag
     if not (tag.startswith("LEAKAGE") or tag.startswith("CONDITIONED_ON")):
         raise ValueError(f"Unrecognized instruction tag {tag!r} on {op!r}")
     params, _ = parse_leakage_tag_magic(op, syntax_only=True)
     tag_prefix = tag.split(":", 1)[0].strip()
     if params is not None:
         check_tag_qubits({op: params}, num_qubits)
-
-    canon_name = canonical_gate_data(op.name).name
-    n_meas = _instruction_num_measurements(op, canon_name)
+    n_meas = ins.num_measurements
     out_records.append(LeakageBarrierRecord(op, tag_prefix, n_meas))
     return next_meas_idx + n_meas
 
@@ -125,16 +110,16 @@ def _slice_axis_to_qubits(ax: CompiledPauliAxis, n_qubits: int) -> CompiledPauli
     return CompiledPauliAxis(a_words=a_d, b_words=b_d, kappa=ax.kappa)
 
 
-def _count_gadget_pauli_selectors(flat_ops: Sequence[stim.CircuitInstruction]) -> int:
+def _count_gadget_pauli_selectors(instrs: Sequence[IRInstr]) -> int:
     total = 0
-    for op in flat_ops:
-        if op.tag != "":
+    for ins in instrs:
+        if ins.tag != "" or ins.category is not Category.NOISE:
             continue
-        cname = canonical_gate_data(op.name).name
-        if cname in _CAT_NOISE_META:
-            arity, k_br = _CAT_NOISE_META[cname]
-            total += k_br * (len(op.targets_copy()) // arity)
-        elif cname in ("E", "CORRELATED_ERROR", "ELSE_CORRELATED_ERROR"):
+        name = ins.op.name
+        if name in _CAT_NOISE_META:
+            arity, k_br = _CAT_NOISE_META[name]
+            total += k_br * (len(ins.op.targets_copy()) // arity)
+        elif name in ("E", "ELSE_CORRELATED_ERROR"):
             total += 1
     return total
 
@@ -217,276 +202,359 @@ class _CircuitPassResult:
     data_final_tableau: ReferenceCHPTableau | None = None
 
 
+@dataclass
+class _PassState:
+    n_data: int
+    selector_mode: bool
+    gad_noise: bool
+    ref_chp: ReferenceCHPTableau
+    next_sel_q: int
+    raw_records: list[CompiledRecord] = field(default_factory=list)
+    frame_events: list[FrameEvent] = field(default_factory=list)
+    gauge_steps: list[tuple[int, CompiledPauliAxis]] = field(default_factory=list)
+    fault_sel_groups: list[tuple[int, ...]] = field(default_factory=list)
+    noise_sel_groups: list[tuple[str, tuple[float, ...], tuple[int, ...]]] = field(
+        default_factory=list
+    )
+    noise_sel_ch_indices: list[int] = field(default_factory=list)
+    noise_max_choices: list[int] = field(default_factory=list)
+    next_meas_idx: int = 0
+    next_noise_idx: int = 0
+    num_resets: int = 0
+
+
+def _emit_fault_slots(
+    st: _PassState, entries: Sequence[tuple[int, CliffordFaultChannel]]
+) -> None:
+    for slot_idx, ch in entries:
+        if st.selector_mode:
+            s_grp = tuple(range(st.next_sel_q, st.next_sel_q + len(ch.branches)))
+            st.next_sel_q += len(ch.branches)
+            st.fault_sel_groups.append(s_grp)
+            for s_q, br in zip(s_grp, ch.branches):
+                _emit_selector_clifford_branch(
+                    s_q, br, st.n_data, st.ref_chp, st.raw_records, st.frame_events, st.gauge_steps
+                )
+        else:
+            b_factors = tuple(
+                compile_clifford_factors(st.ref_chp, b.gate_name, b.targets) for b in ch.branches
+            )
+            probs = np.array([b.prob for b in ch.branches], dtype=np.float64)
+            st.raw_records.append(DirectFaultSlotRecord(slot_idx, b_factors, probs))
+
+
+def _emit_cat_pauli_noise(
+    st: _PassState,
+    kind: str,
+    probs_tup: tuple[float, ...],
+    branch_term_groups: Sequence[Sequence[tuple[int, str]]],
+) -> None:
+    k_br = len(probs_tup)
+    if st.gad_noise:
+        s_grp = tuple(range(st.next_sel_q, st.next_sel_q + k_br))
+        st.next_sel_q += k_br
+        st.noise_sel_groups.append(("CAT", probs_tup, s_grp))
+        st.noise_sel_ch_indices.append(st.next_noise_idx)
+        for s_q, b_terms in zip(s_grp, branch_term_groups):
+            _emit_selector_pauli_branch(
+                s_q, b_terms, st.n_data, st.ref_chp, st.frame_events, st.gauge_steps
+            )
+    else:
+        b_axes = tuple(compile_pauli_product(st.ref_chp, bt) for bt in branch_term_groups)
+        st.raw_records.append(PauliNoiseRecord(kind, probs_tup, b_axes, st.next_noise_idx))
+    st.noise_max_choices.append(k_br)
+    st.next_noise_idx += 1
+
+
+def _emit_measurements(
+    st: _PassState, groups: Sequence[tuple[Sequence[tuple[int, str]], bool]], p_flip: float
+) -> None:
+    for grp_terms, grp_inv in groups:
+        m_rec = compile_pauli_measurement_c15(
+            st.ref_chp, grp_terms, invert_result=grp_inv, flip_prob=p_flip,
+            meas_index=st.next_meas_idx, frame_events=st.frame_events,
+        )
+        st.raw_records.append(m_rec)
+        if st.selector_mode and m_rec.rot_axis is not None:
+            st.gauge_steps.append((-1, _slice_axis_to_qubits(m_rec.rot_axis, st.n_data)))
+        st.next_meas_idx += 1
+
+
+def _lower_feedback_op(
+    st: _PassState, op: stim.CircuitInstruction, targs: Sequence[stim.GateTarget]
+) -> None:
+    name = op.name
+    ax0, ax1 = FEEDBACK_2Q_GATES[name]
+    for off in range(0, len(targs), 2):
+        t0, t1 = targs[off], targs[off + 1]
+        q0_plain = t0.is_qubit_target and not t0.is_inverted_result_target
+        q1_plain = t1.is_qubit_target and not t1.is_inverted_result_target
+        if q0_plain and q1_plain:
+            q_pair = (int(t0.qubit_value), int(t1.qubit_value))
+            st.ref_chp.do_unitary(name, list(q_pair))
+            st.frame_events.append(LeftUnitaryEvent(name, q_pair))
+            continue
+        t0_ctrl = t0.is_measurement_record_target or t0.is_sweep_bit_target
+        t1_ctrl = t1.is_measurement_record_target or t1.is_sweep_bit_target
+        if t0_ctrl and q1_plain and ax0 == "Z":
+            t_src, q_dst, p_dst = t0, int(t1.qubit_value), ax1
+        elif t1_ctrl and q0_plain and ax1 == "Z":
+            t_src, q_dst, p_dst = t1, int(t0.qubit_value), ax0
+        else:
+            raise ValueError(f"Unsupported classical feedback target pair {(t0, t1)} on {name!r}")
+        src_kind: Literal["rec", "sweep"] = "rec" if t_src.is_measurement_record_target else "sweep"
+        st.raw_records.append(
+            FeedbackPauliRecord(
+                src_kind, int(t_src.value), st.next_meas_idx,
+                compile_pauli_product(st.ref_chp, [(q_dst, p_dst)]),
+            )
+        )
+
+
+def _lower_unitary_op(st: _PassState, ins: IRInstr) -> None:
+    op = ins.op
+    name = op.name
+    if ins.arity is None:
+        dag = name == "SPP_DAG"
+        for grp_terms, grp_inv in split_pauli_product_targets(op):
+            st.ref_chp.do_spp(grp_terms, negate=grp_inv, dag=dag)
+            st.frame_events.append(LeftSppEvent(tuple(grp_terms), grp_inv, dag))
+        return
+    targs = op.targets_copy()
+    if ins.has_classical_control:
+        _lower_feedback_op(st, op, targs)
+        return
+    arity = ins.arity
+    qs_u = plain_qubits(targs, name)
+    if name not in ("I", "II"):
+        for off in range(0, len(qs_u), arity):
+            grp_u = tuple(qs_u[off : off + arity])
+            st.ref_chp.do_unitary(name, list(grp_u))
+            st.frame_events.append(LeftUnitaryEvent(name, grp_u))
+
+
+def _lower_noise_op(st: _PassState, ins: IRInstr) -> None:
+    op, name = ins.op, ins.op.name
+    if name in ("I_ERROR", "II_ERROR"):
+        return
+    args, targs = op.gate_args_copy(), op.targets_copy()
+    if ins.category is Category.HERALD:
+        probs_h = (
+            (float(args[0]) * 0.25,) * 4 if name == "HERALDED_ERASE"
+            else (float(args[0]), float(args[1]), float(args[2]), float(args[3]))
+        )
+        for t in targs:
+            q = int(t.qubit_value)
+            b_axes: tuple[CompiledPauliAxis | None, ...] = (
+                None,
+                compile_pauli_product(st.ref_chp, [(q, "X")]),
+                compile_pauli_product(st.ref_chp, [(q, "Y")]),
+                compile_pauli_product(st.ref_chp, [(q, "Z")]),
+            )
+            st.raw_records.append(
+                HeraldedNoiseRecord(name, st.next_meas_idx, probs_h, b_axes, st.next_noise_idx)
+            )
+            st.noise_max_choices.append(4)
+            st.next_meas_idx += 1
+            st.next_noise_idx += 1
+    elif name in ("X_ERROR", "Y_ERROR", "Z_ERROR"):
+        probs_1, pch = (float(args[0]),), name[0]
+        for t in targs:
+            _emit_cat_pauli_noise(st, name, probs_1, ([(int(t.qubit_value), pch)],))
+    elif name in ("DEPOLARIZE1", "PAULI_CHANNEL_1"):
+        probs_3 = (
+            (float(args[0]) / 3.0,) * 3 if name == "DEPOLARIZE1"
+            else (float(args[0]), float(args[1]), float(args[2]))
+        )
+        for t in targs:
+            q = int(t.qubit_value)
+            _emit_cat_pauli_noise(st, name, probs_3, tuple([(q, pch)] for pch in "XYZ"))
+    elif name in ("DEPOLARIZE2", "PAULI_CHANNEL_2"):
+        probs_15 = (
+            (float(args[0]) / 15.0,) * 15 if name == "DEPOLARIZE2"
+            else tuple(float(x) for x in args[:15])
+        )
+        for off in range(0, len(targs), 2):
+            q0, q1 = int(targs[off].qubit_value), int(targs[off + 1].qubit_value)
+            _emit_cat_pauli_noise(
+                st, name, probs_15,
+                tuple([(q0, pair[0]), (q1, pair[1])] for pair in PAULI_2Q_ORDER),
+            )
+    else:
+        p, is_else = float(args[0]), (name == "ELSE_CORRELATED_ERROR")
+        simp_terms = reduce_pauli_product_targets(
+            [tm for g_terms, _ in split_pauli_product_targets(op) for tm in g_terms]
+        )
+        if st.gad_noise:
+            s_q = st.next_sel_q
+            st.next_sel_q += 1
+            st.noise_sel_groups.append(("ELSE_CORR" if is_else else "CORR", (p,), (s_q,)))
+            st.noise_sel_ch_indices.append(st.next_noise_idx)
+            _emit_selector_pauli_branch(
+                s_q, simp_terms, st.n_data, st.ref_chp, st.frame_events, st.gauge_steps
+            )
+        else:
+            st.raw_records.append(
+                CorrelatedNoiseRecord(
+                    is_else, p, compile_pauli_product(st.ref_chp, simp_terms), st.next_noise_idx
+                )
+            )
+        st.noise_max_choices.append(1)
+        st.next_noise_idx += 1
+
+
+def _lower_meas_or_reset_op(st: _PassState, ins: IRInstr) -> None:
+    op, cat = ins.op, ins.category
+    args, targs = op.gate_args_copy(), op.targets_copy()
+    if cat is Category.MEASURE:
+        p_flip = float(args[0]) if args else 0.0
+        if ins.is_product_measurement:
+            if ins.basis is None:
+                groups_m: Sequence[tuple[Sequence[tuple[int, str]], bool]] = (
+                    split_pauli_product_targets(op)
+                )
+            else:
+                pair_basis = ins.basis
+                groups_m = [
+                    (
+                        [
+                            (int(targs[off].qubit_value), pair_basis),
+                            (int(targs[off + 1].qubit_value), pair_basis),
+                        ],
+                        bool(targs[off].is_inverted_result_target)
+                        ^ bool(targs[off + 1].is_inverted_result_target),
+                    )
+                    for off in range(0, len(targs), 2)
+                ]
+        else:
+            pch = ins.basis
+            assert pch is not None
+            groups_m = [
+                ([(int(t.qubit_value), pch)], bool(t.is_inverted_result_target)) for t in targs
+            ]
+        _emit_measurements(st, groups_m, p_flip)
+    elif cat is Category.MPAD:
+        p_flip = float(args[0]) if args else 0.0
+        if not math.isfinite(p_flip) or p_flip < 0.0 or p_flip > 1.0:
+            raise ValueError(f"Invalid MPAD flip probability {p_flip!r}")
+        for t in targs:
+            inv = bool(t.value) ^ bool(t.is_inverted_result_target)
+            st.raw_records.append(MPadRecord(st.next_meas_idx, inv, p_flip))
+            st.next_meas_idx += 1
+    else:
+        is_mr = cat is Category.MEASURE_RESET
+        p_flip = float(args[0]) if (is_mr and args) else 0.0
+        basis_ch = ins.basis
+        assert basis_ch is not None
+        for t in targs:
+            m_idx = st.next_meas_idx if is_mr else None
+            if is_mr:
+                st.next_meas_idx += 1
+            r_rec = compile_reset_c15(
+                st.ref_chp, int(t.qubit_value), basis_ch, meas_index=m_idx,
+                invert_result=bool(t.is_inverted_result_target) if is_mr else False,
+                flip_prob=p_flip, frame_events=st.frame_events,
+            )
+            st.raw_records.append(r_rec)
+            st.num_resets += 1
+            if st.selector_mode and r_rec.rot_axis is not None:
+                st.gauge_steps.append((-1, _slice_axis_to_qubits(r_rec.rot_axis, st.n_data)))
+
+
+def _restrict_selector_data(
+    frame_tup: tuple[FrameEvent, ...], ref_chp: ReferenceCHPTableau, n_data: int
+) -> tuple[tuple[FrameEvent, ...], ReferenceCHPTableau]:
+    data_events = tuple(
+        RightRotEvent(_slice_axis_to_qubits(ev.rot_axis, n_data))
+        if isinstance(ev, RightRotEvent)
+        else ev
+        for ev in frame_tup
+        if not (isinstance(ev, LeftUnitaryEvent) and any(q >= n_data for q in ev.targets))
+    )
+    data_tab = restrict_tableau_to_data(ref_chp, n_data)
+    return data_events, data_tab
+
+
 def _compile_circuit_pass(
     circuit: stim.Circuit,
     fault_channels: Sequence[CliffordFaultChannel] | None = None,
     *,
     selector_mode: bool = False,
     gadgetize_pauli_noise: bool = False,
+    ir: CircuitIR | None = None,
 ) -> _CircuitPassResult:
-    """Shared single-pass lowering for `compile_coordinates`, `compile_direct`, and `compile_selector`."""
-    flat_ops, inline_faults = extract_circuit_faults(circuit)
+    """Shared single-pass lowering for coordinates, direct, and selector plans."""
+    cir = build_ir(circuit) if ir is None else ir
+    inline_faults = extract_inline_faults_from_ir(cir)
     prog_by_step, inline_by_step, all_channels = merge_and_validate_fault_channels(
-        len(flat_ops), inline_faults, fault_channels
+        len(cir.instrs), inline_faults, fault_channels
     )
     n_data = infer_total_data_qubits(circuit, all_channels)
     gad_noise = selector_mode and gadgetize_pauli_noise
     n_fault_sel = sum(len(ch.branches) for ch in all_channels) if selector_mode else 0
-    n_sel = n_fault_sel + (_count_gadget_pauli_selectors(flat_ops) if gad_noise else 0)
+    n_sel = n_fault_sel + (_count_gadget_pauli_selectors(cir.instrs) if gad_noise else 0)
     n_total = n_data + n_sel
+    st = _PassState(n_data, selector_mode, gad_noise, ReferenceCHPTableau(n_total), n_data)
 
-    ref_chp = ReferenceCHPTableau(n_total)
-    raw_records: list[CompiledRecord] = []
-    frame_events: list[FrameEvent] = []
-    gauge_steps: list[tuple[int, CompiledPauliAxis]] = []
-    fault_sel_groups: list[tuple[int, ...]] = []
-    noise_sel_groups: list[tuple[str, tuple[float, ...], tuple[int, ...]]] = []
-    noise_sel_ch_indices: list[int] = []
-    noise_max_choices: list[int] = []
-    next_sel_q = n_data
-    next_meas_idx = 0
-    next_noise_idx = 0
-    num_resets = 0
-
-    def _emit_fault_slots(entries: Sequence[tuple[int, CliffordFaultChannel]]) -> None:
-        nonlocal next_sel_q
-        for slot_idx, ch in entries:
-            if selector_mode:
-                s_grp = tuple(range(next_sel_q, next_sel_q + len(ch.branches)))
-                next_sel_q += len(ch.branches)
-                fault_sel_groups.append(s_grp)
-                for s_q, br in zip(s_grp, ch.branches):
-                    _emit_selector_clifford_branch(
-                        s_q, br, n_data, ref_chp, raw_records, frame_events, gauge_steps
-                    )
-            else:
-                b_factors = tuple(compile_clifford_factors(ref_chp, b.gate_name, b.targets) for b in ch.branches)
-                raw_records.append(
-                    DirectFaultSlotRecord(slot_idx, b_factors, np.array([b.prob for b in ch.branches], dtype=np.float64))
-                )
-
-    def _emit_cat_pauli_noise(
-        kind: str, probs_tup: tuple[float, ...], branch_term_groups: Sequence[Sequence[tuple[int, str]]]
-    ) -> None:
-        nonlocal next_sel_q, next_noise_idx
-        k_br = len(probs_tup)
-        if gad_noise:
-            s_grp = tuple(range(next_sel_q, next_sel_q + k_br))
-            next_sel_q += k_br
-            noise_sel_groups.append(("CAT", probs_tup, s_grp))
-            noise_sel_ch_indices.append(next_noise_idx)
-            for s_q, b_terms in zip(s_grp, branch_term_groups):
-                _emit_selector_pauli_branch(s_q, b_terms, n_data, ref_chp, frame_events, gauge_steps)
-        else:
-            b_axes = tuple(compile_pauli_product(ref_chp, b_terms) for b_terms in branch_term_groups)
-            raw_records.append(PauliNoiseRecord(kind, probs_tup, b_axes, next_noise_idx))
-        noise_max_choices.append(k_br)
-        next_noise_idx += 1
-
-    def _emit_measurements(groups: Sequence[tuple[Sequence[tuple[int, str]], bool]], p_flip: float) -> None:
-        nonlocal next_meas_idx
-        for grp_terms, grp_inv in groups:
-            m_rec = compile_pauli_measurement_c15(
-                ref_chp, grp_terms, invert_result=grp_inv, flip_prob=p_flip,
-                meas_index=next_meas_idx, frame_events=frame_events,
-            )
-            raw_records.append(m_rec)
-            if selector_mode and m_rec.rot_axis is not None:
-                gauge_steps.append((-1, _slice_axis_to_qubits(m_rec.rot_axis, n_data)))
-            next_meas_idx += 1
-
-    for step_idx, op in enumerate(flat_ops):
+    for ins in cir.instrs:
+        step_idx = ins.unrolled_index
         if step_idx in prog_by_step:
-            _emit_fault_slots(prog_by_step[step_idx])
-
-        if op.tag != "":
-            if op.tag in ("T", "T_DAG", "CCZ"):
-                emit_magic_terms(op.tag, validate_magic_op(op), ref_chp, raw_records)
+            _emit_fault_slots(st, prog_by_step[step_idx])
+        tag = ins.tag
+        if tag != "":
+            if tag.startswith("CLIFFORD_FAULT"):
+                pass
+            elif tag in ("T", "T_DAG", "CCZ"):
+                emit_magic_terms(tag, validate_magic_op(ins.op), st.ref_chp, st.raw_records)
             else:
-                next_meas_idx = _validate_and_emit_non_magic_tagged_op(
-                    op, n_data, next_meas_idx, raw_records
+                st.next_meas_idx = _validate_and_emit_non_magic_tagged_op(
+                    ins, n_data, st.next_meas_idx, st.raw_records
                 )
         else:
-            name = op.name
-            canon_name = canonical_gate_data(name).name
-            args = op.gate_args_copy()
-            targs = op.targets_copy()
-
-            if canon_name in _ANNOTATION_GATES or canon_name in ("I_ERROR", "II_ERROR"):
+            cat = ins.category
+            if cat is Category.ANNOTATION:
                 pass
-            elif canon_name in ("SPP", "SPP_DAG"):
-                dag = canon_name == "SPP_DAG"
-                for grp_terms, grp_inv in split_pauli_product_targets(op):
-                    ref_chp.do_spp(grp_terms, negate=grp_inv, dag=dag)
-                    frame_events.append(LeftSppEvent(tuple(grp_terms), grp_inv, dag))
-            elif canon_name in FEEDBACK_2Q_GATES and any(
-                t.is_measurement_record_target or t.is_sweep_bit_target for t in targs
-            ):
-                ax0, ax1 = FEEDBACK_2Q_GATES[canon_name]
-                for off in range(0, len(targs), 2):
-                    t0, t1 = targs[off], targs[off + 1]
-                    q0_plain = t0.is_qubit_target and not t0.is_inverted_result_target
-                    q1_plain = t1.is_qubit_target and not t1.is_inverted_result_target
-                    if q0_plain and q1_plain:
-                        q_pair = (int(t0.qubit_value), int(t1.qubit_value))
-                        ref_chp.do_unitary(canon_name, list(q_pair))
-                        frame_events.append(LeftUnitaryEvent(canon_name, q_pair))
-                        continue
-                    if (t0.is_measurement_record_target or t0.is_sweep_bit_target) and q1_plain and ax0 == "Z":
-                        t_src, q_dst, p_dst = t0, int(t1.qubit_value), ax1
-                    elif (t1.is_measurement_record_target or t1.is_sweep_bit_target) and q0_plain and ax1 == "Z":
-                        t_src, q_dst, p_dst = t1, int(t0.qubit_value), ax0
-                    else:
-                        raise ValueError(f"Unsupported classical feedback target pair {(t0, t1)} on {name!r}")
-                    src_kind: Literal["rec", "sweep"] = "rec" if t_src.is_measurement_record_target else "sweep"
-                    raw_records.append(
-                        FeedbackPauliRecord(
-                            src_kind, int(t_src.value), next_meas_idx,
-                            compile_pauli_product(ref_chp, [(q_dst, p_dst)]),
-                        )
-                    )
-            elif canon_name in DECOMP_1Q or canon_name in DECOMP_2Q:
-                arity = 1 if canon_name in DECOMP_1Q else 2
-                qs_u = plain_qubits(targs, name)
-                if canon_name not in ("I", "II"):
-                    for off in range(0, len(qs_u), arity):
-                        grp_u = tuple(qs_u[off : off + arity])
-                        ref_chp.do_unitary(canon_name, list(grp_u))
-                        frame_events.append(LeftUnitaryEvent(canon_name, grp_u))
-            elif canon_name in ("X_ERROR", "Y_ERROR", "Z_ERROR"):
-                probs_1, pch = (float(args[0]),), canon_name[0]
-                for t in targs:
-                    _emit_cat_pauli_noise(canon_name, probs_1, ([(int(t.qubit_value), pch)],))
-            elif canon_name in ("DEPOLARIZE1", "PAULI_CHANNEL_1"):
-                probs_3 = (
-                    (float(args[0]) / 3.0,) * 3 if canon_name == "DEPOLARIZE1"
-                    else (float(args[0]), float(args[1]), float(args[2]))
-                )
-                for t in targs:
-                    q = int(t.qubit_value)
-                    _emit_cat_pauli_noise(canon_name, probs_3, tuple([(q, pch)] for pch in "XYZ"))
-            elif canon_name in ("DEPOLARIZE2", "PAULI_CHANNEL_2"):
-                probs_15 = (
-                    (float(args[0]) / 15.0,) * 15 if canon_name == "DEPOLARIZE2"
-                    else tuple(float(x) for x in args[:15])
-                )
-                for off in range(0, len(targs), 2):
-                    q0, q1 = int(targs[off].qubit_value), int(targs[off + 1].qubit_value)
-                    _emit_cat_pauli_noise(
-                        canon_name, probs_15, tuple([(q0, pair[0]), (q1, pair[1])] for pair in PAULI_2Q_ORDER)
-                    )
-            elif canon_name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
-                probs_h = (
-                    (float(args[0]) * 0.25,) * 4 if canon_name == "HERALDED_ERASE"
-                    else (float(args[0]), float(args[1]), float(args[2]), float(args[3]))
-                )
-                for t in targs:
-                    q = int(t.qubit_value)
-                    b_axes: tuple[CompiledPauliAxis | None, ...] = (
-                        None,
-                        compile_pauli_product(ref_chp, [(q, "X")]),
-                        compile_pauli_product(ref_chp, [(q, "Y")]),
-                        compile_pauli_product(ref_chp, [(q, "Z")]),
-                    )
-                    raw_records.append(HeraldedNoiseRecord(canon_name, next_meas_idx, probs_h, b_axes, next_noise_idx))
-                    noise_max_choices.append(4)
-                    next_meas_idx += 1
-                    next_noise_idx += 1
-            elif canon_name in ("E", "CORRELATED_ERROR", "ELSE_CORRELATED_ERROR"):
-                p, is_else = float(args[0]), (canon_name == "ELSE_CORRELATED_ERROR")
-                simp_terms = reduce_pauli_product_targets(
-                    [tm for g_terms, _ in split_pauli_product_targets(op) for tm in g_terms]
-                )
-                if gad_noise:
-                    s_q = next_sel_q
-                    next_sel_q += 1
-                    noise_sel_groups.append(("ELSE_CORR" if is_else else "CORR", (p,), (s_q,)))
-                    noise_sel_ch_indices.append(next_noise_idx)
-                    _emit_selector_pauli_branch(s_q, simp_terms, n_data, ref_chp, frame_events, gauge_steps)
-                else:
-                    raw_records.append(
-                        CorrelatedNoiseRecord(is_else, p, compile_pauli_product(ref_chp, simp_terms), next_noise_idx)
-                    )
-                noise_max_choices.append(1)
-                next_noise_idx += 1
-            elif canon_name in ("M", "MZ", "MX", "MY", "MXX", "MYY", "MZZ", "MPP"):
-                p_flip = float(args[0]) if args else 0.0
-                if canon_name == "MPP":
-                    groups_m: Sequence[tuple[Sequence[tuple[int, str]], bool]] = split_pauli_product_targets(op)
-                elif canon_name in ("MXX", "MYY", "MZZ"):
-                    pch = canon_name[1]
-                    groups_m = [
-                        (
-                            [(int(targs[off].qubit_value), pch), (int(targs[off + 1].qubit_value), pch)],
-                            bool(targs[off].is_inverted_result_target) ^ bool(targs[off + 1].is_inverted_result_target),
-                        )
-                        for off in range(0, len(targs), 2)
-                    ]
-                else:
-                    pch = "Z" if canon_name in ("M", "MZ") else canon_name[1]
-                    groups_m = [([(int(t.qubit_value), pch)], bool(t.is_inverted_result_target)) for t in targs]
-                _emit_measurements(groups_m, p_flip)
-            elif canon_name == "MPAD":
-                p_flip = float(args[0]) if args else 0.0
-                if not math.isfinite(p_flip) or p_flip < 0.0 or p_flip > 1.0:
-                    raise ValueError(f"Invalid MPAD flip probability {p_flip!r}")
-                for t in targs:
-                    raw_records.append(MPadRecord(next_meas_idx, bool(t.value) ^ bool(t.is_inverted_result_target), p_flip))
-                    next_meas_idx += 1
-            elif canon_name in ("R", "RZ", "RX", "RY", "MR", "MRZ", "MRX", "MRY"):
-                is_mr = canon_name.startswith("MR")
-                p_flip = float(args[0]) if (is_mr and args) else 0.0
-                basis_ch: Literal["Z", "X", "Y"] = (
-                    "X" if canon_name.endswith("X") else ("Y" if canon_name.endswith("Y") else "Z")
-                )
-                for t in targs:
-                    m_idx = next_meas_idx if is_mr else None
-                    if is_mr:
-                        next_meas_idx += 1
-                    r_rec = compile_reset_c15(
-                        ref_chp, int(t.qubit_value), basis_ch, meas_index=m_idx,
-                        invert_result=bool(t.is_inverted_result_target) if is_mr else False,
-                        flip_prob=p_flip, frame_events=frame_events,
-                    )
-                    raw_records.append(r_rec)
-                    num_resets += 1
-                    if selector_mode and r_rec.rot_axis is not None:
-                        gauge_steps.append((-1, _slice_axis_to_qubits(r_rec.rot_axis, n_data)))
+            elif cat is Category.UNITARY:
+                _lower_unitary_op(st, ins)
+            elif cat in (Category.NOISE, Category.HERALD):
+                _lower_noise_op(st, ins)
+            elif cat in (Category.MEASURE, Category.MPAD, Category.RESET, Category.MEASURE_RESET):
+                _lower_meas_or_reset_op(st, ins)
             else:
-                raise ValueError(f"Unsupported Stim instruction {op!r}")
-
+                raise ValueError(f"Unsupported Stim instruction {ins.op!r}")
         if step_idx in inline_by_step:
-            _emit_fault_slots(inline_by_step[step_idx])
+            _emit_fault_slots(st, inline_by_step[step_idx])
 
-    if len(flat_ops) in prog_by_step:
-        _emit_fault_slots(prog_by_step[len(flat_ops)])
+    if len(cir.instrs) in prog_by_step:
+        _emit_fault_slots(st, prog_by_step[len(cir.instrs)])
 
-    frame_tup = tuple(frame_events)
+    frame_tup = tuple(st.frame_events)
     data_events: tuple[FrameEvent, ...] = ()
     data_tab: ReferenceCHPTableau | None = None
     if selector_mode:
-        data_events = tuple(
-            RightRotEvent(_slice_axis_to_qubits(ev.rot_axis, n_data)) if isinstance(ev, RightRotEvent) else ev
-            for ev in frame_tup
-            if not (isinstance(ev, LeftUnitaryEvent) and any(q >= n_data for q in ev.targets))
-        )
-        data_tab = restrict_tableau_to_data(ref_chp, n_data)
+        data_events, data_tab = _restrict_selector_data(frame_tup, st.ref_chp, n_data)
     return _CircuitPassResult(
-        n_data, n_sel, n_total, next_meas_idx, tuple(raw_records), ref_chp, frame_tup,
-        all_channels, tuple(fault_sel_groups), tuple(noise_sel_groups), tuple(noise_sel_ch_indices),
-        next_noise_idx, tuple(noise_max_choices), num_resets, tuple(gauge_steps), data_events, data_tab,
+        n_data, n_sel, n_total, st.next_meas_idx, tuple(st.raw_records), st.ref_chp, frame_tup,
+        all_channels, tuple(st.fault_sel_groups), tuple(st.noise_sel_groups),
+        tuple(st.noise_sel_ch_indices), st.next_noise_idx, tuple(st.noise_max_choices),
+        st.num_resets, tuple(st.gauge_steps), data_events, data_tab,
     )
 
 
 def compile_coordinates(
     circuit: stim.Circuit,
     fault_channels: Sequence[CliffordFaultChannel] | None = None,
+    *,
+    ir: CircuitIR | None = None,
 ) -> DirectPlan:
-    """`C1` + `C1.5`: Compile circuit into moving-reference records and `ReferenceCHPTableau`."""
-    res = _compile_circuit_pass(circuit, fault_channels=fault_channels, selector_mode=False)
+    """Compile circuit into moving-reference records and ``ReferenceCHPTableau``."""
+    res = _compile_circuit_pass(
+        circuit, fault_channels=fault_channels, selector_mode=False, ir=ir
+    )
     return DirectPlan(
         res.n_data, res.num_measurements, res.raw_records, res.final_tableau,
-        res.frame_events, res.fault_channels, res.raw_records, res.noise_max_choices, res.num_resets,
+        res.frame_events, res.fault_channels, res.raw_records, res.noise_max_choices,
+        res.num_resets,
     )
 
 
@@ -826,9 +894,10 @@ def compile_direct(
     c2_budget: int = 64,
     c2_max_rank: int = _C2_MAX_RANK,
     c2_max_poly_terms: int = 64,
+    ir: CircuitIR | None = None,
 ) -> DirectPlan:
-    """`A1`: Compile `circuit` for zero-branching `DIRECT` trajectory execution."""
-    coord = compile_coordinates(circuit, fault_channels=fault_channels)
+    """Compile ``circuit`` for zero-branching ``DIRECT`` trajectory execution."""
+    coord = compile_coordinates(circuit, fault_channels=fault_channels, ir=ir)
     records = compile_open_block(
         coord, budget=c2_budget, c2_max_rank=c2_max_rank, c2_max_poly_terms=c2_max_poly_terms,
     )
@@ -843,10 +912,15 @@ def compile_selector(
     c2_budget: int = 64,
     c2_max_rank: int = _C2_MAX_RANK,
     c2_max_poly_terms: int = 64,
+    ir: CircuitIR | None = None,
 ) -> SelectorPlan:
-    """`B1`: Compile `circuit` into private-selector-ancilla template (`SELECTOR` mode)."""
+    """Compile ``circuit`` into private-selector-ancilla template (``SELECTOR`` mode)."""
     res = _compile_circuit_pass(
-        circuit, fault_channels=fault_channels, selector_mode=True, gadgetize_pauli_noise=gadgetize_pauli_noise
+        circuit,
+        fault_channels=fault_channels,
+        selector_mode=True,
+        gadgetize_pauli_noise=gadgetize_pauli_noise,
+        ir=ir,
     )
     assert res.data_final_tableau is not None
     records = compile_open_block(

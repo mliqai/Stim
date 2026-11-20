@@ -17,6 +17,7 @@ import subprocess
 import sys
 import sysconfig
 import tarfile
+import threading
 import time
 import types
 import warnings
@@ -1345,13 +1346,13 @@ def test_lock_timeout_default_600s_env_override_and_warning_filter(
     monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
     monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
 
-    # Invalid timeout env values emit RuntimeWarning and fall back to default.
-    for bad_val in ("-1", "abc", "nan", "inf", "1e308"):
+    # Invalid timeout env values emit RuntimeWarning pointing at caller and fall back to default.
+    for bad_val in ("-1", "-inf", "abc", "nan", "1e308"):
         monkeypatch.setenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", bad_val)
         with warnings.catch_warnings(record=True) as caught_bad:
             warnings.simplefilter("always", RuntimeWarning)
             assert _kernel_loader._lock_max_retries() == 12000
-        assert len(caught_bad) == 1
+        assert len(caught_bad) == 1 and caught_bad[0].filename == __file__
         assert issubclass(caught_bad[0].category, RuntimeWarning)
 
     # Zero timeout breaks immediately without sleeping.
@@ -1463,3 +1464,414 @@ def test_native_build_records_and_checks_machine_and_cpu_flags(
     assert _kernel_loader._cpu_flags_digest() == d1 and len(d1) == 16
     monkeypatch.setattr(Path, "read_text", mock.Mock(side_effect=OSError("no procfs")))
     assert _kernel_loader._cpu_flags_digest() == ""
+
+
+def test_lock_inf_timeout_waits_for_release_and_notice_fires_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _require_cxx()
+    fcntl = pytest.importorskip("fcntl")
+    for inf_val in ("inf", "+inf", "infinity", "INF"):
+        monkeypatch.setenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", inf_val)
+        with warnings.catch_warnings(record=True) as caught_inf:
+            warnings.simplefilter("always", RuntimeWarning)
+            assert _kernel_loader._lock_max_retries() is None
+        assert caught_inf == []
+    native, _, resolve = _make_source_native(
+        tmp_path, "tiny_inf", 'extern "C" int tiny_inf_val() { return 19; }\n'
+    )
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    monkeypatch.setenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", "inf")
+    monkeypatch.setattr(_kernel_loader, "_LOCK_RETRY_DELAY_S", 0.01)
+    monkeypatch.setattr(_kernel_loader, "_LOCK_NOTICE_DELAY_S", 0.02)
+
+    holder_fd = os.open(native, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    fcntl.flock(holder_fd, fcntl.LOCK_EX)
+
+    def _release_later() -> None:
+        time.sleep(0.06)
+        os.close(holder_fd)
+
+    releaser = threading.Thread(target=_release_later)
+    releaser.start()
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            so = resolve()
+    finally:
+        releaser.join()
+
+    assert caught == []
+    err_lines = [
+        line for line in capsys.readouterr().err.splitlines() if "waiting for build lock" in line
+    ]
+    assert len(err_lines) == 1
+    assert str(native) in err_lines[0]
+    assert "STIMSIDE_BUILD_LOCK_TIMEOUT_S" in err_lines[0]
+    assert f"uid {os.getuid()}" in err_lines[0]
+    assert _eval_symbol_in_subprocess(so, "tiny_inf_val") == 19
+
+
+def test_lock_wait_notice_and_shared_deadline_across_four_libs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _require_cxx()
+    fcntl = pytest.importorskip("fcntl")
+    native, _, resolve0 = _make_source_native(
+        tmp_path, "tiny_sh0", 'extern "C" int tiny_sh0_val() { return 10; }\n'
+    )
+    resolvers = [resolve0]
+    for i in range(1, 4):
+        name = f"tiny_sh{i}"
+        (native / f"{name}.cpp").write_text(
+            f'extern "C" int {name}_val() {{ return {10 + i}; }}\n', encoding="utf-8"
+        )
+        mod = native / f"{name}.py"
+        mod.write_text("# stub\n", encoding="utf-8")
+        resolvers.append(functools.partial(_kernel_loader.resolve_so, str(mod), name))
+
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    monkeypatch.setenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", "0.05")
+    monkeypatch.setattr(_kernel_loader, "_LOCK_RETRY_DELAY_S", 0.01)
+    monkeypatch.setattr(_kernel_loader, "_LOCK_NOTICE_DELAY_S", 0.02)
+
+    real_sleep = time.sleep
+    sleeps = 0
+
+    def spy_sleep(s: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        real_sleep(s)
+
+    monkeypatch.setattr(time, "sleep", spy_sleep)
+    holder_fd = os.open(native, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fcntl.flock(holder_fd, fcntl.LOCK_EX)
+        with warnings.catch_warnings(record=True) as caught0:
+            warnings.simplefilter("always", RuntimeWarning)
+            so0 = resolvers[0]()
+        assert sleeps >= 1
+        assert len(caught0) == 1 and caught0[0].filename == __file__
+        err0 = capsys.readouterr().err
+        assert err0.count("waiting for build lock") == 1
+        assert "STIMSIDE_BUILD_LOCK_TIMEOUT_S" in err0
+
+        for idx, res in enumerate(resolvers[1:], start=1):
+            sleeps = 0
+            with warnings.catch_warnings(record=True) as caught_i:
+                warnings.simplefilter("always", RuntimeWarning)
+                so_i = res()
+            assert sleeps == 0, f"lib {idx} should reuse exhausted process deadline"
+            assert len(caught_i) == 1 and caught_i[0].filename == __file__
+            assert capsys.readouterr().err == ""
+            assert _eval_symbol_in_subprocess(so_i, f"tiny_sh{idx}_val") == 10 + idx
+    finally:
+        os.close(holder_fd)
+    assert _eval_symbol_in_subprocess(so0, "tiny_sh0_val") == 10
+
+
+def test_adoption_does_not_wait_for_held_dir_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_cxx()
+    fcntl = pytest.importorskip("fcntl")
+    native, _, resolve = _make_source_native(
+        tmp_path, "tiny_lockless_adopt", 'extern "C" int tiny_la_val() { return 23; }\n'
+    )
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    so = resolve()
+    _kernel_loader._build_id_path(so).unlink()
+
+    sleeps = 0
+
+    def spy_sleep(_s: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+
+    monkeypatch.setattr(time, "sleep", spy_sleep)
+    monkeypatch.setenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", "0.05")
+    holder_fd = os.open(native, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fcntl.flock(holder_fd, fcntl.LOCK_EX)
+        with (
+            mock.patch.object(subprocess, "run") as mock_run,
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always", RuntimeWarning)
+            assert resolve() == so
+    finally:
+        os.close(holder_fd)
+
+    mock_run.assert_not_called()
+    assert sleeps == 0
+    assert caught == []
+    assert _read_sidecar_json(so)["mode"] == "unknown"
+
+
+def test_cpu_flags_digest_filters_to_isa_tokens_and_intersects_cores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = "flags : sse2 avx2 fma\n"
+    noisy = "flags : sse2 avx2 fma hypervisor ibpb ibrs ssbd stibp tsc_known_freq apic smep\n"
+    monkeypatch.setattr(Path, "read_text", lambda self, **_kw: base)
+    d_base = _kernel_loader._cpu_flags_digest()
+    monkeypatch.setattr(Path, "read_text", lambda self, **_kw: noisy)
+    assert _kernel_loader._cpu_flags_digest() == d_base and len(d_base) == 16
+
+    with_avx512 = "flags : sse2 avx2 fma avx512f\n"
+    monkeypatch.setattr(Path, "read_text", lambda self, **_kw: with_avx512)
+    d_avx512 = _kernel_loader._cpu_flags_digest()
+    assert d_avx512 != d_base and len(d_avx512) == 16
+
+    hybrid = (
+        "processor : 0\nflags : sse2 avx2 fma avx512f hypervisor\n\n"
+        "processor : 1\nflags : sse2 avx2 fma ibpb\n"
+    )
+    monkeypatch.setattr(Path, "read_text", lambda self, **_kw: hybrid)
+    assert _kernel_loader._cpu_flags_digest() == d_base
+
+    arm_clean = "Features : fp asimd crc32 sve2\n"
+    arm_noisy = "Features : fp asimd crc32 sve2 evtstrm cpuid\n"
+    monkeypatch.setattr(Path, "read_text", lambda self, **_kw: arm_clean)
+    d_arm = _kernel_loader._cpu_flags_digest()
+    monkeypatch.setattr(Path, "read_text", lambda self, **_kw: arm_noisy)
+    assert _kernel_loader._cpu_flags_digest() == d_arm and len(d_arm) == 16
+
+
+def test_readonly_checkout_native_foreign_cpu_warns_once_and_werror_reraises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_cxx()
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses read-only directory mode checks")
+    native, _, resolve = _make_source_native(
+        tmp_path, "tiny_ro_cpu", 'extern "C" int tiny_ro_cpu_val() { return 31; }\n'
+    )
+    monkeypatch.setenv("STIMSIDE_NATIVE_BUILD", "1")
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    so = resolve()
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD")
+    bid = _kernel_loader._build_id_path(so)
+    rec = _read_sidecar_json(so)
+    rec["cpu_flags"] = "0000000000000000"
+    bid.write_text(json.dumps(rec, sort_keys=True) + "\n", encoding="utf-8")
+
+    native.chmod(0o555)
+    try:
+        with mock.patch.object(subprocess, "run") as mock_run:
+            # Under -W error, both call 1 and call 2 must raise (once-only flag not set yet).
+            for _ in range(2):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", RuntimeWarning)
+                    with pytest.raises(RuntimeWarning, match="different CPU"):
+                        resolve()
+            # Under normal warnings, emits once with caller filename, then stays silent.
+            with warnings.catch_warnings(record=True) as caught1:
+                warnings.simplefilter("always", RuntimeWarning)
+                assert resolve() == so
+            assert len(caught1) == 1
+            assert caught1[0].filename == __file__
+            assert "different CPU" in str(caught1[0].message)
+            with warnings.catch_warnings(record=True) as caught2:
+                warnings.simplefilter("always", RuntimeWarning)
+                assert resolve() == so
+            assert caught2 == []
+        mock_run.assert_not_called()
+    finally:
+        native.chmod(0o755)
+
+    # Matching native or portable build in read-only checkout emits no warning.
+    monkeypatch.setenv("STIMSIDE_PORTABLE_BUILD", "1")
+    resolve()
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD")
+    native.chmod(0o555)
+    try:
+        with warnings.catch_warnings(record=True) as caught_ok:
+            warnings.simplefilter("always", RuntimeWarning)
+            assert resolve() == so
+        assert caught_ok == []
+    finally:
+        native.chmod(0o755)
+
+
+def test_failed_rebuild_warning_reraises_under_werror_and_points_at_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_cxx()
+    _, cpp, resolve = _make_source_native(
+        tmp_path, "tiny_werr", 'extern "C" int tiny_werr_val() { return 4; }\n'
+    )
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    so = resolve()
+    cpp.write_text("#error intentional_werror_check\n", encoding="utf-8")
+    newer_ns = so.stat().st_mtime_ns + 5_000_000_000
+    os.utime(cpp, ns=(newer_ns, newer_ns))
+
+    for _ in range(2):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            with pytest.raises(RuntimeWarning, match="failed to rebuild"):
+                resolve()
+
+    with warnings.catch_warnings(record=True) as caught1:
+        warnings.simplefilter("always", RuntimeWarning)
+        assert resolve() == so
+    assert len(caught1) == 1
+    assert caught1[0].filename == __file__
+
+    with warnings.catch_warnings(record=True) as caught2:
+        warnings.simplefilter("always", RuntimeWarning)
+        assert resolve() == so
+    assert caught2 == []
+
+
+def test_stale_temp_files_removed_under_lock_keeping_fresh_and_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_cxx()
+    native, _, resolve = _make_source_native(
+        tmp_path, "tiny_stale", 'extern "C" int tiny_stale_val() { return 42; }\n'
+    )
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", raising=False)
+
+    old_t = time.time() - 1200.0
+    old_so = native / ".libtiny_stale.111.aaaaaa.tmp.so"
+    old_bid = native / ".libtiny_stale.111.aaaaaa.tmp.build_id"
+    fresh_so = native / ".libtiny_stale.222.bbbbbb.tmp.so"
+    other_so = native / ".libother.111.cccccc.tmp.so"
+    target = tmp_path / "outside.txt"
+    link_so = native / ".libtiny_stale.333.dddddd.tmp.so"
+    for p in (old_so, old_bid, fresh_so, other_so, target):
+        p.write_text("x", encoding="utf-8")
+    for p in (old_so, old_bid, other_so, target):
+        os.utime(p, (old_t, old_t))
+    link_so.symlink_to(target)
+    try:
+        os.utime(link_so, (old_t, old_t), follow_symlinks=False)
+    except (NotImplementedError, OSError):
+        pass
+
+    so = resolve()
+    assert not old_so.exists()
+    assert not old_bid.exists()
+    assert fresh_so.exists()
+    assert other_so.exists()
+    assert link_so.is_symlink() and target.exists()
+    assert _eval_symbol_in_subprocess(so, "tiny_stale_val") == 42
+
+
+def test_adopt_exdev_fallback_preserves_valid_native_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_cxx()
+    native, cpp, resolve = _make_source_native(
+        tmp_path, "tiny_exdev", 'extern "C" int tiny_exdev_val() { return 5; }\n'
+    )
+    monkeypatch.setenv("STIMSIDE_NATIVE_BUILD", "1")
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    so = resolve()
+    src_hash = _kernel_loader._compute_source_hash(cpp)
+
+    def fail_exdev(_src: object, _dst: object) -> None:
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(os, "link", fail_exdev)
+    _kernel_loader._adopt_build_record(so, src_hash)
+    assert _read_sidecar_json(so)["mode"] == "native"
+    assert list(native.glob("*.tmp.*")) == []
+
+    _kernel_loader._build_id_path(so).unlink()
+    _kernel_loader._adopt_build_record(so, src_hash)
+    assert _read_sidecar_json(so)["mode"] == "unknown"
+    assert list(native.glob("*.tmp.*")) == []
+
+
+class _BusyThenFreeFcntl:
+    """Stands in for ``fcntl``: the lock is busy for the first three calls."""
+
+    LOCK_EX, LOCK_NB = 2, 4
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def flock(self, _fd: int, _flags: int) -> None:
+        self.calls += 1
+        if self.calls <= 3:
+            raise OSError(errno.EAGAIN, "lock is busy")
+
+
+class _FailingStream:
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.writes = 0
+
+    def write(self, _text: str) -> int:
+        self.writes += 1
+        raise self.exc
+
+    def flush(self) -> None:
+        raise self.exc
+
+
+def _unusable_stream(tmp_path: Path, kind: str) -> object:
+    closed = (tmp_path / "closed_stderr.txt").open("w", encoding="utf-8")
+    closed.close()
+    broken = _FailingStream(BrokenPipeError("stderr pipe is gone"))
+    return {"none": None, "closed": closed, "broken_pipe": broken}[kind]
+
+
+def _wait_for_busy_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: object
+) -> _BusyThenFreeFcntl:
+    """Wait for a lock that is busy three times, with ``stream`` as stderr and the notice due."""
+    monkeypatch.setattr(_kernel_loader, "_LOCK_RETRY_DELAY_S", 0.001)
+    monkeypatch.setattr(_kernel_loader, "_LOCK_NOTICE_DELAY_S", 0.0)
+    monkeypatch.setattr(_kernel_loader, "_LOCK_WAIT_SPENT_S", {})
+    lock = _BusyThenFreeFcntl()
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "stderr", stream)
+        assert _kernel_loader._wait_for_flock(0, tmp_path, 0, math.inf, None, lock) is True
+    return lock
+
+
+@pytest.mark.parametrize("stream_kind", ["none", "closed"])
+def test_lock_notice_is_best_effort_when_stderr_is_unusable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream_kind: str
+) -> None:
+    lock = _wait_for_busy_lock(tmp_path, monkeypatch, _unusable_stream(tmp_path, stream_kind))
+    assert lock.calls == 4  # the wait went on past the notice and took the lock
+
+
+def test_lock_notice_is_tried_once_when_stderr_is_a_broken_pipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stream = _FailingStream(BrokenPipeError("stderr pipe is gone"))
+    lock = _wait_for_busy_lock(tmp_path, monkeypatch, stream)
+    assert (lock.calls, stream.writes) == (4, 1)
+
+
+@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, RuntimeError])
+def test_lock_notice_hides_only_stream_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc_type: type[BaseException]
+) -> None:
+    """An interrupt, or an exception raised by a signal handler, still ends the wait."""
+    with pytest.raises(exc_type):
+        _wait_for_busy_lock(tmp_path, monkeypatch, _FailingStream(exc_type("stop")))
+
+
+@pytest.mark.parametrize("stream_kind", ["none", "closed", "broken_pipe"])
+def test_build_record_warning_is_best_effort_when_stderr_is_unusable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream_kind: str
+) -> None:
+    so_path = tmp_path / "libtiny.so"
+    monkeypatch.setattr(_kernel_loader, "_WARNED_FAILED_BUILD_IDS", set())
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "stderr", _unusable_stream(tmp_path, stream_kind))
+        _kernel_loader._warn_failed_build_id_once(so_path, OSError("read-only"))
+    assert so_path in _kernel_loader._WARNED_FAILED_BUILD_IDS

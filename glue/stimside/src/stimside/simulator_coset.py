@@ -43,6 +43,7 @@ from stimside.util.circuit import (
     stack_measurement_columns,
     unroll_circuit,
 )
+from stimside.util.circuit_ir import build_ir
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.reference_chp import (
     PackedSymplecticTables,
@@ -417,9 +418,12 @@ class CosetsideSimulator(
             (``num_measurements``, ``num_detectors``, ``num_observables``,
             ``num_qubits_in_new_circuit()``) still answer. A caught C++ exception permanently fails
             the native engine (``RuntimeError`` on every state-dependent call, getter, and
-            ``clear()``; create a new simulator). Supported subclasses preserve ``isinstance``
-            and ``__slots__``; subclasses whose latched classes cannot be built or swapped raise
-            ``TypeError`` at construction.
+            ``clear()``; create a new simulator). Ordinary subclasses using ``type`` or
+            ``abc.ABCMeta`` (with mix-ins in any base order) preserve ``isinstance`` and
+            ``__slots__``; custom metaclasses that restrict subclassing or classes blocking
+            ``__class__`` assignment raise ``TypeError`` at construction. Registering metaclasses
+            (and ``__init_subclass__`` on subclasses that require single-base latching) observe
+            the dynamically created ``_Aborted*`` / ``_Failed*`` latch classes.
         Threads:
             Not thread-safe (native kernels release the GIL); use one simulator per thread.
         ``_use_cpp``:
@@ -449,6 +453,11 @@ class CosetsideSimulator(
             raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
         batch_size = int(batch_size)
         _check_qubit_counts(circuit, compiled_ref, compiled_op_handler)  # before engine_create
+        self._latch_classes: tuple[type[Any], type[Any], type[Any]] | None = (
+            _ensure_subclass_latch(self, cls)
+            if (cls := type(self)) is not CosetsideSimulator
+            else None
+        )
         self.circuit = circuit
         n_q = int(circuit.num_qubits)
         self.num_qubits = n_q
@@ -475,17 +484,21 @@ class CosetsideSimulator(
             num_qubits=n_q,
             seed=self.seed,
         )
+        ir = build_ir(self.circuit) if compiled_ref is None else None
         self._compiled_ref = (
-            compiled_ref if compiled_ref is not None else CompiledReferenceCircuit(circuit)
+            compiled_ref
+            if compiled_ref is not None
+            else CompiledReferenceCircuit(self.circuit, ir=ir)
         )
         self._compiled_m2d_converter = circuit.compile_m2d_converter()
         self._compiled_op_handler = compiled_op_handler
         self.compiled_op_handler = compiled_op_handler
         self._init_runtime_buffers(n_q, batch_size)
-        self._latch_classes: tuple[type[Any], type[Any], type[Any]] | None = (
-            _ensure_subclass_latch(self, cls)
-            if (cls := type(self)) is not CosetsideSimulator
-            else None
+        self._run_ops: tuple[stim.CircuitInstruction, ...] | None = (
+            tuple(instr.op for instr in ir.instrs) if ir is not None else None
+        )
+        self._run_ops_circuit_snap: stim.Circuit | None = (
+            self.circuit.copy() if ir is not None else None
         )
 
     def _init_cpp_and_rng_state(self, n_q: int, batch_size: int) -> None:
@@ -532,8 +545,6 @@ class CosetsideSimulator(
         self._unrolled_ops: list[stim.CircuitInstruction] | None = None  # set by interactive_do
         self._unrolled_exact_steps = False
         self._unrolled_circuit_snap: stim.Circuit | None = None
-        self._run_ops: tuple[stim.CircuitInstruction, ...] | None = None
-        self._run_ops_circuit_snap: stim.Circuit | None = None
         self._finished_running_circuit = False
         self._final_measurement_records: NDArray[np.bool_] | None = None
         self._detector_flips: NDArray[np.bool_] | None = None
@@ -904,6 +915,36 @@ class CosetsideSimulator(
     # Public lifecycle methods
     ############################################################################
 
+    def _snapshot_unrolled_ops(
+        self,
+    ) -> tuple[list[stim.CircuitInstruction], bool, stim.Circuit]:
+        snap = self.circuit.copy()
+        if (
+            self._run_ops is not None
+            and self._run_ops_circuit_snap is not None
+            and snap == self._run_ops_circuit_snap
+        ):
+            raw_ops: Iterable[stim.CircuitInstruction] = self._run_ops
+        else:
+            raw_ops = unroll_circuit(snap)
+        steps = self._compiled_ref.steps
+        n_s = len(steps)
+        out: list[stim.CircuitInstruction] = []
+        k = 0
+        exact = True
+        for op in raw_ops:
+            if op.name in ("QUBIT_COORDS", "SHIFT_COORDS"):
+                out.append(op)
+            elif k < n_s and op == steps[k].op:
+                out.append(steps[k].op)
+                k += 1
+            else:
+                out.append(op)
+                exact = False
+        if k != n_s:
+            exact = False
+        return out, exact, snap
+
     def _ensure_run_ops(self) -> tuple[stim.CircuitInstruction, ...]:
         if (
             self._run_ops is not None
@@ -911,19 +952,16 @@ class CosetsideSimulator(
             and self.circuit == self._run_ops_circuit_snap
         ):
             return self._run_ops
-        snap = self.circuit.copy()
-        steps = self._compiled_ref.steps
-        out: list[stim.CircuitInstruction] = []
-        k = 0
-        for op in unroll_circuit(snap):
-            if op.name in ("QUBIT_COORDS", "SHIFT_COORDS"):
-                out.append(op)
-            elif k < len(steps) and op == steps[k].op:
-                out.append(steps[k].op)
-                k += 1
-            else:
-                out.append(op)
-        self._run_ops = tuple(out)
+        if (
+            self._unrolled_ops is not None
+            and self._unrolled_circuit_snap is not None
+            and self.circuit == self._unrolled_circuit_snap
+        ):
+            self._run_ops = tuple(self._unrolled_ops)
+            self._run_ops_circuit_snap = self._unrolled_circuit_snap
+            return self._run_ops
+        ops, _, snap = self._snapshot_unrolled_ops()
+        self._run_ops = tuple(ops)
         self._run_ops_circuit_snap = snap
         return self._run_ops
 
@@ -999,7 +1037,6 @@ class CosetsideSimulator(
         self._used_interactively = False
         self._finished_running_circuit = False
         self._override_packed_words = None
-        self._in_group_callback = False
 
         self._final_measurement_records = None
         self._detector_flips = None
@@ -1032,21 +1069,7 @@ class CosetsideSimulator(
     ) -> tuple[list[stim.CircuitInstruction], bool, stim.Circuit | None]:
         if (unrolled := self._unrolled_ops) is not None:
             return unrolled, self._unrolled_exact_steps, self._unrolled_circuit_snap
-        snap = self.circuit.copy()
-        unrolled = unroll_circuit(snap)
-        steps = self._compiled_ref.steps
-        k, n_s = 0, len(steps)
-        exact = True
-        for op in unrolled:
-            if op.name in ("QUBIT_COORDS", "SHIFT_COORDS"):
-                continue
-            if k >= n_s or steps[k].op != op:
-                exact = False
-                break
-            k += 1
-        if k != n_s:
-            exact = False
-        return unrolled, exact, snap
+        return self._snapshot_unrolled_ops()
 
     def _validate_interactive_slow_op(
         self,
@@ -1210,7 +1233,7 @@ class CosetsideSimulator(
                 for op in unrolled:
                     self._do_instruction(op)
             else:
-                self._do(this, _check_replay=False)
+                self._do(this)
         except BaseException as exc:
             unchanged = (
                 self._mutation_epoch == m0
@@ -1275,9 +1298,10 @@ class CosetsideSimulator(
     def _replays(self, step: StepMeta, op: stim.CircuitInstruction) -> bool:
         """Whether `op` may be run against `step`, the reference step at the cursor.
 
-        interactive_do checked the full op against the circuit; this guards the steps earlier
-        interactive runs appended past its end (kept by clear()). A step only depends on the
-        op's name and targets, so tags (which op handlers remove) and arguments aren't compared.
+        `interactive_do` validates the circuit and any appended steps up front; this serves as
+        the execution-time guard in `_next_step_meta` and unitary step lookup. A step only
+        depends on the op's name and targets, so tags (which op handlers remove) and noise
+        arguments aren't compared.
         """
         return not self._used_interactively or op is step.op or op == step.op or (
             step.op.name == op.name and op.targets_copy() == step.op.targets_copy()
@@ -1401,40 +1425,20 @@ class CosetsideSimulator(
     def _do(
         self,
         this: stim.Circuit | stim.CircuitInstruction | stim.CircuitRepeatBlock,
-        *,
-        _check_replay: bool = True,
     ) -> None:
         if isinstance(this, stim.Circuit):
             for op in this:
                 if isinstance(op, stim.CircuitInstruction):
-                    if _check_replay and self._used_interactively:
-                        assert self._unrolled_ops is not None
-                        check_replay(
-                            op,
-                            self._unrolled_ops,
-                            self._circuit_time,
-                            "CosetsideSimulator",
-                            num_qubits=self._init_num_qubits,
-                        )
                     self._do_instruction(op)
                 else:
-                    self._do(op, _check_replay=_check_replay)
+                    self._do(op)
         elif isinstance(this, stim.CircuitRepeatBlock):
             loop_body = this.body_copy()
             if not _has_any_instruction(loop_body):
                 return
             for _ in range(this.repeat_count):
-                self._do(loop_body, _check_replay=_check_replay)
+                self._do(loop_body)
         elif isinstance(this, stim.CircuitInstruction):
-            if _check_replay and self._used_interactively:
-                assert self._unrolled_ops is not None
-                check_replay(
-                    this,
-                    self._unrolled_ops,
-                    self._circuit_time,
-                    "CosetsideSimulator",
-                    num_qubits=self._init_num_qubits,
-                )
             self._do_instruction(this)
         else:
             raise NotImplementedError(f"Unsupported circuit object: {type(this)}")
@@ -3840,6 +3844,26 @@ class _SuppressInitSubclass:
 _FAILED_CLASSES: weakref.WeakKeyDictionary[type[Any], Any] = weakref.WeakKeyDictionary()
 _ABORTED_CLASSES: weakref.WeakKeyDictionary[type[Any], Any] = weakref.WeakKeyDictionary()
 _SUBCLASS_VERDICTS: weakref.WeakKeyDictionary[type[Any], str] = weakref.WeakKeyDictionary()
+_SINGLE_BASE_SUBCLASSES: weakref.WeakSet[type[Any]] = weakref.WeakSet()
+
+
+def _unlatchable_msg(cls: type[Any], exc: BaseException) -> str:
+    return (
+        f"Subclass {cls.__name__} cannot be latched ({type(exc).__name__}: {exc}); "
+        "such subclasses are not supported by CosetsideSimulator."
+    )
+
+
+def _build_latch_class(
+    cls: type[Any], prefix: str, ns: dict[str, Any], *, single_base: bool
+) -> type[Any]:
+    bases: tuple[type[Any], ...] = (
+        (cls,)
+        if (single_base or issubclass(cls, _SuppressInitSubclass))
+        else (_SuppressInitSubclass, cls)
+    )
+    meta: Any = type(cls)
+    return meta(f"{prefix}{cls.__name__}", bases, dict(ns))
 
 
 def _get_latch_class(
@@ -3850,40 +3874,89 @@ def _get_latch_class(
 ) -> type[Any]:
     ref = cache.get(cls)
     if (sub := ref() if ref is not None else None) is None:
-        bases: tuple[type[Any], ...] = (
-            (cls,) if issubclass(cls, _SuppressInitSubclass) else (_SuppressInitSubclass, cls)
+        sub = _build_latch_class(
+            cls, prefix, ns, single_base=(cls in _SINGLE_BASE_SUBCLASSES)
         )
-        meta: Any = type(cls)
-        sub = meta(f"{prefix}{cls.__name__}", bases, dict(ns))
         cache[cls] = weakref.ref(sub)
     return sub
+
+
+def _test_latch_swap(
+    sim: CosetsideSimulator, cls: type[Any], ab_cls: type[Any], fl_cls: type[Any]
+) -> None:
+    try:
+        object.__setattr__(sim, "__class__", ab_cls)
+        object.__setattr__(sim, "__class__", fl_cls)
+    finally:
+        if type(sim) is not cls:
+            object.__setattr__(sim, "__class__", cls)
+
+
+def _cache_rejected_verdict(cls: type[Any], msg: str) -> None:
+    try:
+        _SUBCLASS_VERDICTS[cls] = msg
+    except TypeError:
+        return
+
+
+def _build_single_base_latch(
+    sim: CosetsideSimulator, cls: type[Any]
+) -> tuple[type[Any], type[Any]]:
+    try:
+        ab_cls = _build_latch_class(cls, "_Aborted", _ABORTED_NS, single_base=True)
+        fl_cls = _build_latch_class(cls, "_Failed", _FAILED_NS, single_base=True)
+    except Exception as exc:
+        if isinstance(exc, (MemoryError, RecursionError)):
+            raise
+        msg = _unlatchable_msg(cls, exc)
+        if isinstance(exc, TypeError):
+            _cache_rejected_verdict(cls, msg)
+        raise TypeError(msg) from exc
+    try:
+        _test_latch_swap(sim, cls, ab_cls, fl_cls)
+    except TypeError as exc:
+        msg = _unlatchable_msg(cls, exc)
+        _cache_rejected_verdict(cls, msg)
+        raise TypeError(msg) from exc
+    except AttributeError as exc:
+        raise TypeError(_unlatchable_msg(cls, exc)) from exc
+    _SINGLE_BASE_SUBCLASSES.add(cls)
+    _ABORTED_CLASSES[cls] = weakref.ref(ab_cls)
+    _FAILED_CLASSES[cls] = weakref.ref(fl_cls)
+    return ab_cls, fl_cls
 
 
 def _ensure_subclass_latch(
     sim: CosetsideSimulator, cls: type[Any]
 ) -> tuple[type[Any], type[Any], type[Any]]:
-    if (verdict := _SUBCLASS_VERDICTS.get(cls)):
+    try:
+        verdict = _SUBCLASS_VERDICTS.get(cls)
+    except TypeError as exc:
+        raise TypeError(_unlatchable_msg(cls, exc)) from exc
+    if verdict:
         raise TypeError(verdict)
+    if verdict == "":
+        return cls, _get_aborted_class(cls), _get_failed_class(cls)
     try:
         ab_cls, fl_cls = _get_aborted_class(cls), _get_failed_class(cls)
-        if verdict is None:
-            try:
-                object.__setattr__(sim, "__class__", ab_cls)
-                object.__setattr__(sim, "__class__", fl_cls)
-            finally:
-                if type(sim) is not cls:
-                    object.__setattr__(sim, "__class__", cls)
-            _SUBCLASS_VERDICTS[cls] = ""
-        return cls, ab_cls, fl_cls
-    except Exception as exc:
-        if isinstance(exc, MemoryError):
-            raise
-        msg = (
-            f"Subclass {cls.__name__} cannot be latched ({type(exc).__name__}: {exc}); "
-            "such subclasses are not supported by CosetsideSimulator."
-        )
-        _SUBCLASS_VERDICTS[cls] = msg
+    except TypeError as exc:
+        _ABORTED_CLASSES.pop(cls, None)
+        _FAILED_CLASSES.pop(cls, None)
+        msg = _unlatchable_msg(cls, exc)
+        _cache_rejected_verdict(cls, msg)
         raise TypeError(msg) from exc
+    try:
+        _test_latch_swap(sim, cls, ab_cls, fl_cls)
+    except AttributeError as exc:
+        _ABORTED_CLASSES.pop(cls, None)
+        _FAILED_CLASSES.pop(cls, None)
+        raise TypeError(_unlatchable_msg(cls, exc)) from exc
+    except TypeError:
+        _ABORTED_CLASSES.pop(cls, None)
+        _FAILED_CLASSES.pop(cls, None)
+        ab_cls, fl_cls = _build_single_base_latch(sim, cls)
+    _SUBCLASS_VERDICTS[cls] = ""
+    return cls, ab_cls, fl_cls
 
 
 def _get_failed_class(cls: type[Any]) -> type[Any]:

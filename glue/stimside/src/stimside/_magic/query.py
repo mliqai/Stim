@@ -67,6 +67,7 @@ from stimside.util.bitwords import (
     n_words_for_qubits,
     unit_bit_words,
 )
+from stimside.util.circuit_ir import CircuitIR
 from stimside.util.reference_chp import ReferenceCHPTableau
 
 __all__ = [
@@ -795,7 +796,11 @@ def _record_axes(rec: Any) -> Sequence[CompiledPauliAxis]:
 
 
 def _compile_plan(
-    circuit: stim.Circuit, mode_norm: str, fault_channels: Sequence[CliffordFaultChannel] | None
+    circuit: stim.Circuit,
+    mode_norm: str,
+    fault_channels: Sequence[CliffordFaultChannel] | None,
+    *,
+    ir: CircuitIR | None = None,
 ) -> DirectPlan | SelectorPlan:
     compiled: DirectPlan | SelectorPlan = (
         compile_direct(
@@ -803,6 +808,7 @@ def _compile_plan(
             fault_channels=fault_channels,
             c2_budget=_C2_BUDGET,
             c2_max_rank=_QUERY_C2_MAX_RANK,
+            ir=ir,
         )
         if mode_norm == "DIRECT"
         else compile_selector(
@@ -811,6 +817,7 @@ def _compile_plan(
             gadgetize_pauli_noise=False,
             c2_budget=_C2_BUDGET,
             c2_max_rank=_QUERY_C2_MAX_RANK,
+            ir=ir,
         )
     )
     if any(isinstance(rec, LeakageBarrierRecord) for rec in compiled.records):
@@ -962,7 +969,7 @@ def _resolve_output_qubits(
     return out_qs
 
 
-def PrepareQueries(
+def _prepare_queries_from_ir(
     circuit: stim.Circuit,
     *,
     fault_mode: str = "DIRECT",
@@ -972,8 +979,8 @@ def PrepareQueries(
     acceptance_spec: Mapping[int, int | bool] | Callable[[NDArray[np.bool_]], bool] | None = None,
     budget: QueryBudget | None = None,
     atol: float = DEFAULT_ATOL,
+    ir: CircuitIR | None = None,
 ) -> PreparedQueryPlan:
-    """`Q1`: Compile `circuit` into a dependency-tracked QFE Choi/Ket segment-tree plan."""
     if not isinstance(circuit, stim.Circuit):
         raise TypeError(f"Expected stim.Circuit, got {type(circuit)!r}")
     if not isinstance(fault_mode, str) or fault_mode.strip().upper() not in ("DIRECT", "SELECTOR"):
@@ -985,7 +992,7 @@ def PrepareQueries(
     )
     if not isinstance(eff_budget, QueryBudget):
         raise TypeError(f"Expected QueryBudget, got {type(eff_budget)!r}")
-    compiled = _compile_plan(circuit, mode_norm, fault_channels)
+    compiled = _compile_plan(circuit, mode_norm, fault_channels, ir=ir)
     n_data, n_op = (
         (compiled.num_qubits if isinstance(compiled, DirectPlan) else compiled.num_data_qubits),
         max(
@@ -1016,31 +1023,38 @@ def PrepareQueries(
         )
         _bell_steps_for(ref_final, comp_target[0], out_qs, bcache)
     st = {
-        "target": comp_target,
-        "bcache": bcache,
-        "slots": slot_id_to_idx,
-        "noise": noise_meta,
-        "q_act": q_act,
-        "ops": otup,
-        "dyn": dyn,
-        "root": root,
-        "nodes": nodes,
-        "lru": OrderedDict(),
-        "bytes": 0,
+        "target": comp_target, "bcache": bcache, "slots": slot_id_to_idx,
+        "noise": noise_meta, "q_act": q_act, "ops": otup, "dyn": dyn,
+        "root": root, "nodes": nodes, "lru": OrderedDict(), "bytes": 0,
     }
     return PreparedQueryPlan(
+        circuit, mode_norm, n_data, n_op, compiled.num_measurements, out_qs,
+        eff_budget, tol, compiled, target_spec, acceptance_spec, st,
+    )
+
+
+def PrepareQueries(
+    circuit: stim.Circuit,
+    *,
+    fault_mode: str = "DIRECT",
+    fault_channels: Sequence[CliffordFaultChannel] | None = None,
+    target_spec: Any = None,
+    output_qubits: Sequence[int] | None = None,
+    acceptance_spec: Mapping[int, int | bool] | Callable[[NDArray[np.bool_]], bool] | None = None,
+    budget: QueryBudget | None = None,
+    atol: float = DEFAULT_ATOL,
+) -> PreparedQueryPlan:
+    """Compile ``circuit`` into a dependency-tracked QFE Choi/Ket segment-tree plan."""
+    return _prepare_queries_from_ir(
         circuit,
-        mode_norm,
-        n_data,
-        n_op,
-        compiled.num_measurements,
-        out_qs,
-        eff_budget,
-        tol,
-        compiled,
-        target_spec,
-        acceptance_spec,
-        st,
+        fault_mode=fault_mode,
+        fault_channels=fault_channels,
+        target_spec=target_spec,
+        output_qubits=output_qubits,
+        acceptance_spec=acceptance_spec,
+        budget=budget,
+        atol=atol,
+        ir=None,
     )
 
 

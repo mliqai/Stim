@@ -48,8 +48,12 @@ DEFAULT_TSV = HERE / "required_mutants.tsv"
 
 GROUPS: dict[str, tuple[str, ...]] = {
     "GOLD": ("golden_test.py",),
-    "TAB": ("simulator_tableau_test.py", "simulator_tableau_routing_test.py"),
-    "MAGIC": ("_magic/compile_test.py",),
+    "TAB": (
+        "simulator_tableau_test.py",
+        "simulator_tableau_routing_test.py",
+        "_tableau/precompile_pure_test.py",
+    ),
+    "MAGIC": ("_magic/compile_test.py", "_magic/plan_ir_test.py"),
     "DEM": (
         "dem_generators/dem_generator_marginal_test.py",
         "dem_generators/marginal_builder_reference_test.py",
@@ -58,9 +62,13 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "UTIL": ("util",),
     "FLIP": (
         "simulator_flip_test.py",
+        "_flip/sync_reference_ir_test.py",
         "op_handlers/leakage_handlers/leakage_uint8_flip_test.py",
     ),
-    "COSET": ("simulator_coset_test.py",),
+    "COSET": (
+        "simulator_coset_test.py",
+        "_coset/reference_compile_ir_test.py",
+    ),
 }
 
 _ASSERT_EXCS = frozenset({"AssertionError", "Failed"})

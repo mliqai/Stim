@@ -7,6 +7,7 @@ import copy
 import dataclasses
 import functools
 import math
+import pickle
 import struct
 import types
 import weakref
@@ -32,7 +33,7 @@ from stimside._magic.live_store import (
 from stimside._native.magic_engine import CLS_ACTIVE, CLS_DEAD, CLS_TRIVIAL
 from stimside._magic.gates import (
     CliffordFaultChannel, CompiledPauliAxis, canonical_clifford_gate_name_and_arity,
-    canonical_gate_data, coerce_strict_int, extract_circuit_faults,
+    canonical_gate_data, coerce_strict_int, extract_inline_faults_from_ir,
     merge_and_validate_fault_channels, parse_clifford_fault_instruction,
 )
 from stimside._magic.plan import DirectPlan, SelectorPlan, compile_direct, compile_open_block, compile_selector
@@ -44,8 +45,8 @@ from stimside._magic.phase_qfe import (
     validate_atol,
 )
 from stimside._magic.query import (
-    PrepareQueries, PreparedQueryPlan, QueryBudget, QueryBudgetExceededError, run_query_batch,
-    _normalize_realization,
+    PreparedQueryPlan, QueryBudget, QueryBudgetExceededError, run_query_batch,
+    _normalize_realization, _prepare_queries_from_ir,
 )
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, OpHandler, _TrivialCompiledOpHandler
 from stimside.op_handlers.seam import SyncRngs
@@ -66,6 +67,7 @@ from stimside.util.circuit import (
     stack_measurement_columns,
     unroll_circuit,
 )
+from stimside.util.circuit_ir import CircuitIR, build_ir
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.reference_chp import PackedSymplecticTables, ReferenceCHPTableau
 from stimside.util.seeding import derived_seed
@@ -425,10 +427,13 @@ _MEMO_SKIP_TYPES = (
 )
 
 
-def _stim_deepcopy_memo(root: Any) -> dict[int, Any]:
+def _stim_deepcopy_memo(
+    root: Any,
+    seed_memo: Mapping[int, Any] | None = None,
+) -> dict[int, Any]:
     """Build a deepcopy memo mapping immutable unpicklable Stim objects to themselves."""
-    memo: dict[int, Any] = {}
-    seen: set[int] = set()
+    memo: dict[int, Any] = dict(seed_memo) if seed_memo else {}
+    seen: set[int] = set(memo)
     stack: list[Any] = [root]
     while stack:
         obj = stack.pop()
@@ -488,7 +493,11 @@ def _stim_deepcopy_memo(root: Any) -> dict[int, Any]:
     return memo
 
 
-def _clone_op_handler(handler: CompiledOpHandler[Any]) -> CompiledOpHandler[Any]:
+def _clone_op_handler(
+    handler: CompiledOpHandler[Any],
+    sim_orig: MagicsideSimulator | None = None,
+    sim_new: MagicsideSimulator | None = None,
+) -> CompiledOpHandler[Any]:
     from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import (
         CompiledLeakageUint8Coset,
     )
@@ -515,15 +524,34 @@ def _clone_op_handler(handler: CompiledOpHandler[Any]) -> CompiledOpHandler[Any]
         and getattr(type(handler), "__deepcopy__", None) is None
     ):
         return copy.copy(handler)
-    return copy.deepcopy(handler, _stim_deepcopy_memo(handler))
+    seed_memo = (
+        {id(sim_orig): sim_new}
+        if sim_orig is not None and sim_new is not None
+        else None
+    )
+    memo = _stim_deepcopy_memo(handler, seed_memo)
+    try:
+        return copy.deepcopy(handler, memo)
+    except (TypeError, pickle.PickleError, copy.Error) as exc:
+        cls_name = type(handler).__name__
+        raise TypeError(
+            f"Cannot copy op handler {cls_name!r}: define __copy__ or __deepcopy__ on "
+            f"{cls_name} to copy MagicsideSimulator ({exc})."
+        ) from exc
 
 
 class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixin):
     """Non-Clifford Phase-QFE simulator compatible with CosetsideSimulator APIs.
 
-    Lifecycle & copying: each ``run()`` refuses dirty retries after instruction 0 fails
-    until ``clear()`` resets the simulator, and ``copy.copy(sim)`` deep-clones mutable
-    simulator state, stores, and op handlers into an independent instance.
+    Lifecycle & copying: each ``run()`` refuses dirty retries via ``run()``,
+    ``interactive_do()``, or ``finish_interactive_run()`` after a failure (including on
+    instruction 0) until ``clear()`` resets the simulator; failed ``interactive_do()`` calls
+    are not guarded and leave partial state. ``copy.copy(sim)`` clones mutable simulator
+    state, stores, and op handlers into an independent instance. Custom user op handlers
+    must be deep-copyable or define ``__copy__`` or ``__deepcopy__`` (otherwise
+    ``copy.copy(sim)`` raises ``TypeError`` naming the handler class); back-references to
+    the simulator inside a deep-copied handler are remapped to the new copy. Direct
+    ``copy.deepcopy(sim)`` and ``pickle.dumps(sim)`` raise ``TypeError``.
     """
 
     def __init__(
@@ -562,11 +590,22 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 raise ValueError(f"reference_sample length {ref_arr.shape} != {circuit.num_measurements}")
             self._explicit_ref_sample = ref_arr.copy()
         self.num_qubits = int(circuit.num_qubits)
-        self._unrolled_ops: list[stim.CircuitInstruction] = unroll_circuit(circuit)
-        self._eff_m2d_mode: Literal["magicside", "stim", "zero"] = ("magicside" if any(op.tag in _MAGIC_TAGS for op in self._unrolled_ops) else "stim") if self.m2d_reference_mode == "auto" else self.m2d_reference_mode
-        flat_ops, inline_faults = extract_circuit_faults(circuit)
+        ir = build_ir(circuit)
+        self._circuit_ir: CircuitIR | None = ir
+        self._circuit_snap: stim.Circuit | None = circuit.copy()
+        self._unrolled_ops: list[stim.CircuitInstruction] = [ins.op for ins in ir.instrs]
+        self._eff_m2d_mode: Literal["magicside", "stim", "zero"] = (
+            ("magicside" if any(ins.tag in _MAGIC_TAGS for ins in ir.instrs) else "stim")
+            if self.m2d_reference_mode == "auto"
+            else self.m2d_reference_mode
+        )
+        inline_faults = extract_inline_faults_from_ir(ir)
         self._user_fault_channels = tuple(fault_channels) if fault_channels is not None else None
-        self._prog_faults, self._inline_faults, self._all_fault_channels = merge_and_validate_fault_channels(len(flat_ops), inline_faults, fault_channels)
+        (
+            self._prog_faults,
+            self._inline_faults,
+            self._all_fault_channels,
+        ) = merge_and_validate_fault_channels(len(ir.instrs), inline_faults, fault_channels)
         self._logical_nq = max([self.num_qubits] + [q + 1 for ch in self._all_fault_channels for b in ch.branches for q in b.targets])
         self._eff_nq = infer_total_data_qubits(circuit, self._all_fault_channels)
         self._tab_scratch_q = self.num_qubits
@@ -578,26 +617,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self.compiled_op_handler = self._compiled_op_handler
         if (self.backend == "QUERY" or self.fault_mode == "SELECTOR") and (not self._has_trivial_handler or self.sync_tableside_rng):
             raise ValueError(f"backend={self.backend!r}, fault_mode={self.fault_mode!r} is incompatible with non-trivial op_handler or sync_tableside_rng=True")
-        self._norm_reals: list[dict[str, Any]] | None = None
-        self._has_non_fault_reals = False
-        if fault_realizations is not None:
-            if not isinstance(fault_realizations, Mapping) and (isinstance(fault_realizations, (str, bytes)) or not isinstance(fault_realizations, Sequence) or len(fault_realizations) != self.batch_size):
-                raise ValueError("fault_realizations must be a Mapping or Sequence of length batch_size")
-            f_max = [len(ch.branches) for ch in self._all_fault_channels]
-            f_id_map = {int(ch.slot_id): i for i, ch in enumerate(self._all_fault_channels)}  # type: ignore[arg-type]
-            raw_seq = [fault_realizations] if isinstance(fault_realizations, Mapping) else fault_realizations
-            parsed = [_normalize_shot_realization(r, f_max, f_id_map, int(circuit.num_measurements)) for r in raw_seq]
-            self._norm_reals = parsed * self.batch_size if isinstance(fault_realizations, Mapping) else parsed
-            if not any(parsed):  # all-empty realizations must behave exactly like None
-                self._norm_reals = None
-            self._has_non_fault_reals = any(bool(set(nr) - {"faults"}) for nr in parsed)
-            if self._has_non_fault_reals and (not self._has_trivial_handler or self.sync_tableside_rng):
-                raise ValueError("Non-fault keys in fault_realizations require trivial op_handler and sync_tableside_rng=False")
-            if any("sweep_bits" in nr for nr in parsed):
-                rows = [nr["sweep_bits"] if "sweep_bits" in nr else (self._sweep_mat[s] if self._sweep_mat is not None else ()) for s, nr in enumerate(self._norm_reals)]
-                self._sweep_mat = np.zeros((self.batch_size, max(len(r) for r in rows)), dtype=np.bool_)
-                for s, r in enumerate(rows):
-                    self._sweep_mat[s, : len(r)] = r
+        self._init_fault_realizations(fault_realizations, int(circuit.num_measurements))
         self._batches_completed = 0
         self._compiled_stream_plan: DirectPlan | SelectorPlan | None = None
         self._compiled_query_plan: PreparedQueryPlan | None = None
@@ -608,6 +628,66 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._unleaked_to_leaked_events: list[list[int]] = []
         self._leakage_events: list[list[LeakageEvent]] = []
         self.clear()
+
+    def _init_fault_realizations(self, fault_realizations: Any, num_measurements: int) -> None:
+        self._norm_reals: list[dict[str, Any]] | None = None
+        self._has_non_fault_reals = False
+        if fault_realizations is None:
+            return
+        if not isinstance(fault_realizations, Mapping) and (
+            isinstance(fault_realizations, (str, bytes))
+            or not isinstance(fault_realizations, Sequence)
+            or len(fault_realizations) != self.batch_size
+        ):
+            raise ValueError(
+                "fault_realizations must be a Mapping or Sequence of length batch_size"
+            )
+        f_max = [len(ch.branches) for ch in self._all_fault_channels]
+        f_id_map = {
+            int(ch.slot_id): i  # type: ignore[arg-type]
+            for i, ch in enumerate(self._all_fault_channels)
+        }
+        raw_seq = (
+            [fault_realizations] if isinstance(fault_realizations, Mapping) else fault_realizations
+        )
+        parsed = [
+            _normalize_shot_realization(r, f_max, f_id_map, num_measurements) for r in raw_seq
+        ]
+        self._norm_reals = (
+            parsed * self.batch_size if isinstance(fault_realizations, Mapping) else parsed
+        )
+        if not any(parsed):  # all-empty realizations must behave exactly like None
+            self._norm_reals = None
+        self._has_non_fault_reals = any(bool(set(nr) - {"faults"}) for nr in parsed)
+        if self._has_non_fault_reals and (
+            not self._has_trivial_handler or self.sync_tableside_rng
+        ):
+            raise ValueError(
+                "Non-fault keys in fault_realizations require trivial op_handler and "
+                "sync_tableside_rng=False"
+            )
+        if any("sweep_bits" in nr for nr in parsed):
+            assert self._norm_reals is not None
+            rows = [
+                nr["sweep_bits"]
+                if "sweep_bits" in nr
+                else (self._sweep_mat[s] if self._sweep_mat is not None else ())
+                for s, nr in enumerate(self._norm_reals)
+            ]
+            self._sweep_mat = np.zeros(
+                (self.batch_size, max(len(r) for r in rows)), dtype=np.bool_
+            )
+            for s, r in enumerate(rows):
+                self._sweep_mat[s, : len(r)] = r
+
+    def _cached_ir(self) -> CircuitIR | None:
+        if (
+            self._circuit_ir is not None
+            and self._circuit_snap is not None
+            and self.circuit == self._circuit_snap
+        ):
+            return self._circuit_ir
+        return None
 
     def _init_rngs(self) -> None:
         if not self.sync_tableside_rng:
@@ -653,8 +733,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def clear(self) -> None:
         """Reset simulator state, RNGs, and batch store for a fresh circuit run.
 
-        Re-reads ``_LIVE_STORE_ENGINE`` when reinitializing ``_live_exps`` and clears
-        ``_started`` so ``run()`` can start a fresh batch even after an earlier error.
+        Reinitializes the live batch store and clears any failed-run state so ``run()``
+        can start a fresh batch even after an earlier error.
         """
         self._measurement_columns.clear()
         self._cached_m2d: tuple[NDArray[np.bool_], NDArray[np.bool_]] | None = None
@@ -704,10 +784,10 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def run(self) -> list[np.ndarray] | None:
         """Execute the full circuit across all ``batch_size`` shots.
 
-        Sets ``_started = True`` before instruction 0; if instruction 0 or any later
-        operation raises, subsequent ``run()``, ``interactive_do()`` and
-        ``finish_interactive_run()`` calls raise ``ValueError`` until ``clear()``
-        resets the simulator. Returns ``get_unleaked_to_leaked_records()`` when
+        Marks the simulator as started before instruction 0; if instruction 0 or any later
+        operation raises, subsequent ``run()``, ``interactive_do()``, and
+        ``finish_interactive_run()`` calls raise ``ValueError`` until ``clear()`` resets the
+        simulator. Returns ``get_unleaked_to_leaked_records()`` when
         ``record_unleaked_to_leaked`` is enabled, otherwise ``None``.
         """
         if (
@@ -724,7 +804,11 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         elif can_use_compiled and (self.fault_mode == "SELECTOR" or self._norm_reals is not None):
             self._run_compiled_stream()
         else:
-            self._do(self.circuit)
+            if self._circuit_snap is not None and self.circuit == self._circuit_snap:
+                for op in self._unrolled_ops:
+                    self._do_instruction(op)
+            else:
+                self._do(self.circuit)
             if len(self._unrolled_ops) == 0 and 0 in self._prog_faults:
                 for slot_idx, ch in self._prog_faults[0]:
                     self._fire_fault_channel_live(slot_idx, ch)
@@ -750,9 +834,13 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
     def _ensure_query_plan(self) -> PreparedQueryPlan:
         if self._compiled_query_plan is None:
-            self._compiled_query_plan = PrepareQueries(
-                self.circuit, fault_mode=self.fault_mode, fault_channels=self._user_fault_channels,
-                budget=self.query_budget, atol=self.atol,
+            self._compiled_query_plan = _prepare_queries_from_ir(
+                self.circuit,
+                fault_mode=self.fault_mode,
+                fault_channels=self._user_fault_channels,
+                budget=self.query_budget,
+                atol=self.atol,
+                ir=self._cached_ir(),
             )
         return self._compiled_query_plan
 
@@ -807,7 +895,12 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def _run_compiled_stream(self) -> None:
         if self._compiled_stream_plan is None:
             fc = self._user_fault_channels
-            self._compiled_stream_plan = compile_selector(self.circuit, fault_channels=fc) if self.fault_mode == "SELECTOR" else compile_direct(self.circuit, fault_channels=fc)
+            cached_ir = self._cached_ir()
+            self._compiled_stream_plan = (
+                compile_selector(self.circuit, fault_channels=fc, ir=cached_ir)
+                if self.fault_mode == "SELECTOR"
+                else compile_direct(self.circuit, fault_channels=fc, ir=cached_ir)
+            )
         plan = self._compiled_stream_plan
         mc_cap = self.max_components if self.on_budget_exceeded == "raise" else None
         recs = np.zeros((self.batch_size, plan.num_measurements), dtype=np.bool_)
@@ -936,6 +1029,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         """Return an independent simulator copy in both engine-backed and Python-list modes."""
         new = self.__class__.__new__(self.__class__)
         new.__dict__.update(self.__dict__)
+        new._circuit_ir = None
+        new._circuit_snap = None if self._circuit_snap is None else self._circuit_snap.copy()
         store: LiveExpansions | None = self.__dict__.get("_live_store")
         in_use = store is not None and self._live_exps is store
         if store is not None:
@@ -990,12 +1085,12 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             new._tab_rngs = [t.copy(copy_rng=True) for t in self._tab_rngs]
         if self._tab_rngs_x is not None:
             new._tab_rngs_x = [t.copy(copy_rng=True) for t in self._tab_rngs_x]
-        cloned_handler = _clone_op_handler(self._compiled_op_handler)
+        cloned_handler = _clone_op_handler(self._compiled_op_handler, self, new)
         new._compiled_op_handler = cloned_handler
         new.compiled_op_handler = (
             cloned_handler
             if self.compiled_op_handler is self._compiled_op_handler
-            else _clone_op_handler(self.compiled_op_handler)
+            else _clone_op_handler(self.compiled_op_handler, self, new)
         )
         return new
 

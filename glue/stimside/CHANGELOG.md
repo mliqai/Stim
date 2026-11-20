@@ -2,6 +2,67 @@
 
 All notable user-visible changes to `stimside` are documented in this file.
 
+## Unreleased
+
+- **`TablesideSimulator`: `SPP`, `SPP_DAG`, `E` and `ELSE_CORRELATED_ERROR` with inverted Pauli
+  targets (`src/stimside/_tableau/runner.py`):** An untagged instruction whose targets are all
+  inverted single Paulis (for example `SPP !X0 !X1`) was precompiled as a two-qubit gate. With a
+  leaked target qubit the default run path then skipped the instruction on the unleaked qubits
+  too, raised `ValueError`, or (odd target count) read past the instruction's targets. Such
+  instructions are now handled like their non-inverted spellings. A hand-built parameter table
+  that attaches a pair condition to an odd number of targets could crash the interpreter in the
+  same way; it now raises an exception when the instruction runs.
+- **Kernel loader messages are best effort (`src/stimside/_native/_kernel_loader.py`):**
+  A process without a usable `stderr` (closed, `None`, or a broken pipe) failed to load the kernel
+  when it had waited more than about `10` s for the build lock, or when the build record could not
+  be written. The lock-wait notice and the build-record warning are now skipped in such a process.
+- **`CosetsideSimulator` mix-in-first subclass support (`src/stimside/simulator_coset.py`):**
+  Accepted subclasses created with ordinary `class` statements and `type` or `abc.ABCMeta` with
+  mix-ins in any base order (including mix-in-first layouts such as `abc.ABC`, `typing.Generic`,
+  `collections.abc` mix-ins, and slotted mix-ins) by falling back to single-base hidden latch
+  classes when the default class swap fails with `TypeError`; checked cached subclass verdicts
+  before constructing the native engine, cached only `TypeError` verdicts, and documented that
+  registering metaclasses and `__init_subclass__` hooks observe the hidden latch classes.
+- **`MagicsideSimulator` copy diagnostics, back-reference remapping, and tests
+  (`src/stimside/simulator_magic.py`, `src/stimside/simulator_magic_live_store_test.py`):**
+  - Updated `_clone_op_handler` to raise a clear `TypeError` naming the handler class and
+    instructing callers to define `__copy__` or `__deepcopy__` when a user op handler cannot be
+    deep-copied.
+  - Seeded `_stim_deepcopy_memo` with `{id(self): new}` during `MagicsideSimulator.__copy__` so
+    handler back-references to the simulator (direct attributes, bound methods, and nested
+    containers) remap cleanly to the new copy in both engine-backed and Python-list modes without
+    raising.
+  - Added structural shared-member tests across live and compiled states, dedicated behavioral
+    isolation tests for `_tab_rngs_x`, `qubit_tags`, and `_measurement_columns`, and dirty-run
+    lifecycle tests across `QUERY`, `SELECTOR`, `DIRECT` with `fault_realizations`, live, and
+    copied simulators.
+- **Native kernel loader refinements (`src/stimside/_native/_kernel_loader.py`,
+  `src/stimside/_native/packaging_build_test.py`):**
+  - Printed one `stderr` progress notice after about `10` s of waiting on the `_native` build lock
+    (naming the directory, lock owner UID, and `STIMSIDE_BUILD_LOCK_TIMEOUT_S`), and shared one
+    cumulative wait budget per process across the libraries in the same directory.
+  - Made missing/legacy `.build_id` adoption lockless via `os.link` so adoption does not wait on
+    a held directory lock while still preserving existing valid v2 records.
+  - Filtered `/proc/cpuinfo` `cpu_flags` digests to instruction-set tokens intersected across all
+    processors (ignoring kernel, hypervisor, and mitigation flags; existing `"native"` `.build_id`
+    records trigger one native rebuild on first use), and added a once-per-library `RuntimeWarning`
+    when a read-only source checkout holds a `"native"` library built for another CPU.
+  - Recorded once-per-library warning guards only after `warnings.warn` / `sys.stderr.write`
+    returns so `-W error` raises reliably on repeated calls.
+  - Cleaned up stale regular `.tmp.so` / `.tmp.build_id` files for the target library older than
+    the lock wait limit while holding the build lock (preserving fresh temp files and symlinks).
+  - Accepted `inf` / `+inf` / `infinity` for `STIMSIDE_BUILD_LOCK_TIMEOUT_S` as no timeout limit,
+    and pointed invalid-value and loader `RuntimeWarning`s at the caller via `stacklevel`.
+- **Hostile OOM tests and documentation (`src/stimside/_native/magic_engine_born_hostile_test.py`,
+  `src/stimside/_native/magic_engine_measure_hostile_test.py`, `README.md`,
+  `src/stimside/simulator_magic.py`):**
+  - Removed the missing-`c++`-compiler skip clause and unused `shutil` import from both Magicside
+    hostile test files so OOM tests skip only under TSan.
+  - Documented loader `-W error` behavior, `STIMSIDE_BUILD_LOCK_TIMEOUT_S` values, lock wait
+    notices, lockless adoption, ISA-only CPU digests, read-only foreign-CPU warnings, stale temp
+    cleanup, and `MagicsideSimulator` handler copying and failed-run semantics in `README.md` and
+    public docstrings.
+
 ## Unreleased — Magicside, Cosetside, Kernel Loader, and Circuit-IR Updates
 
 - **Independent `copy.copy(MagicsideSimulator)` in both engine and list modes:** Rewrote

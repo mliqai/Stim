@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import numpy as np
@@ -13,7 +14,6 @@ from stimside._flip import sync_reference
 from stimside.op_handlers.abstract_op_handler import CompiledOpHandler, TrivialOpHandler
 from stimside.op_handlers.leakage_handlers.leakage_uint8_flip import LeakageUint8Flip
 from stimside.simulator_flip import FlipsideSimulator
-from stimside.util import circuit as circuit_util
 from stimside.util import circuit_ir, known_states
 from stimside.util.circuit import unroll_circuit
 
@@ -40,10 +40,10 @@ class _CustomHookHandler(CompiledOpHandler[FlipsideSimulator]):
         return self._op_targets(op)
 
 
-def test_sync_reference_single_ir_and_no_flat_alignment(
+def test_sync_reference_builds_at_most_one_ir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """compute_sync_reference builds at most one IR and never triggers lazy alignment."""
+    """compute_sync_reference builds at most one IR per call."""
     circ = stim.Circuit(
         "R 0 1\n"
         "REPEAT 3 {\n"
@@ -54,56 +54,39 @@ def test_sync_reference_single_ir_and_no_flat_alignment(
         "}\n"
     )
     build_calls = 0
-    unroll_calls = 0
     orig_build = circuit_ir.build_ir
-    orig_unroll = circuit_util.unroll_circuit
 
     def spy_build(*args: Any, **kwargs: Any) -> circuit_ir.CircuitIR:
         nonlocal build_calls
         build_calls += 1
         return orig_build(*args, **kwargs)
 
-    def spy_unroll(c: stim.Circuit) -> list[stim.CircuitInstruction]:
-        nonlocal unroll_calls
-        unroll_calls += 1
-        return orig_unroll(c)
-
-    def boom_align(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("sync_reference must not trigger lazy flat alignment")
-
     monkeypatch.setattr(sync_reference, "build_ir", spy_build)
-    monkeypatch.setattr(circuit_ir, "unroll_circuit", spy_unroll)
-    monkeypatch.setattr(circuit_ir, "_align_flat_ops", boom_align)
-    monkeypatch.setattr(circuit_ir._FlatAlignment, "get_where", boom_align)
-    monkeypatch.setattr(circuit_ir._FlatAlignment, "get_flat_ops", boom_align)
 
     uops = unroll_circuit(circ)
     want_ref, want_mpad, want_op = sync_reference.compute_sync_reference(
         circ.num_qubits, uops, None
     )
-    assert build_calls == 1 and unroll_calls == 0
+    assert build_calls == 1
     assert want_ref.dtype == np.bool_ and want_ref.shape == (3,)
 
-    for label, src, exp_unroll in (
-        ("tuple", tuple(uops), 0),
-        ("circuit", circ, 1),
-        ("gen", (op for op in uops), 0),
+    for label, src in (
+        ("tuple", tuple(uops)),
+        ("circuit", circ),
+        ("gen", (op for op in uops)),
     ):
         build_calls = 0
-        unroll_calls = 0
         got = sync_reference.compute_sync_reference(circ.num_qubits, src, None)
         assert build_calls == 1, label
-        assert unroll_calls == exp_unroll, label
         assert np.array_equal(got[0], want_ref) and got[1] == want_mpad and got[2] == want_op
 
     for uc in (False, True):
         ir = orig_build(circ, uc=uc)
         build_calls = 0
-        unroll_calls = 0
         got_ref, got_mpad, got_op = sync_reference.compute_sync_reference(
             circ.num_qubits, compiled_op_handler=None, ir=ir
         )
-        assert build_calls == 0 and unroll_calls == 0
+        assert build_calls == 0
         assert np.array_equal(got_ref, want_ref)
         assert got_mpad == want_mpad and got_op == want_op
 
@@ -255,12 +238,12 @@ def test_sync_reference_product_measurements_and_post_state() -> None:
     assert nref.tolist() == [False, False, True, True, True]
 
 
-def test_sync_reference_classical_control_and_fb_cache() -> None:
-    """Exercise all 5 controlled Paulis, rec/sweep/mixed targets, tag rec[, and fb_cache cap."""
+def test_sync_reference_classical_control_and_tagged_cx() -> None:
+    """Exercise all 5 controlled Paulis, rec/sweep/mixed targets, tag rec[, and >4096 CX ops."""
     # Omit initial R so ref_ts has only 2 measurement bits while ref_bits has 7 (rec[-6] is invalid
     # in ref_ts, and ref_bits[0]=True exposes any sweep[0] treated as rec[0]).
     circ = stim.Circuit(
-        "CX 0 1\n"  # non-feedback CX cached BEFORE feedback CX (tests full op key, not name)
+        "CX 0 1\n"  # non-feedback CX before feedback CX
         "X 0\n"
         "M 0 1\n"  # rec[-7]=True, rec[-6]=False -> ref_bits[0]=True
         "MPAD 1 0 1 0\n"  # ref_bits=[T, F, T, F, T, F]
@@ -274,8 +257,8 @@ def test_sync_reference_classical_control_and_fb_cache() -> None:
         "XCZ sweep[0] 6\n"  # unfused sweep-only op (without rec[ in op) must not reach ref_ts.do
         "YCZ 6 sweep[0]\n"  # unfused sweep-only q-sweep op
         "REPEAT 2 {\n"
-        "  CX[rec[0] 0 1\n"  # tag with rec[ hits feedback branch and fb_cache twice
-        "  CX rec[-5] 2\n"  # feedback CX hits fb_cache twice while reading ref_bits
+        "  CX[rec[0] 0 1\n"  # tag containing rec[ stays pure-quantum CX
+        "  CX rec[-5] 2\n"  # feedback CX reads ref_bits
         "}\n"
         "M 0 1 2 3 6\n"
         "MX 4 5 7\n"
@@ -291,7 +274,7 @@ def test_sync_reference_classical_control_and_fb_cache() -> None:
     with pytest.raises(IndexError):
         sync_reference.compute_sync_reference(1, stim.Circuit("M 0\nCX rec[-5] 0\n"), None)
 
-    # Exceed the 4096-entry fb_cache bound with 4105 genuinely distinct tagged CX instructions.
+    # Exceed the 4096-entry classical-control memo bound with 4105 distinct tagged CX ops.
     many_cx = stim.Circuit("\n".join(f"CX[t{i}] 0 1" for i in range(4105)))
     ref_many, _, _ = sync_reference.compute_sync_reference(2, many_cx, None)
     assert ref_many.shape == (0,)
@@ -385,14 +368,13 @@ def test_sync_reference_other_category_and_unused_qubits() -> None:
     """Skip Category.OTHER safely and size TableauSimulator to caller num_qubits."""
     circ = stim.Circuit("H 4\nR 0\nMPP X4\n")
     ir = circuit_ir.build_ir(circ)
-    other_instr = circuit_ir.IRInstr(
-        unrolled_index=1,
-        op=ir.instrs[1].op,
-        tag="",
+    other_instr = dataclasses.replace(
+        ir.instrs[1],
         category=circuit_ir.Category.OTHER,
-        untagged_filter=circuit_ir.UntaggedFilter.NONE,
-        num_measurements=0,
-        first_measurement=0,
+        basis=None,
+        is_product_measurement=False,
+        arity=None,
+        has_classical_control=False,
     )
     synth_ir = circuit_ir.CircuitIR(
         instrs=(ir.instrs[0], other_instr, ir.instrs[2]),
@@ -429,7 +411,7 @@ def test_flipside_simulator_batch_size_validation_and_u2l() -> None:
 
 
 def _install_simulator_ir_spies(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
-    """Install build_ir/compute_sync_reference counters and poison secondary IR/alignment paths."""
+    """Install build_ir/compute_sync_reference counters and guard against secondary IR builds."""
     counts = {"build": 0, "sync": 0}
     orig_build = circuit_ir.build_ir
     orig_sync = sync_reference.compute_sync_reference
@@ -443,14 +425,12 @@ def _install_simulator_ir_spies(monkeypatch: pytest.MonkeyPatch) -> dict[str, in
         return orig_sync(*args, **kwargs)
 
     def boom(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("Unexpected second IR build or lazy flat alignment")
+        raise AssertionError("Unexpected second IR build")
 
     monkeypatch.setattr(simulator_flip, "build_ir", spy_build)
     monkeypatch.setattr(simulator_flip, "compute_sync_reference", spy_sync)
     monkeypatch.setattr(known_states, "build_ir", boom)
     monkeypatch.setattr(sync_reference, "build_ir", boom)
-    monkeypatch.setattr(circuit_ir._FlatAlignment, "get_where", boom)
-    monkeypatch.setattr(circuit_ir._FlatAlignment, "get_flat_ops", boom)
     return counts
 
 
@@ -486,7 +466,7 @@ def test_flipside_simulator_shares_single_ir(
             seed=7,
         )
         assert counts["build"] == (1 if compute_ks else 0) and sim.num_qubits == circ.num_qubits
-        assert sim._unrolled_ops == unroll_circuit(circ) and sim.run() is None
+        assert sim.run() is None
         _ = sim.ref_measurements
         dets, obs, meas = (
             sim.get_detector_flips(),
@@ -514,11 +494,6 @@ def test_flipside_simulator_shares_single_ir(
         assert counts["build"] == 2 and counts["sync"] == 2
 
 
-def test_c2_modules_do_not_import_unroll_circuit() -> None:
-    """Confirm unroll_circuit is absent from the migrated sync_reference walker."""
-    assert not hasattr(sync_reference, "unroll_circuit")
-
-
 def test_flipside_constructor_without_known_states_builds_no_ir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -529,8 +504,7 @@ def test_flipside_constructor_without_known_states_builds_no_ir(
     sim = FlipsideSimulator(
         circ, compiled_op_handler=h, batch_size=4, compute_known_states=False, seed=7
     )
-    assert counts["build"] == 0 and sim._unrolled_ops == unroll_circuit(circ)
-    assert sim.num_qubits == circ.num_qubits
+    assert counts["build"] == 0 and sim.num_qubits == circ.num_qubits
     sim.run()
     _ = sim.ref_measurements
     _ = sim.get_detector_flips()

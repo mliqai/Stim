@@ -37,22 +37,36 @@ first use:
 - **Writable source checkouts** (`.../src/stimside/_native` with `setup.py` and no
   `stimside*.dist-info`) use sticky build flags: unset env vars never trigger a rebuild, and
   source-triggered rebuilds (missing `.so`, newer `.cpp` or regular non-symlink `*.hpp`, changed
-  source hash in `.lib<name>.build_id`, or mismatched `machine` / `cpu_flags` on `"native"`
-  builds) preserve the recorded mode (defaulting to `"portable"` without a record).
+  source hash in `.lib<name>.build_id`, or mismatched `machine` / instruction-set `cpu_flags`
+  digest on `"native"` builds) preserve the recorded mode (defaulting to `"portable"` without a
+  record). The `cpu_flags` digest hashes only instruction-set tokens common to all processors in
+  `/proc/cpuinfo` (ignoring kernel, hypervisor, and mitigation flags). In a read-only source
+  checkout holding a `"native"` library built for another CPU, the library is still loaded and
+  emits a once-per-library `RuntimeWarning`.
 - **Sidecar adoption and fallbacks:** missing or invalid/legacy `.lib<name>.build_id` sidecars are
-  adopted under the build lock as `"unknown"` without overwriting an existing valid v2 record and
-  without rebuilding until `STIMSIDE_NATIVE_BUILD=1` or `STIMSIDE_PORTABLE_BUILD=1` is set. If
-  the compiler rejects `-march=native` and falls back to portable, `"native"` is still recorded so
-  later starts do not loop.
+  adopted locklessly via `os.link` as `"unknown"` without waiting for the build lock, without
+  overwriting an existing valid v2 record, and without rebuilding until `STIMSIDE_NATIVE_BUILD=1`
+  or `STIMSIDE_PORTABLE_BUILD=1` is set. If the compiler rejects `-march=native` and falls back to
+  portable, `"native"` is still recorded so later starts do not loop.
 - **Installer and wheel builds from a checkout:** `pip install .`, `pip install -e .`, and
   building wheels from a checkout (`pip wheel .`, `uv build --wheel`) rebuild in-tree `.so`
   libraries and update their `.build_id` sidecars using the build environment's flags.
-- **Concurrency and warnings:** builds serialize via a non-blocking `flock` on `_native` waiting
-  up to `600` s by default (configurable via `STIMSIDE_BUILD_LOCK_TIMEOUT_S`), emit a
-  `RuntimeWarning` on lock timeout or once per library per process when a rebuild falls back to an
-  existing `.so` (controllable via `warnings` / `PYTHONWARNINGS`), build locklessly via uniquely
-  named temp files on timeout, foreign owner, or unsupported filesystems, and leave
-  no lock files behind (any legacy lock files can be removed with
+- **Concurrency, timeouts, and warnings:** builds serialize via a non-blocking `flock` on `_native`
+  sharing one per-process wait budget across the four libraries in that directory, waiting up to
+  `600` s by default. `STIMSIDE_BUILD_LOCK_TIMEOUT_S` accepts any non-negative number of seconds
+  (`0` for immediate lockless fallback, a finite limit, or `inf` / `+inf` / `infinity` for no
+  limit); invalid values emit a `RuntimeWarning` pointing at the caller and fall back to the
+  default. After about `10` s of waiting on the build lock, one progress notice is printed to
+  `stderr` naming the directory, lock owner UID, and `STIMSIDE_BUILD_LOCK_TIMEOUT_S`. Under the
+  held lock before compiling, stale regular `.tmp.so` / `.tmp.build_id` files for that library
+  older than the lock wait limit are removed (fresh temp files and symlinks are untouched). Lock
+  timeouts, read-only foreign-CPU native loads, and failed-rebuild fallbacks to an existing `.so`
+  emit `RuntimeWarning` via `warnings.warn` (controllable via `warnings` / `PYTHONWARNINGS`).
+  Under `-W error` (`PYTHONWARNINGS=error`), these loader warnings raise `RuntimeWarning`, and
+  once-per-library guards are recorded only after `warnings.warn` returns so repeated calls
+  continue to raise rather than silently falling back. On timeout, foreign owner, or unsupported
+  filesystems, builds proceed locklessly via uniquely named temp files and leave no lock files
+  behind (any legacy lock files can be removed with
   `rm -f "${TMPDIR:-/tmp}"/.stimside_build_*.lock`). Built libraries and build records get the
   usual file modes for your umask (for example `0755` and `0644`), so other users can load them.
 
@@ -250,11 +264,18 @@ print(res_fault.diagnostics.peak_terms, res_fault.diagnostics.cache_hits)
     engine whose native section was active on another thread at the moment of `fork()` is
     poisoned in the child (its handle is never freed there and any subsequent use raises
     `RuntimeError`).
-  - **Copy / pickling:** `copy.copy(sim)` returns an independent simulator copy (cloning both the
-    native engine store and mutable state including pending non-Clifford gates, measurement
-    columns, branch masses, correlated-error flags, reference tableau, handler state, and RNGs)
-    in both engine-backed and Python-list modes; `LiveExpansions` cannot be pickled
-    (`__getstate__` raises `TypeError`).
+  - **Copy, pickling, and failed-run lifecycle:** `copy.copy(sim)` returns an independent simulator
+    copy (cloning both the native engine store and mutable state including pending non-Clifford
+    gates, measurement columns, branch masses, correlated-error flags, reference tableau, handler
+    state, and RNGs) in both engine-backed and Python-list modes. Custom user op handlers must be
+    deep-copyable or define `__copy__` or `__deepcopy__`; otherwise `copy.copy(sim)` raises a
+    `TypeError` naming the handler class. Any back-reference from a deep-copied handler to its
+    simulator (including bound methods and nested containers) is remapped to the new copy in both
+    engine modes. Direct `copy.deepcopy(sim)` and `pickle.dumps(sim)` raise `TypeError` (and
+    `LiveExpansions.__getstate__` raises `TypeError`). If `run()` raises (including on instruction
+    0), subsequent `run()`, `interactive_do()`, and `finish_interactive_run()` calls—including on
+    copies of that simulator—raise `ValueError` until `clear()` resets it; failed
+    `interactive_do()` calls are not guarded and leave partial state.
 
 ### Detector & Observable Conversion (`m2d_reference_mode`)
 

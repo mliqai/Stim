@@ -13,26 +13,8 @@ from stimside.util.numpy_types import Bool1DArray
 _SKIP_KNOWN_STATE_CATS = frozenset(
     {Category.ANNOTATION, Category.NOISE, Category.MPAD, Category.HERALD, Category.OTHER}
 )
-# Single-qubit measurements (distinct from multi-qubit product measurements).
-_SINGLE_QUBIT_MEAS = frozenset({"M", "MZ", "MX", "MY"})
-# Measurement/reset Pauli basis inferred from op name suffix.
-_BASIS_BASE_CODE = {"X": 1, "Y": 3}
-
-_REAL_GATE_DATA = stim.gate_data
-_IS_1Q_GATE_CACHE: dict[str, bool] = {}
-
-
-def _is_single_qubit_gate(op_name: str) -> bool:
-    """Return whether ``op_name`` is a single-qubit gate."""
-    if stim.gate_data is _REAL_GATE_DATA:
-        cached = _IS_1Q_GATE_CACHE.get(op_name)
-        if cached is not None:
-            return cached
-        res = bool(stim.gate_data(op_name).is_single_qubit_gate)
-        if len(_IS_1Q_GATE_CACHE) < 4096:
-            _IS_1Q_GATE_CACHE[op_name] = res
-        return res
-    return bool(stim.gate_data(op_name).is_single_qubit_gate)
+# Measurement/reset Pauli basis code (+X=1, +Y=3, default +Z=5).
+_BASIS_BASE_CODE: dict[str | None, int] = {"X": 1, "Y": 3}
 
 
 def _without_noise_preserving_heralds(circuit: stim.Circuit) -> stim.Circuit:
@@ -161,11 +143,11 @@ def _forward_known_states(
         raw_targets = op.targets_copy()
         if cat in (Category.RESET, Category.MEASURE_RESET):
             q_targets = qubit_targets(raw_targets)
-            reset_code = _BASIS_BASE_CODE.get(op.name[-1], 5)
+            reset_code = _BASIS_BASE_CODE.get(instr.basis, 5)
             states_uint8[i + 1, q_targets] = reset_code
         elif cat is Category.MEASURE:
-            if op.name in _SINGLE_QUBIT_MEAS:
-                base_code = _BASIS_BASE_CODE.get(op.name[-1], 5)
+            if not instr.is_product_measurement:
+                base_code = _BASIS_BASE_CODE.get(instr.basis, 5)
                 meas_base = instr.first_measurement
                 for offset, t in enumerate(raw_targets):
                     this_measurement = known_measurements[meas_base + offset]
@@ -179,7 +161,7 @@ def _forward_known_states(
                         states_uint8[i + 1, q] = 0
             else:
                 states_uint8[i + 1, qubit_targets(raw_targets)] = 0
-        elif cat is Category.UNITARY and _is_single_qubit_gate(op.name):
+        elif cat is Category.UNITARY and instr.arity == 1:
             q_targets = qubit_targets(raw_targets)
             fwd_lut, _ = _get_gate_luts(op.name)
             if len(set(q_targets.tolist())) != len(q_targets):
@@ -213,8 +195,8 @@ def _backward_known_states(
             new_known_state[qubit_targets(op.targets_copy())] = 0
         elif cat in (Category.MEASURE, Category.MEASURE_RESET):
             raw_targets = op.targets_copy()
-            if cat is Category.MEASURE_RESET or op.name in _SINGLE_QUBIT_MEAS:
-                base_code = _BASIS_BASE_CODE.get(op.name[-1], 5)
+            if not instr.is_product_measurement:
+                base_code = _BASIS_BASE_CODE.get(instr.basis, 5)
                 meas_base = instr.first_measurement + shift
                 for offset in range(len(raw_targets) - 1, -1, -1):
                     t = raw_targets[offset]
@@ -229,7 +211,7 @@ def _backward_known_states(
                         new_known_state[q] = 0
             else:
                 new_known_state[qubit_targets(raw_targets)] = 0
-        elif cat is Category.UNITARY and _is_single_qubit_gate(op.name):
+        elif cat is Category.UNITARY and instr.arity == 1:
             q_targets = qubit_targets(op.targets_copy())
             _, bwd_lut = _get_gate_luts(op.name)
             if len(set(q_targets.tolist())) != len(q_targets):
