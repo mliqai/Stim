@@ -37,7 +37,7 @@ from stimside._native import coset_kernels
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.simulator_coset import CosetsideSimulator
 
-_DCC_KERNEL = "engine_batch_inject_general_clifford_v3"
+_DCC_KERNEL = "engine_batch_inject_unitary_v4"
 _GROUP_KERNEL = "engine_inject_group_v3"
 _RESET_KERNEL = "engine_batch_unmatched_noisy_reset_z"
 _PROJECT_KERNEL = "engine_project_pauli"

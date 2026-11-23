@@ -53,12 +53,12 @@ def _hpp_prototypes() -> dict[str, tuple[str, list[str]]]:
 
 def test_specs_match_the_c_prototypes_and_every_pointer_is_bound_c_void_p() -> None:
     protos = _hpp_prototypes()
-    assert {n for n, _, _ in me._SPECS} == set(protos) and len(protos) == 25
+    assert {n for n, _, _ in me._SPECS} == set(protos) and len(protos) == 28
     assert all(n.startswith("mbe_") for n in protos)
     lib = me.get_magic_engine_lib()
     abis = (lib.mbe_abi_v1(), lib.mbe_abi_v2(), lib.mbe_abi_v3(), lib.mbe_abi_v4(),
-            lib.mbe_abi_v5())
-    assert abis == (1, 2, 3, 4, 5)
+            lib.mbe_abi_v5(), lib.mbe_abi_v6())
+    assert abis == (1, 2, 3, 4, 5, 6)
     n_ptr = 0
     for name, (ret, params) in protos.items():
         fn = getattr(lib, name)
@@ -167,6 +167,11 @@ def _one_of_each(lib_hook: Any = None) -> tuple[bytes, _SpyLib]:
     eng.import_shot(1, expansion_to_arrays(e))
     a, b, kap = _hermitian_words(rng, n, 0.5)
     eng.apply_pauli_mask(a, b, kap, np.array([True, True, False, True]))
+    from stimside.util.reference_chp import ReferenceCHPTableau
+    rt = ReferenceCHPTableau(n)
+    xm, zm = np.zeros((n, 4), bool), np.zeros((n, 4), bool)
+    xm[0, 1] = zm[1, 1] = True
+    eng.apply_pauli_noise_batch(rt.x2x, rt.x2z, rt.x_kap, rt.z2x, rt.z2z, rt.z_kap, xm, zm)
     axis = CompiledPauliAxis(a, b, kap)
     fac = CompiledCliffordFactorList(3, axis, (axis,))
     which = np.array([-1, 0, 0, -1], np.int32)
@@ -183,6 +188,11 @@ def _one_of_each(lib_hook: Any = None) -> tuple[bytes, _SpyLib]:
     sp = eng.measure_split((ax2.a_words, ax2.b_words, ax2.kappa), False, (a, b, kap, False))
     chosen = np.where(sp.z01[sp.cls == 2, 0] > 0, sp.z01[sp.cls == 2, 0], sp.z01[sp.cls == 2, 1])
     fin = eng.measure_finish(np.zeros(sp.n_active, bool), chosen) if sp.n_active else None
+    bg = np.random.PCG64(12345)
+    fn_a = ctypes.cast(bg.ctypes.next_double, ctypes.c_void_p).value
+    assert fn_a is not None
+    eng.measure_step((ax2.a_words, ax2.b_words, ax2.kappa), False, (a, b, kap, False), fn_a,
+                     int(bg.ctypes.state_address))
     out_m = eng.export_shot(1)
     # S5b: a peek, a postselection and one unmatched-reset apply
     ob = (a, b, kap)

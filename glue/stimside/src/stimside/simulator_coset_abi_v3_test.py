@@ -13,7 +13,7 @@ import stim
 from stimside._coset.mrqf_state import MRQFState
 from stimside._coset.reference_compile import CompiledReferenceCircuit
 from stimside._native import coset_kernels
-from stimside._native._kernel_loader import i8_p, i32_p, i64_p, u8_p, u64_p
+from stimside._native._kernel_loader import i8_p, i64_p, u8_p, u64_p
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.simulator_coset import CosetsideSimulator
 
@@ -129,21 +129,81 @@ def test_abi_v3_postselect_and_project_pauli_grid_parity(
         _assert_exact_parity(s_cpp, s_py, n_q, f"proj_{pauli}_ord{order}")
 
 
+def _next_splitmix_bit(state: int) -> int:
+    m64 = 0xFFFFFFFFFFFFFFFF
+    s = (state + 0x9E3779B97F4A7C15) & m64
+    z = ((s ^ (s >> 30)) * 0xBF58476D1CE4E5B9) & m64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & m64
+    return (z ^ (z >> 31)) & 1
+
+
 def _seed_shot(sim: CosetsideSimulator, b: int, st: MRQFState) -> None:
     if sim._use_cpp and sim._cpp_lib is not None and sim._cpp_eng is not None:
-        m = max(1, st.d)
-        p_arr = np.array(st.P if st.d > 0 else [-1], dtype=np.int32)
-        sim._cpp_lib.engine_import_shot(
-            sim._cpp_eng,
-            b,
-            st.d,
-            np.ascontiguousarray(st.h_words, dtype=np.uint64).ctypes.data_as(u64_p),
-            np.ascontiguousarray(st.a_union, dtype=np.uint64).ctypes.data_as(u64_p),
-            np.ascontiguousarray(st._A_buf[:m], dtype=np.uint64).ctypes.data_as(u64_p),
-            np.ascontiguousarray(st._ell_buf[:m], dtype=np.uint8).ctypes.data_as(u8_p),
-            np.ascontiguousarray(st._Gamma_buf[:m, :m], dtype=np.uint8).ctypes.data_as(u8_p),
-            p_arr.ctypes.data_as(i32_p),
-        )
+        lib, eng = sim._cpp_lib, sim._cpp_eng
+        n_q, bs, nw = sim.num_qubits, sim.batch_size, sim._n_words
+        tg = np.zeros(1, dtype=np.int64)
+        cm = np.ones((1, bs), dtype=np.uint8)
+        cm[0, b] = 0
+        xs = np.zeros((n_q, bs), dtype=np.uint8)
+        zs = np.zeros((n_q, bs), dtype=np.uint8)
+        z_pw = np.zeros((n_q, nw), dtype=np.uint64)
+        ox = np.zeros((n_q, bs), dtype=np.uint8)
+        oz = np.zeros((n_q, bs), dtype=np.uint8)
+        ax, az = ctypes.c_int(0), ctypes.c_int(0)
+        if st.d > 0:
+            nf = st.d
+            fk = np.ones(nf, dtype=np.uint8)
+            zf = np.zeros(nf, dtype=np.uint8)
+            a1 = np.ascontiguousarray(st._A_buf[:nf], dtype=np.uint64)
+            b1 = a1.copy()
+            kap1 = np.ascontiguousarray((st._ell_buf[:nf].astype(np.int32) - 1) & 3, dtype=np.uint8)
+            b2 = np.zeros((nf, nw), dtype=np.uint64)
+            lib.engine_batch_inject_general_clifford(
+                eng, 1, 1, nf, tg.ctypes.data_as(i64_p), cm.ctypes.data_as(u8_p),
+                xs.ctypes.data_as(u8_p), zs.ctypes.data_as(u8_p), fk.ctypes.data_as(u8_p),
+                zf.ctypes.data_as(u8_p), zf.ctypes.data_as(u8_p),
+                a1.ctypes.data_as(u64_p), b1.ctypes.data_as(u64_p), kap1.ctypes.data_as(u8_p),
+                zf.ctypes.data_as(u8_p), zf.ctypes.data_as(u8_p),
+                b2.ctypes.data_as(u64_p), b2.ctypes.data_as(u64_p), zf.ctypes.data_as(u8_p),
+                z_pw.ctypes.data_as(u64_p), z_pw.ctypes.data_as(u64_p),
+                ox.ctypes.data_as(u8_p), oz.ctypes.data_as(u8_p),
+                ctypes.byref(ax), ctypes.byref(az),
+            )
+        else:
+            fk = np.ones(1, dtype=np.uint8)
+            z1 = np.zeros(1, dtype=np.uint8)
+            a1 = np.ascontiguousarray(st.h_words.reshape(1, nw), dtype=np.uint64)
+            b1 = np.zeros((1, nw), dtype=np.uint64)
+            lib.engine_batch_inject_general_clifford(
+                eng, 1, 1, 1, tg.ctypes.data_as(i64_p), cm.ctypes.data_as(u8_p),
+                xs.ctypes.data_as(u8_p), zs.ctypes.data_as(u8_p), fk.ctypes.data_as(u8_p),
+                z1.ctypes.data_as(u8_p), z1.ctypes.data_as(u8_p),
+                a1.ctypes.data_as(u64_p), b1.ctypes.data_as(u64_p), z1.ctypes.data_as(u8_p),
+                z1.ctypes.data_as(u8_p), z1.ctypes.data_as(u8_p),
+                b1.ctypes.data_as(u64_p), b1.ctypes.data_as(u64_p), z1.ctypes.data_as(u8_p),
+                z_pw.ctypes.data_as(u64_p), z_pw.ctypes.data_as(u64_p),
+                ox.ctypes.data_as(u8_p), oz.ctypes.data_as(u8_p),
+                ctypes.byref(ax), ctypes.byref(az),
+            )
+            rng_saved = np.zeros(bs, dtype=np.uint64)
+            assert lib.engine_get_rng_states(eng, bs, rng_saved.ctypes.data_as(u64_p)) == 0
+            b_meas = np.zeros(nw, dtype=np.uint64)
+            for w in range(nw):
+                val = int(st.h_words[w])
+                if val:
+                    b_meas[w] = np.uint64(val & -val)
+                    break
+            m_ref = _next_splitmix_bit(int(rng_saved[b])) ^ 1
+            m_out = np.zeros(bs, dtype=np.uint8)
+            lib.engine_batch_mixed_substep(
+                eng, 0, 0, m_ref, 0,
+                b_meas.ctypes.data_as(u64_p), b_meas.ctypes.data_as(u64_p),
+                b_meas.ctypes.data_as(u64_p), 0, 0, tg.ctypes.data_as(i64_p),
+                0, tg.ctypes.data_as(i64_p), xs.ctypes.data_as(u8_p), m_out.ctypes.data_as(u8_p),
+                ox.ctypes.data_as(u8_p), oz.ctypes.data_as(u8_p),
+                ctypes.byref(ax), ctypes.byref(az),
+            )
+            assert lib.engine_set_rng_states(eng, rng_saved.ctypes.data_as(u64_p)) == 0
         sim._cpp_dirty = True
     else:
         sim._active_shots[b] = st
@@ -291,6 +351,7 @@ def test_abi_v3_peek_and_evict_v3_and_v2_bounds_checks() -> None:
     assert lib is not None and eng is not None
     assert lib.coset_kernels_abi_v2() == 2
     assert lib.coset_kernels_abi_v3() == 3
+    assert lib.coset_kernels_abi_v4() == 4
     assert lib.engine_num_qubits(eng) == 4
     assert lib.engine_batch_size(eng) == 8
     assert lib.engine_n_words(eng) == 1
@@ -301,33 +362,15 @@ def test_abi_v3_peek_and_evict_v3_and_v2_bounds_checks() -> None:
     x2x, x2z, z2x, z2z, xk, zk = s_cpp._current_packed_words()
     tgts = np.array([0, 2, 3], dtype=np.int64)
     out = np.empty((3, 8), dtype=np.int8)
-    rc = lib.engine_peek_pauli_batch_v3(
+    lib.engine_peek_pauli_batch(
         eng, 3, tgts.ctypes.data_as(i64_p), 1,
-        4, 8, xs_c.ctypes.data_as(u8_p), 4, 8, zs_c.ctypes.data_as(u8_p),
-        4, 1, x2x.ctypes.data_as(u64_p), x2z.ctypes.data_as(u64_p),
+        xs_c.ctypes.data_as(u8_p), zs_c.ctypes.data_as(u8_p),
+        x2x.ctypes.data_as(u64_p), x2z.ctypes.data_as(u64_p),
         z2x.ctypes.data_as(u64_p), z2z.ctypes.data_as(u64_p),
         xk.ctypes.data_as(u8_p), zk.ctypes.data_as(u8_p),
-        3, 8, out.ctypes.data_as(i8_p),
+        out.ctypes.data_as(i8_p),
     )
-    assert rc == 0
     assert np.array_equal(out, s_py.peek_pauli_batch([0, 2, 3], "Y"))
-
-    # engine_batch_evict_v3 rejects wrong dims and succeeds on valid dims
-    evx = np.zeros((4, 8), dtype=np.uint8)
-    evz = np.zeros((4, 8), dtype=np.uint8)
-    ax, az = ctypes.c_int(0), ctypes.c_int(0)
-    assert lib.engine_batch_evict_v3(
-        eng, 99, 1, x2z.ctypes.data_as(u64_p), z2z.ctypes.data_as(u64_p),
-        4, 8, xs_c.ctypes.data_as(u8_p), 4, 8, zs_c.ctypes.data_as(u8_p),
-        4, 8, evx.ctypes.data_as(u8_p), 4, 8, evz.ctypes.data_as(u8_p),
-        ctypes.byref(ax), ctypes.byref(az),
-    ) < 0
-    assert lib.engine_batch_evict_v3(
-        eng, 4, 1, x2z.ctypes.data_as(u64_p), z2z.ctypes.data_as(u64_p),
-        4, 8, xs_c.ctypes.data_as(u8_p), 4, 8, zs_c.ctypes.data_as(u8_p),
-        4, 8, evx.ctypes.data_as(u8_p), 4, 8, evz.ctypes.data_as(u8_p),
-        ctypes.byref(ax), ctypes.byref(az),
-    ) == 0
 
 
 def test_c1_abi_v3_bounds_and_registration() -> None:
@@ -393,7 +436,6 @@ def test_c1_v2_bounds_and_python_guards() -> None:
     xs = np.zeros((4, 8), dtype=np.uint8)
     zs = np.zeros((4, 8), dtype=np.uint8)
     pw = np.zeros((4, 1), dtype=np.uint64)
-    kap = np.zeros(4, dtype=np.uint8)
     fm = np.ones(8, dtype=np.uint8)
     ax, az = ctypes.c_int(0), ctypes.c_int(0)
     fk = np.zeros((2, 1), dtype=np.uint8)
@@ -409,11 +451,9 @@ def test_c1_v2_bounds_and_python_guards() -> None:
         4, 1, pw.ctypes.data_as(u64_p), pw.ctypes.data_as(u64_p),
     )
     assert sid >= 0 and lib.engine_unitary_step_num_groups(eng, sid) == 2
-    assert lib.engine_batch_inject_general_clifford_v3(
-        eng, sid, 8, 8, xs.ctypes.data_as(u8_p),
-        4, 8, xs.ctypes.data_as(u8_p), 4, 8, zs.ctypes.data_as(u8_p),
-        4, 8, xs.ctypes.data_as(u8_p), 4, 8, zs.ctypes.data_as(u8_p),
-        ctypes.byref(ax), ctypes.byref(az),
+    assert lib.engine_batch_inject_unitary_v4(
+        eng, sid, 8, 8, xs.ctypes.data_as(u8_p), ctypes.cast(0, u8_p),
+        xs.ctypes.data_as(u8_p), zs.ctypes.data_as(u8_p), ctypes.byref(s_cpp._call_block),
     ) < 0
     assert lib.engine_inject_group_v3(
         eng, sid, 99, 8, fm.ctypes.data_as(u8_p),
@@ -421,13 +461,6 @@ def test_c1_v2_bounds_and_python_guards() -> None:
         4, 8, xs.ctypes.data_as(u8_p), 4, 8, zs.ctypes.data_as(u8_p),
         ctypes.byref(ax), ctypes.byref(az),
     ) < 0
-    bad_p = np.array([99], dtype=np.int32)
-    h1 = np.zeros(1, dtype=np.uint64)
-    lib.engine_import_shot(
-        eng, 0, 1, h1.ctypes.data_as(u64_p), h1.ctypes.data_as(u64_p),
-        h1.ctypes.data_as(u64_p), kap.ctypes.data_as(u8_p), kap.ctypes.data_as(u8_p),
-        bad_p.ctypes.data_as(i32_p),
-    )
     assert lib.engine_get_active_shot_indices(eng, None, None) == 0
 
     with pytest.raises(ValueError, match="out of range"):
@@ -793,18 +826,18 @@ def test_d0_evict_parity_unmatched_reset_and_postselect() -> None:
     _assert_exact_parity(s_ps_c, s_ps_p, 2, "d0_evict_postselect")
     assert len(s_ps_p._active_shots) == 0
 
-    s_nh_c, s_nh_p = _mk_pair("H 0 1\nM 0 1", 4, seed=102)
+    s_nh_c, s_nh_p = _mk_pair("H 0 1 2\nM 0 1 2", 4, seed=102)
     for sim in (s_nh_c, s_nh_p):
-        st0 = MRQFState(2, 1)
-        st0.h_words[0] = np.uint64(1)
-        _seed_shot(sim, 0, st0)
-        st1 = MRQFState(2, 1)
+        st1 = MRQFState(3, 1)
         st1.p2_apply_quarter_turn(np.array([1], np.uint64), np.array([1], np.uint64), 1)
         st1.p2_apply_quarter_turn(np.array([2], np.uint64), np.array([2], np.uint64), 1)
         _seed_shot(sim, 1, st1)
+        st0 = MRQFState(3, 1)
+        st0.h_words[0] = np.uint64(4)
+        _seed_shot(sim, 0, st0)
     s_nh_c._postselect_cpp(0, flip, des, "X")
     s_nh_p.postselect_z_batch(0, flip, des, "X")
-    _assert_exact_parity(s_nh_c, s_nh_p, 2, "d0_evict_ps_nonhealing")
+    _assert_exact_parity(s_nh_c, s_nh_p, 3, "d0_evict_ps_nonhealing")
     assert list(s_nh_p._active_shots) == [1]
 
 
@@ -1943,7 +1976,7 @@ def test_b2_routing_targets_inject_group_v3_and_preserves_sync_and_python_modes(
     assert real_lib is not None
     tracked = {
         "engine_inject_group_v3", "engine_register_unitary_step",
-        "engine_register_unitary_group_evict", "engine_batch_inject_general_clifford_v3",
+        "engine_register_unitary_group_evict", "engine_batch_inject_unitary_v4",
     }
 
     class _Spy:
@@ -1987,7 +2020,7 @@ def test_b2_routing_targets_inject_group_v3_and_preserves_sync_and_python_modes(
     s_cpp.do_conditional_clifford(stim.CircuitInstruction("CX", [0, 1]), np.zeros((1, 4), bool))
     assert calls == [
         ("engine_register_unitary_step", False, False),
-        ("engine_batch_inject_general_clifford_v3", True, False),
+        ("engine_batch_inject_unitary_v4", True, False),
     ]
     calls.clear()
     s_cpp._do_bare_instruction(stim.CircuitInstruction("TICK", []))

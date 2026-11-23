@@ -1036,6 +1036,39 @@ int64_t finish_commit(MagicBatchEngine& e, const uint8_t* outc, FactorError& err
     return -1;
 }
 
+using NextDoubleFn = double (*)(void*);
+
+// Pass 1 checks all active shots before any RNG draw/mutation; false => 0 draws for Python raise.
+bool step_born_sample(
+    const MagicBatchEngine& e, const SplitOut& out, size_t n_active, NextDoubleFn next_double,
+    void* rng_state, std::vector<uint8_t>& outc, std::vector<double>& chosen, double* out_dlog
+) {
+    const auto& shots = e.pend.shots;
+    std::vector<double> z01_c(2 * n_active);
+    for (size_t i = 0; i < n_active; ++i) {
+        const size_t s = static_cast<size_t>(shots[i]);
+        const double z = out.z[s], z0r = out.z01[2 * s], z1r = out.z01[2 * s + 1];
+        const double scale = z > 1.0 ? z : 1.0;
+        if (!(std::isfinite(z0r) && std::isfinite(z1r))
+            || z0r < -1e-12 * scale || z1r < -1e-12 * scale) return false;
+        const double z0 = z0r > 0.0 ? z0r : 0.0, z1 = z1r > 0.0 ? z1r : 0.0, ztot = z0 + z1;
+        if (!(std::fabs(ztot - z) <= e.atol * scale) || z <= 0.0 || ztot <= 0.0) return false;
+        z01_c[2 * i] = z0, z01_c[2 * i + 1] = z1;
+    }
+    outc.resize(n_active), chosen.resize(n_active);
+    for (size_t i = 0; i < n_active; ++i) {
+        const size_t s = static_cast<size_t>(shots[i]);
+        const double z = out.z[s], z0 = z01_c[2 * i], z1 = z01_c[2 * i + 1], ztot = z0 + z1;
+        const double u = next_double(rng_state);  // one draw per active shot, pinned included
+        const double p1r = z1 / ztot, p1 = p1r < 0.0 ? 0.0 : (p1r > 1.0 ? 1.0 : p1r);
+        const double zf = kMergeCancelTol * z;
+        const uint8_t b = (z0 <= zf) ? 1U : ((z1 <= zf) ? 0U : (u < p1 ? 1U : 0U));
+        outc[i] = b, out.bit[s] = b, chosen[i] = b ? z1 : z0;
+        out_dlog[s] = std::log(chosen[i] / ztot);
+    }
+    return true;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -1230,6 +1263,49 @@ int64_t unmatched_shots(MagicBatchEngine& e, const MeasureJob& job, const Unmatc
     return -1;
 }
 
+// Apply all non-zero rows of mask[n_q, n_b] in ascending qubit order, pulling each physical
+// (q, P) back via (t_a[q], t_b[q], t_kap[q]). Reads each affected row once into local scratch.
+int64_t apply_noise_half(
+    MagicBatchEngine& e, const uint64_t* t_a, const uint64_t* t_b, const uint8_t* t_kap,
+    const uint8_t* mask, int64_t* out_err
+) {
+    const size_t nq = e.n_qubits, B = e.B, nw = e.nw;
+    if (B == 0) return -1;
+    std::vector<uint64_t> aw(nw), bw(nw);
+    std::vector<uint8_t> mr(B);
+    for (size_t q = 0; q < nq; ++q) {
+        const uint8_t* row = mask + q * B;
+        bool any = false;
+        for (size_t s = 0; s < B; ++s) { if (row[s] != 0) { any = true; break; } }
+        if (!any) continue;
+        std::copy(t_a + q * nw, t_a + (q + 1) * nw, aw.begin());
+        std::copy(t_b + q * nw, t_b + (q + 1) * nw, bw.begin());
+        const uint8_t kap = static_cast<uint8_t>(t_kap[q] & 3U);
+        std::copy(row, row + B, mr.begin());
+        const uint8_t par = word_dot_parity(aw.data(), bw.data(), nw);
+        if (((kap - par) & 1U) != 0) {
+            out_err[0] = kErrNotHermitian, out_err[1] = kOpPauli;
+            return out_err[2] = par, out_err[3] = kap, 0;
+        }
+        if (!padding_clear(e, PauliView{aw.data(), bw.data(), kap})) {
+            return out_err[0] = kErrPadding, out_err[1] = kOpPauli, 0;
+        }
+        for (size_t s = 0; s < B; ++s) {
+            EngineShot& sh = e.shots[s];
+            if (mr[s] == 0 || sh.chi == 0) continue;
+            if (!all_finite(sh.w.data(), 2 * sh.chi)) {
+                return out_err[0] = kErrNonFiniteWeights, out_err[1] = kOpPauli,
+                       static_cast<int64_t>(s);
+            }
+            magic_apply_pauli_batch(
+                sh.chi, sh.d, nw, sh.w.data(), sh.h.data(), sh.ell.data(), sh.A.data(),
+                sh.a_union.data(), aw.data(), bw.data(), kap
+            );
+        }
+    }
+    return -1;
+}
+
 }  // namespace
 
 extern "C" {
@@ -1258,6 +1334,9 @@ int32_t mbe_abi_v4() {
 int32_t mbe_abi_v5() {
     return 5;
 }
+
+// v6 adds mbe_measure_step and mbe_apply_pauli_noise_batch.
+int32_t mbe_abi_v6() { return 6; }
 
 size_t mbe_live_engines() {
     return g_live_engines.load();
@@ -1610,6 +1689,59 @@ int64_t mbe_measure_finish(
     }
 }
 
+// Single-call measurement: split, mass check, Born draw, finish.
+// rc: 0 ok (info={n_act,has_dead}); 1 split; 2 mass; 3/4 finish; -2 bad; -3 OOM (info[1]=phase).
+int64_t mbe_measure_step(
+    void* handle, size_t n_b, size_t n_w, const uint64_t* obs_a, const uint64_t* obs_b,
+    uint8_t kappa, int32_t keep_rot, int32_t is_reset, int32_t flip_ref, const uint64_t* kick_a,
+    const uint64_t* kick_b, uint8_t kick_kappa, void* next_double, void* rng_state,
+    uint8_t* out_cls, uint8_t* out_bit, double* out_z, double* out_z01, int64_t* out_chi,
+    double* out_dlog, int64_t* out_err, double* out_errd, int64_t* out_info
+) {
+    MagicBatchEngine* e = engine_of(handle);
+    if (!e || n_b != e->B || n_w != e->nw || !obs_a || !obs_b || !next_double || !rng_state
+        || !out_err || !out_errd || !out_info || (is_reset != 0 && (!kick_a || !kick_b))
+        || (n_b != 0 && (!out_cls || !out_bit || !out_z || !out_z01 || !out_chi || !out_dlog)))
+        return -2;
+    out_info[0] = out_info[1] = 0, e->pend.valid = false;
+    int64_t oom_phase = 0;
+    try {
+        if (n_b != 0) std::fill_n(out_cls, n_b, kUnseen), std::fill_n(out_bit, n_b, uint8_t{0}),
+            std::fill_n(out_dlog, n_b, 0.0);
+        MeasureJob job;
+        build_measure_job(*e, {obs_a, obs_b, kick_a, kick_b, kappa, kick_kappa, keep_rot != 0,
+                               is_reset != 0, flip_ref != 0}, job);
+        const SplitOut out{out_cls, out_bit, out_z, out_z01, out_chi};
+        FactorError err;
+        size_t n_active = 0;
+        int64_t bad = classify_and_kick(*e, job, out, n_active, err);
+        out_info[0] = static_cast<int64_t>(n_active);
+        if (err.kind == kErrNone && n_active > 0 && validate_observable(*e, job, err))
+            bad = project_active(*e, job, out, n_active, err);
+        if (err.kind != kErrNone) {
+            out_err[0] = err.kind, out_err[1] = err.op, out_err[2] = err.aux, out_err[3] = err.aux2;
+            return out_errd[0] = err.pre, out_errd[1] = err.post, out_info[1] = bad, 1;
+        }
+        int64_t has_dead = 0;
+        for (size_t s = 0; s < n_b; ++s) { if (out_cls[s] == kDead) { has_dead = 1; break; } }
+        if (n_active == 0) return out_info[1] = has_dead, 0;
+        std::vector<uint8_t> outc;
+        std::vector<double> chosen;
+        const auto nd = reinterpret_cast<NextDoubleFn>(next_double);
+        if (!step_born_sample(*e, out, n_active, nd, rng_state, outc, chosen, out_dlog)) return 2;
+        e->pend.job = std::move(job), e->pend.n_active = n_active, oom_phase = 1;
+        bad = finish_stage(*e, outc.data(), chosen.data(), err);
+        if (bad < 0) oom_phase = 2, bad = finish_commit(*e, outc.data(), err);
+        if (bad < 0) return out_info[1] = has_dead, 0;
+        out_err[0] = err.kind, out_err[1] = err.op, out_err[2] = err.aux, out_err[3] = err.aux2;
+        return out_errd[0] = err.pre, out_errd[1] = err.post, out_info[1] = bad,
+               oom_phase == 1 ? 3 : 4;
+    } catch (...) {
+        out_err[0] = out_err[1] = out_err[2] = out_err[3] = 0;
+        return e->pend.valid = false, out_info[1] = oom_phase, -3;
+    }
+}
+
 
 // `_obs_p1` of the observable (obs_a, obs_b, kappa) on the listed shots (a private copy of the
 // list is read once): out_p1[i] for shots[i]. Nothing changes (a pending split stays). 0 ok;
@@ -1729,6 +1861,31 @@ int64_t mbe_unmatched_apply(
         return 1;
     } catch (...) {
         out_info[0] = static_cast<int64_t>(at), out_info[1] = phase;
+        return -3;
+    }
+}
+
+// Batch Pauli noise: ascending X qubits 0..n_q-1 then ascending Z qubits 0..n_q-1, shot order.
+// -1 ok; >=0 shot/error index (out_err set); -2 bad args/dims/null; -3 OOM.
+int64_t mbe_apply_pauli_noise_batch(
+    void* handle, size_t n_q, size_t n_b, size_t n_w,
+    const uint64_t* x2x, const uint64_t* x2z, const uint8_t* x_kap,
+    const uint64_t* z2x, const uint64_t* z2z, const uint8_t* z_kap,
+    const uint8_t* xm, const uint8_t* zm, int64_t* out_err
+) {
+    MagicBatchEngine* e = engine_of(handle);
+    if (e == nullptr || out_err == nullptr || n_q != e->n_qubits || n_b != e->B || n_w != e->nw
+        || x2x == nullptr || x2z == nullptr || x_kap == nullptr
+        || z2x == nullptr || z2z == nullptr || z_kap == nullptr
+        || (n_b != 0 && (xm == nullptr || zm == nullptr))) {
+        return -2;
+    }
+    out_err[0] = out_err[1] = out_err[2] = out_err[3] = 0, e->pend.valid = false;
+    try {
+        int64_t rc = apply_noise_half(*e, x2x, x2z, x_kap, xm, out_err);
+        if (rc < 0) rc = apply_noise_half(*e, z2x, z2z, z_kap, zm, out_err);
+        return rc;
+    } catch (...) {
         return -3;
     }
 }

@@ -77,60 +77,78 @@ def _call_export_v3(
     )
 
 
-def _make_shot_inputs(nq: int, nw: int, d: int) -> tuple[np.ndarray[Any, Any], ...]:
+def _seed_active_d_shot(
+    lib: Any, eng: Any, nq: int, bs: int, nw: int, b: int, d: int
+) -> tuple[np.ndarray[Any, Any], ...]:
     h = np.zeros(nw, dtype=np.uint64)
     h[0] = np.uint64(0x5A)
     A = np.zeros((d, nw), dtype=np.uint64)
     for r in range(d):
         A[r, r >> 6] = np.uint64(1) << np.uint64(r & 63)
     au = np.bitwise_or.reduce(A, axis=0) if d > 0 else np.zeros(nw, dtype=np.uint64)
-    ell = (np.arange(d, dtype=np.uint8) * 3) & np.uint8(3)
-    Gamma = np.zeros((d, d), dtype=np.uint8)
+    nf = d + 1
+    tg = np.zeros(1, dtype=np.int64)
+    cm = np.ones((1, bs), dtype=np.uint8)
+    cm[0, b] = 0
+    xs = np.zeros((nq, bs), dtype=np.uint8)
+    zs = np.zeros((nq, bs), dtype=np.uint8)
+    z_pw = np.zeros((nq, nw), dtype=np.uint64)
+    ox = np.zeros((nq, bs), dtype=np.uint8)
+    oz = np.zeros((nq, bs), dtype=np.uint8)
+    ax, az = ctypes.c_int(0), ctypes.c_int(0)
+    fk = np.ones(nf, dtype=np.uint8)
+    fk[0] = 0
+    zf = np.zeros(nf, dtype=np.uint8)
+    a1 = np.zeros((nf, nw), dtype=np.uint64)
+    b1 = np.zeros((nf, nw), dtype=np.uint64)
+    kap1 = np.zeros(nf, dtype=np.uint8)
+    a1[0] = h
     for r in range(d):
-        for c in range(r + 1, d):
-            val = np.uint8((r + c) & 1)
-            Gamma[r, c] = val
-            Gamma[c, r] = val
+        a1[r + 1] = A[r]
+        b1[r + 1, ((r + 1) % d) >> 6] = np.uint64(1) << np.uint64(((r + 1) % d) & 63)
+        kap1[r + 1] = np.uint8(r & 3)
+    b2 = np.zeros((nf, nw), dtype=np.uint64)
+    lib.engine_batch_inject_general_clifford(
+        eng, 1, 1, nf, _ptr(tg, kl.i64_p), _ptr(cm, kl.u8_p),
+        _ptr(xs, kl.u8_p), _ptr(zs, kl.u8_p), _ptr(fk, kl.u8_p),
+        _ptr(zf, kl.u8_p), _ptr(zf, kl.u8_p),
+        _ptr(a1, kl.u64_p), _ptr(b1, kl.u64_p), _ptr(kap1, kl.u8_p),
+        _ptr(zf, kl.u8_p), _ptr(zf, kl.u8_p),
+        _ptr(b2, kl.u64_p), _ptr(b2, kl.u64_p), _ptr(zf, kl.u8_p),
+        _ptr(z_pw, kl.u64_p), _ptr(z_pw, kl.u64_p),
+        _ptr(ox, kl.u8_p), _ptr(oz, kl.u8_p), ctypes.byref(ax), ctypes.byref(az),
+    )
     P = np.arange(d, dtype=np.int32)
-    return h, au, A, ell, Gamma, P
+    return h, au, A, P
 
 
 def test_abi_versions_and_export_shot_v3_matches_v2() -> None:
     lib = ck.get_coset_kernels_lib()
     assert lib.coset_kernels_abi_v2() == 2
     assert lib.coset_kernels_abi_v3() == 3
+    assert lib.coset_kernels_abi_v4() == 4
 
     rng = np.arange(1, 3, dtype=np.uint64)
     eng = lib.engine_create(70, 2, rng.ctypes.data_as(kl.u64_p))
     try:
         nw = lib.engine_n_words(eng)
         assert nw == 2
-        h0, au0, A0, ell0, G0, P0 = _make_shot_inputs(70, nw, 0)
-        lib.engine_import_shot(
-            eng, 0, 0, _ptr(h0, kl.u64_p), _ptr(au0, kl.u64_p),
-            _ptr(A0, kl.u64_p), _ptr(ell0, kl.u8_p), _ptr(G0, kl.u8_p), _ptr(P0, kl.i32_p),
-        )
-        h1, au1, A1, ell1, G1, P1 = _make_shot_inputs(70, nw, 5)
-        lib.engine_import_shot(
-            eng, 1, 5, _ptr(h1, kl.u64_p), _ptr(au1, kl.u64_p),
-            _ptr(A1, kl.u64_p), _ptr(ell1, kl.u8_p), _ptr(G1, kl.u8_p), _ptr(P1, kl.i32_p),
-        )
+        h1, au1, A1, P1 = _seed_active_d_shot(lib, eng, 70, 2, nw, 1, 5)
 
         v3_d0 = _make_sentinel_export_bufs(nw, 0)
         assert _call_export_v3(lib.engine_export_shot_v3, eng, 0, nw, 0, v3_d0) == 0
-        assert np.array_equal(v3_d0["h"], h0) and np.array_equal(v3_d0["au"], au0)
+        assert np.array_equal(v3_d0["h"], np.zeros(nw, dtype=np.uint64))
+        assert np.array_equal(v3_d0["au"], np.zeros(nw, dtype=np.uint64))
 
-        v2 = _make_sentinel_export_bufs(nw, 5)
-        lib.engine_export_shot(
-            eng, 1, _ptr(v2["h"], kl.u64_p), _ptr(v2["au"], kl.u64_p),
-            _ptr(v2["A"], kl.u64_p), _ptr(v2["ell"], kl.u8_p),
-            _ptr(v2["Gamma"], kl.u8_p), _ptr(v2["P"], kl.i32_p),
-        )
         v3 = _make_sentinel_export_bufs(nw, 5)
         assert _call_export_v3(lib.engine_export_shot_v3, eng, 1, nw, 5, v3) == 5
-        for key in ("h", "au", "A", "ell", "Gamma", "P"):
-            assert np.array_equal(v3[key], v2[key]), key
-        assert np.array_equal(v3["A"], A1) and np.array_equal(v3["Gamma"], G1)
+        assert np.array_equal(v3["h"], h1)
+        assert np.array_equal(v3["au"], au1)
+        assert np.array_equal(v3["A"], A1)
+        assert np.array_equal(v3["P"], P1)
+        assert np.all(v3["ell"] < 4)
+        assert np.array_equal(v3["Gamma"], v3["Gamma"].T)
+        assert int(np.sum(v3["Gamma"])) > 0
     finally:
         lib.engine_destroy(eng)
 
@@ -141,11 +159,7 @@ def test_export_shot_v3_error_codes_leave_sentinel_buffers_untouched() -> None:
     eng = lib.engine_create(70, 2, rng.ctypes.data_as(kl.u64_p))
     try:
         nw = lib.engine_n_words(eng)
-        h1, au1, A1, ell1, G1, P1 = _make_shot_inputs(70, nw, 4)
-        lib.engine_import_shot(
-            eng, 1, 4, _ptr(h1, kl.u64_p), _ptr(au1, kl.u64_p),
-            _ptr(A1, kl.u64_p), _ptr(ell1, kl.u8_p), _ptr(G1, kl.u8_p), _ptr(P1, kl.i32_p),
-        )
+        _seed_active_d_shot(lib, eng, 70, 2, nw, 1, 4)
 
         # -4: cap_d < s.d writes nothing
         b_small_d = _make_sentinel_export_bufs(nw, 3)
@@ -444,19 +458,7 @@ eng = lib.engine_create(N, B, p64(rng))
 nw = lib.engine_n_words(eng)
 assert nw == 2
 
-# Import shot 0 (d=1 active) and shot 1 (d=0, h!=0 healed) so eviction & reads have real work.
-h0 = np.array([1, 0], np.uint64)
-au0 = np.array([1, 0], np.uint64)
-A0 = np.zeros((1, nw), np.uint64); A0[0, 0] = 1
-ell0 = np.array([1], np.uint8)
-G0 = np.zeros((1, 1), np.uint8)
-P0 = np.array([0], np.int32)
-lib.engine_import_shot(eng, 0, 1, p64(h0), p64(au0), p64(A0), p8(ell0), p8(G0), p32(P0))
-h1 = np.array([1, 0], np.uint64)
-au1 = np.zeros(nw, np.uint64)
-lib.engine_import_shot(eng, 1, 0, p64(h1), p64(au1), p64(A0), p8(ell0), p8(G0), p32(P0))
-
-# Register a valid 1-group, arity=1, n_factors=1 unitary step (step_id=0) before failing engine.
+# Seed shot 0 (d=1 active) and shot 1 (d=0, h!=0 healed) via live kernels.
 tg = np.array([0], np.int64)
 fk = np.array([1], np.uint8)
 f_u8 = np.zeros(1, np.uint8)
@@ -467,6 +469,33 @@ x2z = np.zeros((N, nw), np.uint64); x2z[0, 0] = 1
 z2x = np.zeros((N, nw), np.uint64)
 z2z = np.zeros((N, nw), np.uint64); z2z[0, 0] = 1; z2z[1, 0] = 1
 kp = np.zeros(N, np.uint8)
+z_pw = np.zeros((N, nw), np.uint64)
+z_xs = np.zeros((N, B), np.uint8)
+z_zs = np.zeros((N, B), np.uint8)
+z_ox = np.zeros((N, B), np.uint8)
+z_oz = np.zeros((N, B), np.uint8)
+s_ax, s_az = ctypes.c_int(0), ctypes.c_int(0)
+cm_s1 = np.array([[1, 0]], np.uint8)
+lib.engine_batch_inject_general_clifford(
+    eng, 1, 1, 1, pi64(tg), p8(cm_s1), p8(z_xs), p8(z_zs), p8(fk),
+    p8(f_u8), p8(f_u8), p64(f_a), p64(z_pw[:1]), p8(f_u8),
+    p8(f_u8), p8(f_u8), p64(z_pw[:1]), p64(z_pw[:1]), p8(f_u8),
+    p64(z_pw), p64(z_pw), p8(z_ox), p8(z_oz), ctypes.byref(s_ax), ctypes.byref(s_az),
+)
+m_tmp = np.zeros(B, np.uint8)
+lib.engine_batch_mixed_substep(
+    eng, 0, 0, 0, 0, p64(f_a[0]), p64(f_a[0]), p64(f_a[0]), 0, 0, pi64(tg), 0, pi64(tg),
+    p8(z_xs), p8(m_tmp), p8(z_ox), p8(z_oz), ctypes.byref(s_ax), ctypes.byref(s_az),
+)
+cm_s0 = np.array([[0, 1]], np.uint8)
+lib.engine_batch_inject_general_clifford(
+    eng, 1, 1, 1, pi64(tg), p8(cm_s0), p8(z_xs), p8(z_zs), p8(fk),
+    p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
+    p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
+    p64(z_pw), p64(z_pw), p8(z_ox), p8(z_oz), ctypes.byref(s_ax), ctypes.byref(s_az),
+)
+
+# Register a valid 1-group, arity=1, n_factors=1 unitary step (step_id=0) before failing engine.
 sid = lib.engine_register_unitary_step(
     eng, 1, 1, 1, pi64(tg), p8(fk), p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
     p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8), N, nw, p64(x2z), p64(z2z),
@@ -482,7 +511,7 @@ rc_oom = int(raw.engine_register_unitary_step(
 fi.fi_disarm()
 assert rc_oom == -9 and int(raw.engine_failed(eng)) == 1
 
-# Properly sized sentinel buffers & valid effect-producing inputs for all 25 guarded exports.
+# Properly sized sentinel buffers & valid effect-producing inputs for all 21 guarded exports.
 out_rng = np.full(B, 0xAAAAAAAAAAAAAAAA, np.uint64)
 out_idx = np.full(B, -99, np.int32)
 out_d = np.full(B, -99, np.int32)
@@ -508,14 +537,15 @@ r1 = np.zeros((N, B), np.uint8)
 fm = np.ones(B, np.uint8)
 db = np.zeros(B, np.uint8)
 out_exp = np.full((1, B), 77, np.int8)
-# Properly sized d=65 > init_cap=64 import buffers so missing sticky guard allocates (>= 4 allocs).
-d_big = 65
-h_big = np.zeros(nw, np.uint64)
-au_big = np.zeros(nw, np.uint64)
-A_big = np.zeros((d_big, nw), np.uint64)
-ell_big = np.zeros(d_big, np.uint8)
-G_big = np.zeros((d_big, d_big), np.uint8)
-P_big = np.arange(d_big, dtype=np.int32)
+
+xs_p = np.zeros((N, (B + 7) >> 3), np.uint8); xs_p[0, 0] = 3
+xs_p_orig = xs_p.copy()
+is_r = np.zeros(1, np.uint8)
+n64, n32, nu64 = ctypes.cast(0, kl.i64_p), ctypes.cast(0, kl.i32_p), ctypes.cast(0, kl.u64_p)
+nu8, p_n = ctypes.cast(0, kl.u8_p), np.array([0.5], np.float64)
+bg_ct = np.random.default_rng(0).bit_generator.ctypes
+bg_fn, bg_st = ctypes.cast(bg_ct.next_double, kl.void_p), kl.void_p(bg_ct.state_address)
+v4_blk = ck.CosetCallBlock(N, B, nw, (B + 7) >> 3, 1, 7, 9, 0, p8(ox), p8(oz), p8(m_mat))
 
 ax, az = ctypes.c_int(7), ctypes.c_int(9)
 def reset_flags():
@@ -531,7 +561,7 @@ def assert_sentinels(name):
     assert np.all(sell == 0xAA) and np.all(sG == 0xAA) and np.all(sP == -1431655766), name
     assert np.all(ox == 0xAA) and np.all(oz == 0xAA), name
     assert np.all(m_mat == 9) and np.all(m_shots == 9) and np.all(out_exp == 77), name
-    assert np.array_equal(xs, xs_orig), name
+    assert np.array_equal(xs, xs_orig) and np.array_equal(xs_p, xs_p_orig), name
 
 # 1. All 16 raw int exports: exact negative rc, zeroed flags, untouched sentinels, 0 allocs.
 rng2 = np.array([33, 44], np.uint64)
@@ -560,19 +590,12 @@ assert int(raw.engine_inject_group_v3(
     eng, 0, 0, B, p8(cm_row), N, B, p8(xs), N, B, p8(zs),
     N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))) == -7
 assert_zero_flags("engine_inject_group_v3")
-reset_flags()
-assert int(raw.engine_batch_inject_general_clifford_v3(
-    eng, 0, 1, B, p8(cm_mat), N, B, p8(xs), N, B, p8(zs),
-    N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))) == -7
-assert_zero_flags("engine_batch_inject_general_clifford_v3")
-assert int(raw.engine_peek_pauli_batch_v3(
-    eng, 1, pi64(tg), 2, N, B, p8(xs), N, B, p8(zs), N, nw,
-    p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp), 1, B, pi8(out_exp))) == -8
-reset_flags()
-assert int(raw.engine_batch_evict_v3(
-    eng, N, nw, p64(x2z), p64(z2z), N, B, p8(xs), N, B, p8(zs),
-    N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))) == -6
-assert_zero_flags("engine_batch_evict_v3")
+nblk = ctypes.cast(0, ck.call_block_p)
+for bp in (ctypes.byref(v4_blk), nblk):
+    v4_blk.any_x, v4_blk.any_z = 7, 9
+    assert int(raw.engine_batch_inject_unitary_v4(
+        eng, 0, 1, B, p8(cm_mat), nu8, p8(xs_p), p8(xs_p), bp)) == -9
+    assert bp is nblk or (v4_blk.any_x == 0 and v4_blk.any_z == 0)
 reset_flags()
 assert int(raw.engine_postselect_batch(
     eng, 0, 2, B, p8(fm), B, p8(db), N, B, p8(xs), N, B, p8(zs), N, nw,
@@ -585,18 +608,23 @@ assert int(raw.engine_project_pauli(
     p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp),
     N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))) == -10
 assert_zero_flags("engine_project_pauli")
+for bp in (ctypes.byref(v4_blk), nblk):
+    v4_blk.any_x, v4_blk.any_z = 7, 9
+    assert int(raw.engine_batch_meas_step_v4(
+        eng, 1, 0, p8(is_r), pi64(tg), p8(mref), n64, n32, p64(b_sub), nu64, nu64,
+        0, n32, n64, 0, n32, n64, p64(x2z), p64(z2z), p8(xs_p), bp)) == -9
+    assert bp is nblk or (v4_blk.any_x == 0 and v4_blk.any_z == 0)
+    v4_blk.any_x, v4_blk.any_z = 7, 9
+    assert int(raw.engine_cond_pauli_noise_v4(
+        eng, 0, 1, pi64(tg), 1, p_n.ctypes.data_as(kl.f64_p), nu8, p8(cm_mat), bg_fn, bg_st, bp
+    )) == -9
+    assert bp is nblk or (v4_blk.any_x == 0 and v4_blk.any_z == 0)
 assert_sentinels("raw_int_exports")
 
-# 2. All 9 raw void exports: zeroed flags, untouched sentinels, 0 allocs on import_shot.
-raw.engine_export_shot(eng, 0, p64(sh), p64(sau), p64(sA), p8(sell), p8(sG), p32(sP))
+# 2. All 6 raw void exports: zeroed flags, untouched sentinels.
 raw.engine_peek_pauli_batch(
     eng, 1, pi64(tg), 2, p8(xs), p8(zs),
     p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp), pi8(out_exp))
-reset_flags()
-raw.engine_batch_det_meas_step(
-    eng, 1, pi64(tg), p8(mref), p64(b_sub), p8(xs), p8(m_mat),
-    p64(x2z), p64(z2z), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))
-assert_zero_flags("engine_batch_det_meas_step")
 reset_flags()
 raw.engine_batch_mixed_substep(
     eng, 0, 0, 0, 0, p64(b_sub), p64(b_sub), p64(b_sub), 0, 0, pi64(tg), 0, pi64(tg),
@@ -619,17 +647,12 @@ raw.engine_batch_inject_general_clifford(
     p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8),
     p64(x2z), p64(z2z), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))
 assert_zero_flags("engine_batch_inject_general_clifford")
-fi.fi_arm(10**9)
-raw.engine_import_shot(
-    eng, 0, d_big, p64(h_big), p64(au_big), p64(A_big), p8(ell_big), p8(G_big), p32(P_big))
-assert fi.fi_count() == 0, fi.fi_count()
-fi.fi_disarm()
 # engine_clear writes no caller buffer and allocates nothing; with all readers guarding
 # fail_kind != 0, removing only its early return is unobservable at the raw ABI.
 raw.engine_clear(eng)
 assert_sentinels("raw_void_exports")
 
-# 3. All 25 guarded wrapper calls raise MemoryError on the failed engine.
+# 3. All 21 guarded wrapper calls raise MemoryError on the failed engine.
 wrapped_calls = [
     ("engine_num_qubits", lambda: lib.engine_num_qubits(eng)),
     ("engine_batch_size", lambda: lib.engine_batch_size(eng)),
@@ -639,15 +662,9 @@ wrapped_calls = [
     ("engine_get_rng_states", lambda: lib.engine_get_rng_states(eng, B, p64(out_rng))),
     ("engine_get_active_shot_indices",
      lambda: lib.engine_get_active_shot_indices(eng, p32(out_idx), p32(out_d))),
-    ("engine_export_shot",
-     lambda: lib.engine_export_shot(
-         eng, 0, p64(sh), p64(sau), p64(sA), p8(sell), p8(sG), p32(sP))),
     ("engine_export_shot_v3",
      lambda: lib.engine_export_shot_v3(
          eng, 0, nw, 1, p64(sh), p64(sau), p64(sA), p8(sell), p8(sG), p32(sP))),
-    ("engine_import_shot",
-     lambda: lib.engine_import_shot(
-         eng, 0, d_big, p64(h_big), p64(au_big), p64(A_big), p8(ell_big), p8(G_big), p32(P_big))),
     ("engine_unitary_step_num_groups", lambda: lib.engine_unitary_step_num_groups(eng, 0)),
     ("engine_register_unitary_step",
      lambda: lib.engine_register_unitary_step(
@@ -655,10 +672,14 @@ wrapped_calls = [
          p8(f_u8), p8(f_u8), p64(f_a), p64(f_b), p8(f_u8), N, nw, p64(x2z), p64(z2z))),
     ("engine_register_unitary_group_evict",
      lambda: lib.engine_register_unitary_group_evict(eng, 0, 1, N, nw, p64(x2z), p64(z2z))),
-    ("engine_batch_det_meas_step",
-     lambda: lib.engine_batch_det_meas_step(
-         eng, 1, pi64(tg), p8(mref), p64(b_sub), p8(xs), p8(m_mat),
-         p64(x2z), p64(z2z), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_batch_meas_step_v4",
+     lambda: lib.engine_batch_meas_step_v4(
+         eng, 1, 0, p8(is_r), pi64(tg), p8(mref), n64, n32, p64(b_sub), nu64, nu64,
+         0, n32, n64, 0, n32, n64, p64(x2z), p64(z2z), p8(xs_p), ctypes.byref(v4_blk))),
+    ("engine_cond_pauli_noise_v4",
+     lambda: lib.engine_cond_pauli_noise_v4(
+         eng, 0, 1, pi64(tg), 1, p_n.ctypes.data_as(kl.f64_p), nu8, p8(cm_mat),
+         bg_fn, bg_st, ctypes.byref(v4_blk))),
     ("engine_batch_mixed_substep",
      lambda: lib.engine_batch_mixed_substep(
          eng, 0, 0, 0, 0, p64(b_sub), p64(b_sub), p64(b_sub), 0, 0, pi64(tg), 0, pi64(tg),
@@ -675,10 +696,6 @@ wrapped_calls = [
      lambda: lib.engine_peek_pauli_batch(
          eng, 1, pi64(tg), 2, p8(xs), p8(zs),
          p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp), pi8(out_exp))),
-    ("engine_peek_pauli_batch_v3",
-     lambda: lib.engine_peek_pauli_batch_v3(
-         eng, 1, pi64(tg), 2, N, B, p8(xs), N, B, p8(zs), N, nw,
-         p64(x2x), p64(x2z), p64(z2x), p64(z2z), p8(kp), p8(kp), 1, B, pi8(out_exp))),
     ("engine_postselect_batch",
      lambda: lib.engine_postselect_batch(
          eng, 0, 2, B, p8(fm), B, p8(db), N, B, p8(xs), N, B, p8(zs), N, nw,
@@ -693,14 +710,9 @@ wrapped_calls = [
      lambda: lib.engine_inject_group_v3(
          eng, 0, 0, B, p8(cm_row), N, B, p8(xs), N, B, p8(zs),
          N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_batch_inject_general_clifford_v3",
-     lambda: lib.engine_batch_inject_general_clifford_v3(
-         eng, 0, 1, B, p8(cm_mat), N, B, p8(xs), N, B, p8(zs),
-         N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))),
-    ("engine_batch_evict_v3",
-     lambda: lib.engine_batch_evict_v3(
-         eng, N, nw, p64(x2z), p64(z2z), N, B, p8(xs), N, B, p8(zs),
-         N, B, p8(ox), N, B, p8(oz), ctypes.byref(ax), ctypes.byref(az))),
+    ("engine_batch_inject_unitary_v4",
+     lambda: lib.engine_batch_inject_unitary_v4(
+         eng, 0, 1, B, p8(cm_mat), nu8, p8(xs_p), p8(xs_p), ctypes.byref(v4_blk))),
     ("engine_batch_inject_general_clifford",
      lambda: lib.engine_batch_inject_general_clifford(
          eng, 1, 1, 1, pi64(tg), p8(cm_mat), p8(xs), p8(zs), p8(fk),
@@ -709,7 +721,7 @@ wrapped_calls = [
          p64(x2z), p64(z2z), p8(ox), p8(oz), ctypes.byref(ax), ctypes.byref(az))),
 ]
 assert {n for n, _ in wrapped_calls} == (ck._VOID_FNS | ck._INT_FNS)
-assert len(wrapped_calls) == 25
+assert len(wrapped_calls) == 22
 for name, fn in wrapped_calls:
     try:
         fn()
@@ -718,7 +730,7 @@ for name, fn in wrapped_calls:
         pass
 assert_sentinels("wrapped_exports")
 lib.engine_destroy(eng)
-print("STICKY_25_OK")
+print("STICKY_22_OK")
 """
 
 
@@ -727,7 +739,7 @@ print("STICKY_25_OK")
     reason="needs a C++ compiler and no TSan runtime (TSan owns operator new)",
 )
 def test_failed_engine_all_25_exports_refuse_work_raw_and_wrapped(tmp_path: Path) -> None:
-    """L-1 + L-7: all 25 guarded exports refuse valid work on a failed engine (raw + wrapped)."""
+    """All 22 guarded exports refuse valid work on a failed engine (raw + wrapped)."""
     cpp, so = tmp_path / "fi_sticky.cpp", tmp_path / "libfi_sticky.so"
     cpp.write_text(_FI_STICKY_CPP, encoding="utf-8")
     subprocess.run(["c++", "-shared", "-fPIC", "-O1", str(cpp), "-o", str(so)], check=True)
@@ -754,7 +766,7 @@ def test_failed_engine_all_25_exports_refuse_work_raw_and_wrapped(tmp_path: Path
         capture_output=True, text=True, env=env, timeout=120, check=False,
     )
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert proc.stdout.strip().splitlines()[-1] == "STICKY_25_OK"
+    assert proc.stdout.strip().splitlines()[-1] == "STICKY_22_OK"
 
 
 def test_engine_owns_rng_states_and_validates_set_get_args() -> None:

@@ -733,7 +733,7 @@ def test_the_wrapper_binds_the_current_sentinel_and_every_earlier_entry_point(
 
     monkeypatch.setattr(me, "get_lib", fake_get_lib)
     assert me.get_magic_engine_lib() == "lib"
-    assert seen["sentinel"] == "mbe_abi_v5" and seen["stem"] == "magic_kernels"  # S5b: v5
+    assert seen["sentinel"] == "mbe_abi_v6" and seen["stem"] == "magic_kernels"
     names = [n for n, _, _ in seen["specs"]]
     assert {"mbe_abi_v4", "mbe_measure_split", "mbe_measure_finish"} <= set(names)  # S5a kept
     assert {"mbe_peek", "mbe_postselect", "mbe_unmatched_apply"} <= set(names)  # S5b added

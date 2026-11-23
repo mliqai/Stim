@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from typing import TYPE_CHECKING, Any, Sequence
+import warnings
 
 import numpy as np
 from numpy.typing import NDArray
@@ -65,11 +66,8 @@ _OUTPUT_EFFECT_TABLE: dict[str, tuple[bool, bool, bool, bool, str | None, bool]]
 
 
 def apply_output_effect(
-    state: NDArray[np.uint8],
-    masks: TransitionEffectMasks,
-    idx: Any,
-    in_st: int | str,
-    out_st: int | str,
+    state: NDArray[np.uint8], masks: TransitionEffectMasks, idx: Any,
+    in_st: int | str, out_st: int | str, *, drop_depol_reset: bool = False,
 ) -> None:
     """Update `state[idx]` and accumulate quantum side-effects in `masks` for `in_st -> out_st`.
 
@@ -90,7 +88,7 @@ def apply_output_effect(
 
     rz_always, rz_if_leaked, set_one, depol, pauli_attr, rand_v = entry
     in_is_leaked = in_st not in (0, 1, "U")
-    if rz_always or (rz_if_leaked and in_is_leaked):
+    if rz_always or (rz_if_leaked and in_is_leaked and not (drop_depol_reset and depol)):
         masks.set_zero[idx] = True
     if set_one:
         masks.set_one[idx] = True
@@ -328,3 +326,72 @@ def unpack_leakage_measurement_targets(
         targets = [t.qubit_value if t.qubit_value is not None else t.value for t in raw]
         inv_flags = [bool(t.is_inverted_result_target) for t in raw]
     return is_mpad, raw, targets, inv_flags
+
+
+def op_reads_frozen_state(inst: stim.CircuitInstruction, parsed_ops: Any) -> bool:
+    """True if ``inst`` may read or couple to a leaked qubit's stored state."""
+    gd = stim.gate_data(inst.name)
+    if gd.produces_measurements and inst.name != "MPAD" and not inst.name.startswith("HERALDED_"):
+        return not isinstance(parsed_ops.get(inst), LeakageMeasurementParams)
+    if inst.tag == "CCZ" or inst.tag.startswith("CLIFFORD_FAULT"):
+        return True
+    if inst.tag.startswith("CONDITIONED_ON") and not gd.is_single_qubit_gate:
+        p = parsed_ops.get(inst)
+        return p is None or any(isinstance(s, int) and s >= 2 for g in p.args for s in g)
+    return False
+
+
+def qualify_fast_1q(
+    circuit: stim.Circuit, parsed_ops: Any, uc: bool, fast_leakage: bool
+) -> tuple[bool, int]:
+    """Check whether single-qubit untagged operations may act on leaked qubits."""
+    if not (fast_leakage and uc):
+        return False, 0
+    blocker: stim.CircuitInstruction | None = None
+
+    def _scan(blk: stim.Circuit) -> int:
+        nonlocal blocker
+        n = 0
+        for item in blk:
+            if isinstance(item, stim.CircuitRepeatBlock):
+                n += item.repeat_count * _scan(item.body_copy()) if item.repeat_count > 0 else 0
+            else:
+                n += 1
+                if blocker is None and op_reads_frozen_state(item, parsed_ops):
+                    blocker = item
+        return n
+
+    total = _scan(circuit)
+    if blocker is not None:
+        warnings.warn(
+            f"fast_leakage: single-qubit acceleration disabled because '{blocker}' "
+            "may read or couple to a leaked qubit's stored state.",
+            UserWarning, stacklevel=3,
+        )
+        return False, total
+    return True, total
+
+
+def check_late_frozen_read(
+    fast_1q: bool, compiled_len: int, op: stim.CircuitInstruction, sss: Any, parsed_ops: Any
+) -> None:
+    """Reject instructions past the compiled circuit that may read a leaked qubit's state."""
+    if fast_1q:
+        check_late_frozen_read_at(
+            fast_1q, compiled_len, sss.get_current_circuit_time(), op, parsed_ops
+        )
+
+
+def check_late_frozen_read_at(
+    fast_1q: bool, compiled_len: int, time: int, op: stim.CircuitInstruction, parsed_ops: Any
+) -> None:
+    """Like `check_late_frozen_read`, for an instruction that will run at circuit time `time`.
+
+    A simulator calls this from the validation pass of `interactive_do`, so that the call is
+    rejected before any of its instructions has changed the simulator.
+    """
+    if fast_1q and time >= compiled_len and op_reads_frozen_state(op, parsed_ops):
+        raise ValueError(
+            f"fast_leakage: instruction '{op}' past the compiled circuit "
+            "may read or couple to a leaked qubit's stored state."
+        )

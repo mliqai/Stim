@@ -1,22 +1,15 @@
-"""Engine-backed store of the live per-shot expansions, and the `_live_exps` proxy over it.
+"""Engine-backed store of the live per-shot expansions (`LiveExpansions` proxy over `_live_exps`).
 
-`LiveExpansions` owns a lazily created `MagicBatchEngine`; it is the only holder of the shots.
-Reading `store[b]` copies shot `b` out as a fresh `ShotExpansion` and `store[b] = exp` copies one
-in, so no `ShotExpansion` aliases engine state and nothing can go stale. It is a drop-in for the
-list `MagicsideSimulator._live_exps` (item get/set, `len`, iteration), which is how the reference
-code, the accessors and white-box tests keep working unchanged when the engine is in use.
-
-It is not a full `list`: elements are copies (editing `store[b]` in place does not reach the
-engine; assign it back), integer indices only (slices read but cannot be assigned), no `==`
-against lists, and it cannot be pickled. `copy()` makes an independent store with the same shots.
+Reading `store[b]` exports a fresh `ShotExpansion` and `store[b] = exp` imports a copy, so no
+expansion aliases engine state. Supports integer indexing, `len`, iteration, and `copy()`.
 """
 
 from __future__ import annotations
 
-import collections
 import contextlib
 import threading
 import weakref
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from typing import Any, overload
 
@@ -25,46 +18,23 @@ from numpy.typing import NDArray
 
 from stimside._magic import phase_qfe as _pq
 from stimside._magic.channels import CompiledCliffordFactorList, apply_clifford_factors
-from stimside._magic.phase_qfe import (
-    K1_CANCEL_REL_TOL,
-    CompiledPauliBlock,
-    CompiledPauliBlockStep,
-    ImpossiblePostselectionError,
-    ShotExpansion,
-    check_unitary_norm,
-    validate_atol,
-)
+from stimside._magic.phase_qfe import K1_CANCEL_REL_TOL, ShotExpansion
 from stimside._magic.query import QueryBudgetExceededError
 from stimside._native import magic_engine as _me
-from stimside._native.magic_engine import (
-    BlockTable,
-    FactorFailure,
-    FactorTable,
-    FinishResult,
-    MagicBatchEngine,
-    OwnedFactorTable,
-    PostselectResult,
-    ShotArrays,
-    SplitResult,
-    UnmatchedResult,
-    as_integer,
-    numerics_match_numpy,
-    own_factor_table,
-    track_locks_for_fork,
-)
+from stimside._native.magic_engine import MagicBatchEngine, own_axis, own_factor_table
 
 
-def expansion_to_arrays(exp: ShotExpansion) -> ShotArrays:
+def expansion_to_arrays(exp: ShotExpansion) -> _me.ShotArrays:
     """The arrays of `exp` as the engine stores them (views, not copies)."""
     assert exp.ell_odd is not None
-    return ShotArrays(
+    return _me.ShotArrays(
         exp.chi, exp.d, bool(exp._is_canonical_merged), float(exp.log_mass), float(exp.atol),
         exp.weights, exp.h_words, exp.ell, exp.A_words, exp.a_union, exp.Gamma, exp.pivots,
         exp.ell_odd,
     )
 
 
-def arrays_to_expansion(n_qubits: int, s: ShotArrays) -> ShotExpansion:
+def arrays_to_expansion(n_qubits: int, s: _me.ShotArrays) -> ShotExpansion:
     """A `ShotExpansion` owning exactly the exported arrays `s`."""
     return ShotExpansion(
         n_qubits, s.d, s.A_words, s.a_union, s.Gamma, s.pivots, s.weights, s.h_words, s.ell,
@@ -73,9 +43,8 @@ def arrays_to_expansion(n_qubits: int, s: ShotArrays) -> ShotExpansion:
 
 
 def engine_numerics_available() -> bool:
-    """False when numpy does not match the engine's FMA / pairwise recipes, or when the native
-    library cannot be loaded (never raises: the caller then keeps the Python list)."""
-    return numerics_match_numpy()
+    """False when numpy does not match engine numerics or the native library cannot load."""
+    return _me.numerics_match_numpy()
 
 
 def _axes_of(fac: CompiledCliffordFactorList) -> list[Any]:
@@ -83,15 +52,12 @@ def _axes_of(fac: CompiledCliffordFactorList) -> list[Any]:
 
 
 def _is_integer(v: Any) -> bool:
-    """An `int` or numpy integer, not a bool: what `compile_*` produces for `v`. (Anything else
-    that merely converts, such as an `__index__`-only object, the reference treats on its own.)"""
+    """An `int` or numpy integer, not a bool."""
     return isinstance(v, (int, np.integer)) and not isinstance(v, (bool, np.bool_))
 
 
 def _well_formed_axis(ax: Any, n_words: int) -> bool:
-    """An axis object with `uint64` word arrays of shape `(n_words,)` and a `kappa` that
-    converts to an int. A `(a, b, kappa)` tuple is declared well formed by the reference
-    (`_unpack_pauli_args`) but is not what `compile_*` produces: it takes the reference path."""
+    """True when `ax` has `uint64` `(n_words,)` word arrays and int-convertible `kappa`."""
     if not all(hasattr(ax, name) for name in ("a_words", "b_words", "kappa")):
         return False
     for w in (ax.a_words, ax.b_words):
@@ -105,13 +71,9 @@ def _well_formed_axis(ax: Any, n_words: int) -> bool:
 
 
 def well_formed_lists(lists: Sequence[CompiledCliffordFactorList], n_words: int) -> bool:
-    """True when every list can be encoded as is: an integer `v` and axes with `uint64` word
-    arrays of shape `(n_words,)` and a `kappa` that converts to an int (what `compile_*` always
-    produces). Total: a list that is not exactly that, of whatever kind, gives False (and so
-    takes the per-shot reference function, which raises or accepts as it always did); this
-    function itself never raises."""
+    """True when every list has integer `v` and uint64 `(n_words,)` axes; never raises."""
     ok = False
-    with contextlib.suppress(Exception):  # hostile objects: the reference raises its own error
+    with contextlib.suppress(Exception):
         ok = all(
             _is_integer(fac.v) and all(_well_formed_axis(ax, n_words) for ax in _axes_of(fac))
             for fac in lists
@@ -119,12 +81,8 @@ def well_formed_lists(lists: Sequence[CompiledCliffordFactorList], n_words: int)
     return ok
 
 
-def factor_table(lists: Sequence[CompiledCliffordFactorList], n_words: int) -> FactorTable:
-    """The compiled factor lists in the engine's table layout (`p0` first, then the r axes).
-
-    Refuses (ValueError) lists `well_formed_lists` refuses: assigning a short or 2-d word array
-    into a row would silently broadcast it, and the reference raises for those.
-    """
+def factor_table(lists: Sequence[CompiledCliffordFactorList], n_words: int) -> _me.FactorTable:
+    """Compile factor lists into the engine's flat table layout (`p0` first, then `r` axes)."""
     if not well_formed_lists(lists, n_words):
         raise ValueError(
             f"factor lists need uint64 word arrays of shape ({n_words},), integer v and kappa"
@@ -132,31 +90,30 @@ def factor_table(lists: Sequence[CompiledCliffordFactorList], n_words: int) -> F
     return _encode_lists(lists, n_words)
 
 
-_TABLE_CACHE_MAX = 4096  # owned factor tables kept per store (each holds its lists alive)
-# Factor lists the simulator built and froze itself (`simulator_magic`'s E1 memo registers each
-# one when it stores it). Weak: an entry lives only as long as its list, so a reused id never
-# matches a dead list.
-_OWN_LISTS: weakref.WeakValueDictionary[int, CompiledCliffordFactorList] = (
-    weakref.WeakValueDictionary()
-)
+_TABLE_CACHE_MAX = 4096
+_OWN_LISTS: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+_OWN_AXES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+_Axis = _me.OwnedAxis | tuple[Any, Any, int]
 
 
 def register_own_list(fac: CompiledCliffordFactorList) -> None:
-    """Mark `fac` (frozen by the simulator, never handed to callers to build) as trusted."""
+    """Mark `fac` (frozen by the simulator's memo) as trusted for cached owned tables."""
     _OWN_LISTS[id(fac)] = fac
 
 
+def register_own_axis(ax: Any) -> None:
+    """Mark `ax` (frozen by the simulator's memo) as trusted for cached owned axes."""
+    _OWN_AXES[id(ax)] = ax
+
+
 def _frozen_key(lists: Sequence[CompiledCliffordFactorList]) -> tuple[Any, ...] | None:
-    """An identity key when every list is one the simulator registered (`register_own_list`),
-    else None. Registration, not a read-only flag, is the test: a caller can make an `owndata`
-    array writable again. The engine still never reads these arrays: `own_factor_table` copies
-    them once, so this choice affects only which lists skip re-encoding, never memory safety."""
+    """Identity key when every list is registered via `register_own_list`, else None."""
     lists_t = lists if type(lists) is tuple else tuple(lists)
     key = tuple(id(fac) for fac in lists_t)
     return key if all(_OWN_LISTS.get(k) is fac for k, fac in zip(key, lists_t)) else None
 
 
-def _encode_lists(lists: Sequence[CompiledCliffordFactorList], n_words: int) -> FactorTable:
+def _encode_lists(lists: Sequence[CompiledCliffordFactorList], n_words: int) -> _me.FactorTable:
     axes: list[Any] = []
     cols: list[list[int]] = [[], [], [], [], []]  # has_p0, n_r, v_fwd, v_inv, axis_start
     for fac in lists:
@@ -171,14 +128,14 @@ def _encode_lists(lists: Sequence[CompiledCliffordFactorList], n_words: int) -> 
     for i, ax in enumerate(axes):
         a[i], b[i] = ax.a_words, ax.b_words
     kappa = np.array([int(ax.kappa) & 3 for ax in axes], dtype=np.uint8)
-    return FactorTable(
+    return _me.FactorTable(
         np.array(cols[0], dtype=np.uint8), np.array(cols[1], dtype=np.int32),
         np.array(cols[2], dtype=np.int32), np.array(cols[3], dtype=np.int32),
         np.array(cols[4], dtype=np.int32), a, b, kappa,
     )
 
 
-def raise_factor_failure(fail: FactorFailure, n_qubits: int, atol: float) -> None:
+def raise_factor_failure(fail: _me.FactorFailure, n_qubits: int, atol: float) -> None:
     """Raise what the per-shot reference function raises for this failure."""
     name = _me.OP_NAMES[fail.op]
     if fail.kind == _me.FAIL_NON_FINITE_WEIGHTS:
@@ -198,7 +155,7 @@ def raise_factor_failure(fail: FactorFailure, n_qubits: int, atol: float) -> Non
             f"Non-zero upper padding bits in packed uint64 word for n_qubits={n_qubits}"
         )
     if fail.kind == _me.FAIL_UNITARITY:
-        check_unitary_norm(fail.pre, fail.post, atol, name)  # raises with the reference text
+        _pq.check_unitary_norm(fail.pre, fail.post, atol, name)  # raises with the reference text
     if fail.kind == _me.FAIL_ZERO_CHOSEN:  # `1.0 / math.sqrt(cz)` of the reference
         if fail.aux2 == 0:
             raise ZeroDivisionError("float division by zero")
@@ -206,10 +163,8 @@ def raise_factor_failure(fail: FactorFailure, n_qubits: int, atol: float) -> Non
     raise RuntimeError(f"unknown factor failure {fail}")
 
 
-def raise_split_failure(res: SplitResult, n_qubits: int, atol: float) -> None:
-    """Raise what `measure_expansions_batch` raises for a failed `measure_split` (no-op when the
-    split went through). The out-of-memory case is raised too (the caller has already recorded
-    the shots classified before it)."""
+def raise_split_failure(res: _me.SplitResult, n_qubits: int, atol: float) -> None:
+    """Raise what `measure_expansions_batch` raises for a failed or OOM `measure_split`."""
     if res.oom:
         raise MemoryError("mbe_measure_split ran out of memory (no shot was measured)")
     fail = res.failure
@@ -223,28 +178,28 @@ def raise_split_failure(res: SplitResult, n_qubits: int, atol: float) -> None:
     raise_factor_failure(fail, n_qubits, atol)
 
 
-def raise_born_failure(fail: FactorFailure, n_qubits: int, atol: float) -> None:
-    """Raise what `measure_expansion` / `_obs_p1` raise for one shot's failure from `peek`,
-    `postselect` or `unmatched_apply` (the Born-split checks, else the factor failures)."""
-    if fail.kind == _me.FAIL_BAD_NORM:
+def raise_born_failure(fail: _me.FactorFailure, n_qubits: int, atol: float) -> None:
+    """Raise reference errors for one shot's failure from `peek`, `postselect`, or `unmatched`."""
+    k = fail.kind
+    if k == _me.FAIL_BAD_NORM:
         raise FloatingPointError(f"Invalid pre-measurement norm squared z={fail.z!r}")
-    if fail.kind == _me.FAIL_NON_FINITE_MASS:
+    if k == _me.FAIL_NON_FINITE_MASS:
         raise FloatingPointError(
             f"Non-finite projected Born masses: z0={fail.pre!r}, z1={fail.post!r}"
         )
-    if fail.kind == _me.FAIL_NEGATIVE_MASS:
+    if k == _me.FAIL_NEGATIVE_MASS:
         raise FloatingPointError(
             f"Significantly negative projected Born mass: z0={fail.pre!r}, z1={fail.post!r}, "
             f"z={fail.z!r}"
         )
-    if fail.kind == _me.FAIL_CONSERVATION:
+    if k == _me.FAIL_CONSERVATION:
         z0, z1 = fail.pre, fail.post
         raise FloatingPointError(
             f"M2 Born mass conservation violated: z0={z0:.16e}, z1={z1:.16e}, "
             f"z0+z1={z0 + z1:.16e}, z={fail.z:.16e}, tol={atol:.3e}"
         )
-    if fail.kind == _me.FAIL_ZERO_POSTSELECT:
-        raise ImpossiblePostselectionError(
+    if k == _me.FAIL_ZERO_POSTSELECT:
+        raise _pq.ImpossiblePostselectionError(
             f"Requested postselection outcome {fail.aux} has zero Born probability "
             f"(z_{fail.aux}={fail.pre:.3e}, total z={fail.z:.3e})"
         )
@@ -252,12 +207,10 @@ def raise_born_failure(fail: FactorFailure, n_qubits: int, atol: float) -> None:
 
 
 def born_outcomes(
-    res: SplitResult, atol: float, rng: np.random.Generator,
+    res: _me.SplitResult, atol: float, rng: np.random.Generator,
     sample_outcome: Callable[[int, float], int] | None,
 ) -> tuple[NDArray[np.bool_], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    """The numpy half of `measure_expansions_batch` between its two kernel runs, on the active
-    shots of a split, with the same expressions: checks of the masses, the Born draw and the
-    outcomes. Returns (outcomes, z0, z1, chosen mass), all over the active shots in order."""
+    """Born mass checks and outcome sampling over active shots; returns (out, z0, z1, chosen)."""
     idx = np.flatnonzero(res.cls == _me.CLS_ACTIVE)
     z, z0r, z1r = res.z[idx], res.z01[idx, 0], res.z01[idx, 1]
     scale = np.maximum(1.0, z)
@@ -269,7 +222,9 @@ def born_outcomes(
     if not np.all(np.abs((z0 + z1) - z) <= atol * scale):
         raise FloatingPointError(f"M2 Born mass conservation violated: {z0!r}, {z1!r}, z={z!r}")
     if np.any((z <= 0.0) | ((z0 + z1) <= 0.0)):
-        raise ImpossiblePostselectionError("Cannot sample measurement from a zero-norm expansion")
+        raise _pq.ImpossiblePostselectionError(
+            "Cannot sample measurement from a zero-norm expansion"
+        )
     zero_floor = K1_CANCEL_REL_TOL * z
     if sample_outcome is None:
         u = rng.random(len(idx))  # one draw per active shot, pinned ones included
@@ -282,7 +237,7 @@ def born_outcomes(
     if sample_outcome is not None:
         chi_chosen = res.chi2[idx, out.astype(np.intp)]
         if np.any((chosen <= zero_floor) | (chi_chosen == 0)):
-            raise ImpossiblePostselectionError(
+            raise _pq.ImpossiblePostselectionError(
                 "Sampled measurement outcome has zero Born probability"
             )
     return out, z0, z1, chosen
@@ -291,74 +246,63 @@ def born_outcomes(
 _KIND = {"P1": 0, "P2": 1, "N1": 2, "N2": 3}
 
 
-def _empty_block_table(mode: int, g_sc: complex, nw: int) -> BlockTable:
-    z32 = np.zeros(0, dtype=np.int32)
-    return BlockTable(
-        mode, g_sc.real, g_sc.imag, z32, z32, z32, np.zeros((0, nw), dtype=np.uint64),
-        np.zeros((0, nw), dtype=np.uint64), np.zeros(0, dtype=np.uint8),
-        np.zeros((0, 2), dtype=np.float64),
+def _empty_block_table(mode: int, g_sc: complex, nw: int) -> _me.BlockTable:
+    z32, zu64 = np.zeros(0, np.int32), np.zeros((0, nw), np.uint64)
+    return _me.BlockTable(
+        mode, g_sc.real, g_sc.imag, z32, z32, z32, zu64, zu64, np.zeros(0, np.uint8),
+        np.zeros((0, 2), np.float64),
     )
 
 
-def _pauli_sum_table(block: CompiledPauliBlock, g_sc: complex) -> BlockTable:
-    """`apply_compiled_block`'s pauli_sum encoding: coefficients `g_sc * coeffs[nz]` (numpy's
-    own product, so the engine multiplies by exactly the values the reference does)."""
+def _pauli_sum_table(block: _pq.CompiledPauliBlock, g_sc: complex) -> _me.BlockTable:
+    """Engine pauli_sum encoding with coefficients `g_sc * coeffs[nz]`."""
     assert block.coeffs is not None and block.a_words is not None
     assert block.b_words is not None and block.kappas is not None
     nz = np.flatnonzero(np.abs(block.coeffs) > 0.0)
-    coeffs = np.asarray(g_sc * block.coeffs[nz], dtype=np.complex128)
-    z32 = np.zeros(0, dtype=np.int32)
-    return BlockTable(
+    z32, coeffs = np.zeros(0, np.int32), np.asarray(g_sc * block.coeffs[nz], np.complex128)
+    return _me.BlockTable(
         0, 1.0, 0.0, z32, z32, z32, block.a_words[nz], block.b_words[nz], block.kappas[nz],
         np.ascontiguousarray(coeffs).view(np.float64).reshape(-1, 2),
     )
 
 
-def _step_rows(step: CompiledPauliBlockStep, nq: int) -> tuple[Any, Any, Any, Any]:
-    """Weights, `a` rows, `b` rows and kappas of a step's axes (8 rows for N2, else 1), from the
-    reference's own `_unpack_pauli_args` / `_normalize_ccz_branches`: the rows it would use."""
+def _step_rows(step: _pq.CompiledPauliBlockStep, nq: int) -> tuple[Any, Any, Any, Any]:
+    """Weights, `a`, `b`, and kappas of a step's axes (8 rows for N2, else 1)."""
     if step.kind == "N2":
         return _pq._normalize_ccz_branches(step.paulis, nq)
     a_w, b_w, kap = _pq._unpack_pauli_args(*step.paulis[0], nq)
     return np.zeros(1, np.complex128), a_w[None, :], b_w[None, :], np.array([kap], np.uint8)
 
 
-def _sequential_table(block: CompiledPauliBlock, g_sc: complex, nq: int) -> BlockTable | None:
-    """The engine encoding of a sequential block; None for a nested block or an unknown step
-    kind (the reference path runs those and raises for the malformed ones)."""
-    nw = _pq.n_words_for_qubits(nq)
-    kinds, signs, starts = [], [], []
-    parts: list[tuple[Any, Any, Any, Any]] = []
-    n_rows = 0
+def _sequential_table(
+    block: _pq.CompiledPauliBlock, g_sc: complex, nq: int
+) -> _me.BlockTable | None:
+    """Engine encoding of a sequential block, or None for nested/unknown steps."""
+    nw, n_rows = _pq.n_words_for_qubits(nq), 0
+    kinds, signs, starts, parts = [], [], [], []
     for step in block.steps:
-        if not isinstance(step, CompiledPauliBlockStep) or step.kind not in _KIND:
+        if not isinstance(step, _pq.CompiledPauliBlockStep) or step.kind not in _KIND:
             return None
         kinds.append(_KIND[step.kind])
         signs.append(int(step.sign))
         starts.append(n_rows)
         parts.append(_step_rows(step, nq))
         n_rows += parts[-1][1].shape[0]
-
-    def cat(i: int, dtype: Any, shape: tuple[int, ...]) -> Any:
-        if not parts:
-            return np.zeros(shape, dtype)
-        return np.concatenate([p[i] for p in parts]).astype(dtype)
-
+    def cat(i: int, dt: Any, sh: tuple[int, ...]) -> Any:
+        return np.concatenate([p[i] for p in parts]).astype(dt) if parts else np.zeros(sh, dt)
     w_ri = np.ascontiguousarray(cat(0, np.complex128, (0,))).view(np.float64).reshape(-1, 2)
-    return BlockTable(
-        1, g_sc.real, g_sc.imag, np.array(kinds, dtype=np.int32), np.array(signs, dtype=np.int32),
-        np.array(starts, dtype=np.int32), cat(1, np.uint64, (0, nw)), cat(2, np.uint64, (0, nw)),
+    return _me.BlockTable(
+        1, g_sc.real, g_sc.imag, np.array(kinds, np.int32), np.array(signs, np.int32),
+        np.array(starts, np.int32), cat(1, np.uint64, (0, nw)), cat(2, np.uint64, (0, nw)),
         cat(3, np.uint8, (0,)), w_ri,
     )
 
 
-def block_table(block: Any, n_qubits: int) -> BlockTable | None:
-    """`block` in the engine's encoding, or None when the engine must not run it: anything the
-    reference validation (`_validate_compiled_block`) rejects, a nested block, an unknown step.
-    The caller then takes the per-group reference path, which raises or runs as it always did."""
-    if not isinstance(block, CompiledPauliBlock):
+def block_table(block: Any, n_qubits: int) -> _me.BlockTable | None:
+    """Encode `block` for the engine, or None if invalid/nested (caller uses reference path)."""
+    if not isinstance(block, _pq.CompiledPauliBlock):
         return None
-    table: BlockTable | None = None
+    table: _me.BlockTable | None = None
     with contextlib.suppress(Exception):  # the reference raises its own error for such a block
         _pq._validate_compiled_block(block, n_qubits)
         g_sc = _pq._coerce_finite_complex(block.global_scalar, "block.global_scalar")
@@ -375,22 +319,17 @@ class LiveExpansions(Sequence[ShotExpansion]):
     """`list[ShotExpansion]`-like view of the engine's shots (copy out on read, in on write)."""
 
     def __init__(self, batch_size: int, n_qubits: int, atol: float) -> None:
-        self.batch_size = as_integer(batch_size, "batch_size")
-        self.n_qubits = as_integer(n_qubits, "n_qubits")
+        self.batch_size = _me.as_integer(batch_size, "batch_size")
+        self.n_qubits = _me.as_integer(n_qubits, "n_qubits")
         if self.batch_size < 0 or self.n_qubits < 1:
             raise ValueError(f"need batch_size >= 0, n_qubits >= 1, got {batch_size}, {n_qubits}")
-        self.atol = validate_atol(atol)
-        # Shot at which the last `inject_factor_lists` raised, else None (see that method).
+        self.atol = _pq.validate_atol(atol)
         self.failed_shot: int | None = None
-        # Owned tables of the simulator's own (frozen) factor lists, keyed by axis identity.
-        self._tables: collections.OrderedDict[Any, Any] = collections.OrderedDict()
+        self._tables: OrderedDict[Any, Any] = OrderedDict()
+        self._axes: OrderedDict[int, tuple[_me.OwnedAxis, Any]] = OrderedDict()
         self._engine: MagicBatchEngine | None = None
-        # Guards creating/dropping the engine, not engine calls. Re-entrant, with `_creating`
-        # refusing a same-thread re-entry into the creation, so a finalizer or signal handler
-        # that fires inside the locked region cannot deadlock on it.
-        self._lock = threading.RLock()
-        self._creating = False
-        track_locks_for_fork(self)
+        self._lock, self._creating = threading.RLock(), False
+        _me.track_locks_for_fork(self)
 
     def _reinit_after_fork(self) -> None:
         """Run in a forked child, which has only the forking thread: renew the lock and flag."""
@@ -399,11 +338,7 @@ class LiveExpansions(Sequence[ShotExpansion]):
 
     @property
     def engine(self) -> MagicBatchEngine:
-        """The native engine, created on first use (compiled-only runs never need one).
-
-        Racing first accesses create exactly one engine; a re-entrant first access from inside
-        the creation (a finalizer, a handler) raises `RuntimeError` instead of deadlocking.
-        """
+        """Native engine created lazily on first use (thread-safe, non-re-entrant)."""
         with self._lock:
             if self._engine is None:
                 if self._creating:
@@ -462,24 +397,44 @@ class LiveExpansions(Sequence[ShotExpansion]):
             raise ValueError(f"shot has n_qubits={exp.n_qubits}, engine has {self.n_qubits}")
         self.engine.import_shot(i, expansion_to_arrays(exp))
 
+    def _owned_axis(self, ax: Any) -> _me.OwnedAxis | tuple[Any, Any, int]:
+        aid = id(ax)
+        reg = _OWN_AXES.get(aid)
+        if reg is not None and reg is ax:
+            cache = self._axes
+            hit = cache.get(aid)
+            if hit is not None and hit[1] is ax:
+                cache.move_to_end(aid)
+                return hit[0]
+            nw = self.engine.n_words
+            if _well_formed_axis(ax, nw):
+                owned = own_axis(ax.a_words, ax.b_words, ax.kappa, nw)
+                cache[aid] = (owned, ax)
+                if len(cache) > _TABLE_CACHE_MAX:
+                    cache.popitem(last=False)
+                return owned
+        return (ax.a_words, ax.b_words, ax.kappa)
+
     def apply_pauli_mask(self, axis: Any, mask: NDArray[np.bool_]) -> None:
         """`apply_pauli(shot, axis)` on every shot of `mask` with chi > 0, in shot order."""
-        self.engine.apply_pauli_mask(axis.a_words, axis.b_words, axis.kappa, mask)
+        self.engine._apply_pauli_mask_obs(self._owned_axis(axis), mask)
+
+    def apply_pauli_noise_batch(
+        self, ref_tab: Any, xm: NDArray[np.bool_], zm: NDArray[np.bool_]
+    ) -> None:
+        self.engine.apply_pauli_noise_batch(
+            ref_tab.x2x, ref_tab.x2z, ref_tab.x_kap, ref_tab.z2x, ref_tab.z2z, ref_tab.z_kap, xm, zm
+        )
 
     def inject_factor_lists(
         self, lists: Sequence[CompiledCliffordFactorList], shot_list: Any, inverse: bool
     ) -> None:
-        """`apply_clifford_factors(shot, lists[shot_list[s]], inverse, check_unitary=True)` on
-        every shot with `shot_list[s] >= 0`, in shot order (what `_apply_factor_list` loops over).
-
-        Shots before a failing one are updated, it and the later ones are not, and the failure
-        raises the same exception as the per-shot function; `failed_shot` is then the index of the
-        shot that failed (None when nothing was applied, or for an out-of-memory error).
-        Lists the engine cannot encode (see `well_formed_lists`) take the per-shot function itself.
-        """
+        """Apply `lists[shot_list[s]]` per shot in shot order (fallback per-shot if malformed)."""
         self.failed_shot = None
         eng = self.engine
-        table: FactorTable | OwnedFactorTable | None = self._trusted_table(lists, eng.n_words)
+        table: _me.FactorTable | _me.OwnedFactorTable | None = self._trusted_table(
+            lists, eng.n_words
+        )
         if table is None:
             if not well_formed_lists(lists, eng.n_words):
                 self._inject_per_shot(lists, shot_list, inverse)
@@ -492,13 +447,8 @@ class LiveExpansions(Sequence[ShotExpansion]):
 
     def _trusted_table(
         self, lists: Sequence[CompiledCliffordFactorList], nw: int
-    ) -> OwnedFactorTable | None:
-        """The owned table of `lists` when every list is one the simulator registered (its own
-        frozen E1-memo objects), cached by identity (glue cut (a)); else None.
-
-        A cached entry holds its lists, so their ids cannot be reused while it lives; frozen
-        dataclasses over frozen arrays make the encoding a function of those ids.
-        """
+    ) -> _me.OwnedFactorTable | None:
+        """Cached `OwnedFactorTable` for registered factor lists, else None."""
         lists_t = lists if type(lists) is tuple else tuple(lists)
         key = _frozen_key(lists_t)
         if key is None:
@@ -531,16 +481,9 @@ class LiveExpansions(Sequence[ShotExpansion]):
                 raise
 
     def apply_block(
-        self, table: BlockTable, max_components: int | None, dedupe: bool = True
+        self, table: _me.BlockTable, max_components: int | None, dedupe: bool = True
     ) -> tuple[int, int]:
-        """`apply_compiled_block(check_unitary=True)` on every group of bit-identical shots with
-        chi > 0 (groups ordered by lowest member), the result copied to each member, then the
-        `max_components` bound: what `_flush_magic` does per block. Returns (groups, live shots).
-
-        Failures raise what the reference raises (`QueryBudgetExceededError` for the bound);
-        groups before the failing one are updated, it and the later ones are not, except for the
-        bound, which is checked after the group was updated. `failed_shot` is the first shot of
-        the failing group (None on success)."""
+        """Apply compiled block per group of identical live shots; returns (groups, live)."""
         self.failed_shot = None
         res = self.engine.apply_block(table, dedupe, max_components)
         fail = res.failure
@@ -555,42 +498,34 @@ class LiveExpansions(Sequence[ShotExpansion]):
         raise AssertionError("unreachable")
 
     def axis_is_encodable(self, axis: Any) -> bool:
-        """True when `axis` has the `uint64` word arrays the engine takes (what `compile_*`
-        always produces); anything else takes the reference code, which raises or accepts."""
+        """True when `axis` has the `uint64` word arrays the engine takes."""
+        hit = self._axes.get(id(axis))
+        if hit is not None and hit[1] is axis:
+            return True
         return _well_formed_axis(axis, self.engine.n_words)
 
-    def measure_split(
-        self, obs: tuple[Any, Any, int], keep_rot: bool, reset: tuple[Any, Any, int, bool] | None
-    ) -> SplitResult:
-        """First half of one measurement substep on every shot
-        (`MagicBatchEngine.measure_split`)."""
+    def measure_split(self, obs: _Axis, keep_rot: bool, reset: Any) -> _me.SplitResult:
         self.failed_shot = None
         return self.engine.measure_split(obs, keep_rot, reset)
 
-    def measure_finish(
-        self, outcome: Any, chosen: Any, split: SplitResult | None = None
-    ) -> FinishResult:
-        """Second half: commit the chosen branches of `split` (see `MagicBatchEngine`)."""
+    def measure_step(
+        self, obs: _Axis, keep_rot: bool, reset: Any, fn_a: int, st_a: int, log_m: Any = None,
+    ) -> tuple[int, Any, Any]:
+        self.failed_shot = None
+        return self.engine.measure_step(obs, keep_rot, reset, fn_a, st_a, log_m)
+
+    def measure_finish(self, outcome: Any, chosen: Any, split: Any = None) -> _me.FinishResult:
         return self.engine.measure_finish(outcome, chosen, split)
 
-    def peek(
-        self, obs: tuple[Any, Any, int], shots: Any
-    ) -> tuple[NDArray[np.float64], FactorFailure | None]:
-        """`_obs_p1` of `obs` on the listed shots (`MagicBatchEngine.peek`): (p1, failure)."""
+    def peek(self, obs: _Axis, shots: Any) -> tuple[NDArray[np.float64], _me.FactorFailure | None]:
         return self.engine.peek(obs, shots)
 
-    def postselect(
-        self, obs: tuple[Any, Any, int], shots: Any, desired: Any
-    ) -> PostselectResult:
-        """The loop of `postselect_z_batch` on the listed shots (`MagicBatchEngine.postselect`)."""
+    def postselect(self, obs: _Axis, shots: Any, desired: Any) -> _me.PostselectResult:
         return self.engine.postselect(obs, shots, desired)
 
     def unmatched_apply(
-        self, obs: tuple[Any, Any, int], kick: tuple[Any, Any, int], shots: Any,
-        bits: Any, measure: Any, kicks: Any,
-    ) -> UnmatchedResult:
-        """Projections and kicks of one qubit of an unmatched noisy reset
-        (`MagicBatchEngine.unmatched_apply`)."""
+        self, obs: _Axis, kick: _Axis, shots: Any, bits: Any, measure: Any, kicks: Any,
+    ) -> _me.UnmatchedResult:
         return self.engine.unmatched_apply(obs, kick, shots, bits, measure, kicks)
 
     def __getstate__(self) -> None:

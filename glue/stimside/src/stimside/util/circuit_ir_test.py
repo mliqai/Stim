@@ -1065,15 +1065,17 @@ def test_i18b_memo_differential_both_directions() -> None:
 
 
 def test_i20_dataclasses_frozen_and_hashable() -> None:
-    """I20 (E2, kills K2: G119, G120, G132, G137, G141): all 5 IR dataclasses."""
-    classes: tuple[Any, ...] = (
-        circuit_ir.IRInstr,
+    """I20 (E2, kills K2: G119, G120, G132, G137, G141): all 5 IR records."""
+    assert issubclass(circuit_ir.IRInstr, tuple)
+    assert hasattr(circuit_ir.IRInstr, "_fields")
+    assert circuit_ir.IRInstr.__hash__ is not None
+    dc_classes: tuple[Any, ...] = (
         circuit_ir.CircuitIR,
         circuit_ir.StepMap,
         circuit_ir.TableauStepLayout,
         circuit_ir.CopyMap,
     )
-    for cls in classes:
+    for cls in dc_classes:
         cls_any: Any = cls
         assert dataclasses.is_dataclass(cls), cls_any.__name__
         assert cls_any.__dataclass_params__.frozen is True, f"{cls_any.__name__} not frozen"
@@ -1098,18 +1100,18 @@ def test_i20_dataclasses_frozen_and_hashable() -> None:
     }
     assert len(table) == 7
 
-    # Mutation must raise FrozenInstanceError on every single one of the 5 dataclasses.
-    mutations: tuple[tuple[Any, str, Any], ...] = (
-        (ir.instrs[0], "unrolled_index", 99),
-        (ir.instrs[0], "flat_index", 99),
-        (ir.instrs[0], "flat_offset", 99),
+    # Mutation must raise on every single one of the 5 record types.
+    for attr_name in ("unrolled_index", "flat_index", "flat_offset"):
+        with pytest.raises(AttributeError):
+            setattr(ir.instrs[0], attr_name, 99)
+    dc_mutations: tuple[tuple[Any, str, Any], ...] = (
         (ir, "num_qubits", 99),
         (ir, "flat_ops", ()),
         (sm, "skip", frozenset()),
         (lay, "step_to_unrolled", ()),
         (cm, "copy_len", ()),
     )
-    for instance, attr_name, val in mutations:
+    for instance, attr_name, val in dc_mutations:
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(instance, attr_name, val)
 
@@ -1559,7 +1561,7 @@ def test_rf_direct_fields_enums_and_empty_circuit() -> None:
         "correlated",
         "pauli_terms",
     }
-    assert tuple(f.name for f in dataclasses.fields(circuit_ir.IRInstr)) == (
+    assert circuit_ir.IRInstr._fields == (
         "unrolled_index",
         "op",
         "tag",
@@ -1570,9 +1572,10 @@ def test_rf_direct_fields_enums_and_empty_circuit() -> None:
         "basis",
         "is_product_measurement",
         "arity",
-        "has_classical_control",
-        "_flat",
+        "flat_box",
     )
+    assert isinstance(circuit_ir.IRInstr.has_classical_control, property)
+    assert isinstance(circuit_ir.IRInstr._flat, property)
     assert tuple(f.name for f in dataclasses.fields(circuit_ir.CircuitIR)) == (
         "instrs",
         "num_qubits",
@@ -2362,7 +2365,7 @@ def test_shared_fields_build_ir_circuit_repeat_and_oplist_parity() -> None:
 
 
 def test_shared_fields_immutability_replace_and_deferred_alignment() -> None:
-    """Verify FrozenInstanceError on new fields, dataclasses.replace, and lazy _FlatAlignment."""
+    """Verify AttributeError on fields, _replace, and lazy _FlatAlignment."""
     circ = stim.Circuit("R 0\nREPEAT 2 {\n  H 0\n}\nM 0\n")
     ir_c = circuit_ir.build_ir(circ, uc=True)
     # Alignment helper must not be instantiated eagerly during build_ir.
@@ -2375,9 +2378,9 @@ def test_shared_fields_immutability_replace_and_deferred_alignment() -> None:
         ("arity", 1),
         ("has_classical_control", True),
     ):
-        with pytest.raises(dataclasses.FrozenInstanceError):
+        with pytest.raises(AttributeError):
             setattr(sample, attr_name, val)
-    replaced = dataclasses.replace(sample, category=circuit_ir.Category.OTHER, basis="X")
+    replaced = sample._replace(category=circuit_ir.Category.OTHER, basis="X")
     assert replaced.category is circuit_ir.Category.OTHER and replaced.basis == "X"
 
     # First flat_ops access creates _FlatAlignment; alignment releases circuit snapshot.
@@ -2491,7 +2494,7 @@ def test_ir_instr_copy_deepcopy_equality_ordering_and_repr() -> None:
             with pytest.raises(TypeError):
                 op_fn(lhs, rhs)
 
-    custom = dataclasses.replace(ins1, tag="DIFFERENT_TAG")
+    custom = ins1._replace(tag="DIFFERENT_TAG")
     assert "tag='DIFFERENT_TAG'" in repr(custom)
 
 
@@ -2686,7 +2689,13 @@ def test_build_ir_checks_classical_control_without_copying_targets() -> None:
         plain.append("CX", [i % 7, 7 + i % 5])
         plain.append("CZ", [i % 5, 5 + i % 7])
         plain.append("H", [i % 7])
-    assert _count_c_calls("targets_copy", lambda: circuit_ir.build_ir(plain)) == 0
+    assert (
+        _count_c_calls(
+            "targets_copy",
+            lambda: [ins.has_classical_control for ins in circuit_ir.build_ir(plain).instrs],
+        )
+        == 0
+    )
     assert not any(ins.has_classical_control for ins in circuit_ir.build_ir(plain).instrs)
 
     # A tag that contains "rec[" only sends the instruction to the exact check.
@@ -2696,3 +2705,46 @@ def test_build_ir_checks_classical_control_without_copying_targets() -> None:
     )
     flags = [ins.has_classical_control for ins in circuit_ir.build_ir(feedback).instrs]
     assert flags == [False, True, False, True, False, True, True, True, False, True, False]
+
+
+def test_build_ir_never_toggles_gc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Building IR never calls gc.disable or gc.enable for any circuit size."""
+    import gc
+
+    def _forbid() -> None:
+        raise AssertionError("build_ir must not toggle the garbage collector")
+
+    monkeypatch.setattr(gc, "disable", _forbid)
+    monkeypatch.setattr(gc, "enable", _forbid)
+    for circ in (
+        stim.Circuit(),
+        _make_sized_flat_circuit(200),
+        _make_sized_flat_circuit(1200),
+        stim.Circuit("R 0\nREPEAT 5 {\n  H 0\n  CX 0 1\n  M 0\n}\n"),
+    ):
+        ir = circuit_ir.build_ir(circ, uc=True)
+        assert len(ir.instrs) == len(unroll_circuit(circ))
+
+
+def test_build_ir_defers_classical_control_until_read() -> None:
+    """Consumers that do not read has_classical_control pay no str/cache work during build_ir."""
+    circ = stim.Circuit("R 0 1\nREPEAT 3 {\n  CX 0 1\n}\nCX rec[-1] 1\nM 0 1\n")
+    ir = circuit_ir.build_ir(circ, uc=True)
+    assert ir._flat is not None and ir._flat[2] is None
+    assert ir.instrs[1].has_classical_control is False
+    assert ir._flat[2] is not None
+    assert ir.instrs[2].has_classical_control is False
+    assert ir.instrs[4].has_classical_control is True
+
+
+def test_ir_instr_optional_field_defaults() -> None:
+    """Direct IRInstr construction defaults optional fields to None/False."""
+    op = stim.Circuit("H 0")[0]
+    direct = circuit_ir.IRInstr(
+        0, op, "", circuit_ir.Category.UNITARY, circuit_ir.UntaggedFilter.ONE_QUBIT, 0, 0
+    )
+    assert direct.basis is None
+    assert direct.is_product_measurement is False
+    assert direct.arity is None
+    assert direct.flat_box is None
+    assert direct.has_classical_control is False

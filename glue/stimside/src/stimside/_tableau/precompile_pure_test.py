@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import FrozenInstanceError
 from typing import Any
 
@@ -10,6 +11,12 @@ import pytest
 import stim  # type: ignore[import-untyped]
 
 from stimside import LeakageUint8Tableau, TablesideSimulator
+from stimside._native.tableside_kernels import (
+    EmittedActionC,
+    StepDescC,
+    TransBranchC,
+    get_tableside_kernels_lib,
+)
 from stimside._tableau.runner import (
     PrecompiledTablesideCircuit,
     PrecompiledTablesideData,
@@ -412,3 +419,117 @@ def test_spp_with_inverted_pauli_targets_skips_only_the_leaked_qubit(sync_rng: b
     for body, want in cases:
         for seed in range(8):
             assert _final_records(leak_q0 + body, sync_rng=sync_rng, seed=seed) == want
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "R 0 1\nCX sweep[5] 1\nM 0 1",
+        "R 0 1\nCX sweep[0] 1\nM 0 1",
+        "R 0 1\nM 0\nCX rec[-1] 1\nM 1",
+        "R 0 1\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nCX sweep[5] 1\nM 1",
+        "R 0 1\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nCX sweep[0] 1\nM 1",
+        "R 0 1\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 1\nCX sweep[5] 1\nM 0",
+        "R 0 1\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 1\nCX sweep[0] 1\nM 0",
+    ],
+)
+def test_sync_rng_sweep_targets_match_default_path(text: str) -> None:
+    """Sync mode handles sweep[k] for both k >= num_qubits and k < num_qubits without error."""
+    for seed in (3, 17):
+        assert _final_records(text, sync_rng=True, seed=seed) == _final_records(
+            text, sync_rng=False, seed=seed
+        )
+
+
+def test_sync_rng_sweep_below_num_qubits_does_not_yield_on_unrelated_leaked_qubit() -> None:
+    """With q0 leaked and q1 unleaked, `CX sweep[0] 1` must not treat sweep[0] as qubit 0."""
+    circuit = stim.Circuit(
+        "R 0 1\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\nCX sweep[0] 1\nM 1"
+    )
+    coh = LeakageUint8Tableau().compile_op_handler(circuit=circuit, batch_size=1)
+    yielded: list[str] = []
+    orig_handle_op = coh.handle_op
+
+    def _spy_handle_op(op: Any, sss: Any) -> Any:
+        yielded.append(op.name)
+        return orig_handle_op(op=op, sss=sss)
+
+    coh.handle_op = _spy_handle_op  # type: ignore[method-assign]
+    sim = TablesideSimulator(circuit, compiled_op_handler=coh, seed=3, sync_tableside_rng=True)
+    sim.run()
+    assert "CX" not in yielded
+
+
+def test_cpp_filter_2q_uu_odd_target_count_does_not_read_past_targets() -> None:
+    """Direct ctypes call with OP_FILTER_2Q_UU (kind=2) and odd target_count=3 stays in bounds."""
+    lib = get_tableside_kernels_lib()
+    raw_t = np.array([0, 1, 2], dtype=np.uint32)
+    qubit_t = np.array([0, 1, 2], dtype=np.int32)
+    masks = np.array([0b111], dtype=np.uint64)
+    steps = (StepDescC * 1)(StepDescC(2, 0, 3, 0, 0.0, 0, 0, 0.0, 0))
+    branches = (TransBranchC * 1)()
+    for leaked_qubit, want_kept in ((0, 0), (2, 2)):
+        eng = lib.fast_engine_create(
+            3,
+            1,
+            42,
+            steps,
+            3,
+            raw_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+            qubit_t.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            1,
+            masks.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+            0,
+            branches,
+        )
+        assert eng
+        try:
+            state_ptr = lib.fast_engine_get_state_ptr(eng)
+            state_ptr[leaked_qubit] = 2
+            lib.fast_engine_sync_leaked_mask(eng)
+            act_ptr = ctypes.POINTER(EmittedActionC)()
+            out_ptr = ctypes.POINTER(ctypes.c_uint32)()
+            n_act = lib.fast_engine_run_segment(
+                eng, 0, ctypes.byref(act_ptr), ctypes.byref(out_ptr)
+            )
+            assert n_act == 1
+            assert act_ptr[0].target_count == want_kept
+        finally:
+            lib.fast_engine_destroy(eng)
+
+
+@pytest.mark.parametrize(
+    ("text", "want_kind"),
+    [
+        ("I_ERROR(0.1) 0", 1),
+        ("I_ERROR(0.1, 0.2) 0", 8),
+        ("II_ERROR(0.1) 0 1", 2),
+        ("II_ERROR(0.1, 0.2) 0 1", 8),
+    ],
+)
+def test_two_arg_i_error_and_ii_error_take_general_path(text: str, want_kind: int) -> None:
+    """Multi-argument gates (e.g. 2-arg I_ERROR/II_ERROR) must precompile to kind 8."""
+    circuit = stim.Circuit(f"R 0 1\nI[LEAKAGE_TRANSITION_1: (1.0, U-->2)] 0\n{text}\nM 0 1")
+    pre = PrecompiledTablesideCircuit(circuit, True, _parsed_ops_for(circuit))
+    assert pre.steps_py[2][0] == want_kind
+    for sync_rng in (False, True):
+        assert len(_final_records(str(circuit), sync_rng=sync_rng, seed=7)) == 2
+
+
+def test_leaked_state_conditioning_does_not_require_tableau() -> None:
+    """Conditioning only on a leaked state (e.g. 2, no 0/1) leaves requires_tableau False."""
+    circuit = stim.Circuit("R 0\nX[CONDITIONED_ON_SELF: 2] 0\nM 0")
+    pre = PrecompiledTablesideCircuit(circuit, True, _parsed_ops_for(circuit))
+    assert pre.steps_py[1][0] == 6
+    assert pre.requires_tableau is False
+
+
+@pytest.mark.parametrize(
+    ("max_qubit", "want_words"),
+    [(0, 1), (63, 1), (64, 2), (127, 2), (128, 3)],
+)
+def test_precompile_num_words_at_64_qubit_boundaries(max_qubit: int, want_words: int) -> None:
+    """num_words uses ceil(num_qubits / 64), staying 1 at 64 qubits and 2 at 128 qubits."""
+    pre = PrecompiledTablesideCircuit(stim.Circuit(f"H {max_qubit}\nM {max_qubit}"))
+    assert pre.num_qubits == max_qubit + 1
+    assert pre.num_words == want_words

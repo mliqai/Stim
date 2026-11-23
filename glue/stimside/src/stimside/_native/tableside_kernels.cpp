@@ -474,7 +474,7 @@ int fast_engine_run_segment(
                 int kept_targets = 0;
                 const int32_t* q_ptr = &eng->all_qubit_targets[st.target_offset];
                 const uint32_t* r_ptr = &eng->all_raw_targets[st.target_offset];
-                for (int i = 0; i < st.target_count; i += 2) {
+                for (int i = 0; i + 1 < st.target_count; i += 2) {
                     if (eng->state[q_ptr[i]] < 2 && eng->state[q_ptr[i + 1]] < 2) {
                         eng->out_targets.push_back(r_ptr[i]);
                         eng->out_targets.push_back(r_ptr[i + 1]);

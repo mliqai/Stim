@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <new>
@@ -915,86 +916,6 @@ int engine_get_active_shot_indices(void* ptr, int32_t* out_indices, int32_t* out
     });
 }
 
-void engine_export_shot(
-    void* ptr,
-    int b,
-    uint64_t* out_h,
-    uint64_t* out_au,
-    uint64_t* out_A,
-    uint8_t* out_ell,
-    uint8_t* out_Gamma,
-    int32_t* out_P
-) {
-    if (!ptr) return;
-    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
-    if (eng->fail_kind != 0 || !out_h || !out_au) return;
-    run_void_guarded(eng, [&]() {
-        if (b < 0 || b >= eng->batch_size) return;
-        const CppMRQFShot& s = eng->shots[b];
-        int nw = eng->n_words;
-        int d = s.d;
-        if (d > 0 && (!out_A || !out_ell || !out_Gamma || !out_P)) return;
-        std::memcpy(out_h, s.h_words.data(), size_t(nw) * sizeof(uint64_t));
-        std::memcpy(out_au, s.a_union.data(), size_t(nw) * sizeof(uint64_t));
-        if (d > 0) {
-            std::memcpy(out_A, s.A_buf.data(), size_t(d) * size_t(nw) * sizeof(uint64_t));
-            std::memcpy(out_ell, s.ell_buf.data(), size_t(d) * sizeof(uint8_t));
-            for (int r = 0; r < d; ++r) {
-                std::memcpy(
-                    out_Gamma + size_t(r) * size_t(d),
-                    &s.Gamma_buf[size_t(r) * size_t(s.cap)],
-                    size_t(d) * sizeof(uint8_t)
-                );
-            }
-            std::memcpy(out_P, s.P.data(), size_t(d) * sizeof(int32_t));
-        }
-    });
-}
-
-void engine_import_shot(
-    void* ptr,
-    int b,
-    int d,
-    const uint64_t* in_h,
-    const uint64_t* in_au,
-    const uint64_t* in_A,
-    const uint8_t* in_ell,
-    const uint8_t* in_Gamma,
-    const int32_t* in_P
-) {
-    if (!ptr) return;
-    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
-    if (eng->fail_kind != 0 || !in_h || !in_au) return;
-    run_void_guarded(eng, [&]() {
-        if (b < 0 || b >= eng->batch_size || d < 0 || d > eng->num_qubits) return;
-        if (d > 0) {
-            if (!in_A || !in_ell || !in_Gamma || !in_P) return;
-            for (int j = 0; j < d; ++j) {
-                if (in_P[j] < 0 || in_P[j] >= eng->num_qubits) return;
-            }
-        }
-        CppMRQFShot& s = eng->shots[b];
-        int nw = eng->n_words;
-        s.ensure_capacity(d);
-        s.d = d;
-        std::memcpy(s.h_words.data(), in_h, size_t(nw) * sizeof(uint64_t));
-        std::memcpy(s.a_union.data(), in_au, size_t(nw) * sizeof(uint64_t));
-        if (d > 0) {
-            std::memcpy(s.A_buf.data(), in_A, size_t(d) * size_t(nw) * sizeof(uint64_t));
-            std::memcpy(s.ell_buf.data(), in_ell, size_t(d) * sizeof(uint8_t));
-            for (int r = 0; r < d; ++r) {
-                std::memcpy(
-                    &s.Gamma_buf[size_t(r) * size_t(s.cap)],
-                    in_Gamma + size_t(r) * size_t(d),
-                    size_t(d) * sizeof(uint8_t)
-                );
-            }
-            std::memcpy(s.P.data(), in_P, size_t(d) * sizeof(int32_t));
-        }
-        eng->is_active[b] = (d > 0 || words_any_nonzero(in_h, nw)) ? 1 : 0;
-    });
-}
-
 static void inject_general_clifford_impl(
     BatchedMRQFEngine* eng,
     int num_groups,
@@ -1092,93 +1013,6 @@ void engine_batch_inject_general_clifford(
             factor_kinds, factor_lx1, factor_lz1, factor_a1_w, factor_b1_w, factor_kap1,
             factor_lx2, factor_lz2, factor_a2_w, factor_b2_w, factor_kap2,
             x2z_w, z2z_w, out_evict_x, out_evict_z, any_evict_x, any_evict_z
-        );
-    }, any_evict_x, any_evict_z);
-}
-
-static void det_meas_step_impl(
-    BatchedMRQFEngine* eng,
-    int num_sub,
-    const int64_t* q_arr,
-    const uint8_t* m_ref_arr,
-    const uint64_t* b_sub_words,
-    uint8_t* xs_base,
-    uint8_t* m_mat,
-    const uint64_t* x2z_w,
-    const uint64_t* z2z_w,
-    uint8_t* accum_x_mask,
-    uint8_t* accum_z_mask,
-    int* any_evict_x,
-    int* any_evict_z
-) {
-    if (num_sub < 0 || !x2z_w || !z2z_w || !accum_x_mask || !accum_z_mask) return;
-    if (num_sub > 0) {
-        if (!q_arr || !m_ref_arr || !b_sub_words || !xs_base || !m_mat) return;
-        for (int k = 0; k < num_sub; ++k) {
-            if (q_arr[k] < 0 || q_arr[k] >= eng->num_qubits) return;
-        }
-    }
-    int B = eng->batch_size;
-    int nw = eng->n_words;
-    for (int k = 0; k < num_sub; ++k) {
-        const uint8_t* xs_row = xs_base + size_t(q_arr[k]) * size_t(B);
-        uint8_t* m_row = m_mat + size_t(k) * size_t(B);
-        uint8_t mr = m_ref_arr[k];
-        for (int b = 0; b < B; ++b) {
-            m_row[b] = xs_row[b] ^ mr;
-        }
-    }
-    for (int b = 0; b < B; ++b) {
-        if (!eng->is_active[b]) continue;
-        CppMRQFShot& mrqf = eng->shots[b];
-        if (mrqf.d == 0 && !words_any_nonzero(mrqf.h_words.data(), nw)) continue;
-        for (int k = 0; k < num_sub; ++k) {
-            const uint64_t* b_k = b_sub_words + size_t(k) * size_t(nw);
-            size_t kb = size_t(k) * size_t(B) + size_t(b);
-            if (mrqf.d == 0 || !words_any_overlap(b_k, mrqf.a_union.data(), nw)) {
-                if (word_dot_parity(b_k, mrqf.h_words.data(), nw)) {
-                    m_mat[kb] ^= 1;
-                }
-            } else {
-                size_t qb = size_t(q_arr[k]) * size_t(B) + size_t(b);
-                int sigma = (int(xs_base[qb]) ^ int(m_ref_arr[k])) & 1;
-                int m_val = mrqf.p3_measure_diagonal(
-                    b_k, sigma, -1, &eng->shot_rng_states_owned[b]
-                );
-                m_mat[kb] = uint8_t(m_val);
-            }
-        }
-    }
-    eng->evict_healed_shots(
-        x2z_w, z2z_w, xs_base, nullptr, accum_x_mask, accum_z_mask, any_evict_x, any_evict_z
-    );
-}
-
-// 2A. Fused batch deterministic Z measurement / reset step
-void engine_batch_det_meas_step(
-    void* ptr,
-    int num_sub,
-    const int64_t* q_arr,
-    const uint8_t* m_ref_arr,
-    const uint64_t* b_sub_words,
-    uint8_t* xs_base,
-    uint8_t* m_mat,
-    const uint64_t* x2z_w,
-    const uint64_t* z2z_w,
-    uint8_t* accum_x_mask,
-    uint8_t* accum_z_mask,
-    int* any_evict_x,
-    int* any_evict_z
-) {
-    if (!ptr || !any_evict_x || !any_evict_z) return;
-    *any_evict_x = 0;
-    *any_evict_z = 0;
-    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
-    if (eng->fail_kind != 0) return;
-    run_void_guarded(eng, [&]() {
-        det_meas_step_impl(
-            eng, num_sub, q_arr, m_ref_arr, b_sub_words, xs_base, m_mat,
-            x2z_w, z2z_w, accum_x_mask, accum_z_mask, any_evict_x, any_evict_z
         );
     }, any_evict_x, any_evict_z);
 }
@@ -2101,140 +1935,6 @@ int engine_inject_group_v3(
     }, any_evict_x, any_evict_z);
 }
 
-int engine_batch_inject_general_clifford_v3(
-    void* ptr,
-    int step_id,
-    int cm_rows, int cm_cols, const uint8_t* cond_mask,
-    int xs_rows, int xs_cols, uint8_t* xs_base,
-    int zs_rows, int zs_cols, uint8_t* zs_base,
-    int out_x_rows, int out_x_cols, uint8_t* out_evict_x,
-    int out_z_rows, int out_z_cols, uint8_t* out_evict_z,
-    int* any_evict_x,
-    int* any_evict_z
-) {
-    if (!ptr) return -1;
-    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
-    if (eng->fail_kind != 0) {
-        if (any_evict_x) *any_evict_x = 0;
-        if (any_evict_z) *any_evict_z = 0;
-        return -7;
-    }
-    if (!xs_base || !zs_base || !out_evict_x || !out_evict_z || !any_evict_x || !any_evict_z) {
-        return -1;
-    }
-    return run_int_guarded(eng, -7, -8, [&]() -> int {
-        int N = eng->num_qubits;
-        int B = eng->batch_size;
-        if (step_id < 0 || step_id >= int(eng->unitary_steps.size())) return -2;
-        const CppUnitaryStep& st = eng->unitary_steps[step_id];
-        if (cm_rows != st.num_groups || cm_cols != B) return -3;
-        if (cm_rows > 0 && !cond_mask) return -4;
-        if (xs_rows != N || xs_cols != B || zs_rows != N || zs_cols != B) return -5;
-        if (out_x_rows != N || out_x_cols != B || out_z_rows != N || out_z_cols != B) return -6;
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-        for (int g = 0; g < st.num_groups; ++g) {
-            eng->inject_group_raw(
-                g, st.arity, st.n_factors, st.target_groups.data(),
-                cond_mask + size_t(g) * size_t(B), xs_base, zs_base,
-                st.factor_kinds.data(), st.factor_lx1.data(), st.factor_lz1.data(),
-                st.factor_a1_w.data(), st.factor_b1_w.data(), st.factor_kap1.data(),
-                st.factor_lx2.data(), st.factor_lz2.data(), st.factor_a2_w.data(),
-                st.factor_b2_w.data(), st.factor_kap2.data()
-            );
-        }
-        eng->evict_healed_shots(
-            st.x2z_w.data(), st.z2z_w.data(), xs_base, zs_base,
-            out_evict_x, out_evict_z, any_evict_x, any_evict_z
-        );
-        return 0;
-    }, any_evict_x, any_evict_z);
-}
-
-int engine_peek_pauli_batch_v3(
-    void* ptr,
-    int num_targets,
-    const int64_t* targets,
-    int pauli_kind,
-    int xs_rows, int xs_cols, const uint8_t* xs_base,
-    int zs_rows, int zs_cols, const uint8_t* zs_base,
-    int pw_rows, int pw_cols,
-    const uint64_t* x2x_w,
-    const uint64_t* x2z_w,
-    const uint64_t* z2x_w,
-    const uint64_t* z2z_w,
-    const uint8_t* x_kappa,
-    const uint8_t* z_kappa,
-    int out_rows, int out_cols, int8_t* out_exps
-) {
-    if (!ptr) return -1;
-    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
-    if (eng->fail_kind != 0) return -8;
-    if (!xs_base || !zs_base || !x2x_w || !x2z_w || !z2x_w || !z2z_w || !x_kappa || !z_kappa) {
-        return -1;
-    }
-    return run_int_guarded(eng, -8, -9, [&]() -> int {
-        int N = eng->num_qubits;
-        int B = eng->batch_size;
-        int nw = eng->n_words;
-        if (num_targets < 0 || pauli_kind < 0 || pauli_kind > 2) return -2;
-        if (xs_rows != N || xs_cols != B || zs_rows != N || zs_cols != B) return -3;
-        if (pw_rows != N || pw_cols != nw) return -4;
-        if (out_rows != num_targets || out_cols != B) return -5;
-        if (num_targets > 0) {
-            if (!targets || !out_exps) return -6;
-            for (int idx = 0; idx < num_targets; ++idx) {
-                if (targets[idx] < 0 || targets[idx] >= N) return -7;
-            }
-        }
-        if (num_targets == 0) return 0;
-        peek_pauli_batch_impl(
-            eng, num_targets, targets, pauli_kind, xs_base, zs_base,
-            x2x_w, x2z_w, z2x_w, z2z_w, x_kappa, z_kappa, out_exps
-        );
-        return 0;
-    });
-}
-
-int engine_batch_evict_v3(
-    void* ptr,
-    int pw_rows, int pw_cols,
-    const uint64_t* x2z_w,
-    const uint64_t* z2z_w,
-    int xs_rows, int xs_cols, uint8_t* xs_base,
-    int zs_rows, int zs_cols, uint8_t* zs_base,
-    int out_x_rows, int out_x_cols, uint8_t* accum_x_mask,
-    int out_z_rows, int out_z_cols, uint8_t* accum_z_mask,
-    int* any_evict_x,
-    int* any_evict_z
-) {
-    if (!ptr) return -1;
-    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
-    if (eng->fail_kind != 0) {
-        if (any_evict_x) *any_evict_x = 0;
-        if (any_evict_z) *any_evict_z = 0;
-        return -6;
-    }
-    if (!x2z_w || !z2z_w || !accum_x_mask || !accum_z_mask || !any_evict_x || !any_evict_z) {
-        return -1;
-    }
-    return run_int_guarded(eng, -6, -7, [&]() -> int {
-        int N = eng->num_qubits;
-        int B = eng->batch_size;
-        int nw = eng->n_words;
-        if (pw_rows != N || pw_cols != nw) return -2;
-        if (xs_base && (xs_rows != N || xs_cols != B)) return -3;
-        if (zs_base && (zs_rows != N || zs_cols != B)) return -4;
-        if (out_x_rows != N || out_x_cols != B || out_z_rows != N || out_z_cols != B) return -5;
-        *any_evict_x = 0;
-        *any_evict_z = 0;
-        eng->evict_healed_shots(
-            x2z_w, z2z_w, xs_base, zs_base, accum_x_mask, accum_z_mask, any_evict_x, any_evict_z
-        );
-        return 0;
-    }, any_evict_x, any_evict_z);
-}
-
 // Export shot with explicit caller buffer capacities (R6-F1 / A''-1).
 // Returns d >= 0 on success, or < 0 on error without writing output buffers:
 //   -1: null ptr/out_h/out_au, or d > 0 with null out_A/out_ell/out_Gamma/out_P
@@ -2285,8 +1985,356 @@ int engine_export_shot_v3(
     });
 }
 
+struct CosetCallBlock {
+    int32_t n_q, n_b, n_w, n_packed_bytes;
+    int32_t m_buf_rows, any_x, any_z, flags;
+    uint8_t *scratch_x_mask, *scratch_z_mask, *m_buf;
+};
+
+static inline int validate_call_block(const BatchedMRQFEngine* eng, CosetCallBlock* blk) {
+    if (blk) { blk->any_x = 0; blk->any_z = 0; }
+    if (eng->fail_kind != 0) return -9;
+    if (!blk) return -1;
+    if (blk->n_q != eng->num_qubits || blk->n_b != eng->batch_size ||
+        blk->n_w != eng->n_words || blk->n_packed_bytes != ((eng->batch_size + 7) >> 3)) {
+        return -2;
+    }
+    if (eng->num_qubits > 0 && (!blk->scratch_x_mask || !blk->scratch_z_mask)) return -1;
+    if (blk->m_buf_rows < 0 || (blk->m_buf_rows > 0 && !blk->m_buf)) return -1;
+    return 0;
+}
+
+static inline uint8_t packed_bit(const uint8_t* row, int b) {
+    return (row[b >> 3] >> (b & 7)) & 1u;
+}
+static inline void packed_xor_bit(uint8_t* row, int b) { row[b >> 3] ^= uint8_t(1u << (b & 7)); }
+
+static int validate_meas_step_v4_args(
+    const BatchedMRQFEngine* eng, int num_sub, const uint8_t* is_rand, const int64_t* q_arr,
+    const uint8_t* m_ref, const int64_t* p_arr, const int32_t* krot, const uint64_t* bw,
+    const uint64_t* brot, const uint64_t* ep, int tot_gx, const int32_t* gxo, const int64_t* gxf,
+    int tot_gz, const int32_t* gzo, const int64_t* gzf, const uint64_t* x2z, const uint64_t* z2z,
+    const uint8_t* xs_p, const CosetCallBlock* blk
+) {
+    if (num_sub < 0 || num_sub > blk->m_buf_rows) return -3;
+    if (!x2z || !z2z) return -1;
+    if (tot_gx < 0 || tot_gz < 0) return -6;
+    if (num_sub == 0) return 0;
+    if (!is_rand || !q_arr || !m_ref || !bw || !xs_p) return -1;
+    int N = eng->num_qubits;
+    for (int k = 0; k < num_sub; ++k) {
+        if (q_arr[k] < 0 || q_arr[k] >= N) return -4;
+        if (!is_rand[k]) continue;
+        if (!p_arr || !krot || !brot || !ep || !gxo || !gzo) return -1;
+        if (p_arr[k] < 0 || p_arr[k] >= N) return -5;
+        int gx0 = gxo[k], gx1 = gxo[k + 1], gz0 = gzo[k], gz1 = gzo[k + 1];
+        if (gx0 < 0 || gx0 > gx1 || gx1 > tot_gx || gz0 < 0 || gz0 > gz1 || gz1 > tot_gz) return -6;
+        if ((gx1 > gx0 && !gxf) || (gz1 > gz0 && !gzf)) return -1;
+        for (int i = gx0; i < gx1; ++i) if (gxf[i] < 0 || gxf[i] >= N) return -7;
+        for (int i = gz0; i < gz1; ++i) if (gzf[i] < 0 || gzf[i] >= N) return -7;
+    }
+    return 0;
+}
+
+static void meas_v4_rand_substep(
+    BatchedMRQFEngine* eng, uint8_t m_ref, int64_t p, const uint64_t* aw, const uint64_t* brot,
+    const uint64_t* ep, int32_t krot, int gx0, int gx1, const int64_t* gx_flat, int gz0, int gz1,
+    const int64_t* gz_flat, uint8_t* xs_packed, const uint8_t* xs_row, uint8_t* m_row,
+    CosetCallBlock* blk
+) {
+    int B = eng->batch_size, npb = blk->n_packed_bytes, pw = int(p >> 6);
+    uint64_t pm = 1ULL << int(p & 63);
+    uint8_t* delta = eng->scratch_delta.data();
+    bool any_delta = false;
+    for (int b = 0; b < B; ++b) {
+        uint8_t m_b = m_row[b] & 1u, fq = packed_bit(xs_row, b), d_b = m_b ^ fq ^ m_ref;
+        if (eng->is_active[b]) {
+            CppMRQFShot& mrqf = eng->shots[b];
+            if ((mrqf.a_union[pw] & pm) == 0ULL) {
+                if ((mrqf.h_words[pw] & pm) != 0ULL) d_b ^= 1;
+            } else {
+                d_b = 0;
+                mrqf.p2_apply_quarter_turn(aw, brot, krot & 3);
+                m_b = uint8_t(mrqf.p3_measure_diagonal(
+                    ep, 0, int(m_b ^ fq), &eng->shot_rng_states_owned[b]) ^ fq);
+            }
+        }
+        m_row[b] = m_b;
+        if ((delta[b] = d_b)) any_delta = true;
+    }
+    if (!any_delta) return;
+    for (int i = gx0; i < gx1; ++i) {
+        int64_t gq = gx_flat[i];
+        uint8_t *sx_row = blk->scratch_x_mask + size_t(gq) * size_t(B),
+                *gxs_row = xs_packed + size_t(gq) * size_t(npb);
+        for (int b = 0; b < B; ++b) {
+            if (delta[b]) { sx_row[b] ^= 1; packed_xor_bit(gxs_row, b); }
+        }
+    }
+    if (gx1 > gx0) blk->any_x = 1;
+    for (int i = gz0; i < gz1; ++i) {
+        uint8_t* sz_row = blk->scratch_z_mask + size_t(gz_flat[i]) * size_t(B);
+        for (int b = 0; b < B; ++b) sz_row[b] ^= delta[b];
+    }
+    if (gz1 > gz0) blk->any_z = 1;
+}
+
+int engine_batch_meas_step_v4(
+    void* ptr, int num_sub, int is_reset, const uint8_t* is_rand_arr, const int64_t* q_arr,
+    const uint8_t* m_ref_arr, const int64_t* p_arr, const int32_t* kappa_rot_arr,
+    const uint64_t* beta_or_a_words, const uint64_t* b_rot_words, const uint64_t* e_p_words,
+    int total_gx, const int32_t* gx_offsets, const int64_t* gx_flat, int total_gz,
+    const int32_t* gz_offsets, const int64_t* gz_flat, const uint64_t* x2z_w, const uint64_t* z2z_w,
+    uint8_t* xs_packed, CosetCallBlock* blk
+) {
+    if (!ptr) return -1;
+    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
+    if (int brc = validate_call_block(eng, blk); brc != 0) return brc;
+    return run_int_guarded(eng, -9, -10, [&]() -> int {
+        int vrc = validate_meas_step_v4_args(
+            eng, num_sub, is_rand_arr, q_arr, m_ref_arr, p_arr, kappa_rot_arr, beta_or_a_words,
+            b_rot_words, e_p_words, total_gx, gx_offsets, gx_flat, total_gz, gz_offsets, gz_flat,
+            x2z_w, z2z_w, xs_packed, blk);
+        if (vrc != 0) return vrc;
+        int B = eng->batch_size, nw = eng->n_words, npb = blk->n_packed_bytes;
+        uint8_t *sx = blk->scratch_x_mask, *sz = blk->scratch_z_mask;
+        for (int k = 0; k < num_sub; ++k) {
+            int64_t q = q_arr[k];
+            uint8_t m_ref = m_ref_arr[k] & 1u, *xs_row = xs_packed + size_t(q) * size_t(npb),
+                    *m_row = blk->m_buf + size_t(k) * size_t(B);
+            const uint64_t* bw = beta_or_a_words + size_t(k) * size_t(nw);
+            if (!is_rand_arr[k]) {
+                for (int b = 0; b < B; ++b) {
+                    uint8_t fq = packed_bit(xs_row, b), m_b = fq ^ m_ref;
+                    if (eng->is_active[b]) {
+                        CppMRQFShot& mrqf = eng->shots[b];
+                        if (mrqf.d == 0 || !words_any_overlap(bw, mrqf.a_union.data(), nw)) {
+                            if (word_dot_parity(bw, mrqf.h_words.data(), nw)) m_b ^= 1;
+                        } else {
+                            m_b = uint8_t(mrqf.p3_measure_diagonal(
+                                bw, int(fq ^ m_ref) & 1, -1, &eng->shot_rng_states_owned[b]));
+                        }
+                    }
+                    m_row[b] = m_b;
+                }
+            } else {
+                meas_v4_rand_substep(
+                    eng, m_ref, p_arr[k], bw, b_rot_words + size_t(k) * size_t(nw),
+                    e_p_words + size_t(k) * size_t(nw), kappa_rot_arr[k], gx_offsets[k],
+                    gx_offsets[k + 1], gx_flat, gz_offsets[k], gz_offsets[k + 1], gz_flat,
+                    xs_packed, xs_row, m_row, blk);
+            }
+            if (is_reset) {
+                uint8_t* sx_row = sx + size_t(q) * size_t(B);
+                bool ak = false;
+                for (int b = 0; b < B; ++b)
+                    if (m_row[b] ^ m_ref) { sx_row[b] ^= 1; packed_xor_bit(xs_row, b); ak = true; }
+                if (ak) blk->any_x = 1;
+            }
+        }
+        eng->evict_healed_shots(x2z_w, z2z_w, nullptr, nullptr, sx, sz, &blk->any_x, &blk->any_z);
+        return 0;
+    }, &blk->any_x, &blk->any_z);
+}
+
+using BitgenNextDoubleFn = double (*)(void*);
+
+static int validate_noise_v4_args(
+    const BatchedMRQFEngine* eng, int ch_code, int num_groups, const int64_t* targets, int n_probs,
+    const double* probs, const uint8_t* ls, const uint8_t* cm, void* nd_fn, void* bg
+) {
+    if (ch_code < 0 || ch_code > 5) return -3;
+    int arity = (ch_code >= 4) ? 2 : 1, req = (ch_code == 3) ? 3 : ((ch_code == 5) ? 15 : 1);
+    if (num_groups < 0 || n_probs != req || !probs) return -4;
+    double hi = (ch_code == 5) ? (1.0 + 1e-12) : 1.0;
+    for (int i = 0; i < req; ++i) {
+        if (!std::isfinite(probs[i]) || probs[i] < 0.0 || probs[i] > hi) return -5;
+        if (ch_code == 5 && i > 0 && probs[i] < probs[i - 1]) return -5;
+    }
+    if (ch_code == 3 && probs[0] + probs[1] + probs[2] > 1.0 + 1e-12) return -5;
+    if (num_groups == 0) return 0;
+    if (!targets || !nd_fn || !bg || (ls == nullptr) == (cm == nullptr)) return -1;
+    size_t tg_count = 0;
+    if (!coset_mul_within(size_t(num_groups), size_t(arity), size_t(INT_MAX), tg_count)) return -4;
+    for (size_t i = 0; i < tg_count; ++i)
+        if (targets[i] < 0 || targets[i] >= eng->num_qubits) return -6;
+    return 0;
+}
+
+static bool noise_v4_has_masked(
+    int ng, int arity, int B, const int64_t* t, const uint8_t* ls, const uint8_t* cm_all
+) {
+    for (int g = 0; g < ng; ++g) {
+        if (ls) {
+            const uint8_t* r0 = ls + size_t(t[size_t(g) * size_t(arity)]) * size_t(B);
+            const uint8_t* r1 = (arity == 2)
+                ? (ls + size_t(t[size_t(g) * 2 + 1]) * size_t(B)) : nullptr;
+            for (int b = 0; b < B; ++b) if (r0[b] >= 2 || (r1 && r1[b] >= 2)) return true;
+        } else {
+            const uint8_t* cm = cm_all + size_t(g) * size_t(B);
+            for (int b = 0; b < B; ++b) if (!cm[b]) return true;
+        }
+    }
+    return false;
+}
+
+int engine_cond_pauli_noise_v4(
+    void* ptr, int ch_code, int num_groups, const int64_t* targets, int n_probs,
+    const double* probs, const uint8_t* leaked_state, const uint8_t* cond_mask,
+    void* next_double_fn, void* bitgen_state, CosetCallBlock* blk
+) {
+    if (!ptr) return -1;
+    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
+    if (int brc = validate_call_block(eng, blk); brc != 0) return brc;
+    return run_int_guarded(eng, -9, -10, [&]() -> int {
+        int vrc = validate_noise_v4_args(
+            eng, ch_code, num_groups, targets, n_probs, probs,
+            leaked_state, cond_mask, next_double_fn, bitgen_state);
+        if (vrc != 0 || num_groups == 0) return vrc;
+        if (ch_code == 4 && probs[0] / 15.0 <= 0.0) return 0;
+        int N = eng->num_qubits, B = eng->batch_size, arity = (ch_code >= 4) ? 2 : 1;
+        bool any_masked = noise_v4_has_masked(
+            num_groups, arity, B, targets, leaked_state, cond_mask);
+        if (!any_masked) return 1;
+        uint8_t *sx = blk->scratch_x_mask, *sz = blk->scratch_z_mask;
+        size_t nb = size_t(N) * size_t(B);
+        if (nb > 0) { std::memset(sx, 0, nb); std::memset(sz, 0, nb); }
+        auto nd = reinterpret_cast<BitgenNextDoubleFn>(next_double_fn);
+        int32_t any_x = 0, any_z = 0;
+        double p0 = probs[0], pxy = (ch_code == 3) ? (p0 + probs[1]) : 0.0;
+        double pxyz = (ch_code == 3) ? (pxy + probs[2]) : 0.0;
+        double step = (ch_code == 4) ? (p0 / 15.0) : 0.0;
+        for (int g = 0; g < num_groups; ++g) {
+            int64_t q0 = targets[size_t(g) * arity];
+            int64_t q1 = (arity == 2) ? targets[size_t(g) * 2 + 1] : 0;
+            const uint8_t* r0 = leaked_state ? (leaked_state + size_t(q0) * size_t(B)) : nullptr;
+            const uint8_t* r1 = (leaked_state && arity == 2)
+                ? (leaked_state + size_t(q1) * size_t(B)) : nullptr;
+            const uint8_t* cm = cond_mask ? (cond_mask + size_t(g) * size_t(B)) : nullptr;
+            for (int b = 0; b < B; ++b) {
+                double u = nd(bitgen_state);
+                bool noise_v4_unmasked = leaked_state
+                    ? (r0[b] < 2 && (!r1 || r1[b] < 2)) : (cm[b] != 0);
+                if (!noise_v4_unmasked) continue;
+                if (ch_code <= 2) {
+                    if (u < p0) {
+                        if (ch_code != 2) { sx[q0 * B + b] ^= 1; any_x = 1; }
+                        if (ch_code != 0) { sz[q0 * B + b] ^= 1; any_z = 1; }
+                    }
+                } else if (ch_code == 3) {
+                    if (u < pxy) { sx[q0 * B + b] ^= 1; any_x = 1; }
+                    if (u >= p0 && u < pxyz) { sz[q0 * B + b] ^= 1; any_z = 1; }
+                } else if (ch_code == 4) {
+                    if (u < p0) {
+                        int bkt = int(std::floor(u / step)) + 1;
+                        if (bkt & 1) { sx[q0 * B + b] ^= 1; any_x = 1; }
+                        if (bkt & 2) { sz[q0 * B + b] ^= 1; any_z = 1; }
+                        if (bkt & 4) { sx[q1 * B + b] ^= 1; any_x = 1; }
+                        if (bkt & 8) { sz[q1 * B + b] ^= 1; any_z = 1; }
+                    }
+                } else if (u < probs[14]) {
+                    int idx = 0;
+                    while (idx < 14 && !(u < probs[idx])) ++idx;
+                    int code = idx + 1, p1 = code >> 2, p2 = code & 3;
+                    if (p1 == 1 || p1 == 2) { sx[q0 * B + b] ^= 1; any_x = 1; }
+                    if (p1 == 2 || p1 == 3) { sz[q0 * B + b] ^= 1; any_z = 1; }
+                    if (p2 == 1 || p2 == 2) { sx[q1 * B + b] ^= 1; any_x = 1; }
+                    if (p2 == 2 || p2 == 3) { sz[q1 * B + b] ^= 1; any_z = 1; }
+                }
+            }
+        }
+        blk->any_x = any_x; blk->any_z = any_z;
+        return 0;
+    }, &blk->any_x, &blk->any_z);
+}
+
+static void unitary_v4_inject_group(
+    BatchedMRQFEngine* eng, const CppUnitaryStep& st, int g, int npb,
+    const uint8_t* cm_row, const uint8_t* leaked_state,
+    const uint8_t* xs_packed, const uint8_t* zs_packed
+) {
+    int B = eng->batch_size, nw = eng->n_words, arity = st.arity, nf = st.n_factors;
+    const int64_t* grp = st.target_groups.data() + size_t(g) * size_t(arity);
+    for (int b = 0; b < B; ++b) {
+        bool met = !leaked_state ? (cm_row[b] != 0) : (arity == 1
+            ? (leaked_state[size_t(grp[0]) * B + b] < 2)
+            : (leaked_state[size_t(grp[0]) * B + b] < 2 &&
+               leaked_state[size_t(grp[1]) * B + b] < 2));
+        if (met) continue;
+        eng->is_active[b] = 1;
+        CppMRQFShot& mrqf = eng->shots[b];
+        uint8_t fx_l[2] = {0, 0}, fz_l[2] = {0, 0};
+        for (int r = 0; r < arity; ++r) {
+            int64_t q_r = grp[r];
+            fx_l[r] = packed_bit(xs_packed + size_t(q_r) * size_t(npb), b);
+            uint8_t fz = packed_bit(zs_packed + size_t(q_r) * size_t(npb), b);
+            fz_l[r] = fz;
+        }
+        for (int f = 0; f < nf; ++f) {
+            size_t gf = size_t(g) * size_t(nf) + size_t(f);
+            uint8_t kind = st.factor_kinds[gf];
+            const uint64_t *aw1 = st.factor_a1_w.data() + gf * size_t(nw),
+                           *bw1 = st.factor_b1_w.data() + gf * size_t(nw);
+            if (kind == 0) { mrqf.p1_apply_pauli(aw1, bw1); continue; }
+            const uint8_t *lx1 = st.factor_lx1.data() + gf * size_t(arity),
+                          *lz1 = st.factor_lz1.data() + gf * size_t(arity);
+            int g1 = 0;
+            for (int r = 0; r < arity; ++r) g1 ^= (lx1[r] & fz_l[r]) ^ (lz1[r] & fx_l[r]);
+            int k1 = (int(st.factor_kap1[gf]) + ((g1 & 1) << 1)) & 3;
+            if (kind == 1) { mrqf.p2_apply_quarter_turn(aw1, bw1, k1); continue; }
+            const uint8_t *lx2 = st.factor_lx2.data() + gf * size_t(arity),
+                          *lz2 = st.factor_lz2.data() + gf * size_t(arity);
+            int g2 = 0;
+            for (int r = 0; r < arity; ++r) g2 ^= (lx2[r] & fz_l[r]) ^ (lz2[r] & fx_l[r]);
+            mrqf.p2_apply_controlled_pauli(
+                aw1, bw1, k1, st.factor_a2_w.data() + gf * size_t(nw),
+                st.factor_b2_w.data() + gf * size_t(nw),
+                (int(st.factor_kap2[gf]) + ((g2 & 1) << 1)) & 3);
+        }
+    }
+}
+
+int engine_batch_inject_unitary_v4(
+    void* ptr, int step_id, int cm_rows, int cm_cols, const uint8_t* cond_mask,
+    const uint8_t* leaked_state, const uint8_t* xs_packed, const uint8_t* zs_packed,
+    CosetCallBlock* blk
+) {
+    if (!ptr) return -1;
+    auto* eng = static_cast<BatchedMRQFEngine*>(ptr);
+    if (int brc = validate_call_block(eng, blk); brc != 0) return brc;
+    return run_int_guarded(eng, -9, -10, [&]() -> int {
+        if (step_id < 0 || step_id >= int(eng->unitary_steps.size())) return -2;
+        const CppUnitaryStep& st = eng->unitary_steps[step_id];
+        int N = eng->num_qubits, B = eng->batch_size, npb = blk->n_packed_bytes;
+        if (leaked_state && cond_mask) return -3;
+        if (leaked_state) { if (cm_rows != 0 || cm_cols != 0) return -3; }
+        else {
+            if (cm_rows != st.num_groups || cm_cols != B) return -3;
+            if (st.num_groups > 0 && !cond_mask) return -4;
+        }
+        if (!xs_packed || !zs_packed) return -1;
+        if (N > 0) {
+            std::memset(blk->scratch_x_mask, 0, size_t(N) * size_t(B));
+            std::memset(blk->scratch_z_mask, 0, size_t(N) * size_t(B));
+        }
+        for (int g = 0; g < st.num_groups; ++g) {
+            unitary_v4_inject_group(
+                eng, st, g, npb, cond_mask ? (cond_mask + size_t(g) * size_t(B)) : nullptr,
+                leaked_state, xs_packed, zs_packed);
+        }
+        eng->evict_healed_shots(
+            st.x2z_w.data(), st.z2z_w.data(), nullptr, nullptr,
+            blk->scratch_x_mask, blk->scratch_z_mask, &blk->any_x, &blk->any_z);
+        return 0;
+    }, &blk->any_x, &blk->any_z);
+}
+
 int coset_kernels_abi_v3() {
     return 3;
+}
+
+int coset_kernels_abi_v4() {
+    return 4;
 }
 
 } // extern "C"

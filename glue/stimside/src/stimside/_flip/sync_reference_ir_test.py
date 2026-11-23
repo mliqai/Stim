@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Any
 
 import numpy as np
@@ -368,14 +367,13 @@ def test_sync_reference_other_category_and_unused_qubits() -> None:
     """Skip Category.OTHER safely and size TableauSimulator to caller num_qubits."""
     circ = stim.Circuit("H 4\nR 0\nMPP X4\n")
     ir = circuit_ir.build_ir(circ)
-    other_instr = dataclasses.replace(
-        ir.instrs[1],
+    other_instr = ir.instrs[1]._replace(
         category=circuit_ir.Category.OTHER,
         basis=None,
         is_product_measurement=False,
         arity=None,
-        has_classical_control=False,
     )
+    assert other_instr.has_classical_control is False
     synth_ir = circuit_ir.CircuitIR(
         instrs=(ir.instrs[0], other_instr, ir.instrs[2]),
         num_qubits=1,

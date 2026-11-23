@@ -1292,7 +1292,7 @@ def test_adoption_write_oserror_is_swallowed_and_never_replaces_valid_record(
     orig_read = _kernel_loader._read_build_record
     calls = 0
 
-    def racing_read(path: Path) -> tuple[str, str, str | None, str | None] | None:
+    def racing_read(path: Path) -> _kernel_loader._BuildRecord | None:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -1875,3 +1875,232 @@ def test_build_record_warning_is_best_effort_when_stderr_is_unusable(
         patch.setattr(sys, "stderr", _unusable_stream(tmp_path, stream_kind))
         _kernel_loader._warn_failed_build_id_once(so_path, OSError("read-only"))
     assert so_path in _kernel_loader._WARNED_FAILED_BUILD_IDS
+
+
+def test_lock_wait_budget_cleared_in_forked_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not hasattr(os, "fork"):
+        pytest.skip("os.fork not available")
+    key = tmp_path.resolve()
+    monkeypatch.setitem(_kernel_loader._LOCK_WAIT_SPENT_S, key, 999.0)
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0 if _kernel_loader._LOCK_WAIT_SPENT_S == {} else 1)
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    assert _kernel_loader._LOCK_WAIT_SPENT_S[key] == 999.0
+
+
+def test_lock_wait_budget_reset_after_compile_and_distinct_exhausted_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_cxx()
+    fcntl = pytest.importorskip("fcntl")
+    native, _, resolve0 = _make_source_native(
+        tmp_path, "tiny_rst0", 'extern "C" int tiny_rst0_val() { return 1; }\n'
+    )
+    (native / "tiny_rst1.cpp").write_text(
+        'extern "C" int tiny_rst1_val() { return 2; }\n', encoding="utf-8"
+    )
+    mod1 = native / "tiny_rst1.py"
+    mod1.write_text("# stub\n", encoding="utf-8")
+    resolve1 = functools.partial(_kernel_loader.resolve_so, str(mod1), "tiny_rst1")
+
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD", raising=False)
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    monkeypatch.setenv("STIMSIDE_BUILD_LOCK_TIMEOUT_S", "0.03")
+    monkeypatch.setattr(_kernel_loader, "_LOCK_RETRY_DELAY_S", 0.01)
+    monkeypatch.setattr(_kernel_loader, "_LOCK_NOTICE_DELAY_S", 10.0)
+    monkeypatch.setattr(_kernel_loader, "_LOCK_WAIT_SPENT_S", {})
+
+    holder_fd = os.open(native, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fcntl.flock(holder_fd, fcntl.LOCK_EX)
+        with warnings.catch_warnings(record=True) as w0:
+            warnings.simplefilter("always", RuntimeWarning)
+            resolve0()
+        assert len(w0) == 1 and "timed out waiting for build lock" in str(w0[0].message)
+        with warnings.catch_warnings(record=True) as w1:
+            warnings.simplefilter("always", RuntimeWarning)
+            resolve1()
+        assert len(w1) == 1
+        assert "budget already exhausted" in str(w1[0].message)
+        assert "timed out waiting for build lock" not in str(w1[0].message)
+    finally:
+        os.close(holder_fd)
+
+    # Once the lock is free, a successful locked rebuild refills the wait budget.
+    monkeypatch.setitem(_kernel_loader._LOCK_WAIT_SPENT_S, native.resolve(), 0.02)
+    resolve0(force_recompile=True)
+    assert native.resolve() not in _kernel_loader._LOCK_WAIT_SPENT_S
+
+
+def test_readonly_legacy_native_record_same_cpu_no_warning_and_writable_upgrades(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_cxx()
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses read-only directory mode checks")
+    native, _, resolve = _make_source_native(
+        tmp_path, "tiny_leg_ro", 'extern "C" int tiny_leg_ro_val() { return 7; }\n'
+    )
+    monkeypatch.setenv("STIMSIDE_NATIVE_BUILD", "1")
+    monkeypatch.delenv("STIMSIDE_PORTABLE_BUILD", raising=False)
+    so = resolve()
+    monkeypatch.delenv("STIMSIDE_NATIVE_BUILD")
+    rec = _read_sidecar_json(so)
+    assert rec["cpu_flags_v"] == 2
+    rec.pop("cpu_flags_v")
+    rec["cpu_flags"] = "legacy_full_cpuinfo_digest"
+    bid = _kernel_loader._build_id_path(so)
+    bid.write_text(json.dumps(rec, sort_keys=True) + "\n", encoding="utf-8")
+
+    # Read-only checkout with legacy same-machine native record must not falsely warn.
+    native.chmod(0o555)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            assert resolve() == so
+    finally:
+        native.chmod(0o755)
+
+    # Different machine on legacy record still warns on read-only checkout.
+    rec["machine"] = "other-arch"
+    bid.write_text(json.dumps(rec, sort_keys=True) + "\n", encoding="utf-8")
+    native.chmod(0o555)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            with pytest.raises(RuntimeWarning, match="different CPU"):
+                resolve()
+    finally:
+        native.chmod(0o755)
+
+    # Writable checkout upgrades legacy record to cpu_flags_v == 2.
+    rec["machine"] = _kernel_loader._current_machine()
+    bid.write_text(json.dumps(rec, sort_keys=True) + "\n", encoding="utf-8")
+    assert resolve() == so
+    assert _read_sidecar_json(so)["cpu_flags_v"] == 2
+
+
+def test_stale_temp_cleanup_respects_age_floor_and_pid_liveness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    so = tmp_path / "libtiny_floor.so"
+    now = time.time()
+    dead_recent = tmp_path / ".libtiny_floor.999999.aaaaaa.tmp.so"
+    live_old = tmp_path / f".libtiny_floor.{os.getpid()}.bbbbbb.tmp.so"
+    dead_old = tmp_path / ".libtiny_floor.999999.cccccc.tmp.so"
+    dead_mid = tmp_path / ".libtiny_floor.999999.dddddd.tmp.so"
+    for p in (dead_recent, live_old, dead_old, dead_mid):
+        p.write_text("x", encoding="utf-8")
+    os.utime(dead_recent, (now - 300.0, now - 300.0))
+    os.utime(live_old, (now - 1200.0, now - 1200.0))
+    os.utime(dead_old, (now - 1200.0, now - 1200.0))
+    os.utime(dead_mid, (now - 900.0, now - 900.0))
+
+    # User timeout smaller than 600 s floor (or 0.0) still keeps 300 s file and live PID.
+    _kernel_loader._cleanup_stale_temp_files(so, 1.0)
+    assert dead_recent.exists()
+    assert live_old.exists()
+    assert not dead_old.exists()
+    assert not dead_mid.exists()
+
+    # Larger user timeout raises the cutoff above 600 s; 0.0 falls back to default 600 s floor.
+    dead_mid.write_text("x", encoding="utf-8")
+    os.utime(dead_mid, (now - 900.0, now - 900.0))
+    _kernel_loader._cleanup_stale_temp_files(so, 1200.0)
+    assert dead_mid.exists()
+    _kernel_loader._cleanup_stale_temp_files(so, 0.0)
+    assert not dead_mid.exists()
+
+    # PermissionError from os.kill distinguishes same-user synthetic PIDs from other users.
+    st_mine = live_old.lstat()
+    monkeypatch.setattr(os, "kill", lambda _pid, _sig: (_ for _ in ()).throw(PermissionError()))
+    assert _kernel_loader._pid_is_alive(dead_recent.name, st_mine) is False
+    fake_other = os.stat_result(
+        tuple(999_999 if i == 4 else v for i, v in enumerate(st_mine))
+    )
+    assert _kernel_loader._pid_is_alive(dead_recent.name, fake_other) is True
+
+
+def test_adopt_fallback_lock_and_exdev_invalid_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    so = tmp_path / "libtiny_adopt_lock.so"
+    so.write_bytes(b"fake")
+    bid = _kernel_loader._build_id_path(so)
+    bid.write_text("legacy-invalid\n", encoding="utf-8")
+
+    # While directory lock is held, unlocked adoption skips replacement instead of clobbering.
+    holder_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fcntl.flock(holder_fd, fcntl.LOCK_EX)
+        _kernel_loader._adopt_build_record(so, "h123")
+        assert bid.read_text(encoding="utf-8") == "legacy-invalid\n"
+        # Caller already holding lock (locked=True) upgrades without self-conflict.
+        _kernel_loader._adopt_build_record(so, "h123", locked=True)
+        assert _read_sidecar_json(so)["mode"] == "unknown"
+    finally:
+        os.close(holder_fd)
+
+    # EXDEV on an existing invalid sidecar still upgrades when unlocked and lock is free.
+    bid.write_text("legacy-invalid\n", encoding="utf-8")
+    monkeypatch.setattr(
+        os, "link", lambda _s, _d: (_ for _ in ()).throw(OSError(errno.EXDEV, "exdev"))
+    )
+    _kernel_loader._adopt_build_record(so, "h456")
+    assert _read_sidecar_json(so)["mode"] == "unknown"
+
+
+def test_lock_notice_wording_and_timeout_warning_closed_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    monkeypatch.setattr(_kernel_loader, "_LOCK_RETRY_DELAY_S", 0.001)
+    monkeypatch.setattr(_kernel_loader, "_LOCK_NOTICE_DELAY_S", 0.0)
+    monkeypatch.setattr(_kernel_loader, "_LOCK_WAIT_SPENT_S", {})
+    lock = _BusyThenFreeFcntl()
+    assert _kernel_loader._wait_for_flock(0, tmp_path, os.getuid(), math.inf, None, lock) is True
+    err = capsys.readouterr().err
+    assert "waiting for build lock" in err
+    assert "STIMSIDE_BUILD_LOCK_TIMEOUT_S" in err
+    assert "shorten the wait" not in err
+
+    # Closed stderr during lock-timeout warning must not raise ValueError.
+    holder_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fcntl.flock(holder_fd, fcntl.LOCK_EX)
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "stderr", _unusable_stream(tmp_path, "closed"))
+            assert (
+                _kernel_loader._acquire_dir_lock(tmp_path, timeout_s=0.0, max_retries=0) is None
+            )
+    finally:
+        os.close(holder_fd)
+
+
+def test_wait_for_flock_accumulates_spent_budget_and_caps_on_retry_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = tmp_path.resolve()
+    monkeypatch.setattr(_kernel_loader, "_LOCK_RETRY_DELAY_S", 0.002)
+    monkeypatch.setattr(_kernel_loader, "_LOCK_NOTICE_DELAY_S", 10.0)
+    monkeypatch.setattr(_kernel_loader, "_LOCK_WAIT_SPENT_S", {key: 0.05})
+    lock = _BusyThenFreeFcntl()
+    assert _kernel_loader._wait_for_flock(0, tmp_path, 0, 1.0, 10, lock) is True
+    assert _kernel_loader._LOCK_WAIT_SPENT_S[key] > 0.05
+
+    class _AlwaysBusyFcntl:
+        LOCK_EX, LOCK_NB = 2, 4
+
+        def flock(self, _fd: int, _flags: int) -> None:
+            raise OSError(errno.EAGAIN, "busy")
+
+    monkeypatch.setattr(_kernel_loader, "_LOCK_WAIT_SPENT_S", {})
+    assert (
+        _kernel_loader._wait_for_flock(0, tmp_path, 0, 1.0, 1, _AlwaysBusyFcntl()) is False
+    )
+    assert _kernel_loader._LOCK_WAIT_SPENT_S[key] >= 1.0

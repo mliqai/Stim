@@ -1,46 +1,11 @@
 """ctypes ABI and handle wrapper for the `mbe_*` MagicBatchEngine entry points.
 
-The engine is C++ code in the same `libmagic_kernels.so` as the `magic_*` kernels (see
-`magic_engine.hpp`), but it is declared here, with its own `_SPECS` and ABI sentinel, so the
-`magic_kernels._SPECS` table, its sentinel and the tests that enumerate it stay as they are.
-
-This module speaks arrays only (no `ShotExpansion`: `_native` may not import `_magic`); the
-`_magic` layer converts between expansions and these arrays. The engine owns the
-shots it holds: `export_shot` returns copies and `import_shot` copies in, so no Python object
-can alias or outlive engine state. A wrapper is never pickled.
-
-Thread safety and handle misuse. ctypes drops the GIL during every `mbe_*` call and the C++ takes
-no locks, so two threads inside one engine (a `close()` or `import_shot` during `apply_pauli_mask`,
-or an import between the header and the export of one shot) would free or resize memory another
-thread reads. Each wrapper therefore holds a private lock around every native call: one engine
-shared by threads is serialised, independent engines never wait for each other.
-
-A native section is not re-entrant, because Python code can run on the thread that is inside it
-(a signal handler, a garbage-collection finalizer, an `__array__` hook). Such code that calls into
-the same engine gets a `RuntimeError`, except `close()`, which is deferred until the section
-exits, so nothing frees an engine a pending native call is about to use. (The lock itself is an
-`RLock` plus a `_busy` flag rather than a plain lock plus an owner id: a handler that fires right
-after the lock was taken, before the flag is set, then simply runs a complete section of its own
-instead of deadlocking, and a `fork()` from a handler cannot deadlock on its own thread.)
-
-A `fork()` takes no lock in the parent: a parent that took the engine locks one after the other
-could deadlock against a handler that nests engines in the other order. Instead the child, which
-has only the forking thread, gives every engine and every `LiveExpansions` a fresh lock and clears
-its busy / close-pending / creating flags, so it never inherits a lock held by a thread that does
-not exist there. An engine that another thread was inside a native section of at the fork is
-*poisoned* in the child: its memory is a copy-on-fork snapshot, possibly mid-update, so any use
-raises `RuntimeError` and it is never freed there. An engine that was idle at the fork, or is
-created afterwards, works normally in the child.
-
-Limits (found, not fixed; the engine path is ON by default via `_LIVE_STORE_ENGINE`): the
-wrapper is not async-signal-safe, so a signal handler or finalizer on the owner thread must not
-touch an engine beyond what is refused above, nor nest engine access while another thread is
-inside a different engine in the opposite order (two threads would then wait on each other).
-
-The raw `mbe_*` ABI trusts its caller (live handle, buffers sized from `mbe_shot_header`, a mask
-of `batch_size` bytes, Pauli words of `n_words`); the wrapper is the only caller and enforces that
-contract: integer sizes and indices, a positive finite `atol`, aligned contiguous buffers, Pauli
-words without padding bits, and a clear `RuntimeError` for any use after `close()`.
+Array-only wrapper around the native batch engine in `libmagic_kernels.so` (`_native` may not
+import `_magic`). `export_shot` returns fresh arrays and `import_shot` copies in. Every native
+call runs inside a per-engine non-re-entrant section (`_section()`: `RLock` + `_busy`; nested
+`close()` is deferred; an interrupt as it is entered leaves the engine usable once the exception
+is released). After `os.fork()`, the child renews locks and poisons any engine that another thread
+was inside at fork time. All caller inputs are validated and copied (or immutable) before C++ runs.
 """
 
 from __future__ import annotations
@@ -68,15 +33,13 @@ from stimside._native.magic_kernels import w_addr
 _LIB_INSTANCE: ctypes.CDLL | None = None
 
 _VP, _SZ, _DBL = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_double
-_I32, _INT, _U8 = ctypes.c_int32, ctypes.c_int, ctypes.c_uint8
+_I32, _I64, _INT, _U8 = ctypes.c_int32, ctypes.c_int64, ctypes.c_int, ctypes.c_uint8
+_U8_DT, _U64_DT, _I32_DT = np.dtype(np.uint8), np.dtype(np.uint64), np.dtype(np.int32)
+_F64_DT, _BOOL_DT = np.dtype(np.float64), np.dtype(np.bool_)
 
 # Pointer parameters are c_void_p, as for the magic_* kernels: callers pass integer addresses.
 _SPECS: tuple[AbiSpec, ...] = (
-    ("mbe_abi_v1", [], _I32),
-    ("mbe_abi_v2", [], _I32),
-    ("mbe_abi_v3", [], _I32),
-    ("mbe_abi_v4", [], _I32),
-    ("mbe_abi_v5", [], _I32),
+    *((f"mbe_abi_v{v}", [], _I32) for v in range(1, 7)),
     ("mbe_live_engines", [], _SZ),
     ("mbe_create", [_SZ, _SZ, _DBL], _VP),
     ("mbe_destroy", [_VP], None),
@@ -84,32 +47,20 @@ _SPECS: tuple[AbiSpec, ...] = (
     ("mbe_import_shot", [_VP, _SZ, _SZ, _SZ, _I32, _DBL, _DBL, *[_VP] * 8], _INT),
     ("mbe_shot_header", [_VP, _SZ, _VP, _VP], _INT),
     ("mbe_export_shot", [_VP, _SZ, *[_VP] * 8], _INT),
-    ("mbe_apply_pauli_mask", [_VP, _VP, _VP, _U8, _VP], ctypes.c_int64),
-    (
-        "mbe_inject_cliffords",
-        [_VP, _SZ, _SZ, *[_VP] * 9, _I32, _VP, _VP],
-        ctypes.c_int64,
-    ),
-    ("mbe_live_shots", [_VP], ctypes.c_int64),
+    ("mbe_apply_pauli_mask", [_VP, _VP, _VP, _U8, _VP], _I64),
+    ("mbe_apply_pauli_noise_batch", [_VP, _SZ, _SZ, _SZ, *[_VP] * 9], _I64),
+    ("mbe_inject_cliffords", [_VP, _SZ, _SZ, *[_VP] * 9, _I32, _VP, _VP], _I64),
+    ("mbe_live_shots", [_VP], _I64),
     ("mbe_partition", [_VP, _I32, _VP], _INT),
-    (
-        "mbe_apply_block",
-        [_VP, _I32, _SZ, _SZ, _DBL, _DBL, *[_VP] * 7, _I32, ctypes.c_int64, *[_VP] * 3],
-        ctypes.c_int64,
-    ),
-    (
-        "mbe_measure_split",
-        [_VP, _VP, _VP, _U8, _I32, _I32, _I32, _VP, _VP, _U8, *[_VP] * 8],
-        ctypes.c_int64,
-    ),
-    ("mbe_measure_finish", [_VP, _SZ, *[_VP] * 5], ctypes.c_int64),
-    ("mbe_peek", [_VP, _VP, _VP, _U8, _VP, _SZ, *[_VP] * 4], ctypes.c_int64),
-    ("mbe_postselect", [_VP, _VP, _VP, _U8, _VP, _SZ, *[_VP] * 6], ctypes.c_int64),
-    (
-        "mbe_unmatched_apply",
-        [_VP, _VP, _VP, _U8, _VP, _VP, _U8, _VP, _SZ, *[_VP] * 6],
-        ctypes.c_int64,
-    ),
+    ("mbe_apply_block", [_VP, _I32, _SZ, _SZ, _DBL, _DBL, *[_VP] * 7, _I32, _I64, *[_VP] * 3],
+     _I64),
+    ("mbe_measure_split", [_VP, _VP, _VP, _U8, _I32, _I32, _I32, _VP, _VP, _U8, *[_VP] * 8], _I64),
+    ("mbe_measure_finish", [_VP, _SZ, *[_VP] * 5], _I64),
+    ("mbe_measure_step",
+     [_VP, _SZ, _SZ, _VP, _VP, _U8, _I32, _I32, _I32, _VP, _VP, _U8, *[_VP] * 11], _I64),
+    ("mbe_peek", [_VP, _VP, _VP, _U8, _VP, _SZ, *[_VP] * 4], _I64),
+    ("mbe_postselect", [_VP, _VP, _VP, _U8, _VP, _SZ, *[_VP] * 6], _I64),
+    ("mbe_unmatched_apply", [_VP, _VP, _VP, _U8, _VP, _VP, _U8, _VP, _SZ, *[_VP] * 6], _I64),
     ("mbe_cmul_scalar", [_SZ, _VP, _DBL, _DBL], None),
     ("mbe_cmul_form", [_SZ, _VP, _DBL, _DBL, _I32], None),
     ("mbe_norm_sq", [_SZ, _VP], _DBL),
@@ -123,7 +74,7 @@ def _resolve_magic_kernels_so(force_recompile: bool = False) -> Path:
 def get_magic_engine_lib(force_recompile: bool = False) -> ctypes.CDLL:
     """The shared library with the `mbe_*` ABI bound (compiled on first use if missing/stale)."""
     return get_lib(
-        sys.modules[__name__], "magic_kernels", "mbe_abi_v5", _SPECS,
+        sys.modules[__name__], "magic_kernels", "mbe_abi_v6", _SPECS,
         force_recompile=force_recompile,
     )
 
@@ -147,9 +98,7 @@ class ShotArrays(NamedTuple):
 
 
 class FactorTable(NamedTuple):
-    """Compiled Clifford factor lists in the engine's layout: list `l` owns the axes
-    `axis_start[l] : axis_start[l] + has_p0[l] + n_r[l]` of `axes_*` (`p0` first, then the `r`
-    axes). `v_fwd` / `v_inv` are the omega index of the closing multiply, -1 for none."""
+    """Compiled Clifford factor lists in the engine's flat layout (`p0` first, then `r` axes)."""
 
     has_p0: Any  # uint8 (L,)
     n_r: Any  # int32 (L,)
@@ -162,27 +111,24 @@ class FactorTable(NamedTuple):
 
 
 class FactorFailure(NamedTuple):
-    """Why `inject_cliffords` stopped at `shot` (earlier shots were updated, later ones not)."""
+    """Failure details reported by an engine command at `shot`."""
 
     shot: int
-    kind: int  # FAIL_* below
-    op: int  # 0 apply_pauli, 1 apply_quarter_turn
+    kind: int
+    op: int
     aux: int
     aux2: int
     pre: float
     post: float
-    z: float = 0.0  # S5b Born-split failures only: the shot's total mass z
+    z: float = 0.0
 
 
 FAIL_NON_FINITE_WEIGHTS, FAIL_NON_FINITE_NORM, FAIL_KERNEL = 1, 2, 3
 FAIL_UNITARITY, FAIL_NOT_HERMITIAN, FAIL_PADDING = 4, 5, 6
 FAIL_MERGE_NON_FINITE, FAIL_MAX_COMPONENTS = 7, 8
-FAIL_BAD_NORM, FAIL_ROTATION, FAIL_ZERO_CHOSEN = 9, 10, 11  # measurements (S5a)
-# Born-split checks of one shot (S5b: `FactorFailure.pre` / `post` / `z` carry the masses)
+FAIL_BAD_NORM, FAIL_ROTATION, FAIL_ZERO_CHOSEN = 9, 10, 11
 FAIL_NON_FINITE_MASS, FAIL_NEGATIVE_MASS, FAIL_CONSERVATION, FAIL_ZERO_POSTSELECT = 12, 13, 14, 15
-# `SplitResult.cls`: what `measure_split` found for each shot.
 CLS_DEAD, CLS_TRIVIAL, CLS_ACTIVE, CLS_UNSEEN = 0, 1, 2, 3
-# `FactorFailure.op`: the phase_qfe function whose exception text the failure is reported as.
 OP_NAMES = (
     "apply_pauli", "apply_quarter_turn", "apply_pauli_t", "apply_ccz", "apply_compiled_block",
     "merge_frames", "project_diagonal",
@@ -190,30 +136,22 @@ OP_NAMES = (
 
 
 class BlockTable(NamedTuple):
-    """A compiled block in the engine's layout (see `mbe_apply_block`).
-
-    `mode` 0: the `axes_*` rows are the branches of a pauli_sum with coefficients `axes_w_ri`
-    (the block's scalar already applied, as the reference does). `mode` 1: step `i` is
-    `step_kind[i]` (0 P1, 1 P2, 2 N1, 3 N2) with `step_sign[i]` over row `step_start[i]` (and
-    the seven rows after it for N2, whose 8 weights are `axes_w_ri`); `g_re`, `g_im` multiply
-    the weights first.
-    """
+    """Compiled block in engine layout (`mode` 0: pauli_sum; `mode` 1: sequential steps)."""
 
     mode: int
     g_re: float
     g_im: float
-    step_kind: Any  # int32 (S,)
-    step_sign: Any  # int32 (S,)
-    step_start: Any  # int32 (S,)
-    axes_a: Any  # uint64 (A, nw)
-    axes_b: Any  # uint64 (A, nw)
-    axes_kappa: Any  # uint8 (A,)
-    axes_w_ri: Any  # float64 (A, 2)
+    step_kind: Any
+    step_sign: Any
+    step_start: Any
+    axes_a: Any
+    axes_b: Any
+    axes_kappa: Any
+    axes_w_ri: Any
 
 
 class BlockResult(NamedTuple):
-    """`apply_block`: `failure` is None on success; `groups`, `live` = groups run, shots with
-    chi > 0 before the block."""
+    """`apply_block` outcome: optional failure plus (groups, live) counts."""
 
     failure: FactorFailure | None
     groups: int
@@ -221,11 +159,7 @@ class BlockResult(NamedTuple):
 
 
 class SplitResult(NamedTuple):
-    """`measure_split`: per shot `cls` (CLS_*; CLS_UNSEEN past a failure), the bit of a trivial
-    shot, the pre-norm `z` and raw masses `z01[:, m]` of an active one, and the rows `chi2[:, m]` of
-    each projected branch. `failure` is set when the split stopped at `failure.shot`; `oom` when
-    it ran out of memory (the shots before it were classified and their kicks applied).
-    `token` is unique to this split (see `MagicBatchEngine.measure_finish`)."""
+    """`measure_split` outcome with per-shot class, trivial bit, active masses, and split token."""
 
     cls: Any
     bit: Any
@@ -239,18 +173,14 @@ class SplitResult(NamedTuple):
 
 
 class FinishResult(NamedTuple):
-    """`measure_finish`: `failure` None when every active shot was committed; `phase` 1 = nothing
-    changed, 2 = the failing reset kick left the shots before it committed."""
+    """`measure_finish` outcome (`phase` 1: staging failed; 2: reset kick failed)."""
 
     failure: FactorFailure | None
     phase: int
 
 
 class PostselectResult(NamedTuple):
-    """`postselect`: `done[i]` = list entry i was committed (a dead shot is skipped, not done),
-    `z01[i]` its clipped masses (z0, z1). `failure.shot` is the list position that failed (the
-    entries before it are committed); `oom_at` the position an out-of-memory stopped at, else
-    None."""
+    """`postselect` outcome: `done`, `z01`, optional failure, and optional OOM list index."""
 
     done: Any
     z01: Any
@@ -259,9 +189,7 @@ class PostselectResult(NamedTuple):
 
 
 class UnmatchedResult(NamedTuple):
-    """`unmatched_apply`: `failure.shot` / `oom_at` are list positions, `phase` 1 = the projection
-    of that entry failed (the shot is as before), 2 = its kick failed (the projection is
-    committed). The entries before it are finished, the later ones untouched."""
+    """`unmatched_apply` outcome: optional failure, optional OOM index, and failure phase."""
 
     failure: FactorFailure | None
     oom_at: int | None
@@ -273,8 +201,7 @@ _SPLIT_TOKENS = itertools.count(1)  # one per `measure_split`, across all engine
 
 
 def addr(arr: Any) -> int:
-    """`magic_kernels.addr`, refusing buffers the C++ must not load through (it reads uint64,
-    int32 and double directly: an unaligned or strided buffer is undefined behaviour)."""
+    """Buffer address; refuses unaligned or non-C-contiguous arrays."""
     flags = arr.flags
     if not (flags.c_contiguous and flags.aligned):
         raise TypeError("native buffers must be aligned and C-contiguous")
@@ -310,12 +237,7 @@ def _check_padding(words: Any, n_qubits: int, what: str) -> None:
 
 
 def _as(arr: Any, dtype: Any, shape: tuple[int, ...], what: str) -> Any:
-    """A private, aligned, C-contiguous copy of `arr` as `dtype` (always a copy).
-
-    The C++ runs with the GIL released: a buffer the caller still owns could be changed by
-    another thread between the C++'s validation of it and its use. So the C++ only ever sees
-    these copies (and, for the Clifford command, copies them once more before reading).
-    """
+    """Private, aligned, C-contiguous copy of `arr` with dtype and shape verified."""
     out = np.array(arr, dtype=dtype, order="C", copy=True)
     if out.shape != shape:
         raise ValueError(f"{what} must have shape {shape}, got {out.shape}")
@@ -324,7 +246,6 @@ def _as(arr: Any, dtype: Any, shape: tuple[int, ...], what: str) -> Any:
 
 _I32_MIN, _I32_MAX = -(2**31), 2**31 - 1
 _FITS_I32 = frozenset(np.dtype(t) for t in (np.int8, np.int16, np.int32, np.uint8, np.uint16))
-_NO_KICK = np.zeros(0, np.uint64)  # empty, so `addr` gives NULL; never written
 
 
 def _int32_value(v: Any, what: str) -> int:
@@ -336,20 +257,14 @@ def _int32_value(v: Any, what: str) -> int:
 
 
 def _as_i32(arr: Any, shape: tuple[int, ...], what: str) -> Any:
-    """`_as(arr, np.int32, ...)` that refuses anything but an integer that fits an int32.
-
-    numpy's `astype`/`array(dtype=np.int32)` wraps an int64 column silently (2**32 + 1 would run
-    as 1) and truncates a float one (NaN and inf become INT_MIN), so a non-integer dtype (float,
-    complex, bool, object, ...) is a TypeError and an out-of-range integer a ValueError. An empty
-    array of any dtype is accepted (`np.asarray([])` is float64); `compile_*` give int32.
-    """
-    out = np.array(arr, order="C", copy=True)  # read the caller's data once; check this copy
+    """Private int32 copy refusing non-integer dtypes and out-of-range values."""
+    out = np.array(arr, order="C", copy=True)
     if out.size and out.dtype.kind not in "iu":
         raise TypeError(f"{what} must be an integer array, got dtype {out.dtype}")
-    fits = out.dtype in _FITS_I32  # every value of these dtypes fits: no range scan
+    fits = out.dtype in _FITS_I32
     if out.size and not fits and (int(out.min()) < _I32_MIN or int(out.max()) > _I32_MAX):
         raise ValueError(f"{what} must fit an int32")
-    if out.dtype == np.int32 and out.flags.aligned:  # `out` is already a private copy
+    if out.dtype == np.int32 and out.flags.aligned:
         if out.shape != shape:
             raise ValueError(f"{what} must have shape {shape}, got {out.shape}")
         return out
@@ -357,11 +272,9 @@ def _as_i32(arr: Any, shape: tuple[int, ...], what: str) -> Any:
 
 
 def _list_indices(shot_list: Any, n_lists: int, batch: int) -> Any:
-    """`shot_list` as a private int32 array: every value below 0 means "skip" (as the reference's
-    `which >= 0`), every value from `n_lists` up becomes `n_lists` (the native refusal), so a
-    wide integer is never wrapped into a valid list index by the int32 conversion."""
+    """Private int32 shot list clipped to `[-1, n_lists]` so wide ints cannot wrap."""
     if type(shot_list) is np.ndarray and shot_list.dtype == np.int32:
-        own = _as(shot_list, np.int32, (batch,), "shot_list")  # int32 needs no narrowing
+        own = _as(shot_list, np.int32, (batch,), "shot_list")
         np.clip(own, -1, n_lists, out=own)
         return own
     raw = np.array(shot_list, order="C", copy=True)
@@ -369,8 +282,7 @@ def _list_indices(shot_list: Any, n_lists: int, batch: int) -> Any:
         raise ValueError(f"shot_list must have shape {(batch,)}, got {raw.shape}")
     if raw.dtype.kind == "u":
         return np.minimum(raw, np.uint64(n_lists)).astype(np.int32)
-    wide = _as(raw, np.int64, (batch,), "shot_list")
-    return np.clip(wide, -1, n_lists).astype(np.int32)
+    return np.clip(_as(raw, np.int64, (batch,), "shot_list"), -1, n_lists).astype(np.int32)
 
 
 _FORK_OWNERS: weakref.WeakSet[Any] = weakref.WeakSet()  # objects a forked child must renew
@@ -380,29 +292,23 @@ def _owned_columns(
     table: FactorTable, nw: int
 ) -> tuple[int, int, tuple[Any, ...], tuple[Any, ...]]:
     """Private, checked copies of a factor table's columns and axes (the C++ reads only these)."""
-    n_lists = int(table.has_p0.shape[0])
+    nl, na = int(table.has_p0.shape[0]), int(table.axes_kappa.shape[0])
     t = (
-        _as(table.has_p0, np.uint8, (n_lists,), "has_p0"),
-        _as_i32(table.n_r, (n_lists,), "n_r"),
-        _as_i32(table.v_fwd, (n_lists,), "v_fwd"),
-        _as_i32(table.v_inv, (n_lists,), "v_inv"),
-        _as_i32(table.axis_start, (n_lists,), "axis_start"),
+        _as(table.has_p0, _U8_DT, (nl,), "has_p0"), _as_i32(table.n_r, (nl,), "n_r"),
+        _as_i32(table.v_fwd, (nl,), "v_fwd"), _as_i32(table.v_inv, (nl,), "v_inv"),
+        _as_i32(table.axis_start, (nl,), "axis_start"),
     )
-    n_axes = int(table.axes_kappa.shape[0])
     axes = (
-        _as(table.axes_a, np.uint64, (n_axes, nw), "axes_a"),
-        _as(table.axes_b, np.uint64, (n_axes, nw), "axes_b"),
-        _as(table.axes_kappa, np.uint8, (n_axes,), "axes_kappa"),
+        _as(table.axes_a, _U64_DT, (na, nw), "axes_a"),
+        _as(table.axes_b, _U64_DT, (na, nw), "axes_b"),
+        _as(table.axes_kappa, _U8_DT, (na,), "axes_kappa"),
     )
-    return n_lists, n_axes, t, axes
+    return nl, na, t, axes
 
 
 @dataclass(frozen=True, eq=False, slots=True, weakref_slot=True)
 class OwnedFactorTable:
-    """A factor table held by stimside alone: private copies made once by `own_factor_table`,
-    read-only, never handed out. `inject_cliffords` uses it without copying it again (glue cut
-    (b)); no caller array is ever behind it, so no caller can change it while the GIL is released.
-    """
+    """Immutable factor table held by stimside alone: copied once by `own_factor_table`."""
 
     cols: tuple[Any, ...]
     axes: tuple[Any, ...]
@@ -410,17 +316,33 @@ class OwnedFactorTable:
     seal: object = None
 
 
-# Module-private weak registry: only `own_factor_table` registers instances and stores their
-# immutable buffers + n_words; `eq=False` prevents forged tables from matching, and storing the
-# arrays here prevents `object.__setattr__(own, "cols"/"axes", ...)` from poisoning C++ calls.
+# Weak registries mapping owned handles to immutable buffers/n_words (immune to setattr/forging).
 _OWNED_TABLES: weakref.WeakKeyDictionary[
     OwnedFactorTable, tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...], int]
 ] = weakref.WeakKeyDictionary()
+_OWNED_TABLE_ADDRS: weakref.WeakKeyDictionary[
+    OwnedFactorTable, tuple[tuple[Any, ...], tuple[Any, ...], int, int, tuple[int, ...]]
+] = weakref.WeakKeyDictionary()
+
+
+@dataclass(frozen=True, eq=False, slots=True, weakref_slot=True)
+class OwnedAxis:
+    """Immutable Pauli axis held by stimside alone: copied once by `own_axis`, never mutated."""
+
+    a_words: Any
+    b_words: Any
+    kappa: int
+    n_words: int
+
+
+_OWNED_AXES: weakref.WeakKeyDictionary[
+    OwnedAxis, tuple[Any, Any, int, int, int, int]
+] = weakref.WeakKeyDictionary()
+_Axis = OwnedAxis | tuple[Any, Any, int]
 
 
 def _immutable(arr: Any) -> Any:
-    """A copy of `arr` over a `bytes` buffer: numpy refuses to make it writable again (unlike
-    an array that owns its data, whose `writeable` flag anyone can turn back on)."""
+    """A copy of `arr` over a `bytes` buffer: numpy refuses to make it writable again."""
     out = np.frombuffer(arr.tobytes(), dtype=arr.dtype).reshape(arr.shape)
     assert out.flags.c_contiguous and out.flags.aligned and not out.flags.writeable
     return out
@@ -430,26 +352,37 @@ def own_factor_table(table: FactorTable, nw: int) -> OwnedFactorTable:
     """Copy and check `table` once (as `inject_cliffords` would), into immutable buffers."""
     if type(nw) is not int or nw < 1:
         raise ValueError(f"n_words must be a positive int, got {nw!r}")
-    _, _, cols, axes = _owned_columns(table, nw)
+    n_lists, n_axes, cols, axes = _owned_columns(table, nw)
     owned = OwnedFactorTable(
         tuple(_immutable(a) for a in cols), tuple(_immutable(a) for a in axes), nw
     )
     _OWNED_TABLES[owned] = (owned.cols, owned.axes, owned.n_words)
+    _OWNED_TABLE_ADDRS[owned] = (
+        owned.cols, owned.axes, n_lists, n_axes,
+        tuple(addr(x) for x in (*owned.cols, *owned.axes)),
+    )
+    return owned
+
+
+def own_axis(a_words: Any, b_words: Any, kappa: int, nw: int) -> OwnedAxis:
+    """Copy and check a Pauli axis once into immutable bytes-backed buffers with cached pointers."""
+    if type(nw) is not int or nw < 1:
+        raise ValueError(f"n_words must be a positive int, got {nw!r}")
+    a_imm = _immutable(_as(a_words, np.uint64, (nw,), "a_words"))
+    b_imm = _immutable(_as(b_words, np.uint64, (nw,), "b_words"))
+    kap = int(kappa) & 3
+    owned = OwnedAxis(a_imm, b_imm, kap, nw)
+    _OWNED_AXES[owned] = (a_imm, b_imm, addr(a_imm), addr(b_imm), kap, nw)
     return owned
 
 
 def track_locks_for_fork(owner: Any) -> None:
-    """Have `owner._reinit_after_fork()` run in every forked child (it renews `owner._lock`).
-
-    Weakly referenced. Only the child touches the table, and only after the fork, so the parent
-    takes no lock and cannot deadlock; the table has no lock of its own (it could itself be
-    inherited held) and a single set operation is atomic under the GIL.
-    """
+    """Have `owner._reinit_after_fork()` run in every forked child (it renews `owner._lock`)."""
     _FORK_OWNERS.add(owner)
 
 
 def _reinit_owners_in_child() -> None:
-    for owner in list(_FORK_OWNERS):  # the forking thread is the only one: nothing changes it
+    for owner in list(_FORK_OWNERS):
         owner._reinit_after_fork()
 
 
@@ -462,16 +395,10 @@ class MagicBatchEngine:
 
     def __init__(self, batch_size: int, n_qubits: int, atol: float) -> None:
         self._handle: int | None = None
-        # Per engine: independent engines never contend. Re-entrant only so that a thread that
-        # already owns it (a handler, a finalizer) can be recognised by `_busy` and refused.
         self._lock = threading.RLock()
-        self._busy = False  # a native section is running (only ever seen set by its own thread)
-        self._close_pending = False  # `close()` was asked for from inside that section
-        self._owner = 0  # id of the thread running that section
-        self._poisoned = False  # forked while another thread ran a section: unusable here
-        self._pending_token = 0  # token of the split `measure_finish` may use (0: none)
-        batch = as_integer(batch_size, "batch_size")
-        nq = as_integer(n_qubits, "n_qubits")
+        self._busy = self._close_pending = self._poisoned = False
+        self._owner = self._pending_token = 0
+        batch, nq = as_integer(batch_size, "batch_size"), as_integer(n_qubits, "n_qubits")
         if not (0 <= batch <= _MAX_SIZE and 1 <= nq <= _MAX_SIZE):
             raise ValueError(f"need 0 <= batch_size, 1 <= n_qubits < 2**63, got {batch}, {nq}")
         tol = _valid_atol(atol)
@@ -482,16 +409,32 @@ class MagicBatchEngine:
         self._handle = int(handle)
         self.batch_size, self.n_qubits, self.atol = batch, nq, tol
         self.n_words = max(1, (self.n_qubits + 63) // 64)
+        self._init_buffers()
         track_locks_for_fork(self)
 
-    def _reinit_after_fork(self) -> None:
-        """Run in a forked child, which has only the forking thread: renew the lock and flags.
+    def _init_buffers(self) -> None:
+        b, nw = self.batch_size, self.n_words
+        self._err, self._errd = np.zeros(4, np.int64), np.zeros(3, _F64_DT)
+        self._info, self._cd, self._lm = np.zeros(2, np.int64), np.zeros(3, _U64_DT), np.zeros(2)
+        self._obs_a, self._obs_b = np.zeros(nw, _U64_DT), np.zeros(nw, _U64_DT)
+        self._kick_a, self._kick_b = np.zeros(nw, _U64_DT), np.zeros(nw, _U64_DT)
+        self._mask_u8, self._shots_i32 = np.zeros(b, _U8_DT), np.zeros(b, _I32_DT)
+        self._outc_u8, self._chosen_f64 = np.zeros(b, _U8_DT), np.zeros(b, _F64_DT)
+        self._ms_cls, self._ms_bit = np.empty(b, _U8_DT), np.empty(b, _U8_DT)
+        self._ms_z, self._ms_z01 = np.empty(b, _F64_DT), np.empty((b, 2), _F64_DT)
+        self._ms_chi2, self._ms_dlog = np.empty((b, 2), np.int64), np.empty(b, _F64_DT)
+        self._err_a, self._errd_a = addr(self._err), addr(self._errd)
+        self._info_a, self._cd_a, self._lm_a = addr(self._info), addr(self._cd), addr(self._lm)
+        self._obs_a_a, self._obs_b_a = addr(self._obs_a), addr(self._obs_b)
+        self._kick_a_a, self._kick_b_a = addr(self._kick_a), addr(self._kick_b)
+        self._mask_a, self._shots_a = addr(self._mask_u8), addr(self._shots_i32)
+        self._outc_a, self._chosen_a = addr(self._outc_u8), addr(self._chosen_f64)
+        ms = (self._ms_cls, self._ms_bit, self._ms_z, self._ms_z01, self._ms_chi2, self._ms_dlog)
+        self._ms_a = tuple(addr(x) for x in ms)
+        self._noise_bufs: tuple[tuple[Any, ...], tuple[int, ...]] | None = None
 
-        An engine that another thread was inside a section of was being updated by a thread that
-        is gone: its memory is a snapshot taken mid-update. It is poisoned (handle forgotten,
-        never freed here). A section of the forking thread itself (a fork from a handler) is not
-        inside a native call: it goes on, and its own exit clears the flags.
-        """
+    def _reinit_after_fork(self) -> None:
+        """Run in a forked child: renew the lock and poison engines held by other threads."""
         self._lock = threading.RLock()
         if self._busy and self._owner != threading.get_ident():
             self._poisoned, self._handle = True, None
@@ -504,6 +447,12 @@ class MagicBatchEngine:
         Python code can run on that thread between reading the handle and the native call (a
         signal handler, a finalizer): it gets a `RuntimeError`, and its `close()` is deferred to
         the end of the section. Other threads wait on the lock and never see `_busy` set.
+
+        The `try`/`finally` is inside the generator, so a `KeyboardInterrupt` (or another
+        exception from a signal handler) raised as the section is entered does not leave `_busy`
+        set for good: once the exception is released, the generator is closed and its `finally`
+        runs. A hand-written `__enter__`/`__exit__` pair has no such fallback: an exception raised
+        after `__enter__` set `_busy` and before the `with` body starts skips `__exit__` for good.
         """
         with self._lock:
             nested = self._busy
@@ -519,17 +468,56 @@ class MagicBatchEngine:
                         self._close_pending = False
                         self._destroy()
 
+    def _fail(self, shot: int, n_d: int = 2) -> FactorFailure:
+        e, d = self._err, self._errd
+        return FactorFailure(
+            shot, int(e[0]), int(e[1]), int(e[2]), int(e[3]),
+            float(d[0]), float(d[1]), float(d[2]) if n_d == 3 else 0.0,
+        )
+
+    @staticmethod
+    def _copy_axis(fa: bool, fb: bool, da: Any, db: Any, a: Any, b: Any) -> None:
+        if fa:
+            np.copyto(da, a)
+        if fb:
+            np.copyto(db, b)
+
+    def _copy_obs_kick(self, obs: tuple[Any, ...], kick: tuple[Any, ...]) -> None:
+        self._copy_axis(obs[5], obs[6], self._obs_a, self._obs_b, obs[0], obs[1])
+        self._copy_axis(kick[5], kick[6], self._kick_a, self._kick_b, kick[0], kick[1])
+
+    def _prep_axis(
+        self, obs: _Axis, kick: bool = False, na: str = "a", nb: str = "b"
+    ) -> tuple[Any, Any, int, int, int, bool, bool]:
+        nw = self.n_words
+        if isinstance(obs, OwnedAxis):
+            ent = None if type(obs) is not OwnedAxis else _OWNED_AXES.get(obs)
+            if ent is None or type(ent[5]) is not int or type(nw) is not int or ent[5] != nw:
+                raise TypeError("an OwnedAxis comes only from own_axis(.., n_words)")
+            return ent[0], ent[1], ent[2], ent[3], ent[4], False, False
+        da, db = (self._kick_a, self._kick_b) if kick else (self._obs_a, self._obs_b)
+        da_a, db_a = (self._kick_a_a, self._kick_b_a) if kick else (self._obs_a_a, self._obs_b_a)
+        ra, rb, rk = obs
+        kap, sh = int(rk) & 3, (nw,)
+        fa = type(ra) is np.ndarray and ra.dtype == _U64_DT and ra.shape == sh == da.shape
+        fb = type(rb) is np.ndarray and rb.dtype == _U64_DT and rb.shape == sh == db.shape
+        ab = ra if fa else _as(ra, np.uint64, sh, na)
+        bb = rb if fb else _as(rb, np.uint64, sh, nb)
+        return ab, bb, da_a if fa else addr(ab), db_a if fb else addr(bb), kap, fa, fb
+
+    def _prep_shots(self, shots: Any) -> tuple[Any, int, int, bool]:
+        s, n, cap = shots, int(np.shape(shots)[0]), self._shots_i32.shape[0]
+        fs = type(s) is np.ndarray and s.dtype == _I32_DT and s.shape == (n,) and n <= cap
+        buf = s if fs else _as_i32(s, (n,), "shots")
+        return buf, n, (self._shots_a if n else 0) if fs else addr(buf), fs
+
     def _destroy(self) -> None:
         handle, self._handle = self._handle, None
         if handle is not None:
             self._lib.mbe_destroy(handle)
 
     def close(self) -> None:
-        """Free the native engine (idempotent; waits for a native call in another thread).
-
-        From inside a native section of the calling thread (a handler or finalizer that fired
-        there) the free is deferred until the section ends.
-        """
+        """Free the native engine (idempotent; defers destroy if called inside a section)."""
         with self._lock:
             if self._busy:
                 self._close_pending = True
@@ -537,7 +525,7 @@ class MagicBatchEngine:
                 self._destroy()
 
     def __del__(self) -> None:
-        if getattr(self, "_handle", None) is not None:  # not after a failed __init__
+        if getattr(self, "_handle", None) is not None:
             self.close()
 
     def __getstate__(self) -> None:
@@ -546,10 +534,8 @@ class MagicBatchEngine:
     def _h(self) -> int:
         if self._handle is None:
             if self._poisoned:
-                raise RuntimeError(
-                    "MagicBatchEngine was inside a native call when the process forked: its "
-                    "state is not usable in the child"
-                )
+                raise RuntimeError("MagicBatchEngine was inside a native call when the process "
+                                   "forked: its state is not usable in the child")
             raise RuntimeError("MagicBatchEngine is closed")
         return self._handle
 
@@ -579,13 +565,10 @@ class MagicBatchEngine:
         atol = _valid_atol(s.atol)
         keep = (
             _as(s.weights, np.complex128, (chi,), "weights"),
-            _as(s.h_words, np.uint64, (chi, nw), "h_words"),
-            _as(s.ell, np.uint8, (chi, d), "ell"),
-            _as(s.A_words, np.uint64, (d, nw), "A_words"),
-            _as(s.a_union, np.uint64, (nw,), "a_union"),
-            _as(s.Gamma, np.uint8, (d, d), "Gamma"),
-            _as_i32(s.pivots, (d,), "pivots"),
-            _as(s.ell_odd, np.uint8, (d,), "ell_odd"),
+            _as(s.h_words, _U64_DT, (chi, nw), "h_words"), _as(s.ell, _U8_DT, (chi, d), "ell"),
+            _as(s.A_words, _U64_DT, (d, nw), "A_words"), _as(s.a_union, _U64_DT, (nw,), "a_union"),
+            _as(s.Gamma, _U8_DT, (d, d), "Gamma"), _as_i32(s.pivots, (d,), "pivots"),
+            _as(s.ell_odd, _U8_DT, (d,), "ell_odd"),
         )
         w, *rest = keep
         with self._section():
@@ -593,23 +576,21 @@ class MagicBatchEngine:
                 self._h(), b, chi, d, int(bool(s.canonical)), float(s.log_mass), atol,
                 w_addr(w), *(addr(x) for x in rest),
             )
-        del keep  # the arrays above must outlive the call
+        del keep
+        if rc == 2:
+            raise MemoryError("mbe_import_shot out of memory")
         if rc != 0:
-            if rc == 2:
-                raise MemoryError("mbe_import_shot out of memory")
             raise ValueError("mbe_import_shot rejected its arguments")
 
     def export_shot(self, b: int) -> ShotArrays:
         """Copy shot `b` out (fresh arrays; the engine keeps its own)."""
         b, nw = self._shot_index(b), self.n_words
-        cd = np.zeros(3, dtype=np.uint64)
-        lm = np.zeros(2, dtype=np.float64)
-        with self._section():  # the sizes read from the header must still hold for the export
-            if self._lib.mbe_shot_header(self._h(), b, addr(cd), addr(lm)) != 0:
+        with self._section():
+            if self._lib.mbe_shot_header(self._h(), b, self._cd_a, self._lm_a) != 0:
                 raise RuntimeError("mbe_shot_header failed")
-            chi, d = int(cd[0]), int(cd[1])
+            chi, d = int(self._cd[0]), int(self._cd[1])
             out = ShotArrays(
-                chi, d, bool(cd[2]), float(lm[0]), float(lm[1]),
+                chi, d, bool(self._cd[2]), float(self._lm[0]), float(self._lm[1]),
                 np.empty(chi, dtype=np.complex128), np.empty((chi, nw), dtype=np.uint64),
                 np.empty((chi, d), dtype=np.uint8), np.empty((d, nw), dtype=np.uint64),
                 np.empty(nw, dtype=np.uint64), np.empty((d, d), dtype=np.uint8),
@@ -624,17 +605,19 @@ class MagicBatchEngine:
             raise RuntimeError("mbe_export_shot failed")
         return out
 
-    def apply_pauli_mask(self, a_words: Any, b_words: Any, kappa: int, mask: Any) -> None:
-        """`P = i**kappa X(a) Z(b)` on every shot with `mask` set and chi > 0, in shot order."""
-        nw = self.n_words
-        a_w = _as(a_words, np.uint64, (nw,), "a_words")
-        b_w = _as(b_words, np.uint64, (nw,), "b_words")
-        _check_padding(a_w, self.n_qubits, "a_words")
-        _check_padding(b_w, self.n_qubits, "b_words")
-        m = _as(mask, np.bool_, (self.batch_size,), "mask").view(np.uint8)
-        kap = int(kappa) & 3
+    def _apply_pauli_mask_obs(self, obs: _Axis, mask: Any) -> None:
+        m, b, mu = mask, self.batch_size, self._mask_u8
+        ab, bb, aa, ba, kap, fa, fb = self._prep_axis(obs, False, "a_words", "b_words")
+        fm = type(m) is np.ndarray and m.dtype == _BOOL_DT and m.shape == (b,) == mu.shape
+        mb = m if fm else _as(m, np.bool_, (b,), "mask").view(np.uint8)
+        ma = self._mask_a if fm else addr(mb)
         with self._section():
-            bad = self._lib.mbe_apply_pauli_mask(self._h(), addr(a_w), addr(b_w), kap, addr(m))
+            self._copy_axis(fa, fb, self._obs_a, self._obs_b, ab, bb)
+            if fm:
+                np.copyto(self._mask_u8, mb)
+            _check_padding(self._obs_a if fa else ab, self.n_qubits, "a_words")
+            _check_padding(self._obs_b if fb else bb, self.n_qubits, "b_words")
+            bad = self._lib.mbe_apply_pauli_mask(self._h(), aa, ba, kap, ma)
         if bad >= 0:
             raise FloatingPointError("Non-finite weights in apply_pauli")
         if bad == -3:
@@ -642,48 +625,95 @@ class MagicBatchEngine:
         if bad != -1:
             raise RuntimeError("mbe_apply_pauli_mask: invalid engine handle")
 
+    def apply_pauli_mask(self, a_words: Any, b_words: Any, kappa: int, mask: Any) -> None:
+        """`P = i**kappa X(a) Z(b)` on every shot with `mask` set and chi > 0, in shot order."""
+        self._apply_pauli_mask_obs((a_words, b_words, kappa), mask)
+
+    def apply_pauli_noise_batch(
+        self, x2x: Any, x2z: Any, x_kap: Any, z2x: Any, z2z: Any, z_kap: Any, xm: Any, zm: Any,
+    ) -> None:
+        """Apply batch X-then-Z Pauli noise masks pulled back through `(x2x..z_kap)`."""
+        nq, b, nw = self.n_qubits, self.batch_size, self.n_words
+        specs = (
+            (x2x, _U64_DT, (nq, nw), "x2x"), (x2z, _U64_DT, (nq, nw), "x2z"),
+            (x_kap, _U8_DT, (nq,), "x_kap"), (z2x, _U64_DT, (nq, nw), "z2x"),
+            (z2z, _U64_DT, (nq, nw), "z2z"), (z_kap, _U8_DT, (nq,), "z_kap"),
+            (xm, _BOOL_DT, (nq, b), "xm"), (zm, _BOOL_DT, (nq, b), "zm"),
+        )
+        fast = (nq * b <= (1 << 20) and b == self._mask_u8.shape[0] and nw == self._obs_a.shape[0]
+                and all(type(a) is np.ndarray and a.dtype == dt and a.shape == sh
+                        for a, dt, sh, _ in specs))
+        copies = None if fast else tuple(_as(a, dt, sh, nm) for a, dt, sh, nm in specs)
+        addrs = None if fast else tuple(addr(c) for c in copies)  # type: ignore[union-attr]
+        with self._section():
+            if fast:
+                nb = self._noise_bufs
+                if nb is None or nb[0][0].shape != (nq, nw) or nb[0][6].shape != (nq, b):
+                    bufs = tuple(np.empty(sh, dt) for _, dt, sh, _ in specs)
+                    nb = self._noise_bufs = (bufs, tuple(addr(c) for c in bufs))
+                for dst, (src, _, _, _) in zip(nb[0], specs):
+                    np.copyto(dst, src)
+                addrs = nb[1]
+            assert addrs is not None
+            self._pending_token = 0
+            bad = self._lib.mbe_apply_pauli_noise_batch(self._h(), nq, b, nw, *addrs, self._err_a)
+            ek, ea1, ea2 = (int(self._err[0]), int(self._err[2]), int(self._err[3]))
+        del copies
+        if bad >= 0:
+            if ek == FAIL_NOT_HERMITIAN:
+                raise ValueError(
+                    f"Pauli operator P(a, b, kappa={ea2}) must be Hermitian (<a,b>={ea1})"
+                )
+            if ek == FAIL_PADDING:
+                raise ValueError(
+                    f"Non-zero upper padding bits in packed uint64 word for n_qubits={nq}"
+                )
+            raise FloatingPointError("Non-finite weights in apply_pauli")
+        if bad == -3:
+            raise MemoryError("mbe_apply_pauli_noise_batch out of memory (shots before updated)")
+        if bad != -1:
+            raise RuntimeError(f"mbe_apply_pauli_noise_batch failed before running ({bad})")
+
     def inject_cliffords(
         self, table: FactorTable | OwnedFactorTable, shot_list: Any, inverse: bool
     ) -> FactorFailure | None:
-        """Apply factor list `shot_list[s]` (-1: none) to every shot, in shot order.
-
-        What `apply_clifford_factors(..., check_unitary=True)` does per shot, committed shot by
-        shot: on a failure the shots before it are updated, it and the later ones are not, and
-        the failure is returned (the caller raises the reference exception). None on success.
-        An `OwnedFactorTable` (built by `own_factor_table`) is used as is; any other table is
-        copied first.
-        """
-        nw = self.n_words
+        """Apply factor list `shot_list[s]` (-1: none) to every shot, in shot order."""
+        nw, b = self.n_words, self.batch_size
+        addrs: tuple[int, ...] | None = None
         if isinstance(table, OwnedFactorTable):
             entry = None if type(table) is not OwnedFactorTable else _OWNED_TABLES.get(table)
             if entry is None or type(entry[2]) is not int or type(nw) is not int or entry[2] != nw:
-                raise TypeError(
-                    "an OwnedFactorTable comes only from own_factor_table(.., n_words)"
-                )
+                raise TypeError("an OwnedFactorTable comes only from own_factor_table(.., n_words)")
             t, axes, _ = entry
-            n_lists, n_axes = int(t[0].shape[0]), int(axes[2].shape[0])
+            cached = _OWNED_TABLE_ADDRS.get(table)
+            if cached is not None and cached[0] is t and cached[1] is axes:
+                _, _, n_lists, n_axes, addrs = cached
+            else:
+                n_lists, n_axes = int(t[0].shape[0]), int(axes[2].shape[0])
         else:
             n_lists, n_axes, t, axes = _owned_columns(table, nw)
-        shots = _list_indices(shot_list, n_lists, self.batch_size)
-        err, errd = np.zeros(4, dtype=np.int64), np.zeros(2, dtype=np.float64)
-        t0, t1, t2, t3, t4 = t
-        a0, a1, a2 = axes
+        s, sb = shot_list, self._shots_i32
+        fs = type(s) is np.ndarray and s.dtype == _I32_DT and s.shape == (b,) == sb.shape
+        shots = None if fs else _list_indices(s, n_lists, b)
+        if addrs is None:
+            addrs = tuple(addr(x) for x in (*t, *axes))
+        sa, inv = self._shots_a if fs else addr(shots), int(bool(inverse))
         with self._section():
+            if fs:
+                np.copyto(self._shots_i32, s)
             bad = self._lib.mbe_inject_cliffords(
-                self._h(), n_lists, n_axes, addr(t0), addr(t1), addr(t2), addr(t3), addr(t4),
-                addr(a0), addr(a1), addr(a2), addr(shots), int(bool(inverse)), addr(err),
-                addr(errd),
+                self._h(), n_lists, n_axes, *addrs, sa, inv, self._err_a, self._errd_a
             )
-        if bad == -1:
-            return None
-        if bad == -3:  # the C++ reports the shot it was at: the ones before it are committed
-            raise MemoryError(
-                f"mbe_inject_cliffords ran out of memory at shot {int(err[2])}: the shots before "
-                "it were updated, it and the later ones were not"
-            )
+            if bad == -1:
+                return None
+            err_s = int(self._err[2]) if bad == -3 else 0
+            fail = self._fail(bad) if bad >= 0 else None
+        if bad == -3:
+            raise MemoryError(f"mbe_inject_cliffords ran out of memory at shot {err_s}: the shots "
+                              "before it were updated, it and the later ones were not")
         if bad < 0:
             raise RuntimeError(f"mbe_inject_cliffords failed before running ({bad})")
-        return FactorFailure(int(bad), *(int(x) for x in err), *(float(x) for x in errd))
+        return fail
 
     def live_shots(self) -> int:
         """Number of shots with chi > 0."""
@@ -694,8 +724,7 @@ class MagicBatchEngine:
         return n
 
     def partition(self, dedupe: bool) -> Any:
-        """`rep[s]` = lowest shot of shot s's group of bit-identical states, -1 when chi == 0
-        (each live shot is its own group when `dedupe` is False)."""
+        """`rep[s]` = lowest shot of shot s's group of bit-identical states, -1 when chi == 0."""
         rep = np.empty(self.batch_size, dtype=np.int64)
         with self._section():
             rc = self._lib.mbe_partition(self._h(), int(bool(dedupe)), addr(rep))
@@ -708,204 +737,223 @@ class MagicBatchEngine:
     def apply_block(
         self, block: BlockTable, dedupe: bool, max_components: int | None
     ) -> BlockResult:
-        """`apply_compiled_block(check_unitary=True)` on every group of identical shots, the
-        result copied to each member, then the `max_components` bound (see `mbe_apply_block`).
-
-        On a failure the groups before the failing one are updated and it and the later ones
-        are not (for `FAIL_MAX_COMPONENTS` the failing group is updated as well).
-        """
+        """`apply_compiled_block(check_unitary=True)` per group of identical shots."""
         nw, n_axes = self.n_words, int(block.axes_kappa.shape[0])
         n_steps = int(block.step_kind.shape[0])
         t = (
             _as_i32(block.step_kind, (n_steps,), "step_kind"),
             _as_i32(block.step_sign, (n_steps,), "step_sign"),
             _as_i32(block.step_start, (n_steps,), "step_start"),
-            _as(block.axes_a, np.uint64, (n_axes, nw), "axes_a"),
-            _as(block.axes_b, np.uint64, (n_axes, nw), "axes_b"),
-            _as(block.axes_kappa, np.uint8, (n_axes,), "axes_kappa"),
-            _as(block.axes_w_ri, np.float64, (n_axes, 2), "axes_w_ri"),
+            _as(block.axes_a, _U64_DT, (n_axes, nw), "axes_a"),
+            _as(block.axes_b, _U64_DT, (n_axes, nw), "axes_b"),
+            _as(block.axes_kappa, _U8_DT, (n_axes,), "axes_kappa"),
+            _as(block.axes_w_ri, _F64_DT, (n_axes, 2), "axes_w_ri"),
         )
         mode = _int32_value(block.mode, "block mode")
         mc = _MAX_SIZE if max_components is None else as_integer(max_components, "max_components")
-        mc = min(max(mc, -1), _MAX_SIZE)  # INT64_MAX: no bound; any negative bound: always hit
-        err, errd = np.zeros(4, dtype=np.int64), np.zeros(2, dtype=np.float64)
-        info = np.zeros(2, dtype=np.int64)
+        mc = min(max(mc, -1), _MAX_SIZE)
+        g_re, g_im, dd = float(block.g_re), float(block.g_im), int(bool(dedupe))
         with self._section():
             bad = self._lib.mbe_apply_block(
-                self._h(), mode, n_steps, n_axes, float(block.g_re), float(block.g_im),
-                *(addr(x) for x in t), int(bool(dedupe)), mc, addr(err), addr(errd), addr(info),
+                self._h(), mode, n_steps, n_axes, g_re, g_im, *(addr(x) for x in t), dd, mc,
+                self._err_a, self._errd_a, self._info_a,
             )
-        groups, live = int(info[0]), int(info[1])
+            groups, live = int(self._info[0]), int(self._info[1])
+            fail = self._fail(bad) if bad >= 0 else None
         if bad == -1:
             return BlockResult(None, groups, live)
         if bad == -3:
             raise MemoryError("mbe_apply_block ran out of memory (groups before it were updated)")
         if bad < 0:
             raise RuntimeError(f"mbe_apply_block failed before running ({bad})")
-        fail = FactorFailure(int(bad), *(int(x) for x in err), *(float(x) for x in errd))
         return BlockResult(fail, groups, live)
 
+    def _prep_reset(
+        self, reset: tuple[Any, ...] | None
+    ) -> tuple[Any, Any, int, int, int, bool, bool, bool]:
+        if reset is None:
+            return None, None, 0, 0, 0, False, False, False
+        ko, flip = (reset[0], bool(reset[1])) if len(reset) == 2 else (reset[:3], bool(reset[3]))
+        return (*self._prep_axis(ko, True, "kick a", "kick b"), flip)
 
     def measure_split(
-        self, obs: tuple[Any, Any, int], keep_rot: bool,
-        reset: tuple[Any, Any, int, bool] | None,
+        self, obs: _Axis, keep_rot: bool, reset: tuple[Any, ...] | None
     ) -> SplitResult:
-        """First half of measuring the Pauli `obs = (a_words, b_words, kappa)` on every shot.
-
-        Nothing of a shot changes except the reset kicks of trivial shots (`reset` = the kick's
-        `(a_words, b_words, kappa)` and `reset_flip_ref`). Both projected branches of every shot
-        that needs a Born draw are kept for `measure_finish` (see `mbe_measure_split`). The
-        observable is not validated here: the engine does it, after classifying, as the
-        reference does.
-        """
-        nw, batch = self.n_words, self.batch_size
-        a_w, b_w = (_as(x, np.uint64, (nw,), n) for x, n in ((obs[0], "a"), (obs[1], "b")))
-        k_a = k_b = _NO_KICK  # address 0: read only for a reset (the engine accepts NULL otherwise)
-        k_kap, flip_ref = 0, False
-        if reset is not None:
-            k_a = _as(reset[0], np.uint64, (nw,), "kick a")
-            k_b = _as(reset[1], np.uint64, (nw,), "kick b")
-            k_kap, flip_ref = int(reset[2]) & 3, bool(reset[3])
-        cls = np.full(batch, CLS_UNSEEN, dtype=np.uint8)
-        bit = np.zeros(batch, dtype=np.uint8)
-        z, z01 = np.zeros(batch), np.zeros((batch, 2))
-        chi2 = np.zeros((batch, 2), dtype=np.int64)
-        err, errd, info = np.zeros(4, np.int64), np.zeros(2), np.zeros(2, np.int64)
+        """First half of measuring `obs` on every shot (fresh non-aliasing result arrays)."""
+        batch, o, k = self.batch_size, self._prep_axis(obs), self._prep_reset(reset)
+        cls, bit = np.full(batch, CLS_UNSEEN, _U8_DT), np.zeros(batch, _U8_DT)
+        z, z01, chi2 = np.zeros(batch), np.zeros((batch, 2)), np.zeros((batch, 2), np.int64)
         token = next(_SPLIT_TOKENS)
         with self._section():
-            self._pending_token = 0  # the native call drops the previous split in every case
+            self._copy_obs_kick(o, k)
+            self._pending_token = 0
             rc = self._lib.mbe_measure_split(
-                self._h(), addr(a_w), addr(b_w), int(obs[2]) & 3, int(bool(keep_rot)),
-                int(reset is not None), int(flip_ref), addr(k_a), addr(k_b), k_kap, addr(cls),
-                addr(bit), addr(z), addr(z01), addr(chi2), addr(err), addr(errd), addr(info),
+                self._h(), o[2], o[3], o[4], int(bool(keep_rot)), int(reset is not None),
+                int(k[7]), k[2], k[3], k[4], addr(cls), addr(bit), addr(z), addr(z01), addr(chi2),
+                self._err_a, self._errd_a, self._info_a,
             )
-            if rc == 0 and info[0] > 0:  # the engine keeps this split for `measure_finish`
+            n_act = int(self._info[0])
+            if rc == 0 and n_act > 0:
                 self._pending_token = token
+            fail = self._fail(int(self._info[1])) if rc == 1 else None
         if rc not in (0, 1, -3):
             raise RuntimeError(f"mbe_measure_split failed before running ({rc})")
-        fail = None
-        if rc == 1:
-            fail = FactorFailure(int(info[1]), *(int(x) for x in err), *(float(x) for x in errd))
-        return SplitResult(cls, bit, z, z01, chi2, int(info[0]), fail, rc == -3, token)
+        return SplitResult(cls, bit, z, z01, chi2, n_act, fail, rc == -3, token)
+
+    def measure_step(
+        self, obs: _Axis, keep_rot: bool, reset: tuple[Any, ...] | None,
+        fn_addr: int, state_addr: int, log_masses: Any = None,
+    ) -> tuple[int, Any, Any]:
+        """Single-call measurement: split, mass check, Born draw, finish."""
+        b, nw = self.batch_size, self.n_words
+        if log_masses is not None and (
+            type(log_masses) is not np.ndarray or log_masses.dtype != _F64_DT
+            or log_masses.shape != (b,)
+        ):
+            raise ValueError("log_masses must be a float64 array of shape (batch_size,)")
+        o, k = self._prep_axis(obs), self._prep_reset(reset)
+        with self._section():
+            self._copy_obs_kick(o, k)
+            self._pending_token = 0
+            rc = self._lib.mbe_measure_step(
+                self._h(), b, nw, o[2], o[3], o[4], int(bool(keep_rot)), int(reset is not None),
+                int(k[7]), k[2], k[3], k[4], fn_addr, state_addr, *self._ms_a,
+                self._err_a, self._errd_a, self._info_a,
+            )
+            n_act, info1 = int(self._info[0]), int(self._info[1])
+            if log_masses is not None and (info1 if rc == 0 else rc in (1, 2, 3, 4, -3)):
+                log_masses[self._ms_cls == CLS_DEAD] = -math.inf
+            if log_masses is not None and ((rc == 0 and n_act) or rc == 4):
+                log_masses += self._ms_dlog
+            if rc == 0:
+                return 0, self._ms_bit.view(np.bool_).copy(), None
+            if rc in (1, 2):
+                fail = self._fail(info1) if rc == 1 else None
+                return rc, None, SplitResult(
+                    self._ms_cls.copy(), self._ms_bit.copy(), self._ms_z.copy(),
+                    self._ms_z01.copy(), self._ms_chi2.copy(), n_act, fail, False, 0,
+                )
+            if rc in (3, 4):
+                return rc, None, self._fail(info1)
+        if rc == -3:
+            if info1 == 0:
+                raise MemoryError("mbe_measure_split ran out of memory (no shot was measured)")
+            msg = "(no shot was changed)" if info1 == 1 else "(shots before it were committed)"
+            raise MemoryError(f"mbe_measure_finish ran out of memory {msg}")
+        raise RuntimeError(f"mbe_measure_step failed before running ({rc})")
 
     def measure_finish(
         self, outcome: Any, chosen: Any, split: SplitResult | None = None
     ) -> FinishResult:
-        """Second half: commit outcome `outcome[i]` (bool) of the i-th active shot of the last
-        `measure_split`, whose chosen mass is `chosen[i]` (see `mbe_measure_finish`). Any other
-        engine call in between drops the pending split (RuntimeError here).
-
-        `split` is the `SplitResult` the outcomes were drawn from: when another split replaced
-        it (another thread's, say) the call is refused with a RuntimeError before the engine is
-        touched, so the outcomes of one split can never commit the branches of another. (Without
-        `split` the outcomes are applied to whatever split is pending; the simulator always
-        passes it.)
-        """
-        n = int(np.shape(outcome)[0])
-        out = _as(np.asarray(outcome, dtype=np.bool_), np.uint8, (n,), "outcome")
-        ch = _as(chosen, np.float64, (n,), "chosen")
-        err, errd, info = np.zeros(4, np.int64), np.zeros(2), np.zeros(2, np.int64)
+        """Second half: commit outcome `outcome[i]` of each active shot of the last split."""
+        o, c, n, cap = outcome, chosen, int(np.shape(outcome)[0]), self._outc_u8.shape[0]
+        fo = type(o) is np.ndarray and o.dtype == _BOOL_DT and o.shape == (n,) and n <= cap
+        fc = type(c) is np.ndarray and c.dtype == _F64_DT and c.shape == (n,) and n <= cap
+        out = o if fo else _as(np.asarray(o, dtype=np.bool_), np.uint8, (n,), "outcome")
+        ch = c if fc else _as(c, np.float64, (n,), "chosen")
+        out_a = (self._outc_a if n else 0) if fo else addr(out)
+        ch_a = (self._chosen_a if n else 0) if fc else addr(ch)
         with self._section():
             if split is not None and split.token != self._pending_token:
-                raise RuntimeError(
-                    "mbe_measure_finish: no pending measure_split matches this split (another "
-                    "split replaced it, or it was already finished)"
-                )
-            self._pending_token = 0  # used up in every case, as in the engine
+                raise RuntimeError("mbe_measure_finish: no pending measure_split matches this "
+                                   "split (another split replaced it, or it was already finished)")
+            self._pending_token = 0
+            if fo and n:
+                np.copyto(self._outc_u8[:n], out)
+            if fc and n:
+                np.copyto(self._chosen_f64[:n], ch)
             rc = self._lib.mbe_measure_finish(
-                self._h(), n, addr(out), addr(ch), addr(err), addr(errd), addr(info)
+                self._h(), n, out_a, ch_a, self._err_a, self._errd_a, self._info_a
             )
+            if rc == 0:
+                return FinishResult(None, 0)
+            phase = int(self._info[0])
+            fail = self._fail(int(self._info[1])) if rc > 0 else None
         if rc == -3:
             raise MemoryError(
                 "mbe_measure_finish ran out of memory "
-                + ("(no shot was changed)" if info[0] == 1 else "(shots before it were committed)")
+                + ("(no shot was changed)" if phase == 1 else "(shots before it were committed)")
             )
         if rc == -2:
             raise RuntimeError("mbe_measure_finish: no pending measure_split for this engine")
         if rc == -4:
             raise ValueError("mbe_measure_finish: outcome / chosen do not match the active shots")
-        if rc == 0:
-            return FinishResult(None, 0)
-        fail = FactorFailure(int(info[1]), *(int(x) for x in err), *(float(x) for x in errd))
-        return FinishResult(fail, int(info[0]))
+        return FinishResult(fail, phase)
 
-    def _born_args(self, obs: tuple[Any, Any, int], shots: Any) -> tuple[Any, Any, int, Any]:
-        """The observable words and the list of shots as private arrays (the C++ reads these)."""
-        nw = self.n_words
-        a_w, b_w = (_as(x, np.uint64, (nw,), n) for x, n in ((obs[0], "a"), (obs[1], "b")))
-        n = int(np.shape(shots)[0])
-        return a_w, b_w, int(obs[2]) & 3, _as_i32(shots, (n,), "shots")
-
-    @staticmethod
-    def _born_failure(rc: int, info: Any, err: Any, errd: Any) -> FactorFailure | None:
-        if rc != 1:
-            return None
-        return FactorFailure(int(info[0]), *(int(x) for x in err), *(float(x) for x in errd))
-
-    def peek(self, obs: tuple[Any, Any, int], shots: Any) -> tuple[Any, FactorFailure | None]:
-        """`_obs_p1` of `obs = (a_words, b_words, kappa)` on every listed shot (see `mbe_peek`).
-
-        Returns (p1, failure): p1[i] belongs to shots[i] and is valid before `failure.shot`
-        (a position in `shots`); nothing changes. An out-of-memory is a MemoryError.
-        """
-        a_w, b_w, kap, lst = self._born_args(obs, shots)
-        p1 = np.zeros(lst.shape[0])
-        err, errd, info = np.zeros(4, np.int64), np.zeros(3), np.zeros(1, np.int64)
+    def peek(self, obs: _Axis, shots: Any) -> tuple[Any, FactorFailure | None]:
+        """`_obs_p1` of `obs` on every listed shot (fresh non-aliasing `p1`)."""
+        ab, bb, aa, ba, kap, fa, fb = self._prep_axis(obs)
+        lst, n, la, fs = self._prep_shots(shots)
+        p1 = np.zeros(n)
         with self._section():
+            self._copy_axis(fa, fb, self._obs_a, self._obs_b, ab, bb)
+            if fs and n:
+                np.copyto(self._shots_i32[:n], lst)
             rc = self._lib.mbe_peek(
-                self._h(), addr(a_w), addr(b_w), kap, addr(lst), lst.shape[0], addr(p1),
-                addr(err), addr(errd), addr(info),
+                self._h(), aa, ba, kap, la, n, addr(p1), self._err_a, self._errd_a, self._info_a
             )
+            if rc == 0:
+                return p1, None
+            at = int(self._info[0])
+            fail = self._fail(at, 3) if rc == 1 else None
         if rc == -3:
-            raise MemoryError(f"mbe_peek ran out of memory at list entry {int(info[0])}")
-        if rc not in (0, 1):
+            raise MemoryError(f"mbe_peek ran out of memory at list entry {at}")
+        if rc != 1:
             raise RuntimeError(f"mbe_peek failed before running ({rc})")
-        return p1, self._born_failure(rc, info, err, errd)
+        return p1, fail
 
-    def postselect(
-        self, obs: tuple[Any, Any, int], shots: Any, desired: Any
-    ) -> PostselectResult:
-        """`postselect_z_batch`'s loop: shot shots[i] is projected onto bit desired[i] & 1 (dead
-        shots skipped), in order, each committed before the next (see `mbe_postselect`)."""
-        a_w, b_w, kap, lst = self._born_args(obs, shots)
-        n = lst.shape[0]
-        want = _as(np.asarray(desired, dtype=np.uint8), np.uint8, (n,), "desired")
+    def postselect(self, obs: _Axis, shots: Any, desired: Any) -> PostselectResult:
+        """Project each listed shot onto `desired[i] & 1` (fresh non-aliasing result arrays)."""
+        ab, bb, aa, ba, kap, fa, fb = self._prep_axis(obs)
+        lst, n, la, fs = self._prep_shots(shots)
+        d, cap = desired, self._outc_u8.shape[0]
+        fw = type(d) is np.ndarray and d.dtype == _U8_DT and d.shape == (n,) and n <= cap
+        want = d if fw else _as(np.asarray(d, dtype=np.uint8), np.uint8, (n,), "desired")
+        wa = (self._outc_a if n else 0) if fw else addr(want)
         done, z01 = np.zeros(n, np.uint8), np.zeros((n, 2))
-        err, errd, info = np.zeros(4, np.int64), np.zeros(3), np.zeros(1, np.int64)
         with self._section():
-            self._pending_token = 0  # the native call drops a pending split
+            self._copy_axis(fa, fb, self._obs_a, self._obs_b, ab, bb)
+            if fs and n:
+                np.copyto(self._shots_i32[:n], lst)
+            if fw and n:
+                np.copyto(self._outc_u8[:n], want)
+            self._pending_token = 0
             rc = self._lib.mbe_postselect(
-                self._h(), addr(a_w), addr(b_w), kap, addr(lst), n, addr(want), addr(done),
-                addr(z01), addr(err), addr(errd), addr(info),
+                self._h(), aa, ba, kap, la, n, wa, addr(done), addr(z01),
+                self._err_a, self._errd_a, self._info_a,
             )
+            at = int(self._info[0]) if rc in (1, -3) else 0
+            fail = self._fail(at, 3) if rc == 1 else None
         if rc not in (0, 1, -3):
             raise RuntimeError(f"mbe_postselect failed before running ({rc})")
-        oom = int(info[0]) if rc == -3 else None
-        return PostselectResult(done, z01, self._born_failure(rc, info, err, errd), oom)
+        return PostselectResult(done, z01, fail, at if rc == -3 else None)
 
     def unmatched_apply(
-        self, obs: tuple[Any, Any, int], kick: tuple[Any, Any, int], shots: Any,
-        bits: Any, measure: Any, kick_flags: Any,
+        self, obs: _Axis, kick: _Axis, shots: Any, bits: Any, measure: Any, kick_flags: Any,
     ) -> UnmatchedResult:
-        """Second half of an unmatched noisy reset: per listed shot, project onto `bits[i]` where
-        `measure[i]`, then kick where `kick_flags[i]` and the shot is alive (see
-        `mbe_unmatched_apply`)."""
-        a_w, b_w, kap, lst = self._born_args(obs, shots)
-        n, nw = lst.shape[0], self.n_words
-        k_a, k_b = (_as(x, np.uint64, (nw,), n_) for x, n_ in ((kick[0], "ka"), (kick[1], "kb")))
-        flags = tuple(_as(np.asarray(x, dtype=np.uint8), np.uint8, (n,), nm)
-                      for x, nm in ((bits, "bits"), (measure, "measure"), (kick_flags, "kicks")))
-        err, errd, info = np.zeros(4, np.int64), np.zeros(3), np.zeros(2, np.int64)
+        """Second half of an unmatched noisy reset: project and kick listed shots."""
+        ab, bb, aa, ba, kap, fa, fb = self._prep_axis(obs)
+        ka_b, kb_b, ka_a, kb_a, k_kap, fka, fkb = self._prep_axis(kick, True, "ka", "kb")
+        lst, n, la, fs = self._prep_shots(shots)
+        flags = tuple(
+            _as(np.asarray(x, dtype=np.uint8), np.uint8, (n,), nm)
+            for x, nm in ((bits, "bits"), (measure, "measure"), (kick_flags, "kicks"))
+        )
         with self._section():
+            self._copy_axis(fa, fb, self._obs_a, self._obs_b, ab, bb)
+            self._copy_axis(fka, fkb, self._kick_a, self._kick_b, ka_b, kb_b)
+            if fs and n:
+                np.copyto(self._shots_i32[:n], lst)
             self._pending_token = 0
             rc = self._lib.mbe_unmatched_apply(
-                self._h(), addr(a_w), addr(b_w), kap, addr(k_a), addr(k_b), int(kick[2]) & 3,
-                addr(lst), n, *(addr(f) for f in flags), addr(err), addr(errd), addr(info),
+                self._h(), aa, ba, kap, ka_a, kb_a, k_kap, la, n, *(addr(f) for f in flags),
+                self._err_a, self._errd_a, self._info_a,
             )
+            at, phase = int(self._info[0]), int(self._info[1])
+            fail = self._fail(at, 3) if rc == 1 else None
         if rc not in (0, 1, -3):
             raise RuntimeError(f"mbe_unmatched_apply failed before running ({rc})")
-        fail = self._born_failure(rc, info, err, errd)
-        return UnmatchedResult(fail, int(info[0]) if rc == -3 else None, int(info[1]))
+        return UnmatchedResult(fail, at if rc == -3 else None, phase)
 
 
 _SELF_CHECK_FACTORS = (
@@ -938,14 +986,7 @@ def _numpy_in_place(one: Any, c: complex) -> Any:
 
 @functools.cache
 def numerics_match_numpy() -> bool:
-    """True when the engine's complex multiplies and norm_sq reproduce numpy bit for bit.
-
-    numpy's FMA contraction and pairwise summation are properties of the numpy build and the
-    CPU, so the engine checks them once on fixed inputs (with zeros and -0.0) before use: the
-    pairwise norm, form A (`w * c`), form B (`np.complex128(c) * w`) and the unfused in-place
-    multiply of a single element. False too when the library cannot be loaded or built (the
-    caller then keeps the Python path).
-    """
+    """True when engine complex multiplies and norm_sq match numpy bit-for-bit (False on error)."""
     try:
         lib = get_magic_engine_lib()
     except (OSError, RuntimeError):  # missing/unloadable library, or the rebuild failed

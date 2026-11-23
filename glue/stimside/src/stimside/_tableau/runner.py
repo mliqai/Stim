@@ -945,7 +945,9 @@ def run_tableside_sync_rng(
     """Tier 1 Python execution preserving 100% exact RNG lockstep with CosetsideSimulator(sync_tableside_rng=True)."""
     state = tss._compiled_op_handler.state
     steps = pre.steps_py
+    orig_ops = pre.orig_ops
     cur = _StepCursor(tss, pre, sync=True)
+    special_qs: dict[stim.CircuitInstruction, np.ndarray] = {}
 
     for s in range(pre.num_steps):
         kind, _, _, _, qubit_i32, params = steps[s]
@@ -953,11 +955,18 @@ def run_tableside_sync_rng(
             continue
         if kind in (1, 2, 5, 8):
             is_other = isinstance(params, LeakageConditioningParams) and params.targets
-            check_qs = (
-                np.asarray(params.targets, dtype=np.int32)
-                if is_other
-                else qubit_i32[qubit_i32 >= 0]
-            )
+            if is_other:
+                check_qs = np.asarray(params.targets, dtype=np.int32)
+            elif kind == 8:
+                op_s = orig_ops[s]
+                if op_s not in special_qs:
+                    special_qs[op_s] = np.fromiter(
+                        (q for t in op_s.targets_copy() if (q := t.qubit_value) is not None),
+                        dtype=np.int32,
+                    )
+                check_qs = special_qs[op_s]
+            else:
+                check_qs = qubit_i32[qubit_i32 >= 0]
             # A stim-fused CONDITIONED_ON_OTHER op (more targets than the tag lists) goes to the
             # handler, which applies its copies one by one, drawing RNG like CosetsideSimulator.
             if not np.any(state[check_qs] >= 2) and not (

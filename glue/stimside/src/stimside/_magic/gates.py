@@ -391,13 +391,24 @@ def extract_inline_faults_from_ir(ir: CircuitIR) -> tuple[CliffordFaultChannel, 
     return tuple(inline_faults)
 
 
+def validate_circuit_ir(circuit: stim.Circuit, ir: CircuitIR) -> CircuitIR:
+    """Validate that a supplied ``CircuitIR`` matches ``circuit``."""
+    if not isinstance(ir, CircuitIR):
+        raise TypeError(f"Expected CircuitIR or None, got {type(ir)!r}")
+    got = (ir.num_qubits, ir.num_measurements, len(ir.instrs))
+    exp = (circuit.num_qubits, circuit.num_measurements, len(circuit))
+    if got[:2] != exp[:2] or (not ir.has_repeat and not ir.from_op_list and got[2] != exp[2]):
+        raise ValueError(f"CircuitIR does not match circuit: got {got}, expected {exp}")
+    return ir
+
+
 def extract_circuit_faults(
     circuit: stim.Circuit,
     *,
     ir: CircuitIR | None = None,
 ) -> tuple[list[stim.CircuitInstruction], tuple[CliffordFaultChannel, ...]]:
     """Unroll ``circuit`` via ``CircuitIR`` and extract inline ``CLIFFORD_FAULT`` ops."""
-    cir = build_ir(circuit) if ir is None else ir
+    cir = build_ir(circuit) if ir is None else validate_circuit_ir(circuit, ir)
     inline_faults = extract_inline_faults_from_ir(cir)
     fault_steps = {ch.step_index for ch in inline_faults}
     flat_ops = [

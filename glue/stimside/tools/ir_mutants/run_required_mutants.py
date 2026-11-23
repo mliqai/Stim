@@ -54,6 +54,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "_tableau/precompile_pure_test.py",
     ),
     "MAGIC": ("_magic/compile_test.py", "_magic/plan_ir_test.py"),
+    "MAGIC_STAGE_A": ("_native/magic_engine_stage_a_test.py",),
     "DEM": (
         "dem_generators/dem_generator_marginal_test.py",
         "dem_generators/marginal_builder_reference_test.py",
@@ -69,6 +70,11 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "simulator_coset_test.py",
         "_coset/reference_compile_ir_test.py",
     ),
+    "COSET_V4": (
+        "simulator_coset_cmeas_test.py",
+        "simulator_coset_p2_test.py",
+    ),
+    "LEAKAGE": ("op_handlers/leakage_handlers/fast_leakage_test.py",),
 }
 
 _ASSERT_EXCS = frozenset({"AssertionError", "Failed"})
@@ -408,6 +414,8 @@ def _snapshot_pkg(pkg_root: Path, dst_root: Path) -> None:
     )
     shutil.copytree(pkg_root / "src", dst_root / "src", ignore=ignore)
     shutil.copy2(pkg_root / "pyproject.toml", dst_root / "pyproject.toml")
+    if (pkg_root / "setup.py").is_file():
+        shutil.copy2(pkg_root / "setup.py", dst_root / "setup.py")
 
 
 def _run_baseline(
@@ -426,10 +434,13 @@ def _run_baseline(
         ("GOLD", GROUPS["GOLD"], (), None),
         ("TAB", GROUPS["TAB"], (), None),
         ("MAGIC", GROUPS["MAGIC"], (), None),
+        ("MAGIC_STAGE_A", GROUPS["MAGIC_STAGE_A"], (), None),
         ("DEM", GROUPS["DEM"], (), None),
         ("UTIL", GROUPS["UTIL"], ("--ignore=src/stimside/util/circuit_ir_test.py",), None),
         ("FLIP", GROUPS["FLIP"], (), None),
         ("COSET", GROUPS["COSET"], (), None),
+        ("COSET_V4", GROUPS["COSET_V4"], (), None),
+        ("LEAKAGE", GROUPS["LEAKAGE"], (), None),
     ]
     results: dict[str, DetectorResult] = {}
 
@@ -497,6 +508,11 @@ def _run_one_mutant(
                 f"{spec.mid}: PATTERN-COUNT={src.count(spec.old)} in {spec.rel_file}"
             )
         target.write_text(src.replace(spec.old, spec.new, 1), encoding="utf-8")
+        if spec.rel_file.endswith((".cpp", ".hpp")):
+            native_dir = mroot / "src" / "stimside" / "_native"
+            for pat in ("lib*.so", ".lib*.build_id"):
+                for p in native_dir.glob(pat):
+                    p.unlink(missing_ok=True)
 
         detectors["INV"] = _run_pytest_detector(
             "INV", ("util/circuit_ir_test.py",), mroot,

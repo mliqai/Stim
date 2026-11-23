@@ -21,7 +21,11 @@ from stimside.op_handlers.leakage_handlers.tag_registry import (
     parse_leakage_tag_magic as _parse_leakage_tag_magic,
     validate_magic_op,
 )
-from stimside.op_handlers.leakage_handlers.transition_effects import meas_basis
+from stimside.op_handlers.leakage_handlers.transition_effects import (
+    check_late_frozen_read,
+    meas_basis,
+    qualify_fast_1q,
+)
 from stimside.util.stim_workarounds import split_fused_instruction
 
 if TYPE_CHECKING:
@@ -116,15 +120,21 @@ def _parse_leakage_in_circuit_magic(
 
 @dataclasses.dataclass
 class LeakageUint8Magic(LeakageUint8Coset):
-    """Batched uint8 leakage OpHandler for MagicsideSimulator."""
+    """Batched uint8 leakage OpHandler for MagicsideSimulator (inherits ``fast_leakage``)."""
 
     def compile_op_handler(self, *, circuit: stim.Circuit, batch_size: int) -> CompiledLeakageUint8Magic:
         ops_to_params, u_meas_ops, magic_ops = _parse_leakage_in_circuit_magic(circuit, circuit.num_qubits)
-        return CompiledLeakageUint8Magic(
+        fast_1q, compiled_len = qualify_fast_1q(
+            circuit, ops_to_params, self.unconditional_condition_on_U, self.fast_leakage
+        )
+        compiled = CompiledLeakageUint8Magic(
             num_qubits=circuit.num_qubits, batch_size=batch_size,
             unconditional_condition_on_U=self.unconditional_condition_on_U,
-            ops_to_params=ops_to_params, u_measurement_ops=u_meas_ops, magic_ops=magic_ops,
+            ops_to_params=ops_to_params, fast_leakage=self.fast_leakage,
+            u_measurement_ops=u_meas_ops, magic_ops=magic_ops,
         )
+        compiled._set_fast_1q(fast_1q, compiled_len)
+        return compiled
 
 
 @dataclasses.dataclass
@@ -137,6 +147,7 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
     def handle_op(self, op: stim.CircuitInstruction, sss: MagicsideSimulator) -> None:  # type: ignore[override]
         self._ensure_batch_size(sss.batch_size)
         if op.tag in _MAGIC_TAGS:
+            check_late_frozen_read(self._fast_1q, self._compiled_len, op, sss, self.ops_to_params)
             qs = self.magic_ops.get(op)
             if qs is None:
                 qs = validate_magic_op(op, sss.num_qubits)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Literal, Sequence, cast
+from typing import Any, Literal, NamedTuple, Sequence, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -22,15 +22,60 @@ from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
 from stimside.op_handlers.leakage_handlers.transition_effects import (
     TransitionEffectMasks,
     apply_output_effect,
+    check_late_frozen_read,
     dispatch_tagged_leakage_op,
     eval_allowed_state_mask,
     exec_leakage_swap,
     meas_basis,
+    qualify_fast_1q,
     sample_batched_group_transitions,
     unpack_leakage_measurement_targets,
 )
 from stimside.op_handlers.seam import BatchedLeakageSimulator
 from stimside.util.stim_workarounds import split_fused_instruction
+
+_REC_BARE, _REC_PLAIN_UNIT, _REC_PLAIN_NOISE, _REC_MASK_UNIT_U = 0, 1, 2, 3
+_REC_MASK_NOISE_U, _REC_MASK_CORR_U, _REC_MASK_SPP_U, _REC_TAGGED = 4, 5, 6, 7
+_NOISE_CH: dict[str, tuple[int, int]] = {
+    "X_ERROR": (0, 1), "Y_ERROR": (1, 1), "Z_ERROR": (2, 1),
+    "DEPOLARIZE1": (3, 1), "PAULI_CHANNEL_1": (3, 1),
+    "DEPOLARIZE2": (4, 2), "PAULI_CHANNEL_2": (5, 2),
+}
+_FAST_UNIT_SKIP = frozenset({"I", "II", "I_ERROR", "II_ERROR", "X", "Y", "Z", "SPP", "SPP_DAG"})
+
+
+class _OpRec(NamedTuple):
+    kind: int
+    arity: int
+    q_check: NDArray[np.intp] | None
+    qs_arr: NDArray[np.int64] | None
+    spp_terms: tuple[list[int], ...] | None
+    noise_spec: tuple[int, int, NDArray[np.float64], bool] | None
+    fast_unitary_ok: bool
+    claimed: bool
+    params: LeakageParams | None
+
+
+def _make_noise_spec(
+    op_name: str, op: stim.CircuitInstruction, n_q: int, has_classical: bool
+) -> tuple[int, int, NDArray[np.float64], bool] | None:
+    if has_classical or op_name not in _NOISE_CH:
+        return None
+    ch_code, arity = _NOISE_CH[op_name]
+    args = op.gate_args_copy()
+    is_zero = len(args) == 0 or max(args) <= 0.0
+    if is_zero:
+        probs = np.zeros(1, dtype=np.float64)
+    elif op_name == "DEPOLARIZE1":
+        p3 = args[0] / 3.0
+        probs = np.array([p3, p3, p3], dtype=np.float64)
+    elif op_name == "PAULI_CHANNEL_1":
+        probs = np.array(args[:3], dtype=np.float64)
+    elif op_name == "PAULI_CHANNEL_2":
+        probs = np.ascontiguousarray(np.cumsum(args, dtype=np.float64), dtype=np.float64)
+    else:
+        probs = np.array([args[0]], dtype=np.float64)
+    return (ch_code, n_q // arity, probs, is_zero)
 
 
 @dataclasses.dataclass
@@ -46,21 +91,28 @@ class LeakageUint8Coset(OpHandler[BatchedLeakageSimulator]):
             and resets are never filtered: they act on, or read, the frozen state.
             Details are in "Untagged Instructions on Leaked Qubits" in the top-level
             README.
+        fast_leakage: if True, enable distribution-preserving leakage speedups
+            (seeded outputs differ from default). See README for details.
     """
 
     unconditional_condition_on_U: bool = True
+    fast_leakage: bool = False
 
     def compile_op_handler(
         self, *, circuit: stim.Circuit, batch_size: int
     ) -> "CompiledLeakageUint8Coset":
         parsed_ops = parse_leakage_in_circuit(circuit)
         check_tag_qubits(parsed_ops, circuit.num_qubits)
-        return CompiledLeakageUint8Coset(
-            num_qubits=circuit.num_qubits,
-            batch_size=batch_size,
-            ops_to_params=parsed_ops,
-            unconditional_condition_on_U=self.unconditional_condition_on_U,
+        fast_1q, compiled_len = qualify_fast_1q(
+            circuit, parsed_ops, self.unconditional_condition_on_U, self.fast_leakage
         )
+        compiled = CompiledLeakageUint8Coset(
+            num_qubits=circuit.num_qubits, batch_size=batch_size, ops_to_params=parsed_ops,
+            unconditional_condition_on_U=self.unconditional_condition_on_U,
+            fast_leakage=self.fast_leakage,
+        )
+        compiled._set_fast_1q(fast_1q, compiled_len)
+        return compiled
 
 
 @dataclasses.dataclass
@@ -71,6 +123,11 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
     batch_size: int
     unconditional_condition_on_U: bool
     ops_to_params: dict[stim.CircuitInstruction, LeakageParams]
+    # Keyword-only, so that positional calls keep the parameter order they had before this option.
+    fast_leakage: bool = dataclasses.field(default=False, kw_only=True)
+    # Set by compile_op_handler from the circuit it compiles; not constructor parameters.
+    _fast_1q: bool = dataclasses.field(default=False, init=False)
+    _compiled_len: int = dataclasses.field(default=0, init=False)
 
     _state: NDArray[np.uint8] = dataclasses.field(init=False)
     _scratch_depolarize: NDArray[np.bool_] = dataclasses.field(init=False)
@@ -82,53 +139,50 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
     _scratch_rand_x: NDArray[np.bool_] = dataclasses.field(init=False)
     _scratch_rand_phase: NDArray[np.bool_] = dataclasses.field(init=False)
     _scratch_zero_mask: NDArray[np.bool_] = dataclasses.field(init=False)
+    _op_records: dict[stim.CircuitInstruction, _OpRec] = dataclasses.field(
+        init=False, repr=False, compare=False)
+    _op_rec_cfg: tuple[bool, bool] = dataclasses.field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.claimed_ops_keys = set(self.ops_to_params.keys())
         self._alloc_scratch(self.batch_size)
         self.clear()
 
+    def _set_fast_1q(self, fast_1q: bool, compiled_len: int) -> None:
+        """Record whether change 1 of `fast_leakage` applies, and the compiled circuit's length."""
+        self._fast_1q, self._compiled_len = fast_1q, compiled_len
+        self._op_records, self._op_rec_cfg = {}, (self.unconditional_condition_on_U, fast_1q)
+
     def _alloc_scratch(self, b_size: int) -> None:
-        shape = (self.num_qubits, b_size)
-        self._scratch_depolarize = np.zeros(shape, dtype=np.bool_)
-        self._scratch_pauli_X = np.zeros(shape, dtype=np.bool_)
-        self._scratch_pauli_Y = np.zeros(shape, dtype=np.bool_)
-        self._scratch_pauli_Z = np.zeros(shape, dtype=np.bool_)
-        self._scratch_set_one = np.zeros(shape, dtype=np.bool_)
-        self._scratch_set_zero = np.zeros(shape, dtype=np.bool_)
-        self._scratch_rand_x = np.zeros(shape, dtype=np.bool_)
-        self._scratch_rand_phase = np.zeros(shape, dtype=np.bool_)
-        self._scratch_zero_mask = np.zeros(shape, dtype=np.bool_)
+        self._op_records, self._op_rec_cfg = {}, (self.unconditional_condition_on_U, self._fast_1q)
+        sh = (self.num_qubits, b_size)
+        for nm in (
+            "depolarize", "pauli_X", "pauli_Y", "pauli_Z",
+            "set_one", "set_zero", "rand_x", "rand_phase", "zero_mask",
+        ):
+            setattr(self, f"_scratch_{nm}", np.zeros(sh, dtype=np.bool_))
 
     @property
     def state(self) -> NDArray[np.uint8]:
-        if self.batch_size == 1:
-            return self._state[:, 0]
-        return self._state
+        return self._state[:, 0] if self.batch_size == 1 else self._state
 
     @state.setter
     def state(self, val: NDArray[np.uint8]) -> None:
         arr = np.asarray(val, dtype=np.uint8)
-        if arr.ndim == 1:
-            self._state = np.broadcast_to(
-                arr[:, None], (self.num_qubits, self.batch_size)
-            ).copy()
-        else:
-            self._state = arr.copy()
+        self._state = (
+            np.broadcast_to(arr[:, None], (self.num_qubits, self.batch_size)).copy()
+            if arr.ndim == 1 else arr.copy()
+        )
 
     def _ensure_batch_size(self, sim_batch_size: int) -> None:
         if self._state.shape[1] != sim_batch_size:
             old_col = self._state[:, :1].copy()
             self.batch_size = sim_batch_size
-            self._state = np.broadcast_to(
-                old_col, (self.num_qubits, sim_batch_size)
-            ).copy()
+            self._state = np.broadcast_to(old_col, (self.num_qubits, sim_batch_size)).copy()
             self._alloc_scratch(sim_batch_size)
 
     def clear(self) -> None:
-        self._state = np.zeros(
-            (self.num_qubits, self.batch_size), dtype=np.uint8
-        )
+        self._state = np.zeros((self.num_qubits, self.batch_size), dtype=np.uint8)
 
     def _update_state_from_peek_Z(
         self, targets: Sequence[int] | NDArray[np.int_], css: BatchedLeakageSimulator
@@ -137,18 +191,12 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
         unique_targets = list(dict.fromkeys(int(t) for t in targets if int(t) >= 0))
         if not unique_targets:
             return
-
-        p1_mat = css.peek_pauli_born_batch(unique_targets, pauli="Z")
-        any_projected = False
+        p1_mat, any_projected = css.peek_pauli_born_batch(unique_targets, pauli="Z"), False
         for idx, q in enumerate(unique_targets):
             comp_mask = self._state[q, :] < 2
             if not np.any(comp_mask):
                 continue
-            p1_row = (
-                css.peek_pauli_born_batch([q], pauli="Z")[0]
-                if any_projected
-                else p1_mat[idx]
-            )
+            p1_row = css.peek_pauli_born_batch([q], pauli="Z")[0] if any_projected else p1_mat[idx]
             new_row = np.zeros(css.batch_size, dtype=np.uint8)
             det_one = p1_row >= 1.0 - 1e-12
             new_row[det_one] = 1
@@ -156,22 +204,15 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
             num_flips = int(np.count_nonzero(flip_mask))
             if num_flips > 0:
                 if (rngs := css.sync_rngs()) is not None:
-                    new_row[flip_mask] = np.asarray(
-                        [
-                            rngs.shot_np_rngs[int(b)].binomial(
-                                1,
-                                0.5 if abs(p1_row[b] - 0.5) <= 1e-12 else float(p1_row[b]),
-                            )
-                            for b in np.flatnonzero(flip_mask)
-                        ],
-                        dtype=np.uint8,
-                    )
+                    new_row[flip_mask] = np.asarray([
+                        rngs.shot_np_rngs[int(b)].binomial(
+                            1, 0.5 if abs(p1_row[b] - 0.5) <= 1e-12 else float(p1_row[b])
+                        ) for b in np.flatnonzero(flip_mask)
+                    ], dtype=np.uint8)
                 else:
                     p_sub = p1_row[flip_mask]
                     new_row[flip_mask] = css.np_rng.binomial(
-                        1,
-                        0.5 if np.allclose(p_sub, 0.5, atol=1e-12) else p_sub,
-                        size=num_flips,
+                        1, 0.5 if np.allclose(p_sub, 0.5, atol=1e-12) else p_sub, size=num_flips,
                     ).astype(np.uint8)
                 css.postselect_z_batch(q, flip_mask, new_row)
                 any_projected = True
@@ -183,37 +224,28 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
             row[row == 1] = 0
 
     def _filter_targets_1q_mask(
-        self,
-        targets: Sequence[int] | NDArray[np.int_],
-        allowed_st_list: tuple[tuple[int | str, ...], ...],
-        css: BatchedLeakageSimulator,
+        self, targets: Sequence[int] | NDArray[np.int_],
+        allowed_st_list: tuple[tuple[int | str, ...], ...], css: BatchedLeakageSimulator,
     ) -> NDArray[np.bool_]:
         self._ensure_batch_size(css.batch_size)
-        targets_arr = np.asarray(targets, dtype=np.intp)
-        allowed_group = allowed_st_list[0]
+        targets_arr, allowed_group = np.asarray(targets, dtype=np.intp), allowed_st_list[0]
         valid_qs = targets_arr[targets_arr >= 0]
         peeked = len(valid_qs) > 0 and (1 in allowed_group or 0 in allowed_group)
         if peeked:
             self._update_state_from_peek_Z(valid_qs, css)
-
-        safe_qs = np.where(targets_arr >= 0, targets_arr, 0)
-        target_states = self._state[safe_qs, :].copy()  # (len(targets), batch_size)
-        is_classical = (targets_arr < 0)[:, None]
-        target_states = np.where(is_classical, 0, target_states)
+        is_cl = (targets_arr < 0)[:, None]
+        st = np.where(is_cl, 0, self._state[np.where(targets_arr >= 0, targets_arr, 0), :].copy())
         if peeked:
             self._clear_transient_ones(valid_qs)
-        return eval_allowed_state_mask(
-            target_states, is_classical, allowed_group
-        )
+        return eval_allowed_state_mask(st, is_cl, allowed_group)
 
     def _filter_targets_2q_mask(
-        self,
-        targets: Sequence[Sequence[int]] | NDArray[np.int_],
+        self, targets: Sequence[Sequence[int]] | NDArray[np.int_],
         allowed_st_list: tuple[tuple[int | str, ...], tuple[int | str, ...]],
         css: BatchedLeakageSimulator,
     ) -> NDArray[np.bool_]:
         self._ensure_batch_size(css.batch_size)
-        targets_np = np.asarray(targets, dtype=np.intp)  # (num_pairs, 2)
+        targets_np = np.asarray(targets, dtype=np.intp)
         if len(targets_np) == 0:
             return np.zeros((0, css.batch_size), dtype=np.bool_)
         peeked_qs: list[int] = []
@@ -223,115 +255,142 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
                 if len(valid_qs) > 0:
                     self._update_state_from_peek_Z(valid_qs, css)
                     peeked_qs.extend(int(q) for q in valid_qs)
-
-        is_c0 = (targets_np[:, 0] < 0)[:, None]
-        is_c1 = (targets_np[:, 1] < 0)[:, None]
-        q0_safe = np.where(targets_np[:, 0] >= 0, targets_np[:, 0], 0)
-        q1_safe = np.where(targets_np[:, 1] >= 0, targets_np[:, 1], 0)
-        s0 = np.where(is_c0, 0, self._state[q0_safe, :])
-        s1 = np.where(is_c1, 0, self._state[q1_safe, :])
+        t0, t1 = targets_np[:, 0], targets_np[:, 1]
+        is_c0, is_c1 = (t0 < 0)[:, None], (t1 < 0)[:, None]
+        s0 = np.where(is_c0, 0, self._state[np.where(t0 >= 0, t0, 0), :])
+        s1 = np.where(is_c1, 0, self._state[np.where(t1 >= 0, t1, 0), :])
         if peeked_qs:
             self._clear_transient_ones(peeked_qs)
-        allowed_mask = np.zeros((len(targets_np), css.batch_size), dtype=np.bool_)
+        out = np.zeros((len(targets_np), css.batch_size), dtype=np.bool_)
         for n in range(len(allowed_st_list[0])):
-            m0 = eval_allowed_state_mask(
-                s0, is_c0, (allowed_st_list[0][n],)
-            )
-            m1 = eval_allowed_state_mask(
-                s1, is_c1, (allowed_st_list[1][n],)
-            )
-            allowed_mask |= m0 & m1
-        return allowed_mask
+            m0 = eval_allowed_state_mask(s0, is_c0, (allowed_st_list[0][n],))
+            out |= m0 & eval_allowed_state_mask(s1, is_c1, (allowed_st_list[1][n],))
+        return out
 
-    def handle_op(
-        self, op: stim.CircuitInstruction, sss: BatchedLeakageSimulator
-    ) -> None:
-        self._ensure_batch_size(sss.batch_size)
-        if op not in self.claimed_ops_keys:
+    def _make_u_rec(
+        self, op: stim.CircuitInstruction, gd: Any, is_1q_or_corr: bool, claimed: bool,
+        params: LeakageParams | None,
+    ) -> _OpRec:
+        op_name, raw_t = op.name, op.targets_copy()
+        has_cl = any(t.qubit_value is None for t in raw_t)
+        q_list = [int(t.qubit_value) for t in raw_t if t.qubit_value is not None]
+        q_check = np.array(list(dict.fromkeys(q_list)), dtype=np.intp)
+        qs_arr: NDArray[np.int64] | None = None
+        spp_terms: tuple[list[int], ...] | None = None
+        if is_1q_or_corr:
+            arity = 1
+            qs_arr = np.array(
+                [int(t.qubit_value) if t.qubit_value is not None else -1 for t in raw_t], np.int64
+            )
+            kind = (
+                _REC_MASK_UNIT_U if gd.is_unitary
+                else (_REC_MASK_NOISE_U if gd.is_single_qubit_gate else _REC_MASK_CORR_U)
+            )
+        elif gd.is_two_qubit_gate:
+            arity, kind = 2, (_REC_MASK_UNIT_U if gd.is_unitary else _REC_MASK_NOISE_U)
+            qs_arr = np.array(
+                [[int(g[0].qubit_value) if g[0].qubit_value is not None else -1,
+                  int(g[1].qubit_value) if g[1].qubit_value is not None else -1]
+                 for g in op.target_groups()], dtype=np.int64,
+            ).reshape(-1, 2)
+        else:
+            arity, kind = 0, _REC_MASK_SPP_U
+            spp_terms = tuple([int(t.qubit_value) for t in term] for term in op.target_groups())
+        nspec = (
+            _make_noise_spec(op_name, op, len(raw_t), has_cl) if kind == _REC_MASK_NOISE_U else None
+        )
+        fast_u = (
+            kind == _REC_MASK_UNIT_U and arity in (1, 2) and not has_cl and len(q_list) > 0
+            and len(q_check) == len(q_list) and op_name not in _FAST_UNIT_SKIP
+        )
+        return _OpRec(kind, arity, q_check, qs_arr, spp_terms, nspec, fast_u, claimed, params)
+
+    def _build_op_record(
+        self, op: stim.CircuitInstruction, claimed: bool, params: LeakageParams | None
+    ) -> _OpRec:
+        if not claimed:
             if self.unconditional_condition_on_U:
                 op_name = op.name
                 gd = stim.gate_data(op_name)
-                if gd.produces_measurements or not (
-                    gd.is_noisy_gate or gd.is_unitary
-                ):
-                    sss._do_bare_instruction(op)
-                    return
-
+                if gd.produces_measurements or not (gd.is_noisy_gate or gd.is_unitary):
+                    return _OpRec(_REC_BARE, 0, None, None, None, None, False, False, None)
                 is_1q_or_corr = gd.is_single_qubit_gate or op_name in (
-                    "E",
-                    "CORRELATED_ERROR",
-                    "ELSE_CORRELATED_ERROR",
+                    "E", "CORRELATED_ERROR", "ELSE_CORRELATED_ERROR",
                 )
-                if not (
-                    is_1q_or_corr
-                    or gd.is_two_qubit_gate
-                    or op_name in ("SPP", "SPP_DAG")
-                ):
-                    sss._do_bare_instruction(op)
-                    return
-
-                qs = [
-                    t.qubit_value
-                    for t in op.targets_copy()
-                    if t.qubit_value is not None
-                ]
-                if not qs or not np.any(self._state[qs, :] >= 2):
-                    if gd.is_unitary:
-                        sss.do_conditional_clifford(op, None)
-                    else:
-                        sss.do_conditional_pauli_noise(op, None)
-                    return
-
-                if is_1q_or_corr:
-                    targets = [
-                        t.qubit_value if t.qubit_value is not None else -1
-                        for t in op.targets_copy()
-                    ]
-                    cond_mask = self._filter_targets_1q_mask(
-                        targets, (("U",),), sss
+                if not (is_1q_or_corr or gd.is_two_qubit_gate or op_name in ("SPP", "SPP_DAG")):
+                    return _OpRec(_REC_BARE, 0, None, None, None, None, False, False, None)
+                if gd.is_single_qubit_gate and self._fast_1q:
+                    nspec = (
+                        None if gd.is_unitary
+                        else _make_noise_spec(op_name, op, len(op.targets_copy()), False)
                     )
-                    if not gd.is_single_qubit_gate:
-                        # A correlated error is one Pauli product (like a pair for 2q ops): skip all of it.
-                        cond_mask[:] = cond_mask.all(axis=0)
-                elif gd.is_two_qubit_gate:
-                    target_pairs = [
-                        [
-                            grp[0].qubit_value
-                            if grp[0].qubit_value is not None
-                            else -1,
-                            grp[1].qubit_value
-                            if grp[1].qubit_value is not None
-                            else -1,
-                        ]
-                        for grp in op.target_groups()
-                    ]
-                    cond_mask = self._filter_targets_2q_mask(
-                        target_pairs, (("U",), ("U",)), sss
+                    return _OpRec(
+                        _REC_PLAIN_UNIT if gd.is_unitary else _REC_PLAIN_NOISE,
+                        1, None, None, None, nspec, False, False, None,
                     )
-                else:
-                    terms = op.target_groups()
-                    cond_mask = (
-                        np.array(
-                            [
-                                np.all(self._state[[t.qubit_value for t in term], :] < 2, axis=0)
-                                for term in terms
-                            ],
-                            dtype=np.bool_,
-                        )
-                        if terms
-                        else np.zeros((0, sss.batch_size), dtype=np.bool_)
-                    )
+                return self._make_u_rec(op, gd, is_1q_or_corr, False, None)
+            return _OpRec(_REC_BARE, 0, None, None, None, None, False, False, None)
+        if (
+            isinstance(params, LeakageConditioningParams) and not params.targets
+            and type(self).leakage_conditioning is CompiledLeakageUint8Coset.leakage_conditioning
+        ):
+            gd = stim.gate_data(op.name)
+            if not gd.produces_measurements and (gd.is_unitary or gd.is_noisy_gate) and (
+                (gd.is_single_qubit_gate and params.args == (("U",),))
+                or (gd.is_two_qubit_gate and params.args == (("U",), ("U",)))
+            ):
+                return self._make_u_rec(op, gd, gd.is_single_qubit_gate, True, params)
+        return _OpRec(_REC_TAGGED, 0, None, None, None, None, False, True, params)
 
-                if gd.is_unitary:
-                    sss.do_conditional_clifford(op, cond_mask)
-                else:
-                    sss.do_conditional_pauli_noise(op, cond_mask)
-                return
+    def _get_op_record(self, op: stim.CircuitInstruction) -> _OpRec:
+        cfg = (self.unconditional_condition_on_U, self._fast_1q)
+        if cfg != self._op_rec_cfg:
+            self._op_records, self._op_rec_cfg = {}, cfg
+        claimed = op in self.claimed_ops_keys
+        params = self.ops_to_params.get(op) if claimed else None
+        rec = self._op_records.get(op)
+        if rec is not None and rec.claimed == claimed and rec.params is params:
+            return rec
+        self._op_records[op] = rec = self._build_op_record(op, claimed, params)
+        return rec
 
+    def handle_op(self, op: stim.CircuitInstruction, sss: BatchedLeakageSimulator) -> None:
+        self._ensure_batch_size(sss.batch_size)
+        check_late_frozen_read(self._fast_1q, self._compiled_len, op, sss, self.ops_to_params)
+        rec = self._get_op_record(op)
+        kind = rec.kind
+        if kind == _REC_BARE:
             sss._do_bare_instruction(op)
-            return
-
-        dispatch_tagged_leakage_op(self, op, sss)
+        elif kind == _REC_TAGGED:
+            dispatch_tagged_leakage_op(self, op, sss)
+        elif kind == _REC_PLAIN_UNIT:
+            sss.do_conditional_clifford(op, None)
+        elif kind == _REC_PLAIN_NOISE:
+            sss.do_conditional_pauli_noise(op, None)
+        else:
+            do_cond = (
+                sss.do_conditional_clifford if kind in (_REC_MASK_UNIT_U, _REC_MASK_SPP_U)
+                else sss.do_conditional_pauli_noise
+            )
+            qc = rec.q_check
+            if qc is None or len(qc) == 0 or not np.any(self._state[qc, :] >= 2):
+                do_cond(op, None)
+                return
+            if rec.arity == 1:
+                assert rec.qs_arr is not None
+                cm = self._filter_targets_1q_mask(rec.qs_arr, (("U",),), sss)
+                if kind == _REC_MASK_CORR_U:
+                    cm[:] = cm.all(axis=0)
+            elif rec.arity == 2:
+                assert rec.qs_arr is not None
+                cm = self._filter_targets_2q_mask(rec.qs_arr, (("U",), ("U",)), sss)
+            else:
+                terms = rec.spp_terms or ()
+                cm = (
+                    np.array([np.all(self._state[t, :] < 2, axis=0) for t in terms], np.bool_)
+                    if terms else np.zeros((0, sss.batch_size), dtype=np.bool_)
+                )
+            do_cond(op, cm)
 
     def leakage_swap(self, op: stim.CircuitInstruction, tss: BatchedLeakageSimulator) -> None:
         """SWAP[LEAKAGE_SWAP]: SWAP the qubits in every shot, then swap leakage states."""
@@ -343,127 +402,65 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
         tss: BatchedLeakageSimulator,
         params: LeakageConditioningParams,
     ) -> None:
-        condition_groups = params.args
-        other_targets = params.targets
-        if other_targets:
-            # stim fuses k identical consecutive CONDITIONED_ON_OTHER lines into one op with k times
-            # the targets; each copy reuses the tag's controls.
-            copy_len = len(other_targets)
-            copies = split_fused_instruction(op, copy_len)
-            if len(copies) > 1 and not stim.gate_data(op.name).is_unitary:
-                # Noise has a no-op reference step, so loop (RNG draws as for k separate ops).
+        cg, ot = params.args, params.targets
+        gd = stim.gate_data(op.name)
+        if ot:
+            copies = split_fused_instruction(op, len(ot))
+            if len(copies) > 1 and not gd.is_unitary:
                 tss.do_copies_on_fused_step(
                     op, copies, lambda sub_op: self.leakage_conditioning(sub_op, tss, params)
                 )
                 return
-            # A unitary's reference step is the fused op, so tile the controls instead of looping.
-            other_targets = other_targets * len(copies)
-        gd = stim.gate_data(op.name)
-        raw_targets = op.targets_copy()
-        if gd.is_unitary and any(0 in g or 1 in g for g in condition_groups):
+            ot = ot * len(copies)
+        raw_t = op.targets_copy()
+        cg2 = cast(tuple[tuple[int | str, ...], tuple[int | str, ...]], cg)
+        if gd.is_unitary and any(0 in g or 1 in g for g in cg):
             t_groups = op.target_groups()
             if len(t_groups) > 1:
                 all_qs = [
-                    t.qubit_value
-                    for grp in t_groups
-                    for t in grp
-                    if t.qubit_value is not None
+                    t.qubit_value for grp in t_groups for t in grp if t.qubit_value is not None
                 ]
-                if other_targets:
-                    all_qs.extend(other_targets)
+                if ot:
+                    all_qs.extend(ot)
                 if len(set(all_qs)) < len(all_qs):
                     def _eval_group_cond(g_idx: int) -> NDArray[np.bool_]:
                         grp = t_groups[g_idx]
-                        if other_targets:
-                            step_ot = len(other_targets) // len(t_groups)
-                            sub_ot = list(
-                                other_targets[
-                                    g_idx * step_ot : (g_idx + 1) * step_ot
-                                ]
-                            )
+                        if ot:
+                            step = len(ot) // len(t_groups)
                             return self._filter_targets_1q_mask(
-                                sub_ot,
-                                cast(
-                                    tuple[tuple[int | str, ...], ...],
-                                    condition_groups,
-                                ),
-                                tss,
+                                list(ot[g_idx * step : (g_idx + 1) * step]), cg, tss
                             )[0]
-                        if len(condition_groups) == 1:
-                            sub_qs = [
-                                t.qubit_value if t.qubit_value is not None else -1
-                                for t in grp
-                            ]
+                        if len(cg) == 1:
                             return self._filter_targets_1q_mask(
-                                sub_qs, condition_groups, tss
+                                [t.qubit_value if t.qubit_value is not None else -1 for t in grp],
+                                cg, tss,
                             )[0]
-                        pair = [
-                            [
-                                grp[0].qubit_value
-                                if grp[0].qubit_value is not None
-                                else -1,
-                                grp[1].qubit_value
-                                if grp[1].qubit_value is not None
-                                else -1,
-                            ]
-                        ]
-                        return self._filter_targets_2q_mask(
-                            pair,
-                            cast(
-                                tuple[
-                                    tuple[int | str, ...],
-                                    tuple[int | str, ...],
-                                ],
-                                condition_groups,
-                            ),
-                            tss,
-                        )[0]
+                        pair = [[
+                            grp[0].qubit_value if grp[0].qubit_value is not None else -1,
+                            grp[1].qubit_value if grp[1].qubit_value is not None else -1,
+                        ]]
+                        return self._filter_targets_2q_mask(pair, cg2, tss)[0]
 
-                    tss.do_conditional_clifford(
-                        op, condition_group_fn=_eval_group_cond
-                    )
+                    tss.do_conditional_clifford(op, condition_group_fn=_eval_group_cond)
                     return
-        if other_targets:
-            if len(other_targets) != len(raw_targets):
+        if ot:
+            if len(ot) != len(raw_t):
                 raise ValueError(
                     f"The number of targets of the {op} is not the same as the "
                     "number of targets specified in the CONDITIONED_ON_OTHER tag."
                 )
+            cond_mask = self._filter_targets_1q_mask(list(ot), cg, tss)
+        elif len(cg) == 1:
             cond_mask = self._filter_targets_1q_mask(
-                list(other_targets),
-                cast(tuple[tuple[int | str, ...], ...], condition_groups),
-                tss,
+                [t.qubit_value if t.qubit_value is not None else -1 for t in raw_t], cg, tss
             )
         else:
-            if len(condition_groups) == 1:
-                targets = [
-                    t.qubit_value if t.qubit_value is not None else -1
-                    for t in raw_targets
-                ]
-                cond_mask = self._filter_targets_1q_mask(
-                    targets, condition_groups, tss
-                )
-            else:
-                target_pairs = [
-                    [
-                        grp[0].qubit_value
-                        if grp[0].qubit_value is not None
-                        else -1,
-                        grp[1].qubit_value
-                        if grp[1].qubit_value is not None
-                        else -1,
-                    ]
-                    for grp in op.target_groups()
-                ]
-                cond_mask = self._filter_targets_2q_mask(
-                    target_pairs,
-                    cast(
-                        tuple[tuple[int | str, ...], tuple[int | str, ...]],
-                        condition_groups,
-                    ),
-                    tss,
-                )
-
+            pairs = [
+                [g[0].qubit_value if g[0].qubit_value is not None else -1,
+                 g[1].qubit_value if g[1].qubit_value is not None else -1]
+                for g in op.target_groups()
+            ]
+            cond_mask = self._filter_targets_2q_mask(pairs, cg2, tss)
         if gd.is_unitary:
             tss.do_conditional_clifford(op, cond_mask)
         else:
@@ -533,57 +530,93 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
                 else:
                     tss.apply_pauli(pauli, arr, 0.5)
 
+    def _attempt_project(
+        self, targets: NDArray[np.intp], css: BatchedLeakageSimulator, p_star: float
+    ) -> NDArray[np.bool_]:
+        self._ensure_batch_size(css.batch_size)
+        comp = self._state[targets, :] < 2
+        attempt = np.zeros(comp.shape, dtype=np.bool_)
+        n_comp = int(np.count_nonzero(comp))
+        n_att = (
+            n_comp if p_star >= 1.0 - 1e-12
+            else (0 if p_star <= 0.0 else int(css.np_rng.binomial(n_comp, p_star)))
+        )
+        if n_att > 0:
+            rows_c, shots_c = np.nonzero(comp)
+            pick: slice | NDArray[np.intp] = (
+                slice(None) if n_att == n_comp else css.np_rng.choice(n_comp, n_att, replace=False)
+            )
+            attempt[rows_c[pick], shots_c[pick]] = True
+        if n_att < n_comp:
+            self._scratch_pauli_Z.fill(False)
+            self._scratch_pauli_Z[targets, :] = comp & ~attempt
+            css.apply_pauli("Z", self._scratch_pauli_Z, 0.5)
+        rows = np.flatnonzero(attempt.any(axis=1))
+        if len(rows) == 0:
+            return attempt
+        p1_mat = css.peek_pauli_born_batch(targets[rows], pauli="Z")
+        dirty = np.zeros(css.batch_size, dtype=np.bool_)
+        for j, i in enumerate(rows):
+            q, m = int(targets[i]), attempt[i]
+            p1_row = (
+                css.peek_pauli_born_batch([q], pauli="Z")[0]
+                if np.any(m & dirty) else p1_mat[j]
+            )
+            det_one = p1_row >= 1.0 - 1e-12
+            new_row = det_one.astype(np.uint8)
+            flip = m & (p1_row > 1e-12) & ~det_one
+            if np.any(flip):
+                p_sub = p1_row[flip]
+                p_arg = 0.5 if np.allclose(p_sub, 0.5, atol=1e-12) else p_sub
+                new_row[flip] = css.np_rng.binomial(1, p_arg, size=int(flip.sum())).astype(np.uint8)
+                css.postselect_z_batch(q, flip, new_row)
+                dirty |= flip
+            self._state[q, m] = new_row[m]
+        return attempt
+
     def leakage_transition_1(
-        self,
-        op: stim.CircuitInstruction,
-        tss: BatchedLeakageSimulator,
-        params: LeakageTransition1Params,
-        *,
-        _advance_step: bool = True,
+        self, op: stim.CircuitInstruction, tss: BatchedLeakageSimulator,
+        params: LeakageTransition1Params, *, _advance_step: bool = True,
     ) -> None:
         raw_t = op.targets_copy()
-        target_indices = [
-            t.qubit_value if t.qubit_value is not None else t.value
-            for t in raw_t
-        ]
+        target_indices = [t.qubit_value if t.qubit_value is not None else t.value for t in raw_t]
         if _advance_step:
             tss._next_step_meta(op)
-        if len(target_indices) > 1 and len(set(target_indices)) < len(
-            target_indices
-        ):
+        if len(target_indices) > 1 and len(set(target_indices)) < len(target_indices):
             for t in raw_t:
-                sub_op = stim.CircuitInstruction(
-                    op.name, [t], op.gate_args_copy()
-                )
                 self.leakage_transition_1(
-                    sub_op, tss, params, _advance_step=False
+                    stim.CircuitInstruction(op.name, [t], op.gate_args_copy()),
+                    tss, params, _advance_step=False,
                 )
             return
         sorted_target_indices = np.array(sorted(set(target_indices)), dtype=np.intp)
-
-        to_depolarize = self._scratch_depolarize
-        to_set_to_one = self._scratch_set_one
-        to_set_to_zero = self._scratch_set_zero
-        to_depolarize.fill(False)
-        to_set_to_one.fill(False)
-        to_set_to_zero.fill(False)
-        effects = TransitionEffectMasks(
-            set_zero=to_set_to_zero, set_one=to_set_to_one, depolarize=to_depolarize
+        to_dep, to_one, to_zero = (
+            self._scratch_depolarize, self._scratch_set_one, self._scratch_set_zero
         )
-
+        to_dep.fill(False)
+        to_one.fill(False)
+        to_zero.fill(False)
+        effects = TransitionEffectMasks(to_zero, to_one, to_dep)
+        rngs = tss.sync_rngs()
+        batched = rngs is None and not (tss.batch_size == 1 and tss.seed is not None)
         peeked_01 = any(k in (0, 1) for k in params.args_by_input_state.keys())
+        attempt: NDArray[np.bool_] | None = None
+        p_star = 0.0
         if peeked_01:
-            self._update_state_from_peek_Z(sorted_target_indices, tss)
+            if self.fast_leakage and batched and "U" not in params.args_by_input_state:
+                p_star = max(
+                    float(sum(p for _, p in tr))
+                    for k, tr in params.args_by_input_state.items() if k in (0, 1)
+                )
+                attempt = self._attempt_project(sorted_target_indices, tss, p_star)
+            else:
+                self._update_state_from_peek_Z(sorted_target_indices, tss)
         target_states = self._state[sorted_target_indices, :].copy()
-
-        if (rngs := tss.sync_rngs()) is not None or (
-            tss.batch_size == 1 and tss.seed is not None
-        ):
+        if not batched:
             for input_state in params.args_by_input_state.keys():
                 for b in range(tss.batch_size):
                     in_mask_b = (
-                        target_states[:, b] < 2
-                        if input_state == "U"
+                        target_states[:, b] < 2 if input_state == "U"
                         else target_states[:, b] == input_state
                     )
                     ow_qs = sorted_target_indices[in_mask_b]
@@ -594,7 +627,10 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
                         input_state=input_state, num_samples=len(ow_qs), np_rng=rng_b
                     ).astype(str)
                     for q_np, out_st in zip(ow_qs, out_b):
-                        apply_output_effect(self._state, effects, (int(q_np), b), input_state, out_st)
+                        apply_output_effect(
+                            self._state, effects, (int(q_np), b), input_state, out_st,
+                            drop_depol_reset=self.fast_leakage,
+                        )
         else:
             for input_state, transitions in params.args_by_input_state.items():
                 total_p = float(sum(p for _, p in transitions))
@@ -603,14 +639,18 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
                 input_state_mask = (
                     target_states < 2 if input_state == "U" else target_states == input_state
                 )
+                if attempt is not None and input_state in (0, 1):
+                    input_state_mask &= attempt
+                    transitions = tuple((o, p / p_star) for o, p in transitions)
+                    total_p = min(1.0, total_p / p_star)
                 for out_s, r_sub, b_sub in sample_batched_group_transitions(
                     transitions, total_p, tss.np_rng, input_state_mask
                 ):
                     if len(r_sub) > 0 and str(out_s) != str(input_state):
                         apply_output_effect(
-                            self._state, effects, (sorted_target_indices[r_sub], b_sub), input_state, out_s
+                            self._state, effects, (sorted_target_indices[r_sub], b_sub),
+                            input_state, out_s, drop_depol_reset=self.fast_leakage,
                         )
-
         if peeked_01:
             self._clear_transient_ones(sorted_target_indices)
         self._apply_transition_effects(tss, effects)
@@ -704,11 +744,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
                     for pair, out_pair in zip(trig_pairs_b, out_b):
                         for leg in (0, 1):
                             apply_output_effect(
-                                self._state,
-                                effects,
-                                (int(pair[leg]), b),
-                                input_state[leg],
-                                out_pair[leg],
+                                self._state, effects, (int(pair[leg]), b),
+                                input_state[leg], out_pair[leg], drop_depol_reset=self.fast_leakage,
                             )
         else:
             for input_state, transitions in params.args_by_input_state.items():
@@ -735,7 +772,8 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
                         (odd_targets_arr[p_sub], input_state[1], out_pair[1]),
                     ):
                         apply_output_effect(
-                            self._state, effects, (q_sub, b_sub), in_s, out_s
+                            self._state, effects, (q_sub, b_sub), in_s, out_s,
+                            drop_depol_reset=self.fast_leakage,
                         )
 
         if peeked_2q:
@@ -992,7 +1030,7 @@ class CompiledLeakageUint8Coset(CompiledOpHandler[BatchedLeakageSimulator]):
                     )
 
         if not is_mpad:
-            if has_leaked:
+            if has_leaked and not self.fast_leakage:
                 leaked_zero_mask = self._scratch_set_zero
                 leaked_zero_mask.fill(False)
                 leaked_zero_mask[targets_arr, :] = leaked_mask

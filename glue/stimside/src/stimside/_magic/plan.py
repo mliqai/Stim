@@ -48,6 +48,7 @@ from stimside._magic.gates import (
     merge_and_validate_fault_channels,
     plain_qubits,
     spec_terms,
+    validate_circuit_ir,
 )
 from stimside._magic.phase_qfe import (
     OMEGA_ARR as _OMEGA_ARR,
@@ -312,14 +313,15 @@ def _lower_feedback_op(
 
 
 def _lower_unitary_op(st: _PassState, ins: IRInstr) -> None:
-    op = ins.op
-    name = op.name
-    if ins.arity is None:
+    op, name = ins.op, ins.op.name
+    if name in ("SPP", "SPP_DAG"):
         dag = name == "SPP_DAG"
         for grp_terms, grp_inv in split_pauli_product_targets(op):
             st.ref_chp.do_spp(grp_terms, negate=grp_inv, dag=dag)
             st.frame_events.append(LeftSppEvent(tuple(grp_terms), grp_inv, dag))
         return
+    if ins.arity is None:
+        raise ValueError(f"Unsupported Stim instruction {op!r}")
     targs = op.targets_copy()
     if ins.has_classical_control:
         _lower_feedback_op(st, op, targs)
@@ -380,7 +382,7 @@ def _lower_noise_op(st: _PassState, ins: IRInstr) -> None:
                 st, name, probs_15,
                 tuple([(q0, pair[0]), (q1, pair[1])] for pair in PAULI_2Q_ORDER),
             )
-    else:
+    elif name in {"E", "ELSE_CORRELATED_ERROR"}:
         p, is_else = float(args[0]), (name == "ELSE_CORRELATED_ERROR")
         simp_terms = reduce_pauli_product_targets(
             [tm for g_terms, _ in split_pauli_product_targets(op) for tm in g_terms]
@@ -401,6 +403,8 @@ def _lower_noise_op(st: _PassState, ins: IRInstr) -> None:
             )
         st.noise_max_choices.append(1)
         st.next_noise_idx += 1
+    else:
+        raise ValueError(f"Unsupported Stim instruction {op!r}")
 
 
 def _lower_meas_or_reset_op(st: _PassState, ins: IRInstr) -> None:
@@ -484,7 +488,7 @@ def _compile_circuit_pass(
     ir: CircuitIR | None = None,
 ) -> _CircuitPassResult:
     """Shared single-pass lowering for coordinates, direct, and selector plans."""
-    cir = build_ir(circuit) if ir is None else ir
+    cir = build_ir(circuit) if ir is None else validate_circuit_ir(circuit, ir)
     inline_faults = extract_inline_faults_from_ir(cir)
     prog_by_step, inline_by_step, all_channels = merge_and_validate_fault_channels(
         len(cir.instrs), inline_faults, fault_channels

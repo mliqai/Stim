@@ -17,7 +17,7 @@ import pytest
 import stim
 
 from stimside._coset.mrqf_state import MRQFState
-from stimside._native._kernel_loader import i32_p, u8_p, u64_p
+from stimside._native._kernel_loader import i64_p, u8_p, u64_p
 from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import LeakageUint8Coset
 from stimside.simulator_coset import CosetsideSimulator
 
@@ -43,6 +43,7 @@ _CIRCUIT = stim.Circuit(
     M 0 1 2 3
     """
 )
+_CIRCUIT_MX = stim.Circuit(str(_CIRCUIT[:-2]) + "\nH 0\nMX 0 1 2 3")
 _DET_MEASURE_CIRCUIT = stim.Circuit(
     """
     R 0 1 2 3
@@ -80,7 +81,6 @@ class _CountingLib:
         self._lib = lib
         self.fail_export_call = fail_export_call
         self.counts = {
-            "engine_import_shot": 0,
             "engine_clear": 0,
             "engine_export_shot_v3": 0,
         }
@@ -99,24 +99,67 @@ class _CountingLib:
         return counted
 
 
-def _seed_shot(sim: CosetsideSimulator, b: int, st: MRQFState) -> None:
+def _next_splitmix_bit(state: int) -> int:
+    m64 = 0xFFFFFFFFFFFFFFFF
+    s = (state + 0x9E3779B97F4A7C15) & m64
+    z = ((s ^ (s >> 30)) * 0xBF58476D1CE4E5B9) & m64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & m64
+    return (z ^ (z >> 31)) & 1
+
+
+def _seed_shots_d0(sim: CosetsideSimulator, shots: list[int], st: MRQFState) -> None:
     if sim._use_cpp and sim._cpp_lib is not None and sim._cpp_eng is not None:
-        m = max(1, st.d)
-        p_arr = np.array(st.P if st.d > 0 else [-1], dtype=np.int32)
-        sim._cpp_lib.engine_import_shot(
-            sim._cpp_eng,
-            b,
-            st.d,
-            np.ascontiguousarray(st.h_words, dtype=np.uint64).ctypes.data_as(u64_p),
-            np.ascontiguousarray(st.a_union, dtype=np.uint64).ctypes.data_as(u64_p),
-            np.ascontiguousarray(st._A_buf[:m], dtype=np.uint64).ctypes.data_as(u64_p),
-            np.ascontiguousarray(st._ell_buf[:m], dtype=np.uint8).ctypes.data_as(u8_p),
-            np.ascontiguousarray(st._Gamma_buf[:m, :m], dtype=np.uint8).ctypes.data_as(u8_p),
-            p_arr.ctypes.data_as(i32_p),
+        lib, eng = sim._cpp_lib, sim._cpp_eng
+        n_q, bs, nw = sim.num_qubits, sim.batch_size, sim._n_words
+        tg = np.zeros(1, dtype=np.int64)
+        cm = np.ones((1, bs), dtype=np.uint8)
+        for b in shots:
+            cm[0, b] = 0
+        xs = np.zeros((n_q, bs), dtype=np.uint8)
+        zs = np.zeros((n_q, bs), dtype=np.uint8)
+        z_pw = np.zeros((n_q, nw), dtype=np.uint64)
+        ox = np.zeros((n_q, bs), dtype=np.uint8)
+        oz = np.zeros((n_q, bs), dtype=np.uint8)
+        ax, az = ctypes.c_int(0), ctypes.c_int(0)
+        fk = np.ones(1, dtype=np.uint8)
+        z1 = np.zeros(1, dtype=np.uint8)
+        a1 = np.ascontiguousarray(st.h_words.reshape(1, nw), dtype=np.uint64)
+        b1 = np.zeros((1, nw), dtype=np.uint64)
+        lib.engine_batch_inject_general_clifford(
+            eng, 1, 1, 1, tg.ctypes.data_as(i64_p), cm.ctypes.data_as(u8_p),
+            xs.ctypes.data_as(u8_p), zs.ctypes.data_as(u8_p), fk.ctypes.data_as(u8_p),
+            z1.ctypes.data_as(u8_p), z1.ctypes.data_as(u8_p),
+            a1.ctypes.data_as(u64_p), b1.ctypes.data_as(u64_p), z1.ctypes.data_as(u8_p),
+            z1.ctypes.data_as(u8_p), z1.ctypes.data_as(u8_p),
+            b1.ctypes.data_as(u64_p), b1.ctypes.data_as(u64_p), z1.ctypes.data_as(u8_p),
+            z_pw.ctypes.data_as(u64_p), z_pw.ctypes.data_as(u64_p),
+            ox.ctypes.data_as(u8_p), oz.ctypes.data_as(u8_p),
+            ctypes.byref(ax), ctypes.byref(az),
         )
+        rng_saved = np.zeros(bs, dtype=np.uint64)
+        assert lib.engine_get_rng_states(eng, bs, rng_saved.ctypes.data_as(u64_p)) == 0
+        b_meas = np.zeros(nw, dtype=np.uint64)
+        for w in range(nw - 1, -1, -1):
+            val = int(st.h_words[w])
+            if val:
+                b_meas[w] = np.uint64(1 << (val.bit_length() - 1))
+                break
+        for b in shots:
+            xs[0, b] = np.uint8(_next_splitmix_bit(int(rng_saved[b])) ^ 1)
+        m_out = np.zeros(bs, dtype=np.uint8)
+        lib.engine_batch_mixed_substep(
+            eng, 0, 0, 0, 0,
+            b_meas.ctypes.data_as(u64_p), b_meas.ctypes.data_as(u64_p),
+            b_meas.ctypes.data_as(u64_p), 0, 0, tg.ctypes.data_as(i64_p),
+            0, tg.ctypes.data_as(i64_p), xs.ctypes.data_as(u8_p), m_out.ctypes.data_as(u8_p),
+            ox.ctypes.data_as(u8_p), oz.ctypes.data_as(u8_p),
+            ctypes.byref(ax), ctypes.byref(az),
+        )
+        assert lib.engine_set_rng_states(eng, rng_saved.ctypes.data_as(u64_p)) == 0
         sim._cpp_dirty = True
     else:
-        sim._active_shots[b] = st
+        for b in shots:
+            sim._active_shots[b] = st.copy()
 
 
 def _install_counting_lib(sim: CosetsideSimulator, **kwargs) -> _CountingLib:
@@ -185,7 +228,6 @@ def test_cpp_ops_and_peeks_never_import_from_python(batch: int) -> None:
         for _ in range(5):
             sim.peek_pauli_batch([1], "Z")
         assert sim._cpp_dirty
-    assert lib.counts["engine_import_shot"] == 0
     assert lib.counts["engine_clear"] == 0
     assert len(sim.active_shots) > 0
     assert not sim._cpp_dirty
@@ -202,7 +244,6 @@ def test_empty_order_reset_does_not_clear_cpp_dirty_or_import(batch: int) -> Non
     sim.do_unmatched_noisy_reset_z(np.zeros_like(r1), r1, "X", order=[])
     assert sim._cpp_dirty
     peeks = _peek_all(sim)
-    assert lib.counts["engine_import_shot"] == 0
     assert lib.counts["engine_clear"] == 0
     assert len(sim.active_shots) > 0
     assert not sim._cpp_dirty
@@ -269,11 +310,10 @@ def test_healed_shot_with_nonzero_h_seeded_into_engine_agrees_with_python(batch:
         sim = _setup_sim(batch, use_cpp, _DET_MEASURE_CIRCUIT)
         free = [b for b in range(batch) if b not in sim.active_shots][-3:]
         assert len(free) == 3
-        for b in free:
-            healed = MRQFState(sim.num_qubits, sim._n_words)
-            healed.h_words[0] ^= np.uint64(0b1011)
-            assert healed.d == 0
-            _seed_shot(sim, b, healed)
+        healed = MRQFState(sim.num_qubits, sim._n_words)
+        healed.h_words[0] ^= np.uint64(0b1011)
+        assert healed.d == 0
+        _seed_shots_d0(sim, free, healed)
         _peek_all(sim)
         for inst in list(_DET_MEASURE_CIRCUIT)[_N_SETUP:]:
             sim.interactive_do(inst)
@@ -594,7 +634,7 @@ def _measure(circuit: stim.Circuit) -> Callable[[CosetsideSimulator], None]:
 
 _KERNEL_CASES = [
     pytest.param(
-        "engine_batch_inject_general_clifford_v3",
+        "engine_batch_inject_unitary_v4",
         _DISJOINT_CX_CIRCUIT,
         _cc_disjoint,
         1,
@@ -629,17 +669,32 @@ _KERNEL_CASES = [
         id="postselect_Z",
     ),
     pytest.param(
-        "engine_batch_mixed_substep", _CIRCUIT, _measure(_CIRCUIT), 1, id="mixed_substep_1st"
+        "engine_batch_mixed_substep",
+        _CIRCUIT_MX,
+        _measure(_CIRCUIT_MX),
+        1,
+        id="mixed_substep_1st",
     ),
     pytest.param(
-        "engine_batch_mixed_substep", _CIRCUIT, _measure(_CIRCUIT), 2, id="mixed_substep_2nd"
+        "engine_batch_mixed_substep",
+        _CIRCUIT_MX,
+        _measure(_CIRCUIT_MX),
+        2,
+        id="mixed_substep_2nd",
     ),
     pytest.param(
-        "engine_batch_det_meas_step",
+        "engine_batch_meas_step_v4",
         _DET_MEASURE_CIRCUIT,
         _measure(_DET_MEASURE_CIRCUIT),
         1,
         id="measure_deterministic_batch",
+    ),
+    pytest.param(
+        "engine_batch_meas_step_v4",
+        _CIRCUIT,
+        _measure(_CIRCUIT),
+        1,
+        id="measure_mixed_v4",
     ),
 ]
 
@@ -924,7 +979,8 @@ def test_interrupt_after_the_first_nonrandom_mixed_kernel_leaves_a_flag_raised(
     batch: int,
 ) -> None:
     circuit = stim.Circuit(
-        str(_CIRCUIT[:_N_SETUP]) + "\nTICK\nSQRT_X 1 3 2 0\nTICK\nCX 1 0\nTICK\nM 0 1 2 3"
+        str(_CIRCUIT[:_N_SETUP])
+        + "\nTICK\nSQRT_X 1 3 2 0\nTICK\nCX 1 0\nTICK\nH 0 1 2 3\nMX 0 1 2 3"
     )
     sim = _setup_sim(batch, True, circuit)
     _peek_all(sim)

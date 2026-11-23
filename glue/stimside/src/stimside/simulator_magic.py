@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import collections
 import copy
+import ctypes
 import dataclasses
 import functools
 import math
 import pickle
 import struct
 import types
+import warnings
 import weakref
 from typing import Any, Callable, Literal, Mapping, Sequence
 
@@ -28,9 +30,9 @@ from stimside._magic.channels import (
 )
 from stimside._magic.live_store import (
     LiveExpansions, block_table, born_outcomes, engine_numerics_available, raise_born_failure,
-    raise_factor_failure, raise_split_failure, register_own_list,
+    raise_factor_failure, raise_split_failure, register_own_axis, register_own_list,
 )
-from stimside._native.magic_engine import CLS_ACTIVE, CLS_DEAD, CLS_TRIVIAL
+from stimside._native.magic_engine import CLS_ACTIVE, CLS_DEAD, CLS_TRIVIAL, MagicBatchEngine
 from stimside._magic.gates import (
     CliffordFaultChannel, CompiledPauliAxis, canonical_clifford_gate_name_and_arity,
     canonical_gate_data, coerce_strict_int, extract_inline_faults_from_ir,
@@ -53,32 +55,19 @@ from stimside.op_handlers.seam import SyncRngs
 from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import LeakageUint8Magic, _strip_circuit_for_noiseless_ref
 from stimside.op_handlers.leakage_handlers.tag_registry import MAGIC_TAGS as _MAGIC_TAGS, validate_magic_op
 from stimside.util.bitwords import (
-    first_set_bit_in_words,
-    unit_bit_words,
-    word_dot_parity,
-    words_any_nonzero,
+    first_set_bit_in_words, unit_bit_words, word_dot_parity, words_any_nonzero,
 )
 from stimside.util.circuit import (
-    apply_coords_op,
-    check_replay,
-    format_detector_flips,
-    pack_shot_flips,
-    reduce_hermitian_pauli_product,
-    stack_measurement_columns,
-    unroll_circuit,
+    apply_coords_op, check_replay, format_detector_flips, pack_shot_flips,
+    reduce_hermitian_pauli_product, stack_measurement_columns, unroll_circuit,
 )
 from stimside.util.circuit_ir import CircuitIR, build_ir
 from stimside.util.leakage_events import LeakageEvent, LeakageEventsRecorderMixin
 from stimside.util.reference_chp import PackedSymplecticTables, ReferenceCHPTableau
 from stimside.util.seeding import derived_seed
 from stimside.util.sync_rng import (
-    apply_sync_meas_flips,
-    build_sync_rngs,
-    conditioned_targets_per_shot,
-    draw_tab_rng_bit,
-    exec_sync_correlated_error,
-    exec_sync_heralded_noise,
-    exec_sync_pauli_batch,
+    apply_sync_meas_flips, build_sync_rngs, conditioned_targets_per_shot, draw_tab_rng_bit,
+    exec_sync_correlated_error, exec_sync_heralded_noise, exec_sync_pauli_batch,
 )
 from stimside.util.unleaked_to_leaked import UnleakedToLeakedRecordsMixin
 
@@ -100,6 +89,32 @@ _REF_MEMO_VERIFY = False
 _REF_MEMO_MAX_ENTRIES = 8192
 _REF_MEMO_MAX_BYTES = 32 * 1024 * 1024
 _MEMO_ENTRY_OVERHEAD = 128
+_I32_0, _I32_M1 = np.int32(0), np.int32(-1)
+_STD_BITGENS = (
+    np.random.PCG64, np.random.PCG64DXSM, np.random.MT19937, np.random.Philox, np.random.SFC64,
+)
+_ORIG_BORN, _ORIG_LIVE_EXP = born_outcomes, LiveExpansions
+_ORIG_SPLIT, _ORIG_FINISH = MagicBatchEngine.measure_split, MagicBatchEngine.measure_finish
+_LUT_1Q_X, _LUT_1Q_Z = np.array([1, 1, 0, 0], np.bool_), np.array([0, 1, 1, 0], np.bool_)
+_P2_EXT = (*PAULI_2Q_ORDER, "II")
+_LUT_2Q_X0 = np.array([p[0] in ("X", "Y") for p in _P2_EXT], np.bool_)
+_LUT_2Q_Z0 = np.array([p[0] in ("Z", "Y") for p in _P2_EXT], np.bool_)
+_LUT_2Q_X1 = np.array([p[1] in ("X", "Y") for p in _P2_EXT], np.bool_)
+_LUT_2Q_Z1 = np.array([p[1] in ("Z", "Y") for p in _P2_EXT], np.bool_)
+
+
+@functools.lru_cache(maxsize=256)
+def _pauli_noise_table(cname: str, args: tuple[float, ...]) -> NDArray[np.float64]:
+    probs = (
+        (args[0] / 3.0,) * 3 if cname == "DEPOLARIZE1"
+        else args[:3] if cname == "PAULI_CHANNEL_1"
+        else (args[0] / 15.0,) * 15 if cname == "DEPOLARIZE2" else args[:15]
+    )
+    acc, edges = 0.0, []
+    for pr in probs:
+        acc += pr
+        edges.append(acc)
+    return np.array(edges, dtype=np.float64)
 
 
 def _freeze_value(val: Any) -> None:
@@ -167,23 +182,19 @@ class _TrackedRefTableau(ReferenceCHPTableau):
             self._sid = None
         super().do_unitary(gate_name, targets)
 
-    def do_spp(
-        self, terms: Sequence[tuple[int, str]], *, negate: bool = False, dag: bool = False
-    ) -> None:
+    def do_spp(self, terms: Sequence[tuple[int, str]], *, negate: bool = False,
+               dag: bool = False) -> None:
         if not self._in_memo:
             self._sid = None
         super().do_spp(terms, negate=negate, dag=dag)
 
-    def apply_right_rot(
-        self, rot_a: NDArray[np.uint64], rot_b: NDArray[np.uint64], fac_kap: int
-    ) -> None:
+    def apply_right_rot(self, rot_a: NDArray[np.uint64], rot_b: NDArray[np.uint64],
+                        fac_kap: int) -> None:
         if not self._in_memo:
             self._sid = None
         super().apply_right_rot(rot_a, rot_b, fac_kap)
 
-    def measure_z(
-        self, q: int, *, is_reset: bool = False, m_ref_override: int = 0
-    ) -> Any:
+    def measure_z(self, q: int, *, is_reset: bool = False, m_ref_override: int = 0) -> Any:
         if not self._in_memo:
             self._sid = None
         return super().measure_z(q, is_reset=is_reset, m_ref_override=m_ref_override)
@@ -193,15 +204,11 @@ class _RefMemo:
     """Per-simulator bounded LRU memo keyed by hash-consed reference-tableau sid history."""
 
     def __init__(self, max_entries: int, max_bytes: int) -> None:
-        self.max_entries = max(0, int(max_entries))
-        self.max_bytes = max(0, int(max_bytes))
+        self.max_entries, self.max_bytes = max(0, int(max_entries)), max(0, int(max_bytes))
         self.max_trie = max(self.max_entries * 4, 32768)
         self.entries: collections.OrderedDict[Any, tuple[Any, int]] = collections.OrderedDict()
         self._trie: collections.OrderedDict[tuple[int, Any], int] = collections.OrderedDict()
-        self._next_sid = 0
-        self.total_bytes = 0
-        self.hits = 0
-        self.misses = 0
+        self._next_sid = self.total_bytes = self.hits = self.misses = 0
 
     def root_sid(self, n_qubits: int) -> int:
         return self.child(0, ("root", int(n_qubits)))
@@ -403,27 +410,12 @@ def _group_shots_by_state(exps: Sequence[ShotExpansion]) -> list[list[int]]:
 
 
 _IMMUTABLE_STIM_TYPES = (
-    stim.CircuitInstruction,
-    stim.CircuitRepeatBlock,
-    stim.GateTarget,
-    stim.DemInstruction,
-    stim.DemRepeatBlock,
-    stim.DemTarget,
-    stim.GateData,
-    stim.Flow,
+    stim.CircuitInstruction, stim.CircuitRepeatBlock, stim.GateTarget, stim.DemInstruction,
+    stim.DemRepeatBlock, stim.DemTarget, stim.GateData, stim.Flow,
 )
 _MEMO_SKIP_TYPES = (
-    type(None),
-    bool,
-    int,
-    float,
-    complex,
-    str,
-    bytes,
-    type,
-    types.FunctionType,
-    types.BuiltinFunctionType,
-    types.ModuleType,
+    type(None), bool, int, float, complex, str, bytes, type,
+    types.FunctionType, types.BuiltinFunctionType, types.ModuleType,
 )
 
 
@@ -494,41 +486,29 @@ def _stim_deepcopy_memo(
 
 
 def _clone_op_handler(
-    handler: CompiledOpHandler[Any],
-    sim_orig: MagicsideSimulator | None = None,
+    handler: CompiledOpHandler[Any], sim_orig: MagicsideSimulator | None = None,
     sim_new: MagicsideSimulator | None = None,
 ) -> CompiledOpHandler[Any]:
-    from stimside.op_handlers.leakage_handlers.leakage_uint8_coset import (
-        CompiledLeakageUint8Coset,
-    )
-    from stimside.op_handlers.leakage_handlers.leakage_uint8_magic import (
-        CompiledLeakageUint8Magic,
-    )
+    from stimside.op_handlers.leakage_handlers import leakage_uint8_coset as _lc
+    from stimside.op_handlers.leakage_handlers import leakage_uint8_magic as _lm
 
-    if type(handler) in (CompiledLeakageUint8Coset, CompiledLeakageUint8Magic):
-        assert isinstance(handler, CompiledLeakageUint8Coset)
+    if type(handler) in (_lc.CompiledLeakageUint8Coset, _lm.CompiledLeakageUint8Magic):
+        assert isinstance(handler, _lc.CompiledLeakageUint8Coset)
         clone = copy.copy(handler)
         clone._state = handler._state.copy()
         clone._alloc_scratch(handler.batch_size)
         clone.ops_to_params = dict(handler.ops_to_params)
         clone.claimed_ops_keys = set(handler.claimed_ops_keys)
-        if (
-            isinstance(handler, CompiledLeakageUint8Magic)
-            and isinstance(clone, CompiledLeakageUint8Magic)
+        if isinstance(handler, _lm.CompiledLeakageUint8Magic) and isinstance(
+            clone, _lm.CompiledLeakageUint8Magic
         ):
             clone.u_measurement_ops = set(handler.u_measurement_ops)
             clone.magic_ops = {k: list(v) for k, v in handler.magic_ops.items()}
         return clone
-    if (
-        getattr(type(handler), "__copy__", None) is not None
-        and getattr(type(handler), "__deepcopy__", None) is None
-    ):
+    if (getattr(type(handler), "__copy__", None) is not None
+            and getattr(type(handler), "__deepcopy__", None) is None):
         return copy.copy(handler)
-    seed_memo = (
-        {id(sim_orig): sim_new}
-        if sim_orig is not None and sim_new is not None
-        else None
-    )
+    seed_memo = {id(sim_orig): sim_new} if sim_orig is not None and sim_new is not None else None
     memo = _stim_deepcopy_memo(handler, seed_memo)
     try:
         return copy.deepcopy(handler, memo)
@@ -549,10 +529,14 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     are not guarded and leave partial state. ``copy.copy(sim)`` clones mutable simulator
     state, stores, and op handlers into an independent instance. Custom user op handlers
     must be deep-copyable or define ``__copy__`` or ``__deepcopy__`` (otherwise
-    ``copy.copy(sim)`` raises ``TypeError`` naming the handler class); back-references to
-    the simulator inside a deep-copied handler are remapped to the new copy. Direct
-    ``copy.deepcopy(sim)`` and ``pickle.dumps(sim)`` raise ``TypeError``.
+    ``copy.copy(sim)`` raises ``TypeError`` naming the handler class); direct attributes,
+    bound methods, and nested containers holding back-references to the simulator inside a
+    deep-copied handler are remapped to the new copy, whereas ``weakref`` and closure
+    back-references are not remapped. Direct ``copy.deepcopy(sim)`` and ``pickle.dumps(sim)``
+    raise ``TypeError``.
     """
+
+    _use_fast_glue: bool = True
 
     def __init__(
         self, circuit: stim.Circuit, compiled_op_handler: CompiledOpHandler[Any] | None = None, *,
@@ -591,28 +575,33 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._explicit_ref_sample = ref_arr.copy()
         self.num_qubits = int(circuit.num_qubits)
         ir = build_ir(circuit)
-        self._circuit_ir: CircuitIR | None = ir
-        self._circuit_snap: stim.Circuit | None = circuit.copy()
+        self._circuit_ir: CircuitIR = ir
+        self._circuit_snap: stim.Circuit = circuit.copy()
         self._unrolled_ops: list[stim.CircuitInstruction] = [ins.op for ins in ir.instrs]
         self._eff_m2d_mode: Literal["magicside", "stim", "zero"] = (
             ("magicside" if any(ins.tag in _MAGIC_TAGS for ins in ir.instrs) else "stim")
-            if self.m2d_reference_mode == "auto"
-            else self.m2d_reference_mode
+            if self.m2d_reference_mode == "auto" else self.m2d_reference_mode
         )
         inline_faults = extract_inline_faults_from_ir(ir)
         self._user_fault_channels = tuple(fault_channels) if fault_channels is not None else None
-        (
-            self._prog_faults,
-            self._inline_faults,
-            self._all_fault_channels,
-        ) = merge_and_validate_fault_channels(len(ir.instrs), inline_faults, fault_channels)
+        self._prog_faults, self._inline_faults, self._all_fault_channels = (
+            merge_and_validate_fault_channels(len(ir.instrs), inline_faults, fault_channels)
+        )
         self._logical_nq = max([self.num_qubits] + [q + 1 for ch in self._all_fault_channels for b in ch.branches for q in b.targets])
         self._eff_nq = infer_total_data_qubits(circuit, self._all_fault_channels)
         self._tab_scratch_q = self.num_qubits
         self._sweep_mat = _normalize_sweep_matrix(sweep_bits, self.batch_size)
         if compiled_op_handler is None and op_handler is not None:
             compiled_op_handler = op_handler.compile_op_handler(circuit=circuit, batch_size=self.batch_size)
-        self._compiled_op_handler: CompiledOpHandler[Any] = _TrivialCompiledOpHandler() if compiled_op_handler is None else compiled_op_handler
+        self._compiled_op_handler: CompiledOpHandler[Any] = (
+            _TrivialCompiledOpHandler() if compiled_op_handler is None else compiled_op_handler
+        )
+        if self._prog_faults and getattr(self._compiled_op_handler, "_fast_1q", False):
+            self._compiled_op_handler._fast_1q = False  # type: ignore[attr-defined]
+            warnings.warn(
+                "Programmatic fault channels disable single-qubit fast-leakage acceleration.",
+                UserWarning, stacklevel=2,
+            )
         self._has_trivial_handler = isinstance(self._compiled_op_handler, _TrivialCompiledOpHandler)
         self.compiled_op_handler = self._compiled_op_handler
         if (self.backend == "QUERY" or self.fault_mode == "SELECTOR") and (not self._has_trivial_handler or self.sync_tableside_rng):
@@ -643,10 +632,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 "fault_realizations must be a Mapping or Sequence of length batch_size"
             )
         f_max = [len(ch.branches) for ch in self._all_fault_channels]
-        f_id_map = {
-            int(ch.slot_id): i  # type: ignore[arg-type]
-            for i, ch in enumerate(self._all_fault_channels)
-        }
+        f_id_map = {int(c.slot_id): i for i, c in enumerate(self._all_fault_channels)
+                    if c.slot_id is not None}
         raw_seq = (
             [fault_realizations] if isinstance(fault_realizations, Mapping) else fault_realizations
         )
@@ -669,25 +656,16 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if any("sweep_bits" in nr for nr in parsed):
             assert self._norm_reals is not None
             rows = [
-                nr["sweep_bits"]
-                if "sweep_bits" in nr
+                nr["sweep_bits"] if "sweep_bits" in nr
                 else (self._sweep_mat[s] if self._sweep_mat is not None else ())
                 for s, nr in enumerate(self._norm_reals)
             ]
-            self._sweep_mat = np.zeros(
-                (self.batch_size, max(len(r) for r in rows)), dtype=np.bool_
-            )
+            self._sweep_mat = np.zeros((self.batch_size, max(len(r) for r in rows)), dtype=np.bool_)
             for s, r in enumerate(rows):
                 self._sweep_mat[s, : len(r)] = r
 
     def _cached_ir(self) -> CircuitIR | None:
-        if (
-            self._circuit_ir is not None
-            and self._circuit_snap is not None
-            and self.circuit == self._circuit_snap
-        ):
-            return self._circuit_ir
-        return None
+        return self._circuit_ir if self.circuit == self._circuit_snap else None
 
     def _init_rngs(self) -> None:
         if not self.sync_tableside_rng:
@@ -710,8 +688,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
         zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
         exec_sync_pauli_batch(self._tab_rngs, self._tab_rngs_x, op_name, targets_per_shot, gate_args, xm, zm)
-        self._apply_pauli_mask("X", xm)
-        self._apply_pauli_mask("Z", zm)
+        self._apply_pauli_masks_xz(xm, zm)
 
     sample_pauli_noise_sync = _sample_pauli_noise_via_tab_rng
 
@@ -742,15 +719,14 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self.qubit_tags: dict[int, str] = {}
         self.coords_shifts: list[float] = []
         self._init_rngs()
+        self._bitgen_cache: tuple[Any, int, int] | None = None
         self._compiled_op_handler.clear()
         if self.record_unleaked_to_leaked:
             self._unleaked_to_leaked_events = [[] for _ in range(self.batch_size)]
         if self.record_leakage_events:
             self._leakage_events = [[] for _ in range(self.batch_size)]
         self._circuit_time = 0
-        self._used_interactively = False
-        self._finished_running_circuit = False
-        self._started = False
+        self._used_interactively = self._finished_running_circuit = self._started = False
         self._live_ref_tab: ReferenceCHPTableau = (
             self._new_ref_tab() if _REF_MEMO_ENABLED else ReferenceCHPTableau(self._eff_nq)
         )
@@ -790,12 +766,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         simulator. Returns ``get_unleaked_to_leaked_records()`` when
         ``record_unleaked_to_leaked`` is enabled, otherwise ``None``.
         """
-        if (
-            self._started
-            or self._used_interactively
-            or self._circuit_time != 0
-            or self._finished_running_circuit
-        ):
+        if (self._started or self._used_interactively or self._circuit_time != 0
+                or self._finished_running_circuit):
             raise ValueError("MagicsideSimulator is not clean; call .clear() before .run().")
         self._started = True
         can_use_compiled = self._has_trivial_handler and not self.sync_tableside_rng
@@ -804,7 +776,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         elif can_use_compiled and (self.fault_mode == "SELECTOR" or self._norm_reals is not None):
             self._run_compiled_stream()
         else:
-            if self._circuit_snap is not None and self.circuit == self._circuit_snap:
+            if self.circuit == self._circuit_snap:
                 for op in self._unrolled_ops:
                     self._do_instruction(op)
             else:
@@ -835,12 +807,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def _ensure_query_plan(self) -> PreparedQueryPlan:
         if self._compiled_query_plan is None:
             self._compiled_query_plan = _prepare_queries_from_ir(
-                self.circuit,
-                fault_mode=self.fault_mode,
-                fault_channels=self._user_fault_channels,
-                budget=self.query_budget,
-                atol=self.atol,
-                ir=self._cached_ir(),
+                self.circuit, fault_mode=self.fault_mode, fault_channels=self._user_fault_channels,
+                budget=self.query_budget, atol=self.atol, ir=self._cached_ir(),
             )
         return self._compiled_query_plan
 
@@ -1012,6 +980,18 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             ax = self._compile_axis([(int(q_np), pauli)])
             self._apply_axis_to_shots(ax, mask[int(q_np)])
 
+    def _apply_pauli_masks_xz(self, xm: NDArray[np.bool_], zm: NDArray[np.bool_]) -> None:
+        store = self._live_exps
+        if type(store) is _ORIG_LIVE_EXP and self._use_fast_glue and not _REF_MEMO_VERIFY:
+            xm_s, zm_s = xm[: self._eff_nq], zm[: self._eff_nq]
+            if not (xm_s.any() or zm_s.any()):
+                return
+            self._flush_magic()
+            store.apply_pauli_noise_batch(self._live_ref_tab, xm_s, zm_s)
+            return
+        self._apply_pauli_mask("X", xm)
+        self._apply_pauli_mask("Z", zm)
+
     def _fresh_live_exps(self) -> list[ShotExpansion] | LiveExpansions:
         """`ShotExpansion.zero` for every shot: a list, or the (reused) engine-backed store."""
         if not (_LIVE_STORE_ENGINE and engine_numerics_available()):
@@ -1029,58 +1009,48 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         """Return an independent simulator copy in both engine-backed and Python-list modes."""
         new = self.__class__.__new__(self.__class__)
         new.__dict__.update(self.__dict__)
-        new._circuit_ir = None
-        new._circuit_snap = None if self._circuit_snap is None else self._circuit_snap.copy()
+        new._circuit_ir = copy.copy(self._circuit_ir)
+        new._circuit_snap = self._circuit_snap.copy()
         store: LiveExpansions | None = self.__dict__.get("_live_store")
         in_use = store is not None and self._live_exps is store
         if store is not None:
             new_store = (
-                store.copy()
-                if in_use
+                store.copy() if in_use
                 else LiveExpansions(store.batch_size, store.n_qubits, store.atol)
             )
             new._live_store = new_store
-            new._live_exps = (
-                new_store
-                if in_use
-                else [exp.copy() for exp in self._live_exps]
-            )
+            new._live_exps = new_store if in_use else [exp.copy() for exp in self._live_exps]
         else:
             new._live_exps = [exp.copy() for exp in self._live_exps]
         new._pending_magic = list(self._pending_magic)
         new._measurement_columns = [col.copy() for col in self._measurement_columns]
         new._cached_m2d = (
-            None
-            if self._cached_m2d is None
+            None if self._cached_m2d is None
             else (self._cached_m2d[0].copy(), self._cached_m2d[1].copy())
         )
         new._log_branch_masses = self._log_branch_masses.copy()
         new._corr_occurred = self._corr_occurred.copy()
         new._live_ref_tab = self._live_ref_tab.copy()
         new._live_frame_events = list(self._live_frame_events)
-        new._shot_tabs = (
-            None if self._shot_tabs is None else [t.copy() for t in self._shot_tabs]
-        )
+        new._shot_tabs = None if self._shot_tabs is None else [t.copy() for t in self._shot_tabs]
         new._shot_sel_bits = (
-            None
-            if self._shot_sel_bits is None
+            None if self._shot_sel_bits is None
             else [None if sb is None else sb.copy() for sb in self._shot_sel_bits]
         )
         new.qubit_coords = {k: list(v) for k, v in self.qubit_coords.items()}
-        new.qubit_tags = dict(self.qubit_tags)
-        new.coords_shifts = list(self.coords_shifts)
+        new.qubit_tags, new.coords_shifts = dict(self.qubit_tags), list(self.coords_shifts)
         new._unleaked_to_leaked_events = [list(ev) for ev in self._unleaked_to_leaked_events]
         new._leakage_events = [list(ev) for ev in self._leakage_events]
         new._ref_sample_cache = dict(self._ref_sample_cache)
         if self._shot_np_rngs is not None:
             new._shot_np_rngs = [copy.deepcopy(r) for r in self._shot_np_rngs]
             new.np_rng = (
-                new._shot_np_rngs[0]
-                if self.np_rng is self._shot_np_rngs[0]
+                new._shot_np_rngs[0] if self.np_rng is self._shot_np_rngs[0]
                 else copy.deepcopy(self.np_rng)
             )
         else:
             new.np_rng = copy.deepcopy(self.np_rng)
+        new._bitgen_cache = None
         if self._tab_rngs is not None:
             new._tab_rngs = [t.copy(copy_rng=True) for t in self._tab_rngs]
         if self._tab_rngs_x is not None:
@@ -1149,6 +1119,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             return hit
         ax = compile_pauli_product(tab, terms_t, negate=neg)
         memo.put(key, ax, _value_nbytes(ax) + _MEMO_ENTRY_OVERHEAD)
+        if memo.get_quiet(key) is ax:
+            register_own_axis(ax)
         return ax
 
     def _compile_factors(
@@ -1173,82 +1145,63 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             register_own_list(fac)
         return fac
 
-    def _do_unitary_ref(self, canon: str, grp: tuple[int, ...]) -> None:
-        info = self._memo_tab()
+    def _step_ref_memo(
+        self, step: tuple[Any, ...], ev: FrameEvent, apply: Callable[[ReferenceCHPTableau], None],
+        label: str, info: tuple[_RefMemo, _TrackedRefTableau, int] | None,
+    ) -> None:
         if info is None:
-            self._live_ref_tab.do_unitary(canon, grp)
-            self._live_frame_events.append(LeftUnitaryEvent(canon, grp))
+            apply(self._live_ref_tab)
+            self._live_frame_events.append(ev)
             return
         memo, tab, sid = info
-        key = ("u", sid, canon, grp)
+        key = (step[0], sid, *step[1:])
         hit = memo.get(key)
         if hit is not None:
-            next_sid, packed, ev = hit
+            next_sid, packed, h_ev = hit
             if _REF_MEMO_VERIFY:
                 chk = tab.copy()
-                chk.do_unitary(canon, grp)
-                assert _tab_equal(chk, packed), "E1 unitary memo mismatch"
+                apply(chk)
+                assert _tab_equal(chk, packed), f"E1 {label} memo mismatch"
             self._restore_tracked_tab(memo, next_sid, packed)
-            self._live_frame_events.append(ev)
+            self._live_frame_events.append(h_ev)
             return
         tab._in_memo = True
         try:
-            tab.do_unitary(canon, grp)
+            apply(tab)
         except Exception:
             tab._sid = None
             raise
         finally:
             tab._in_memo = False
-        ev = LeftUnitaryEvent(canon, grp)
         self._live_frame_events.append(ev)
-        next_sid = memo.child(sid, ("u", canon, grp))
-        packed = tab.snapshot_packed()
+        next_sid, packed = memo.child(sid, step), tab.snapshot_packed()
         tab._sid = next_sid
         memo.put(key, (next_sid, packed, ev), _packed_nbytes(packed) + _MEMO_ENTRY_OVERHEAD)
+
+    def _do_unitary_ref(self, canon: str, grp: tuple[int, ...]) -> None:
+        info = self._memo_tab()
+        if info is not None and not _REF_MEMO_VERIFY:
+            key = ("u", info[2], canon, grp)
+            if info[0].get_quiet(key) is not None and (hit := info[0].get(key)) is not None:
+                self._restore_tracked_tab(info[0], hit[0], hit[1])
+                self._live_frame_events.append(hit[2])
+                return
+        self._step_ref_memo(
+            ("u", canon, grp), LeftUnitaryEvent(canon, grp), lambda t: t.do_unitary(canon, grp),
+            "unitary", info,
+        )
 
     def _do_spp_ref(
         self, terms: Sequence[tuple[int, str]], negate: bool, dag: bool
     ) -> None:
-        terms_t = tuple((int(q), p) for q, p in terms)
-        neg, is_dag = bool(negate), bool(dag)
-        info = self._memo_tab()
-        if info is None:
-            self._live_ref_tab.do_spp(terms_t, negate=neg, dag=is_dag)
-            self._live_frame_events.append(LeftSppEvent(terms_t, neg, is_dag))
-            return
-        memo, tab, sid = info
-        key = ("spp", sid, terms_t, neg, is_dag)
-        hit = memo.get(key)
-        if hit is not None:
-            next_sid, packed, ev = hit
-            if _REF_MEMO_VERIFY:
-                chk = tab.copy()
-                chk.do_spp(terms_t, negate=neg, dag=is_dag)
-                assert _tab_equal(chk, packed), "E1 spp memo mismatch"
-            self._restore_tracked_tab(memo, next_sid, packed)
-            self._live_frame_events.append(ev)
-            return
-        tab._in_memo = True
-        try:
-            tab.do_spp(terms_t, negate=neg, dag=is_dag)
-        except Exception:
-            tab._sid = None
-            raise
-        finally:
-            tab._in_memo = False
-        ev = LeftSppEvent(terms_t, neg, is_dag)
-        self._live_frame_events.append(ev)
-        next_sid = memo.child(sid, ("spp", terms_t, neg, is_dag))
-        packed = tab.snapshot_packed()
-        tab._sid = next_sid
-        memo.put(key, (next_sid, packed, ev), _packed_nbytes(packed) + _MEMO_ENTRY_OVERHEAD)
+        terms_t, neg, is_dag = tuple((int(q), p) for q, p in terms), bool(negate), bool(dag)
+        self._step_ref_memo(
+            ("spp", terms_t, neg, is_dag), LeftSppEvent(terms_t, neg, is_dag),
+            lambda t: t.do_spp(terms_t, negate=neg, dag=is_dag), "spp", self._memo_tab(),
+        )
 
     def _compile_meas_ref(
-        self,
-        terms: Sequence[tuple[int, str]],
-        *,
-        invert_result: bool,
-        flip_prob: float,
+        self, terms: Sequence[tuple[int, str]], *, invert_result: bool, flip_prob: float,
         meas_index: int,
     ) -> MeasurementRecord:
         terms_t = tuple((int(q), p) for q, p in terms)
@@ -1300,17 +1253,15 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         else:
             next_sid, packed_out = sid, None
         nbytes = _value_nbytes(rec) + (_packed_nbytes(packed_out) if packed_out else 0)
-        memo.put(key, (rec, next_sid, packed_out, delta), nbytes + _MEMO_ENTRY_OVERHEAD)
+        val = (rec, next_sid, packed_out, delta)
+        memo.put(key, val, nbytes + _MEMO_ENTRY_OVERHEAD)
+        if memo.get_quiet(key) is val:
+            register_own_axis(rec.obs_axis)
         return rec
 
     def _compile_reset_ref(
-        self,
-        q: int,
-        basis: Literal["Z", "X", "Y"],
-        *,
-        meas_index: int | None,
-        invert_result: bool,
-        flip_prob: float,
+        self, q: int, basis: Literal["Z", "X", "Y"], *, meas_index: int | None,
+        invert_result: bool, flip_prob: float,
     ) -> ResetRecord:
         qi, inv, fp = int(q), bool(invert_result), float(flip_prob)
         info = self._memo_tab()
@@ -1360,7 +1311,11 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         else:
             next_sid, packed_out = sid, None
         nbytes = _value_nbytes(rec) + (_packed_nbytes(packed_out) if packed_out else 0)
-        memo.put(key, (rec, next_sid, packed_out, delta), nbytes + _MEMO_ENTRY_OVERHEAD)
+        val = (rec, next_sid, packed_out, delta)
+        memo.put(key, val, nbytes + _MEMO_ENTRY_OVERHEAD)
+        if memo.get_quiet(key) is val:
+            register_own_axis(rec.obs_axis)
+            register_own_axis(rec.reset_kick_axis)
         return rec
 
     def _apply_axis_to_shots(self, ax: Any, mask: NDArray[np.bool_]) -> None:
@@ -1463,9 +1418,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         pass
 
     def do_copies_on_fused_step(
-        self,
-        op: stim.CircuitInstruction,
-        copies: list[stim.CircuitInstruction],
+        self, op: stim.CircuitInstruction, copies: list[stim.CircuitInstruction],
         do_copy: Callable[[stim.CircuitInstruction], None],
     ) -> None:
         for sub_op in copies:
@@ -1480,10 +1433,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         for op in unroll_circuit(obj):
             if self._used_interactively:
                 check_replay(
-                    op,
-                    self._unrolled_ops,
-                    self._circuit_time,
-                    "MagicsideSimulator",
+                    op, self._unrolled_ops, self._circuit_time, "MagicsideSimulator",
                     num_qubits=self.num_qubits,
                     allow_tag=lambda tag: tag in _MAGIC_TAGS or tag.startswith("CLIFFORD_FAULT"),
                 )
@@ -1495,6 +1445,14 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             for slot_idx, ch in self._prog_faults[t]:
                 self._fire_fault_channel_live(slot_idx, ch)
         if op.tag.startswith("CLIFFORD_FAULT"):
+            if getattr(self._compiled_op_handler, "_fast_1q", False) and (
+                self.get_current_circuit_time()
+                >= getattr(self._compiled_op_handler, "_compiled_len", 0)
+            ):
+                raise ValueError(
+                    "Late CLIFFORD_FAULT instructions after the compiled circuit are unsupported "
+                    "while single-qubit fast-leakage acceleration is active."
+                )
             for slot_idx, ch in (self._inline_faults.get(t, ()) if t < n else ((-1, c) for c in parse_clifford_fault_instruction(op, t))):
                 self._fire_fault_channel_live(slot_idx, ch)
         elif apply_coords_op(op, self.qubit_coords, self.qubit_tags, self.coords_shifts):
@@ -1597,8 +1555,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 xm[q] ^= (r >= ci) & (r < cy)
                 zm[q] ^= (r >= cx) & (r < cz)
                 self._measurement_columns.append(r < cz)
-        self._apply_pauli_mask("X", xm)
-        self._apply_pauli_mask("Z", zm)
+        self._apply_pauli_masks_xz(xm, zm)
 
     def _apply_meas_flip_noise(self, p_err: float, num_m: int) -> None:
         if p_err <= 0.0 or num_m <= 0:
@@ -1635,21 +1592,45 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             else int(self._shot_np_rngs[b].random() < p1)  # type: ignore[index]
         )
 
+    def _bitgen_addrs(self) -> tuple[int, int]:
+        bg, c = self.np_rng.bit_generator, self._bitgen_cache
+        if c is not None and c[0] is bg:
+            return c[1], c[2]
+        fn = ctypes.cast(bg.ctypes.next_double, ctypes.c_void_p).value
+        assert fn is not None
+        self._bitgen_cache = (bg, fn, int(bg.ctypes.state_address))
+        return fn, self._bitgen_cache[2]
+
     def _project_substep_engine(
         self, store: LiveExpansions, rec: MeasurementRecord | ResetRecord
     ) -> NDArray[np.bool_]:
-        """`_project_substep_batch` with the shots in the engine: the C++ classifies, kicks the
-        trivial shots of a reset and projects both outcomes of the others (`measure_split`); the
-        decisions that need Python (checks, the draw, the sync callback, the log of the masses) stay
-        here, in the reference's order; `measure_finish` commits the chosen branches."""
-        obs = rec.obs_axis
-        reset = None
-        if isinstance(rec, ResetRecord):
-            kick = rec.reset_kick_axis
-            reset = (kick.a_words, kick.b_words, kick.kappa, rec.reset_flip_ref)
-        res = store.measure_split(
-            (obs.a_words, obs.b_words, obs.kappa), rec.rot_axis is not None, reset
+        """Engine measurement substep: single-call batch path or general two-call path."""
+        obs = store._owned_axis(rec.obs_axis)
+        reset = (
+            (store._owned_axis(rec.reset_kick_axis), rec.reset_flip_ref)
+            if isinstance(rec, ResetRecord) else None
         )
+        if (
+            self._use_fast_glue and self._tab_rngs is None
+            and type(self.np_rng) is np.random.Generator
+            and type(self.np_rng.bit_generator) in _STD_BITGENS
+            and born_outcomes is _ORIG_BORN and MagicBatchEngine.measure_split is _ORIG_SPLIT
+            and MagicBatchEngine.measure_finish is _ORIG_FINISH
+            and "measure_split" not in store.__dict__ and "measure_finish" not in store.__dict__
+        ):
+            rc, bits, aux = store.measure_step(
+                obs, rec.rot_axis is not None, reset, *self._bitgen_addrs(),
+                self._log_branch_masses,
+            )
+            if rc == 0:
+                return bits
+            if rc == 1:
+                raise_split_failure(aux, self._eff_nq, self.atol)
+            if rc == 2:
+                born_outcomes(aux, self.atol, self.np_rng, None)
+                raise RuntimeError("mbe_measure_step mass check rejected")
+            raise_factor_failure(aux, self._eff_nq, self.atol)
+        res = store.measure_split(obs, rec.rot_axis is not None, reset)
         m_shots = np.zeros(self.batch_size, dtype=np.bool_)
         self._log_branch_masses[res.cls == CLS_DEAD] = -math.inf
         triv = res.cls == CLS_TRIVIAL
@@ -1753,14 +1734,11 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 seen.clear()
             rec: MeasurementRecord | ResetRecord = (
                 self._compile_reset_ref(
-                    payload[0], payload[1],
-                    meas_index=0 if gd.produces_measurements else None,
+                    payload[0], payload[1], meas_index=0 if gd.produces_measurements else None,
                     invert_result=inv, flip_prob=0.0,
                 )
-                if gd.is_reset
-                else self._compile_meas_ref(
-                    payload, invert_result=inv, flip_prob=0.0, meas_index=0
-                )
+                if gd.is_reset else
+                self._compile_meas_ref(payload, invert_result=inv, flip_prob=0.0, meas_index=0)
             )
             m_shots = self._project_substep_batch(rec)
             if gd.produces_measurements:
@@ -1840,63 +1818,70 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         )
 
     def _apply_conditional_ref_step(
-        self,
-        mask_g: NDArray[np.bool_] | None,
-        advance_ref: Callable[[], None],
+        self, mask_g: NDArray[np.bool_] | None, advance_ref: Callable[[], None],
         compile_fac: Callable[[], CompiledCliffordFactorList],
     ) -> None:
-        if mask_g is None or np.all(mask_g):
+        if mask_g is None:
             advance_ref()
             return
         n_act = int(np.count_nonzero(mask_g))
+        if n_act == mask_g.size:
+            advance_ref()
+            return
         if n_act == 0:
             return
         self._flush_magic()
         fac = compile_fac()
         if 2 * n_act <= self.batch_size:
-            self._apply_factor_lists([fac], np.where(mask_g, 0, -1).astype(np.int32), False)
+            self._apply_factor_lists([fac], np.where(mask_g, _I32_0, _I32_M1), False)
         else:
             advance_ref()
-            self._apply_factor_lists([fac], np.where(mask_g, -1, 0).astype(np.int32), True)
+            self._apply_factor_lists([fac], np.where(mask_g, _I32_M1, _I32_0), True)
 
-    def do_conditional_pauli_noise(self, op: stim.CircuitInstruction, condition_met_mask: NDArray[np.bool_] | None = None) -> None:
+    def _do_correlated_pauli_noise(
+        self, cname: str, op: stim.CircuitInstruction, args: list[float],
+        condition_met_mask: NDArray[np.bool_] | None,
+    ) -> None:
+        p_c, raw_t = args[0] if args else 0.0, op.targets_copy()
+        xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+        zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+        if self._tab_rngs is not None:
+            assert self._tab_rngs_x is not None
+            exec_sync_correlated_error(
+                self._tab_rngs, self._tab_rngs_x, cname, raw_t, p_c, condition_met_mask, xm, zm
+            )
+        else:
+            if p_c <= 0.0:
+                if cname != "ELSE_CORRELATED_ERROR":
+                    self._corr_occurred.fill(False)
+                return
+            u = self.np_rng.random(self.batch_size)
+            if cname != "ELSE_CORRELATED_ERROR":
+                occ = u < p_c
+                self._corr_occurred[:] = occ
+            else:
+                occ = (~self._corr_occurred) & (u < p_c)
+                self._corr_occurred |= occ
+            if np.any(occ):
+                for t_idx, gt in enumerate(raw_t):
+                    if gt.qubit_value is None:
+                        continue
+                    hit = occ if condition_met_mask is None else (occ & condition_met_mask[t_idx])
+                    if gt.is_x_target or gt.is_y_target:
+                        xm[int(gt.qubit_value)] ^= hit
+                    if gt.is_z_target or gt.is_y_target:
+                        zm[int(gt.qubit_value)] ^= hit
+        self._apply_pauli_masks_xz(xm, zm)
+
+    def do_conditional_pauli_noise(
+        self, op: stim.CircuitInstruction, condition_met_mask: NDArray[np.bool_] | None = None
+    ) -> None:
         cname = canonical_gate_data(op.name).name
         if cname in ("I_ERROR", "II_ERROR", "I", "II"):
             return
         args = [float(a) for a in op.gate_args_copy()]
         if cname in ("CORRELATED_ERROR", "E", "ELSE_CORRELATED_ERROR"):
-            p_c = args[0] if args else 0.0
-            raw_t = op.targets_copy()
-            xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
-            zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
-            if self._tab_rngs is not None:
-                assert self._tab_rngs_x is not None
-                exec_sync_correlated_error(
-                    self._tab_rngs, self._tab_rngs_x, cname, raw_t, p_c, condition_met_mask, xm, zm
-                )
-            else:
-                if p_c <= 0.0:
-                    if cname != "ELSE_CORRELATED_ERROR":
-                        self._corr_occurred.fill(False)
-                    return
-                u = self.np_rng.random(self.batch_size)
-                if cname != "ELSE_CORRELATED_ERROR":
-                    occ = u < p_c
-                    self._corr_occurred[:] = occ
-                else:
-                    occ = (~self._corr_occurred) & (u < p_c)
-                    self._corr_occurred |= occ
-                if np.any(occ):
-                    for t_idx, gt in enumerate(raw_t):
-                        if gt.qubit_value is None:
-                            continue
-                        hit = occ if condition_met_mask is None else (occ & condition_met_mask[t_idx])
-                        if gt.is_x_target or gt.is_y_target:
-                            xm[int(gt.qubit_value)] ^= hit
-                        if gt.is_z_target or gt.is_y_target:
-                            zm[int(gt.qubit_value)] ^= hit
-            self._apply_pauli_mask("X", xm)
-            self._apply_pauli_mask("Z", zm)
+            self._do_correlated_pauli_noise(cname, op, args, condition_met_mask)
             return
         raw = [int(t.qubit_value) for t in op.targets_copy()]
         if not raw or not any(p > 0.0 for p in args):
@@ -1904,36 +1889,44 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         arity = 2 if cname in ("DEPOLARIZE2", "PAULI_CHANNEL_2") else 1
         if self._tab_rngs is not None:
             self._sample_pauli_noise_via_tab_rng(
-                cname, conditioned_targets_per_shot(raw, arity, self.batch_size, condition_met_mask), args
+                cname,
+                conditioned_targets_per_shot(raw, arity, self.batch_size, condition_met_mask), args,
             )
             return
-        groups = [raw[i : i + arity] for i in range(0, len(raw), arity)]
-        xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
-        zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
-        u = self.np_rng.random((len(groups), self.batch_size))
+        u = self.np_rng.random((len(raw) // arity, self.batch_size))
         if condition_met_mask is not None:
             u = np.where(condition_met_mask, u, 2.0)
         if cname in ("X_ERROR", "Y_ERROR", "Z_ERROR"):
-            terms: Sequence[tuple[str, float]] = [(cname[0], args[0])]
-        elif cname in ("DEPOLARIZE1", "PAULI_CHANNEL_1"):
-            probs1 = (args[0] / 3.0,) * 3 if cname == "DEPOLARIZE1" else (args[0], args[1], args[2])
-            terms = list(zip(("X", "Y", "Z"), probs1))
+            hit = u < args[0]
+            if not np.any(hit):
+                return
+            xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+            zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+            do_x, do_z = cname != "Z_ERROR", cname != "X_ERROR"
+            for g_i in np.flatnonzero(np.any(hit, axis=1)):
+                q = raw[int(g_i)]
+                if do_x:
+                    xm[q] ^= hit[g_i]
+                if do_z:
+                    zm[q] ^= hit[g_i]
         else:
-            probs2 = (args[0] / 15.0,) * 15 if cname == "DEPOLARIZE2" else tuple(args[:15])
-            terms = list(zip(PAULI_2Q_ORDER, probs2))
-        acc = 0.0
-        for label, pr in terms:
-            lo, acc = acc, acc + pr
-            hit = (u >= lo) & (u < acc)
-            if np.any(hit):
-                for g_i, grp in enumerate(groups):
-                    for k, pch in enumerate(label):
-                        if pch in ("X", "Y"):
-                            xm[grp[k]] ^= hit[g_i]
-                        if pch in ("Z", "Y"):
-                            zm[grp[k]] ^= hit[g_i]
-        self._apply_pauli_mask("X", xm)
-        self._apply_pauli_mask("Z", zm)
+            edges = _pauli_noise_table(cname, tuple(args))
+            idx = np.searchsorted(edges, u, side="right")
+            hit = idx < edges.size
+            if not np.any(hit):
+                return
+            xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+            zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+            for g_i in np.flatnonzero(np.any(hit, axis=1)):
+                gi, row = int(g_i), idx[int(g_i)]
+                if arity == 1:
+                    q0 = raw[gi]
+                    xm[q0], zm[q0] = xm[q0] ^ _LUT_1Q_X[row], zm[q0] ^ _LUT_1Q_Z[row]
+                else:
+                    q0, q1 = raw[2 * gi], raw[2 * gi + 1]
+                    xm[q0], zm[q0] = xm[q0] ^ _LUT_2Q_X0[row], zm[q0] ^ _LUT_2Q_Z0[row]
+                    xm[q1], zm[q1] = xm[q1] ^ _LUT_2Q_X1[row], zm[q1] ^ _LUT_2Q_Z1[row]
+        self._apply_pauli_masks_xz(xm, zm)
 
     def _engine_store(
         self, shots: Sequence[int] | NDArray[np.int_], *axes: Any
@@ -1973,7 +1966,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         is updated (scalar `np.log`, as the reference), then the failure, if any, is raised."""
         # `desired_bits` is a plain bool/integer array (`_plain_bits`): the low bit, vectorized
         want = (desired_bits[shots] & desired_bits.dtype.type(1)).astype(np.uint8)
-        res = store.postselect((obs.a_words, obs.b_words, obs.kappa), shots, want)
+        res = store.postselect(store._owned_axis(obs), shots, want)
         z01 = res.z01.tolist()
         for i in np.flatnonzero(res.done).tolist():
             z0, z1 = z01[i]
@@ -1990,7 +1983,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         one apply. The reference peeks, draws and applies shot by shot, so when a shot fails the
         draws made for the shots after it are taken back (the generator is restored and redrawn up
         to the failing shot), and a failing peek applies the shots before it first."""
-        o, k = (obs.a_words, obs.b_words, obs.kappa), (kick.a_words, kick.b_words, kick.kappa)
+        o, k = store._owned_axis(obs), store._owned_axis(kick)
         if self._tab_rngs is not None:
             return self._unmatched_sync(store, o, k, shots, one_mask)
         p1, peek_fail = store.peek(o, shots)
@@ -2010,7 +2003,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._engine_error(peek_fail, None, "mbe_peek")
 
     def _unmatched_sync(
-        self, store: LiveExpansions, o: tuple[Any, Any, int], k: tuple[Any, Any, int],
+        self, store: LiveExpansions, o: Any, k: Any,
         shots: NDArray[np.intp], one_mask: NDArray[np.int64],
     ) -> None:
         """Sync mode: every shot has its own streams, so shot by shot as the reference does."""
@@ -2034,8 +2027,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             )
             store = None if shared_obs is None else self._engine_store((), shared_obs)
             if store is not None and shared_obs is not None:
-                obs_t = (shared_obs.a_words, shared_obs.b_words, shared_obs.kappa)
-                p1, fail = store.peek(obs_t, np.arange(self.batch_size))
+                p1, fail = store.peek(
+                    store._owned_axis(shared_obs), np.arange(self.batch_size, dtype=np.int32)
+                )
                 self._engine_error(fail, None, "mbe_peek")
                 out[row_i] = p1
                 continue

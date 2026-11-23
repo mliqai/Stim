@@ -23,10 +23,12 @@ from stimside.op_handlers.leakage_handlers.tag_registry import check_tag_qubits
 from stimside.op_handlers.leakage_handlers.transition_effects import (
     TransitionEffectMasks,
     apply_output_effect,
+    check_late_frozen_read,
     dispatch_tagged_leakage_op,
     emit_tableau_transition_effects,
     eval_allowed_state_mask,
     exec_leakage_swap,
+    qualify_fast_1q,
     sample_tableau_transitions,
     unpack_leakage_measurement_targets,
 )
@@ -96,21 +98,28 @@ class LeakageUint8Tableau(OpHandler["TablesideSimulator"]):
             and resets are never filtered: they act on, or read, the frozen state.
             Details are in "Untagged Instructions on Leaked Qubits" in the top-level
             README.
+        fast_leakage: if True, enable distribution-preserving leakage speedups
+            (seeded outputs differ from default). See README for details.
     """
 
     unconditional_condition_on_U: bool = True
+    fast_leakage: bool = False
 
     def compile_op_handler(
         self, *, circuit: stim.Circuit, batch_size: int
     ) -> "CompiledLeakageUint8Tableau":
         parsed_ops = parse_leakage_in_circuit(circuit)
         check_tag_qubits(parsed_ops, circuit.num_qubits)
-        return CompiledLeakageUint8Tableau(
-            num_qubits=circuit.num_qubits,
-            batch_size=batch_size,
-            ops_to_params=parsed_ops,
-            unconditional_condition_on_U=self.unconditional_condition_on_U,
+        fast_1q, compiled_len = qualify_fast_1q(
+            circuit, parsed_ops, self.unconditional_condition_on_U, self.fast_leakage
         )
+        compiled = CompiledLeakageUint8Tableau(
+            num_qubits=circuit.num_qubits, batch_size=batch_size, ops_to_params=parsed_ops,
+            unconditional_condition_on_U=self.unconditional_condition_on_U,
+            fast_leakage=self.fast_leakage,
+        )
+        compiled._fast_1q, compiled._compiled_len = fast_1q, compiled_len
+        return compiled
 
 
 @dataclasses.dataclass
@@ -123,6 +132,11 @@ class CompiledLeakageUint8Tableau(CompiledOpHandler["TablesideSimulator"]):
     state: NDArray[np.uint8] = dataclasses.field(init=False)
 
     ops_to_params: dict[stim.CircuitInstruction, LeakageParams]
+    # Keyword-only, so that positional calls keep the parameter order they had before this option.
+    fast_leakage: bool = dataclasses.field(default=False, kw_only=True)
+    # Set by compile_op_handler from the circuit it compiles; not constructor parameters.
+    _fast_1q: bool = dataclasses.field(default=False, init=False)
+    _compiled_len: int = dataclasses.field(default=0, init=False)
 
     def __post_init__(self):
         self.claimed_ops_keys = set(self.ops_to_params.keys())
@@ -142,7 +156,8 @@ class CompiledLeakageUint8Tableau(CompiledOpHandler["TablesideSimulator"]):
         dataclass fields, every instance attribute of a subclass that shadows a base member, plus
         "claimed_ops_keys" if it differs from ops_to_params (the runners read only the latter):
         the precompiled runners would silently skip any of these."""
-        base_mro = CompiledLeakageUint8Tableau.__mro__
+        base = CompiledLeakageUint8Tableau
+        base_mro = base.__mro__
         names = [
             n
             for k in type(self).__mro__
@@ -150,8 +165,10 @@ class CompiledLeakageUint8Tableau(CompiledOpHandler["TablesideSimulator"]):
             for n, v in vars(k).items()
             if not _is_plain_member(n, v, n in vars(k).get("__dataclass_fields__", ()))
         ]
-        if type(self) is not CompiledLeakageUint8Tableau:  # the base type stays exempt (as at HEAD)
-            names += [n for n in vars(self) if hasattr(CompiledLeakageUint8Tableau, n)]
+        if type(self) is not base:  # the base type stays exempt (as at HEAD)
+            names += [
+                n for n in vars(self) if hasattr(base, n) and n not in base.__dataclass_fields__
+            ]
         if self.claimed_ops_keys != self.ops_to_params.keys():
             names.append("claimed_ops_keys")
         return list(dict.fromkeys(names))
@@ -367,6 +384,7 @@ class CompiledLeakageUint8Tableau(CompiledOpHandler["TablesideSimulator"]):
 
     def handle_op(self, op: stim.CircuitInstruction, sss: TablesideSimulator):
         """handle a single stim CircuitInstruction."""
+        check_late_frozen_read(self._fast_1q, self._compiled_len, op, sss, self.ops_to_params)
         if op not in self.claimed_ops_keys:
             if self.unconditional_condition_on_U and np.any(self.state >= 2):
                 op_name = op.name
@@ -374,6 +392,10 @@ class CompiledLeakageUint8Tableau(CompiledOpHandler["TablesideSimulator"]):
                 if gate_data.produces_measurements or not (
                     gate_data.is_noisy_gate or gate_data.is_unitary
                 ):
+                    sss._do_bare_instruction(op)
+                    return
+
+                if gate_data.is_single_qubit_gate and self._fast_1q:
                     sss._do_bare_instruction(op)
                     return
 
@@ -586,7 +608,10 @@ class CompiledLeakageUint8Tableau(CompiledOpHandler["TablesideSimulator"]):
             if not isinstance(sel, slice):
                 target_qs = target_qs[np.sort(sel)]
             for q_np, out_st in zip(target_qs, output_states):
-                apply_output_effect(self.state, effects, int(q_np), input_state, out_st)
+                apply_output_effect(
+                    self.state, effects, int(q_np), input_state, out_st,
+                    drop_depol_reset=self.fast_leakage,
+                )
 
         self.state[self.state == 1] = 0
         emit_tableau_transition_effects(tss, effects)
@@ -655,11 +680,8 @@ class CompiledLeakageUint8Tableau(CompiledOpHandler["TablesideSimulator"]):
             for pair, out_pair in zip(triggered_pairs, output_states):
                 for leg in (0, 1):
                     apply_output_effect(
-                        self.state,
-                        effects,
-                        int(pair[leg]),
-                        input_state[leg],
-                        out_pair[leg],
+                        self.state, effects, int(pair[leg]), input_state[leg], out_pair[leg],
+                        drop_depol_reset=self.fast_leakage,
                     )
 
         self.state[self.state == 1] = 0

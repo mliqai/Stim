@@ -122,6 +122,51 @@ What an untagged instruction does to a leaked qubit (`state >= 2`) depends on th
 
 An untagged `SWAP` never moves leakage states, in any simulator: each qubit keeps its own leakage state, and only the computational states (the Pauli frames in `FlipsideSimulator`) are swapped as described above. To move leakage with the qubits, use `SWAP[LEAKAGE_SWAP]`.
 
+### Fast Leakage Mode (`fast_leakage=True`)
+`LeakageUint8Tableau`, `LeakageUint8Coset`, and `LeakageUint8Magic` accept an opt-in
+`fast_leakage: bool = False` option. With `fast_leakage=False` (default), behavior and seeded
+outputs are unchanged bit for bit. With `fast_leakage=True`, the output distribution of every
+circuit is preserved, while seeded outputs differ from the default path and may change between
+versions:
+- **Single-qubit operations on leaked qubits:** On circuits where no instruction can read or
+  couple to a leaked qubit's stored computational state (no untagged measurement such as `M`,
+  `MX`, `MY`, `MR`, `MRX`, `MRY`, `MPP`, `MXX`, `MYY`, or `MZZ`; no two-qubit `CONDITIONED_ON_*`
+  tag with a leaked state key `2`–`9`; and no `I[CCZ]` or `CLIFFORD_FAULT`), untagged single-qubit
+  gates and single-qubit noise act on leaked qubits instead of being skipped per shot. Two-qubit
+  instructions, `CORRELATED_ERROR`/`ELSE_CORRELATED_ERROR`, and `SPP`/`SPP_DAG` keep the default
+  skipping rules.
+  - If a circuit contains an instruction that may read or couple to a leaked qubit's stored state,
+    single-qubit acceleration is automatically disabled with a `UserWarning` naming the first
+    preventing instruction, while the other `fast_leakage` optimizations remain active.
+  - If an instruction appended later via `interactive_do` past the compiled circuit would read or
+    couple to a leaked qubit's stored state (such as an untagged measurement, a two-qubit
+    `CONDITIONED_ON_*` tag with a leaked state key, `I[CCZ]`, or `I[CLIFFORD_FAULT: ...]`) while
+    single-qubit acceleration is active, a `ValueError` is raised. `CosetsideSimulator` raises it
+    before any instruction of the call has run; `TablesideSimulator` and `MagicsideSimulator`
+    raise it when they reach the instruction, after the call's earlier instructions have run.
+  - On `MagicsideSimulator`, programmatic `fault_channels` (`CliffordFaultChannel`, not present in
+    the circuit) automatically disable single-qubit fast-leakage acceleration with a
+    `UserWarning`, while the other `fast_leakage` optimizations remain active (inline
+    `I[CLIFFORD_FAULT: ...]` present in the construction circuit is likewise detected at compile
+    time and disables single-qubit acceleration with a `UserWarning`).
+  - With `unconditional_condition_on_U=False`, untagged instructions already act on leaked qubits,
+    so single-qubit acceleration is not needed and emits no warning.
+- **Attempt-only projection for `0`/`1`-conditioned `LEAKAGE_TRANSITION_1`:** In batch mode (when
+  not using `sync_tableside_rng=True` and when the tag has no `U` key), only the entries where the
+  transition is attempted are projected in the $Z$ basis, while unattempted unleaked entries
+  receive a 50% $Z$ phase flip—producing the exact same quantum channel and documented collapse
+  semantics with far fewer projections.
+- **Redundant resets dropped before full depolarization:** Resets immediately followed by full
+  depolarization (on returning from a leaked state to `U` or `D`, and before a batch-mode
+  leakage-aware measurement of a leaked target) are omitted.
+- **Unspecified leaked-qubit state and peeks:** Under `fast_leakage=True`, the stored
+  computational state of a leaked qubit is unspecified, so inspecting a leaked qubit directly
+  through Python peek methods may differ from the default path.
+- **Sync lockstep and `TablesideSimulator`:** When `fast_leakage=True` is set on all three
+  handlers, `TablesideSimulator`, `CosetsideSimulator`, and `MagicsideSimulator` remain in
+  shot-for-shot lockstep under `sync_tableside_rng=True`. Non-sync `TablesideSimulator.run()`
+  continues to use its native C++ path unchanged.
+
 ### `SWAP[LEAKAGE_SWAP]`
 `SWAP[LEAKAGE_SWAP] 0 1 2 3` is a `SWAP` that also swaps the leakage states of each target pair, in all four simulators. The tag takes no arguments and is only allowed on `SWAP`; anything else (e.g. `CX[LEAKAGE_SWAP]` or `SWAP[LEAKAGE_SWAP: (0.5)]`) raises `ValueError`.
 - **`TablesideSimulator`, `CosetsideSimulator`, and `MagicsideSimulator`:** every pair is swapped, leaked qubits included, whatever `unconditional_condition_on_U` is. A leaked qubit's frozen computational state moves with its leakage state, so the whole qubit moves: after `SWAP[LEAKAGE_SWAP] 0 1` with qubit 0 leaked and qubit 1 in `|1>`, qubit 1 is leaked and qubit 0 is in `|1>`.
@@ -163,6 +208,8 @@ An untagged `SWAP` never moves leakage states, in any simulator: each qubit keep
 >
 > **`TablesideSampler` statistics:** sinter counts every shot of a shared-trajectory batch as independent, so its error bars are too narrow; `TablesideSampler` therefore emits a `UserWarning` when constructed with `batch_size > 1` (it has no `sync_tableside_rng` option), and `batch_size=1` (the default) or `CosetsideSampler` gives independent shots.
 
+Constructing a `CompiledLeakageUint8Tableau` by hand with a parameter table that does not fit
+the circuit is not supported; compile it with `LeakageUint8Tableau.compile_op_handler` instead.
 
 ### Synchronized Shot-for-Shot Equivalence (`sync_tableside_rng=True`)
 Passing `sync_tableside_rng=True` to `TablesideSimulator` and `CosetsideSimulator` (with the same integer `seed` and `batch_size`, and likewise to `MagicsideSimulator` on Clifford-plus-leakage circuits) synchronizes all stabilizer measurement collapses, noise channels, herald draws, and leakage transition alias-table draws per shot (shot `n` of the run, counting across batches, is seeded with a splitmix64 hash of `seed` and `n`; without `sync_tableside_rng`, batch `n` is seeded the same way, so runs with different seeds don't share random streams), producing identical shot-for-shot measurement records, detector flips, observable flips, and `unleaked_to_leaked` event indices across the simulators. Caveats:

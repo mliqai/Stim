@@ -3,14 +3,13 @@
 ABI notes:
 - ABI v2 (``coset_kernels_abi_v2() == 2``): void-returning entry points validate pointers,
   dimensions, and qubit/target ranges and return silently on invalid input without returning an
-  error code. On a healthy engine (``fail_kind == 0``), ``engine_batch_inject_general_clifford``,
-  ``engine_batch_det_meas_step``, and ``engine_batch_unmatched_noisy_reset_z`` zero non-null
-  output kick flags on invalid input (with non-null ``ptr``), whereas ``engine_batch_mixed_substep``
-  and ``engine_batch_evict`` leave accumulator flags untouched on invalid input; no v2 kernel
-  touches flags when ``ptr == NULL``. ``engine_set_rng_states`` copies in place (no heap
-  allocation) and returns ``0`` on success or ``< 0`` on ``NULL``/error; ``engine_get_rng_states``
-  copies owned RNG states with ``n_shots == batch_size`` check. ``engine_get_active_shot_indices``
-  returns ``-1`` on ``NULL``.
+  error code. On a healthy engine (``fail_kind == 0``), ``engine_batch_inject_general_clifford``
+  and ``engine_batch_unmatched_noisy_reset_z`` zero non-null output kick flags on invalid input
+  (with non-null ``ptr``), whereas ``engine_batch_mixed_substep`` and ``engine_batch_evict`` leave
+  accumulator flags untouched on invalid input; no v2 kernel touches flags when ``ptr == NULL``.
+  ``engine_set_rng_states`` copies in place (no heap allocation) and returns ``0`` on success or
+  ``< 0`` on ``NULL``/error; ``engine_get_rng_states`` copies owned RNG states with
+  ``n_shots == batch_size`` check. ``engine_get_active_shot_indices`` returns ``-1`` on ``NULL``.
 - ABI v3 (``coset_kernels_abi_v3() == 3``): additive ``int``-returning entry points validate
   engine-owned dimensions and return ``< 0`` on invalid arguments or allocation failure.
 - Failed-engine & exception safety: ``engine_failed(ptr)`` returns ``0`` (healthy), ``1``
@@ -27,12 +26,13 @@ ABI notes:
 from __future__ import annotations
 
 import ctypes
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any, cast
 
 from stimside._native._kernel_loader import (
     AbiSpec,
+    f64_p,
     get_lib,
     i8_p,
     i32_p,
@@ -44,9 +44,18 @@ from stimside._native._kernel_loader import (
     void_p,
 )
 
-_c_int = ctypes.c_int
-_c_i64 = ctypes.c_int64
-_c_u8 = ctypes.c_uint8
+_c_int, _c_i32, _c_i64, _c_u8 = ctypes.c_int, ctypes.c_int32, ctypes.c_int64, ctypes.c_uint8
+
+
+class CosetCallBlock(ctypes.Structure):
+    _fields_ = [
+        ("n_q", _c_i32), ("n_b", _c_i32), ("n_w", _c_i32), ("n_packed_bytes", _c_i32),
+        ("m_buf_rows", _c_i32), ("any_x", _c_i32), ("any_z", _c_i32), ("flags", _c_i32),
+        ("scratch_x_mask", u8_p), ("scratch_z_mask", u8_p), ("m_buf", u8_p),
+    ]
+
+
+call_block_p = ctypes.POINTER(CosetCallBlock)
 
 _LIB_INSTANCE: ctypes.CDLL | None = None
 _WRAPPED_CACHE: tuple[ctypes.CDLL, ctypes.CDLL] | None = None
@@ -54,168 +63,85 @@ _WRAPPED_CACHE: tuple[ctypes.CDLL, ctypes.CDLL] | None = None
 _SPECS: tuple[AbiSpec, ...] = (
     ("coset_kernels_abi_v2", [], _c_int),
     ("coset_kernels_abi_v3", [], _c_int),
+    ("coset_kernels_abi_v4", [], _c_int),
     ("engine_create", [_c_int, _c_int, u64_p], void_p),
     ("engine_destroy", [void_p], None),
     ("engine_set_rng_states", [void_p, u64_p], _c_int),
     ("engine_get_rng_states", [void_p, _c_int, u64_p], _c_int),
     ("engine_clear", [void_p], None),
     ("engine_get_active_shot_indices", [void_p, i32_p, i32_p], _c_int),
-    ("engine_export_shot", [void_p, _c_int, u64_p, u64_p, u64_p, u8_p, u8_p, i32_p], None),
-    (
-        "engine_export_shot_v3",
-        [void_p, _c_int, _c_int, _c_int, u64_p, u64_p, u64_p, u8_p, u8_p, i32_p],
-        _c_int,
-    ),
-    ("engine_import_shot", [void_p, _c_int, _c_int, u64_p, u64_p, u64_p, u8_p, u8_p, i32_p], None),
-    (
-        "engine_batch_inject_general_clifford",
-        [
-            void_p, _c_int, _c_int, _c_int, i64_p, u8_p, u8_p, u8_p, u8_p, u8_p, u8_p,
-            u64_p, u64_p, u8_p, u8_p, u8_p, u64_p, u64_p, u8_p, u64_p, u64_p, u8_p, u8_p,
-            int_p, int_p,
-        ],
-        None,
-    ),
-    (
-        "engine_batch_det_meas_step",
-        [void_p, _c_int, i64_p, u8_p, u64_p, u8_p, u8_p, u64_p, u64_p, u8_p, u8_p, int_p, int_p],
-        None,
-    ),
-    (
-        "engine_batch_mixed_substep",
-        [
-            void_p, _c_int, _c_i64, _c_u8, _c_i64,
-            u64_p, u64_p, u64_p, _c_int, _c_int, i64_p, _c_int, i64_p,
-            u8_p, u8_p, u8_p, u8_p, int_p, int_p,
-        ],
-        None,
-    ),
+    ("engine_export_shot_v3", [
+        void_p, _c_int, _c_int, _c_int, u64_p, u64_p, u64_p, u8_p, u8_p, i32_p,
+    ], _c_int),
+    ("engine_batch_inject_general_clifford", [
+        void_p, _c_int, _c_int, _c_int, i64_p, u8_p, u8_p, u8_p, u8_p, u8_p, u8_p, u64_p, u64_p,
+        u8_p, u8_p, u8_p, u64_p, u64_p, u8_p, u64_p, u64_p, u8_p, u8_p, int_p, int_p,
+    ], None),
+    ("engine_batch_meas_step_v4", [
+        void_p, _c_int, _c_int, u8_p, i64_p, u8_p, i64_p, i32_p, u64_p, u64_p, u64_p,
+        _c_int, i32_p, i64_p, _c_int, i32_p, i64_p, u64_p, u64_p, u8_p, call_block_p,
+    ], _c_int),
+    ("engine_cond_pauli_noise_v4", [
+        void_p, _c_int, _c_int, i64_p, _c_int, f64_p, u8_p, u8_p, void_p, void_p, call_block_p,
+    ], _c_int),
+    ("engine_batch_mixed_substep", [
+        void_p, _c_int, _c_i64, _c_u8, _c_i64, u64_p, u64_p, u64_p, _c_int, _c_int, i64_p,
+        _c_int, i64_p, u8_p, u8_p, u8_p, u8_p, int_p, int_p,
+    ], None),
     ("engine_batch_evict", [void_p, u64_p, u64_p, u8_p, u8_p, u8_p, u8_p, int_p, int_p], None),
-    (
-        "engine_batch_unmatched_noisy_reset_z",
-        [void_p, u8_p, u8_p, u8_p, u64_p, u64_p, u8_p, u64_p, u8_p, u8_p, int_p, int_p],
-        None,
-    ),
-    (
-        "engine_peek_pauli_batch",
-        [void_p, _c_int, i64_p, _c_int, u8_p, u8_p, u64_p, u64_p, u64_p, u64_p, u8_p, u8_p, i8_p],
-        None,
-    ),
+    ("engine_batch_unmatched_noisy_reset_z", [
+        void_p, u8_p, u8_p, u8_p, u64_p, u64_p, u8_p, u64_p, u8_p, u8_p, int_p, int_p,
+    ], None),
+    ("engine_peek_pauli_batch", [
+        void_p, _c_int, i64_p, _c_int, u8_p, u8_p, u64_p, u64_p, u64_p, u64_p, u8_p, u8_p, i8_p,
+    ], None),
     ("engine_num_qubits", [void_p], _c_int),
     ("engine_batch_size", [void_p], _c_int),
     ("engine_n_words", [void_p], _c_int),
-    (
-        "engine_postselect_batch",
-        [
-            void_p, _c_i64, _c_int, _c_int, u8_p, _c_int, u8_p,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, _c_int,
-            u64_p, u64_p, u64_p, u64_p, u8_p, u8_p,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
-        ],
-        _c_int,
-    ),
-    (
-        "engine_project_pauli",
-        [
-            void_p, _c_int, _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, i64_p,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, _c_int,
-            u64_p, u64_p, u64_p, u64_p, u8_p, u8_p,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
-        ],
-        _c_int,
-    ),
-    (
-        "engine_register_unitary_step",
-        [
-            void_p, _c_int, _c_int, _c_int, i64_p, u8_p, u8_p, u8_p,
-            u64_p, u64_p, u8_p, u8_p, u8_p, u64_p, u64_p, u8_p,
-            _c_int, _c_int, u64_p, u64_p,
-        ],
-        _c_int,
-    ),
+    ("engine_postselect_batch", [
+        void_p, _c_i64, _c_int, _c_int, u8_p, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, _c_int,
+        u8_p, _c_int, _c_int, u64_p, u64_p, u64_p, u64_p, u8_p, u8_p,
+        _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
+    ], _c_int),
+    ("engine_project_pauli", [
+        void_p, _c_int, _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, i64_p, _c_int, _c_int,
+        u8_p, _c_int, _c_int, u8_p, _c_int, _c_int, u64_p, u64_p, u64_p, u64_p, u8_p, u8_p,
+        _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
+    ], _c_int),
+    ("engine_register_unitary_step", [
+        void_p, _c_int, _c_int, _c_int, i64_p, u8_p, u8_p, u8_p, u64_p, u64_p, u8_p, u8_p, u8_p,
+        u64_p, u64_p, u8_p, _c_int, _c_int, u64_p, u64_p,
+    ], _c_int),
     ("engine_unitary_step_num_groups", [void_p, _c_int], _c_int),
-    (
-        "engine_register_unitary_group_evict",
-        [void_p, _c_int, _c_int, _c_int, _c_int, u64_p, u64_p],
-        _c_int,
-    ),
-    (
-        "engine_inject_group_v3",
-        [
-            void_p, _c_int, _c_int, _c_int, u8_p,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
-        ],
-        _c_int,
-    ),
-    (
-        "engine_batch_inject_general_clifford_v3",
-        [
-            void_p, _c_int, _c_int, _c_int, u8_p,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
-        ],
-        _c_int,
-    ),
-    (
-        "engine_peek_pauli_batch_v3",
-        [
-            void_p, _c_int, i64_p, _c_int,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, _c_int,
-            u64_p, u64_p, u64_p, u64_p, u8_p, u8_p, _c_int, _c_int, i8_p,
-        ],
-        _c_int,
-    ),
-    (
-        "engine_batch_evict_v3",
-        [
-            void_p, _c_int, _c_int, u64_p, u64_p,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p,
-            _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
-        ],
-        _c_int,
-    ),
+    ("engine_register_unitary_group_evict", [
+        void_p, _c_int, _c_int, _c_int, _c_int, u64_p, u64_p,
+    ], _c_int),
+    ("engine_inject_group_v3", [
+        void_p, _c_int, _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, _c_int, _c_int, u8_p,
+        _c_int, _c_int, u8_p, _c_int, _c_int, u8_p, int_p, int_p,
+    ], _c_int),
+    ("engine_batch_inject_unitary_v4", [
+        void_p, _c_int, _c_int, _c_int, u8_p, u8_p, u8_p, u8_p, call_block_p,
+    ], _c_int),
     ("engine_failed", [void_p], _c_int),
     ("engine_create_last_error", [], _c_int),
 )
 
 _NO_GUARD: frozenset[str] = frozenset({
-    "coset_kernels_abi_v2",
-    "coset_kernels_abi_v3",
-    "engine_destroy",
-    "engine_failed",
-    "engine_create_last_error",
+    "coset_kernels_abi_v2", "coset_kernels_abi_v3", "coset_kernels_abi_v4",
+    "engine_destroy", "engine_failed", "engine_create_last_error",
 })
-
 _VOID_FNS: frozenset[str] = frozenset({
-    "engine_clear",
-    "engine_export_shot",
-    "engine_import_shot",
-    "engine_batch_inject_general_clifford",
-    "engine_batch_det_meas_step",
-    "engine_batch_mixed_substep",
-    "engine_batch_evict",
-    "engine_batch_unmatched_noisy_reset_z",
-    "engine_peek_pauli_batch",
+    "engine_clear", "engine_batch_inject_general_clifford", "engine_batch_mixed_substep",
+    "engine_batch_evict", "engine_batch_unmatched_noisy_reset_z", "engine_peek_pauli_batch",
 })
-
 _INT_FNS: frozenset[str] = frozenset({
-    "engine_set_rng_states",
-    "engine_get_rng_states",
-    "engine_get_active_shot_indices",
-    "engine_export_shot_v3",
-    "engine_num_qubits",
-    "engine_batch_size",
-    "engine_n_words",
-    "engine_postselect_batch",
-    "engine_project_pauli",
-    "engine_register_unitary_step",
-    "engine_unitary_step_num_groups",
-    "engine_register_unitary_group_evict",
-    "engine_inject_group_v3",
-    "engine_batch_inject_general_clifford_v3",
-    "engine_peek_pauli_batch_v3",
-    "engine_batch_evict_v3",
+    "engine_set_rng_states", "engine_get_rng_states", "engine_get_active_shot_indices",
+    "engine_export_shot_v3", "engine_num_qubits", "engine_batch_size", "engine_n_words",
+    "engine_postselect_batch", "engine_project_pauli", "engine_register_unitary_step",
+    "engine_unitary_step_num_groups", "engine_register_unitary_group_evict",
+    "engine_inject_group_v3", "engine_batch_inject_unitary_v4",
+    "engine_batch_meas_step_v4", "engine_cond_pauli_noise_v4",
 })
 
 _SPEC_NAMES: frozenset[str] = frozenset(spec[0] for spec in _SPECS)
@@ -293,7 +219,7 @@ def get_coset_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
     raw = get_lib(
         sys.modules[__name__],
         "coset_kernels",
-        "coset_kernels_abi_v3",
+        "coset_kernels_abi_v4",
         _SPECS,
         force_recompile=force_recompile,
     )

@@ -332,31 +332,6 @@ class MeasStepMeta(_StepWordsMixin):
     substeps: list[MeasSubStepMeta]
     _packed_words: PackedSymplecticTables | None = None
     num_qubits: int = 0
-    _det_batch_cache: (
-        tuple[NDArray[np.int64], NDArray[np.bool_], NDArray[np.uint64]] | None
-    ) = None
-
-    def get_det_batch_arrays(
-        self,
-    ) -> tuple[NDArray[np.int64], NDArray[np.bool_], NDArray[np.uint64]]:
-        if self._det_batch_cache is None:
-            num_sub = len(self.substeps)
-            q_arr = np.fromiter(
-                (s.meta.q for s in self.substeps), dtype=np.int64, count=num_sub
-            )
-            m_ref_arr = np.fromiter(
-                (bool(s.meta.m_ref) for s in self.substeps),
-                dtype=np.bool_,
-                count=num_sub,
-            )
-            b_sub_words = np.ascontiguousarray(
-                np.vstack(
-                    [s.meta.beta_Z_words for s in self.substeps]  # type: ignore[union-attr]
-                ),
-                dtype=np.uint64,
-            )
-            self._det_batch_cache = (q_arr, m_ref_arr, b_sub_words)
-        return self._det_batch_cache
 
 
 @dataclasses.dataclass

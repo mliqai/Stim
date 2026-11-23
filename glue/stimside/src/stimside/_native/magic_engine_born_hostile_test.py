@@ -20,6 +20,7 @@ import ctypes
 import gc
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -523,8 +524,8 @@ def fi_so(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.mark.skipif(
-    _under_tsan(),
-    reason="TSan owns operator new",
+    _under_tsan() or shutil.which("c++") is None,
+    reason="needs a C++ compiler and no TSan runtime (TSan owns operator new)",
 )
 @pytest.mark.parametrize(
     "case", ["peek", "peek70", "postselect", "postselect70", "unmatched", "unmatched70"]

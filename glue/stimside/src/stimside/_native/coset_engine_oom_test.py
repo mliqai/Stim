@@ -125,7 +125,7 @@ def _make_case(name):
     if name == "pub_disjoint_clifford_v3":
         sim = _sim_with_d(66, 64)
         op = stim.CircuitInstruction("S", [64])
-        return sim, "engine_batch_inject_general_clifford_v3", lambda: sim.do_conditional_clifford(
+        return sim, "engine_batch_inject_unitary_v4", lambda: sim.do_conditional_clifford(
             op, np.zeros((1, 1), dtype=bool)
         )
     if name == "pub_inject_group_v3":
@@ -139,15 +139,20 @@ def _make_case(name):
         sim = _sim_with_d(262, 260)
         sim.interactive_do(stim.Circuit("S_DAG 0 1\nH 0 1"))
         op = stim.Circuit("M 0 1")
-        return sim, "engine_batch_det_meas_step", lambda: sim.interactive_do(op)
+        return sim, "engine_batch_meas_step_v4", lambda: sim.interactive_do(op)
+    if name == "pub_meas_step_v4_rand":
+        sim = _sim_with_d(262, 260)
+        op = stim.Circuit("M 0")
+        return sim, "engine_batch_meas_step_v4", lambda: sim.interactive_do(op)
     if name == "pub_mixed_substep_det":
         sim = _sim_with_d(262, 260)
-        sim.interactive_do(stim.Circuit("S_DAG 0\nH 0"))
-        op = stim.Circuit("M 0")
+        sim.interactive_do(stim.Circuit("S_DAG 0"))
+        op = stim.Circuit("MX 0")
         return sim, "engine_batch_mixed_substep", lambda: sim.interactive_do(op)
     if name == "pub_mixed_substep_rand":
         sim = _sim_with_d(262, 260)
-        op = stim.Circuit("M 0")
+        sim.interactive_do(stim.Circuit("H 0"))
+        op = stim.Circuit("MX 0")
         return sim, "engine_batch_mixed_substep", lambda: sim.interactive_do(op)
     if name == "pub_unmatched_reset_z":
         sim = _sim_with_d(262, 260)
@@ -174,7 +179,7 @@ def _make_case(name):
     if name == "sticky_s5_eliminate_zero":
         sim = _sim_with_d(262, 260)
         op = stim.CircuitInstruction("S", [0])
-        return sim, "engine_batch_inject_general_clifford_v3", lambda: sim.do_conditional_clifford(
+        return sim, "engine_batch_inject_unitary_v4", lambda: sim.do_conditional_clifford(
             op, np.zeros((1, 1), dtype=bool)
         )
     raise SystemExit("unknown case " + name)
@@ -334,6 +339,7 @@ _CASES = [
     "pub_disjoint_clifford_v3",
     "pub_inject_group_v3",
     "pub_det_meas_step",
+    "pub_meas_step_v4_rand",
     "pub_mixed_substep_det",
     "pub_mixed_substep_rand",
     "pub_unmatched_reset_z",

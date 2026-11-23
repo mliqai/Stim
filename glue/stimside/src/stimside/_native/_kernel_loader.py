@@ -95,6 +95,8 @@ _LOCK_MAX_RETRIES: int = 12000
 _LOCK_RETRY_DELAY_S: float = 0.05
 _LOCK_NOTICE_DELAY_S: float = 10.0
 _LOCK_WAIT_SPENT_S: dict[Path, float] = {}
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_LOCK_WAIT_SPENT_S.clear)
 _WARNED_FAILED_REBUILDS: set[Path] = set()
 _WARNED_FAILED_BUILD_IDS: set[Path] = set()
 _WARNED_CPU_MISMATCHES: set[Path] = set()
@@ -240,33 +242,34 @@ def _compute_source_hash(cpp_path: Path) -> str:
     return h.hexdigest()
 
 
-def _read_build_record(so_path: Path) -> tuple[str, str, str | None, str | None] | None:
-    """Return ``(source_hash, mode, machine, cpu_flags)`` from v2 JSON, or ``None``."""
+_BuildRecord = tuple[str, str, str | None, str | None, int | None]
+
+
+def _read_build_record(so_path: Path) -> _BuildRecord | None:
+    """Return ``(source_hash, mode, machine, cpu_flags, cpu_flags_v)`` from v2 JSON, or ``None``."""
     try:
         data = json.loads(_build_id_path(so_path).read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None
-    ver = data.get("version")
-    src_hash = data.get("source_hash")
-    mode = data.get("mode")
+    ver, src_hash, mode = data.get("version"), data.get("source_hash"), data.get("mode")
     if (
-        type(ver) is not int
-        or ver != 2
-        or not isinstance(src_hash, str)
-        or not src_hash
-        or not isinstance(mode, str)
-        or mode not in _VALID_BUILD_MODES
+        type(ver) is not int or ver != 2
+        or not isinstance(src_hash, str) or not src_hash
+        or not isinstance(mode, str) or mode not in _VALID_BUILD_MODES
     ):
         return None
-    machine = data.get("machine")
-    cpu_flags = data.get("cpu_flags")
-    if "machine" in data and not isinstance(machine, str):
+    machine, cpu_flags, cpu_flags_v = (
+        data.get("machine"), data.get("cpu_flags"), data.get("cpu_flags_v")
+    )
+    if (
+        ("machine" in data and not isinstance(machine, str))
+        or ("cpu_flags" in data and not isinstance(cpu_flags, str))
+        or ("cpu_flags_v" in data and type(cpu_flags_v) is not int)
+    ):
         return None
-    if "cpu_flags" in data and not isinstance(cpu_flags, str):
-        return None
-    return src_hash, mode, machine, cpu_flags
+    return src_hash, mode, machine, cpu_flags, cpu_flags_v
 
 
 def _write_build_record(so_path: Path, source_hash: str, mode: str) -> None:
@@ -275,6 +278,7 @@ def _write_build_record(so_path: Path, source_hash: str, mode: str) -> None:
     if mode == "native":
         record["machine"] = _current_machine()
         record["cpu_flags"] = _cpu_flags_digest()
+        record["cpu_flags_v"] = 2
     payload = json.dumps(record, sort_keys=True)
     tmp_id = _mkstemp_with_umask_mode(so_path, ".tmp.build_id", 0o666)
     try:
@@ -285,30 +289,55 @@ def _write_build_record(so_path: Path, source_hash: str, mode: str) -> None:
         raise
 
 
-def _adopt_build_record(so_path: Path, source_hash: str) -> None:
+def _open_owned_dir(here: Path) -> tuple[Any, int, int] | None:
+    import fcntl  # POSIX-only, and only needed when locking.
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(here, flags)
+    try:
+        lock_uid = os.fstat(fd).st_uid
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
+    if lock_uid != (os.getuid() if hasattr(os, "getuid") else 0):
+        os.close(fd)
+        return None
+    return fcntl, fd, lock_uid
+
+
+def _adopt_build_record(
+    so_path: Path, source_hash: str, *, locked: bool = False
+) -> None:
     """Adopt a missing/legacy sidecar as ``unknown`` without replacing a valid v2 record."""
     bid_path = _build_id_path(so_path)
     payload = json.dumps(
         {"mode": "unknown", "source_hash": source_hash, "version": 2}, sort_keys=True
     )
     tmp_id: Path | None = None
+    lock_fd: int | None = None
     try:
         tmp_id = _mkstemp_with_umask_mode(so_path, ".tmp.build_id", 0o666)
         tmp_id.write_text(f"{payload}\n", encoding="utf-8")
         try:
             os.link(tmp_id, bid_path)
             return
-        except FileExistsError:
-            if _read_build_record(so_path) is None:
-                os.replace(tmp_id, bid_path)
-            return
         except OSError:
+            if not locked:
+                opened = _open_owned_dir(so_path.parent)
+                if opened is None:
+                    return
+                fcntl_mod, lock_fd, _ = opened
+                fcntl_mod.flock(lock_fd, fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
             if not bid_path.exists() or _read_build_record(so_path) is None:
                 os.replace(tmp_id, bid_path)
             return
-    except OSError:
+    except (ImportError, OSError):
         return
     finally:
+        if lock_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(lock_fd)
         if tmp_id is not None:
             tmp_id.unlink(missing_ok=True)
 
@@ -324,12 +353,12 @@ def _is_source_checkout(here: Path) -> bool:
 
 
 def _is_native_cpu_mismatch(
-    rec: tuple[str, str, str | None, str | None] | None,
+    rec: _BuildRecord | None, *, allow_legacy_flags: bool = False
 ) -> bool:
-    return (
-        rec is not None
-        and rec[1] == "native"
-        and (rec[2] != _current_machine() or rec[3] != _cpu_flags_digest())
+    if rec is None or rec[1] != "native":
+        return False
+    return rec[2] != _current_machine() or (
+        not (allow_legacy_flags and rec[4] is None) and rec[3] != _cpu_flags_digest()
     )
 
 
@@ -454,8 +483,9 @@ def _wait_for_flock(
                 # Best effort: stderr may be None, closed, or a broken pipe.
                 with contextlib.suppress(AttributeError, OSError, ValueError):
                     sys.stderr.write(
-                        f"stimside: waiting for build lock on {here} (owned by uid {lock_uid}); "
-                        "set STIMSIDE_BUILD_LOCK_TIMEOUT_S to shorten the wait\n"
+                        f"stimside: waiting for build lock on {here} (owned by uid {lock_uid}; "
+                        "another process is compiling; timeout controlled by "
+                        "STIMSIDE_BUILD_LOCK_TIMEOUT_S)\n"
                     )
                     sys.stderr.flush()
             time.sleep(_LOCK_RETRY_DELAY_S)
@@ -475,50 +505,36 @@ def _acquire_dir_lock(
     NFSv4 ``EBADF``, or timeout), concurrent builds remain correct because each process compiles
     to a unique ``.lib<name>.<pid>.*.tmp.so`` and atomically ``os.replace``s it.
     """
-    uid = os.getuid() if hasattr(os, "getuid") else 0
     lock_fd: int | None = None
     try:
-        import fcntl  # POSIX-only, and only needed when compiling.
-
-        dir_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        lock_fd = os.open(here, dir_flags)
-        lock_uid = os.fstat(lock_fd).st_uid
-        if lock_uid != uid:  # Never wait on another user's lock.
-            fd, lock_fd = lock_fd, None
-            os.close(fd)
+        opened = _open_owned_dir(here)
+        if opened is None:  # Never wait on another user's lock.
             return None
+        fcntl, lock_fd, lock_uid = opened
         if timeout_s is None:
             timeout_s, max_retries = _parse_lock_timeout(stacklevel=warn_stacklevel + 1)
+        exhausted = (
+            not math.isinf(timeout_s) and timeout_s > 0.0
+            and _LOCK_WAIT_SPENT_S.get(here.resolve(), 0.0) >= timeout_s
+        )
         if _wait_for_flock(lock_fd, here, lock_uid, timeout_s, max_retries, fcntl):
             return lock_fd
-        warnings.warn(
-            f"stimside warning: timed out waiting for build lock on {here}; "
-            "proceeding to build without cross-process lock",
-            RuntimeWarning,
-            stacklevel=warn_stacklevel,
+        reason = (
+            f"build lock wait budget already exhausted for {here}"
+            if exhausted else f"timed out waiting for build lock on {here}"
         )
+        msg = f"stimside warning: {reason}; proceeding to build without cross-process lock"
+        with contextlib.suppress(ValueError):
+            warnings.warn(msg, RuntimeWarning, stacklevel=warn_stacklevel)
         fd, lock_fd = lock_fd, None
         os.close(fd)
         return None
-    except (ImportError, OSError):
+    except BaseException as exc:
         if lock_fd is not None:
-            fd, lock_fd = lock_fd, None
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        return None
-    except BaseException:
-        if lock_fd is not None:
-            fd, lock_fd = lock_fd, None
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            with contextlib.suppress(OSError):
+                os.close(lock_fd)
+        if isinstance(exc, (ImportError, OSError)):
+            return None
         raise
 
 
@@ -532,13 +548,23 @@ def _warn_failed_build_id_once(so_path: Path, exc: Exception) -> None:
         _WARNED_FAILED_BUILD_IDS.add(so_path)
 
 
+def _pid_is_alive(name: str, st: os.stat_result) -> bool:
+    parts = name.split(".")
+    if len(parts) < 5 or not parts[2].isdigit() or (pid := int(parts[2])) <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return not hasattr(os, "getuid") or st.st_uid != os.getuid()
+    except OSError:
+        return False
+
+
 def _cleanup_stale_temp_files(so_path: Path, max_age_s: float) -> None:
-    """Remove leftover regular temp files for ``so_path`` older than the lock wait limit."""
-    age_limit = (
-        max_age_s
-        if math.isfinite(max_age_s) and max_age_s > 0.0
-        else _default_lock_timeout_s()
-    )
+    """Remove leftover regular temp files for ``so_path`` older than the wait floor."""
+    default_s = _default_lock_timeout_s()
+    age_limit = max(default_s, max_age_s) if math.isfinite(max_age_s) else default_s
     if age_limit <= 0.0:
         return
     cutoff = time.time() - age_limit
@@ -546,7 +572,10 @@ def _cleanup_stale_temp_files(so_path: Path, max_age_s: float) -> None:
         for tmp in so_path.parent.glob(pat):
             try:
                 st = tmp.lstat()
-                if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                if (
+                    stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff
+                    and not _pid_is_alive(tmp.name, st)
+                ):
                     tmp.unlink(missing_ok=True)
             except OSError:
                 continue
@@ -618,6 +647,20 @@ def _warn_readonly_cpu_mismatch_once(so_path: Path) -> None:
         _WARNED_CPU_MISMATCHES.add(so_path)
 
 
+def _check_can_compile(here: Path, cpp_path: Path, so_path: Path) -> None:
+    if not cpp_path.exists():
+        raise FileNotFoundError(
+            f"Compiled shared library '{so_path.name}' not found in {here} "
+            f"and source '{cpp_path.name}' is missing. "
+            f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
+        )
+    if not os.access(here, os.W_OK):
+        raise PermissionError(
+            f"Cannot compile '{so_path.name}' into read-only directory {here}. "
+            f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
+        )
+
+
 def resolve_so(
     module_file: str,
     name: str,
@@ -635,24 +678,12 @@ def resolve_so(
     if not needs_build:
         if needs_adopt and src_hash is not None:
             _adopt_build_record(so_path, src_hash)
-        elif (
-            in_source_tree
-            and not os.access(here, os.W_OK)
-            and _is_native_cpu_mismatch(_read_build_record(so_path))
+        elif in_source_tree and not os.access(here, os.W_OK) and _is_native_cpu_mismatch(
+            _read_build_record(so_path), allow_legacy_flags=True
         ):
             _warn_readonly_cpu_mismatch_once(so_path)
         return so_path
-    if not cpp_path.exists():
-        raise FileNotFoundError(
-            f"Compiled shared library '{so_path.name}' not found in {here} "
-            f"and source '{cpp_path.name}' is missing. "
-            f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
-        )
-    if not os.access(here, os.W_OK):
-        raise PermissionError(
-            f"Cannot compile '{so_path.name}' into read-only directory {here}. "
-            f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
-        )
+    _check_can_compile(here, cpp_path, so_path)
     timeout_s, max_retries = _parse_lock_timeout(stacklevel=3)
     lock_fd = _acquire_dir_lock(
         here, timeout_s=timeout_s, max_retries=max_retries, warn_stacklevel=3
@@ -665,24 +696,18 @@ def resolve_so(
         )
         if not needs_build:
             if needs_adopt and src_hash is not None:
-                _adopt_build_record(so_path, src_hash)
+                _adopt_build_record(so_path, src_hash, locked=(lock_fd is not None))
+            if lock_fd is not None:
+                _LOCK_WAIT_SPENT_S.pop(here.resolve(), None)
             return so_path
-        if not cpp_path.exists():
-            raise FileNotFoundError(
-                f"Compiled shared library '{so_path.name}' not found in {here} "
-                f"and source '{cpp_path.name}' is missing. "
-                f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
-            )
-        if not os.access(here, os.W_OK):
-            raise PermissionError(
-                f"Cannot compile '{so_path.name}' into read-only directory {here}. "
-                f"Please run 'pip install -e .' or 'pip install .' in Stim/glue/stimside."
-            )
+        _check_can_compile(here, cpp_path, so_path)
         if lock_fd is not None:
             _cleanup_stale_temp_files(so_path, timeout_s)
         last_exc, primary_cmd = _compile_so_variants(
             cpp_path, so_path, in_source_tree, effective_mode
         )
+        if lock_fd is not None and last_exc is None:
+            _LOCK_WAIT_SPENT_S.pop(here.resolve(), None)
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
