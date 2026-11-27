@@ -79,7 +79,7 @@ def test_engine_symbols_are_kept_out_of_the_magic_kernel_table() -> None:
     assert not any(n.startswith("magic_") for n, _, _ in me._SPECS)
     cpp = (_NATIVE / "magic_kernels.cpp").read_text()
     assert cpp.count('#include "magic_engine.hpp"') == 1  # one translation unit, one include
-    assert cpp.rstrip().endswith('#include "magic_engine.hpp"')
+    assert cpp.index('#include "magic_engine.hpp"') > cpp.rindex('}  // extern "C"')
 
 
 def test_packaging_lists_the_header_by_explicit_name_only() -> None:

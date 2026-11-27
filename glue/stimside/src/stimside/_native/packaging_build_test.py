@@ -36,7 +36,7 @@ _CPP_NAMES = (
     "marginal_dem_kernels.cpp",
     "tableside_kernels.cpp",
 )
-_HPP_NAMES = ("qfe_core.hpp", "magic_engine.hpp")
+_HPP_NAMES = ("qfe_core.hpp", "magic_engine.hpp", "branch_kernels.hpp")
 _SO_NAMES = (
     "libcoset_kernels.so",
     "libmagic_kernels.so",

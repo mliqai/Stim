@@ -39,7 +39,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "stimside" = ["golden_digests.json"]
-"stimside._native" = ["*.cpp", "qfe_core.hpp", "magic_engine.hpp"]
+"stimside._native" = ["*.cpp", "qfe_core.hpp", "magic_engine.hpp", "branch_kernels.hpp"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

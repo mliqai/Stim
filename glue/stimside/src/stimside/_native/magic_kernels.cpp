@@ -707,3 +707,6 @@ int64_t magic_measure_batch(
 
 // MagicBatchEngine (WP-25): mbe_* entry points; included last, it calls the kernels above.
 #include "magic_engine.hpp"
+
+// Stabilizer-branch engine (Method C): mbr_* entry points.
+#include "branch_kernels.hpp"
