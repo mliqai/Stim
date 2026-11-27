@@ -1489,6 +1489,39 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
 
     emit_magic_op = _emit_magic_op
 
+    def do_conditional_magic(
+        self, op: stim.CircuitInstruction, qs: Sequence[int], condition_met_mask: NDArray[np.bool_]
+    ) -> None:
+        """Apply each gate group of magic `op` only in the shots where its mask row is True.
+
+        `condition_met_mask` has shape (groups, batch_size), as for `do_conditional_clifford`. A
+        group is a triple for `I[CCZ]` and a single qubit for `I[T]` / `I[T_DAG]`.
+        """
+        arity = 3 if op.tag == "CCZ" else 1
+        for g_idx, off in enumerate(range(0, len(qs), arity)):
+            grp, mask_g = qs[off : off + arity], condition_met_mask[g_idx]
+            n_act = int(np.count_nonzero(mask_g))
+            if n_act == 0:
+                continue
+            if n_act == mask_g.size:
+                self._emit_magic_op(op, grp)
+                continue
+            # A block is applied to every shot with chi > 0, so the skipping shots are taken out of
+            # the store while this group's block runs and put back unchanged.
+            self._flush_magic()
+            store = self._live_exps
+            saved = [(int(s), store[int(s)]) for s in np.flatnonzero(~mask_g)]
+            try:
+                for s, _ in saved:
+                    store[s] = ShotExpansion.from_components(
+                        (), n_qubits=self._eff_nq, merge=False, atol=self.atol
+                    )
+                self._emit_magic_op(op, grp)
+                self._flush_magic()
+            finally:
+                for s, exp in saved:
+                    store[s] = exp
+
     def _do_bare_instruction(self, op: stim.Circuit | stim.CircuitInstruction) -> None:
         if isinstance(op, stim.Circuit):
             for sub in op:

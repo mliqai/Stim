@@ -152,6 +152,18 @@ class CompiledLeakageUint8Magic(CompiledLeakageUint8Coset):
             if qs is None:
                 qs = validate_magic_op(op, sss.num_qubits)
                 self.magic_ops[op] = qs
+            if op.tag == "CCZ" and self.unconditional_condition_on_U:
+                # Like an untagged Clifford gate: a triple is skipped in the shots where any of
+                # its three qubits is leaked.
+                if np.any(self._state[qs, :] >= 2):
+                    triples = [qs[i : i + 3] for i in range(0, len(qs), 3)]
+                    acts = np.array(
+                        [np.all(self._state[t, :] < 2, axis=0) for t in triples], np.bool_
+                    )
+                    sss.do_conditional_magic(op, qs, acts)
+                else:
+                    sss.emit_magic_op(op, qs)
+                return
             for grp in ([qs[i : i + 3] for i in range(0, len(qs), 3)] if op.tag == "CCZ" else [[q] for q in qs]):
                 if np.any(self._state[grp, :] >= 2):
                     warnings.warn(f"Magic gate I[{op.tag}] applied to leaked group {tuple(grp)}", UserWarning, stacklevel=2)

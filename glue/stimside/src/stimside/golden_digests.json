@@ -75,7 +75,7 @@
   },
   "c08_magic_with_leakage": {
     "magic_ds": "dc6cdf640678596ef70fafb141696e70",
-    "magic_sync": "053296907e421b41b81ecd3a8774de2b"
+    "magic_sync": "cead6b56947eb495654c95059809a251"
   },
   "c09_multiword_70q_leakage": {
     "coset_nosync_cpp": "f3d4bed6aa3c462d40ca3753ae5c05ea",

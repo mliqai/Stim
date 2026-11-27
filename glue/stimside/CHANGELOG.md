@@ -21,6 +21,14 @@ All notable user-visible changes to `stimside` are documented in this file.
   depolarization on returns to `U`/`D` and batch leakage-aware measurements of leaked targets.
   Three-way `sync_tableside_rng=True` lockstep and `TablesideSimulator`'s native C++ path are
   preserved.
+- **`I[CCZ]` skips leaked qubits on `MagicsideSimulator` (behavior change):** With
+  `LeakageUint8Magic(unconditional_condition_on_U=True)` (default), an `I[CCZ]` triple is now
+  skipped, per shot, when any of its three qubits is leaked (`state >= 2`), like an untagged
+  two-qubit Clifford gate, and no longer emits a `UserWarning`. `I[T]` / `I[T_DAG]` are unchanged
+  (applied in all shots with a `UserWarning`), and so is `unconditional_condition_on_U=False`
+  (all three gates act in all shots). Seeded outputs change only for circuits with an `I[CCZ]` on
+  a leaked qubit; the golden digest `c08_magic_with_leakage` / `magic_sync` was regenerated.
+  Added `MagicsideSimulator.do_conditional_magic(op, qs, condition_met_mask)`.
 - **`TablesideSimulator` and circuit IR:**
   - Untagged `SPP`, `SPP_DAG`, `E`, and `ELSE_CORRELATED_ERROR` instructions whose targets are all
     inverted single Paulis (such as `SPP !X0 !X1`) are now handled identically to their
