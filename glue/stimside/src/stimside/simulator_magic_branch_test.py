@@ -1235,3 +1235,151 @@ def test_branch_engine_toggle_false_to_true_copy_and_back(
     gc.collect()
     assert bk.BranchStore.live_stores() == 0
     assert bk.BranchState.live_states() == 0
+
+
+def test_wp6_sparse_pauli_and_correlated_noise_parity_and_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP6: Verify sparse vs dense Pauli/correlated noise parity (distinct & repeated targets, masked/unmasked, exact pauli_faults, run_direct replay, F5 determinism)."""
+    # 1. Distinct-target circuit exercising every branch-mode sparse noise fast path
+    distinct_circ = stim.Circuit(
+        """
+        R 0 1 2 3 4 5
+        H 0 1 2 3 4 5
+        I[T] 0 1 2
+        CX 0 1 2 3 4 5
+        X_ERROR(0.15) 0 1 2 3 4 5
+        Y_ERROR(0.12) 0 2 4
+        Z_ERROR(0.18) 1 3 5
+        DEPOLARIZE1(0.20) 0 1 2 3 4 5
+        DEPOLARIZE2(0.25) 0 1 2 3 4 5
+        PAULI_CHANNEL_1(0.0, 0.0, 0.20) 0 1 2 3
+        PAULI_CHANNEL_2(0.05,0,0,0, 0.05,0,0,0, 0,0,0,0.05, 0,0,0.05) 0 1 2 3
+        E(0.00001) X0 Y1 Z2
+        ELSE_CORRELATED_ERROR(0.25) Z0 X2 Y3
+        ELSE_CORRELATED_ERROR(0.30) Y1 Z4 X5
+        E(0.0) X0
+        ELSE_CORRELATED_ERROR(0.10) X3 Z4
+        I[CCZ] 0 1 2
+        I[T_DAG] 3 4 5
+        H 0 2 4
+        M 0 1 2 3 4 5
+        """
+    )
+    # 2. Repeated-target circuit exercising the fallback dense path cleanly
+    repeated_circ = stim.Circuit(
+        """
+        R 0 1 2 3
+        H 0 1 2 3
+        I[T] 0 1
+        CX 0 1 2 3
+        X_ERROR(0.30) 0 1 0 2
+        Y_ERROR(0.25) 1 1 3
+        Z_ERROR(0.20) 2 0 2
+        DEPOLARIZE1(0.35) 0 1 0 2
+        DEPOLARIZE2(0.35) 0 1 1 2 0 3
+        E(0.40) X0 Z1 Y0
+        ELSE_CORRELATED_ERROR(0.40) X1 X1 Z2
+        I[CCZ] 0 1 2
+        H 0 1
+        M 0 1 2 3
+        """
+    )
+
+    for label, circ in (("distinct", distinct_circ), ("repeated", repeated_circ)):
+        # Untraced (uses sparse fast path for distinct targets) vs traced (uses dense path) with identical seed
+        sim_sparse = MagicsideSimulator(circ, batch_size=64, seed=202606, _engine="branches")
+        sim_sparse.run()
+
+        sim_traced = MagicsideSimulator(circ, batch_size=64, seed=202606, _engine="branches")
+        sim_traced._enable_branch_trace(True)
+        sim_traced.run()
+
+        assert np.array_equal(
+            sim_sparse.get_final_measurement_records(),
+            sim_traced.get_final_measurement_records(),
+        ), label
+        assert sim_sparse._branch_counters()["faults_realized"] == sim_traced._branch_counters()["faults_realized"], label
+        assert sim_sparse._branch_counters()["faults_realized"]["pauli_faults"] > 0, label
+        assert sim_sparse._branch_batch is not None and sim_traced._branch_batch is not None
+        assert np.array_equal(sim_sparse._branch_batch.fx, sim_traced._branch_batch.fx), label
+        assert np.array_equal(sim_sparse._branch_batch.fz, sim_traced._branch_batch.fz), label
+        assert np.array_equal(sim_sparse._branch_batch.node, sim_traced._branch_batch.node), label
+        for s in range(8):
+            assert _phase_aligned_diff(sim_sparse.state_vector(s), sim_traced.state_vector(s)) < 1e-12, (label, s)
+
+        # Exact run_direct forced-trajectory replay parity
+        _replay_and_verify(circ, batch_size=12, seed=4242, check_statevector=True)
+
+        # F5 warm vs cold vs cap=50 bit-identical determinism
+        runs = {}
+        for cap in (300_000, 50, 0):
+            monkeypatch.setattr(sm, "_BRANCH_STORE_MAX_NODES", cap)
+            sim_d = MagicsideSimulator(circ, batch_size=32, seed=8888, _engine="branches")
+            recs = []
+            for b in range(3):
+                if b > 0:
+                    sim_d.clear()
+                sim_d.run()
+                recs.append(sim_d.get_final_measurement_records())
+            runs[cap] = (recs, sim_d._branch_counters()["faults_realized"])
+        for b in range(3):
+            assert np.array_equal(runs[300_000][0][b], runs[50][0][b]), (label, b)
+            assert np.array_equal(runs[300_000][0][b], runs[0][0][b]), (label, b)
+        assert runs[300_000][1] == runs[50][1] == runs[0][1]
+
+    # 3. Masked do_conditional_pauli_noise (condition_met_mask != None): sparse untraced == dense traced
+    monkeypatch.setattr(sm, "_BRANCH_STORE_MAX_NODES", 300_000)
+    base_c = stim.Circuit("R 0 1 2 3\nH 0 1 2 3\nI[T] 0 1\nCX 0 1 2 3")
+    rng = np.random.default_rng(7777)
+    ops_and_masks = [
+        (stim.CircuitInstruction("X_ERROR", [0, 1, 2, 3], [0.4]), rng.random((4, 32)) < 0.6),
+        (stim.CircuitInstruction("Y_ERROR", [0, 2], [0.35]), rng.random((2, 32)) < 0.5),
+        (stim.CircuitInstruction("DEPOLARIZE1", [0, 1, 2, 3], [0.45]), rng.random((4, 32)) < 0.7),
+        (stim.CircuitInstruction("DEPOLARIZE2", [0, 1, 2, 3], [0.50]), rng.random((2, 32)) < 0.6),
+        (stim.CircuitInstruction("DEPOLARIZE1", [0, 1, 0], [0.45]), rng.random((3, 32)) < 0.7),  # repeated!
+        (stim.CircuitInstruction("CORRELATED_ERROR", [stim.target_x(0), stim.target_z(2)], [0.5]), rng.random((2, 32)) < 0.6),
+        (stim.CircuitInstruction("ELSE_CORRELATED_ERROR", [stim.target_y(1), stim.target_x(3)], [0.5]), rng.random((2, 32)) < 0.6),
+    ]
+    sim_m_sp = MagicsideSimulator(base_c, batch_size=32, seed=5555, _engine="branches")
+    sim_m_tr = MagicsideSimulator(base_c, batch_size=32, seed=5555, _engine="branches")
+    sim_m_tr._enable_branch_trace(True)
+    sim_m_sp.run()
+    sim_m_tr.run()
+    for inst, mask in ops_and_masks:
+        sim_m_sp.do_conditional_pauli_noise(inst, condition_met_mask=mask)
+        sim_m_tr.do_conditional_pauli_noise(inst, condition_met_mask=mask)
+    assert sim_m_sp._branch_batch is not None and sim_m_tr._branch_batch is not None
+    assert np.array_equal(sim_m_sp._branch_batch.fx, sim_m_tr._branch_batch.fx)
+    assert np.array_equal(sim_m_sp._branch_batch.fz, sim_m_tr._branch_batch.fz)
+    assert sim_m_sp._branch_batch.faults_realized == sim_m_tr._branch_batch.faults_realized
+    assert sim_m_sp._branch_batch.faults_realized["pauli_faults"] > 0
+
+    # Also verify masked Pauli noise during full run() with LeakageUint8Magic (updates _branch_counters)
+    leak_noise_c = stim.Circuit(
+        """
+        R 0 1 2 3
+        H 0 1 2 3
+        I[LEAKAGE_TRANSITION_1: (0.25, U-->2)] 0 1 2 3
+        DEPOLARIZE1(0.30) 0 1 2 3
+        DEPOLARIZE2(0.30) 0 1 2 3
+        X_ERROR(0.25) 0 1 2 3
+        E(0.30) X0 Z1 Y2
+        ELSE_CORRELATED_ERROR(0.30) Z1 X3
+        I[CCZ] 0 1 2
+        M[LEAKAGE_PROJECTION_Z: (1.0, 2)] 0 1 2 3
+        """
+    )
+    sim_l_sp = MagicsideSimulator(leak_noise_c, op_handler=LeakageUint8Magic(), batch_size=64, seed=6060, _engine="branches")
+    sim_l_tr = MagicsideSimulator(leak_noise_c, op_handler=LeakageUint8Magic(), batch_size=64, seed=6060, _engine="branches")
+    sim_l_tr._enable_branch_trace(True)
+    sim_l_sp.run()
+    sim_l_tr.run()
+    assert np.array_equal(sim_l_sp.get_final_measurement_records(), sim_l_tr.get_final_measurement_records())
+    assert sim_l_sp._branch_counters()["faults_realized"] == sim_l_tr._branch_counters()["faults_realized"]
+    assert sim_l_sp._branch_counters()["faults_realized"]["pauli_faults"] > 0
+
+    del sim_sparse, sim_traced, sim_d, sim_m_sp, sim_m_tr, sim_l_sp, sim_l_tr
+    gc.collect()
+    assert bk.BranchStore.live_stores() == 0
+    assert bk.BranchState.live_states() == 0

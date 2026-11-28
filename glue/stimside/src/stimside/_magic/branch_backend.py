@@ -28,7 +28,8 @@ from stimside.util.reference_chp import ReferenceCHPTableau
 _DEFAULT_STORE_MAX_NODES: int = bk._BRANCH_STORE_MAX_NODES  # 300_000
 _BRANCH_STORE_MAX_NODES: int = _DEFAULT_STORE_MAX_NODES
 
-_CCZ_MASKS: tuple[int, ...] = (1, 2, 4, 3, 5, 6, 7)
+_CCZ_FLIP_MASKS: NDArray[np.uint32] = np.array([1, 2, 4, 3, 5, 6, 7], dtype=np.uint32)
+_T_FLIP_MASKS: NDArray[np.uint32] = np.array([1], dtype=np.uint32)
 _CCZ_EXPS: NDArray[np.uint8] = np.array([1, 1, 1, 7, 7, 7, 1], dtype=np.uint8)
 _T_EXPS: NDArray[np.uint8] = np.array([1], dtype=np.uint8)
 _TDAG_EXPS: NDArray[np.uint8] = np.array([7], dtype=np.uint8)
@@ -84,27 +85,6 @@ def accumulate_retired_counters(dst: dict[str, Any], snap: dict[str, Any], *, ex
 
 def empty_faults_realized() -> dict[str, int]:
     return {k: 0 for k in _FAULT_KEYS}
-
-
-def _anti_batch(
-    fx: NDArray[np.uint64],
-    fz: NDArray[np.uint64],
-    px: NDArray[np.uint64],
-    pz: NDArray[np.uint64],
-) -> NDArray[np.uint8]:
-    """Return `popcount((fx & pz) ^ (fz & px)) & 1` as `(M,) uint8` for arbitrary `nw >= 1`."""
-    nw = fx.shape[1]
-    acc = (fx[:, 0] & pz[0]) ^ (fz[:, 0] & px[0])
-    for w in range(1, nw):
-        acc ^= (fx[:, w] & pz[w]) ^ (fz[:, w] & px[w])
-    return (np.bitwise_count(acc) & np.uint8(1)).astype(np.uint8, copy=False)
-
-
-def _safe_log(p: NDArray[np.float64]) -> NDArray[np.float64]:
-    out = np.full(p.shape, -math.inf, dtype=np.float64)
-    pos = p > 0.0
-    out[pos] = np.log(p[pos])
-    return out
 
 
 class _StoreOwnerToken:
@@ -347,15 +327,176 @@ class _SharedBranchStore:
             finally:
                 self._busy, self._busy_tid = prev_busy, prev_tid
 
-    def counters(self) -> dict[str, Any]:
+    def node_count_unlocked(self) -> int:
+        self._check_not_poisoned()
+        prev_busy, prev_tid = self._busy, self._busy_tid
+        self._busy, self._busy_tid = True, threading.get_ident()
+        try:
+            return self.native.node_count
+        finally:
+            self._busy, self._busy_tid = prev_busy, prev_tid
+
+    def counters_unlocked(self) -> dict[str, Any]:
+        self._check_not_poisoned()
+        prev_busy, prev_tid = self._busy, self._busy_tid
+        self._busy, self._busy_tid = True, threading.get_ident()
+        try:
+            return self.native.counters()
+        finally:
+            self._busy, self._busy_tid = prev_busy, prev_tid
+
+    def batch_step_rotations(
+        self,
+        eid: int,
+        kind: int,
+        gen_x: NDArray[np.uint64],
+        gen_z: NDArray[np.uint64],
+        base_x: NDArray[np.uint64],
+        base_z: NDArray[np.uint64],
+        base_k: NDArray[np.uint8],
+        ax_e: NDArray[np.uint8],
+        flip_masks: NDArray[np.uint32],
+        fx: NDArray[np.uint64],
+        fz: NDArray[np.uint64],
+        nodes: NDArray[np.int64],
+        peaks: NDArray[np.int16],
+        *,
+        sel_mask: NDArray[np.bool_] | None = None,
+    ) -> None:
         with self.lock:
             self._check_not_poisoned()
             prev_busy, prev_tid = self._busy, self._busy_tid
             self._busy, self._busy_tid = True, threading.get_ident()
             try:
-                return self.native.counters()
+                self.native.batch_step_rotations(
+                    eid, kind, gen_x, gen_z, base_x, base_z, base_k, ax_e, flip_masks,
+                    fx, fz, nodes, peaks, sel_mask=sel_mask,
+                )
+            except bk.BranchBudgetError as exc:
+                raise QueryBudgetExceededError(str(exc)) from exc
             finally:
                 self._busy, self._busy_tid = prev_busy, prev_tid
+
+    def batch_step_qturns(
+        self,
+        eid: int,
+        kind: int,
+        base_x: NDArray[np.uint64],
+        base_z: NDArray[np.uint64],
+        base_k: NDArray[np.uint8],
+        fx: NDArray[np.uint64],
+        fz: NDArray[np.uint64],
+        nodes: NDArray[np.int64],
+        peaks: NDArray[np.int16],
+        *,
+        sel_mask: NDArray[np.bool_] | None = None,
+    ) -> None:
+        with self.lock:
+            self._check_not_poisoned()
+            prev_busy, prev_tid = self._busy, self._busy_tid
+            self._busy, self._busy_tid = True, threading.get_ident()
+            try:
+                self.native.batch_step_qturns(
+                    eid, kind, base_x, base_z, base_k, fx, fz, nodes, peaks, sel_mask=sel_mask,
+                )
+            except bk.BranchBudgetError as exc:
+                raise QueryBudgetExceededError(str(exc)) from exc
+            finally:
+                self._busy, self._busy_tid = prev_busy, prev_tid
+
+    def batch_step_meas(
+        self,
+        eid: int,
+        kind: int,
+        mx: NDArray[np.uint64],
+        mz: NDArray[np.uint64],
+        mk: int,
+        uniforms: NDArray[np.float64],
+        fx: NDArray[np.uint64],
+        fz: NDArray[np.uint64],
+        nodes: NDArray[np.int64],
+        peaks: NDArray[np.int16],
+        *,
+        log_mass: NDArray[np.float64] | None = None,
+        update_log_mass: bool = True,
+        sel_mask: NDArray[np.bool_] | None = None,
+        kick_x: NDArray[np.uint64] | None = None,
+        kick_z: NDArray[np.uint64] | None = None,
+        want_one_mask: NDArray[np.bool_] | None = None,
+        out_true_m: NDArray[np.bool_] | None = None,
+        out_p_chosen: NDArray[np.float64] | None = None,
+    ) -> None:
+        with self.lock:
+            self._check_not_poisoned()
+            prev_busy, prev_tid = self._busy, self._busy_tid
+            self._busy, self._busy_tid = True, threading.get_ident()
+            try:
+                self.native.batch_step_meas(
+                    eid, kind, mx, mz, mk, uniforms, fx, fz, nodes, peaks,
+                    log_mass=log_mass, update_log_mass=update_log_mass,
+                    sel_mask=sel_mask, kick_x=kick_x, kick_z=kick_z,
+                    want_one_mask=want_one_mask, out_true_m=out_true_m,
+                    out_p_chosen=out_p_chosen,
+                )
+            except bk.BranchBudgetError as exc:
+                raise QueryBudgetExceededError(str(exc)) from exc
+            finally:
+                self._busy, self._busy_tid = prev_busy, prev_tid
+
+    def batch_step_peek(
+        self,
+        eid: int,
+        mx: NDArray[np.uint64],
+        mz: NDArray[np.uint64],
+        mk: int,
+        fx: NDArray[np.uint64],
+        fz: NDArray[np.uint64],
+        nodes: NDArray[np.int64],
+        out_p1: NDArray[np.float64],
+    ) -> None:
+        with self.lock:
+            self._check_not_poisoned()
+            prev_busy, prev_tid = self._busy, self._busy_tid
+            self._busy, self._busy_tid = True, threading.get_ident()
+            try:
+                self.native.batch_step_peek(eid, mx, mz, mk, fx, fz, nodes, out_p1)
+            except bk.BranchBudgetError as exc:
+                raise QueryBudgetExceededError(str(exc)) from exc
+            finally:
+                self._busy, self._busy_tid = prev_busy, prev_tid
+
+    def batch_step_postselect(
+        self,
+        eid: int,
+        mx: NDArray[np.uint64],
+        mz: NDArray[np.uint64],
+        mk: int,
+        desired_bits: NDArray[np.uint8] | NDArray[np.bool_],
+        fx: NDArray[np.uint64],
+        fz: NDArray[np.uint64],
+        nodes: NDArray[np.int64],
+        peaks: NDArray[np.int16],
+        log_mass: NDArray[np.float64],
+        *,
+        sel_mask: NDArray[np.bool_] | None = None,
+    ) -> int:
+        with self.lock:
+            self._check_not_poisoned()
+            prev_busy, prev_tid = self._busy, self._busy_tid
+            self._busy, self._busy_tid = True, threading.get_ident()
+            try:
+                return self.native.batch_step_postselect(
+                    eid, mx, mz, mk, desired_bits, fx, fz, nodes, peaks, log_mass,
+                    sel_mask=sel_mask,
+                )
+            except bk.BranchBudgetError as exc:
+                raise QueryBudgetExceededError(str(exc)) from exc
+            finally:
+                self._busy, self._busy_tid = prev_busy, prev_tid
+
+    def counters(self) -> dict[str, Any]:
+        with self.lock:
+            return self.counters_unlocked()
 
 
 @dataclass(frozen=True)
@@ -489,50 +630,8 @@ class BranchBatch:
         return new
 
     # ------------------------------------------------------------------
-    # Internal packed transition dispatch
+    # Internal event compilation
     # ------------------------------------------------------------------
-
-    def _step_packed(
-        self,
-        sel: NDArray[np.bool_] | None,
-        sb: NDArray[np.int64],
-        shift: int,
-        step_fn: Callable[[int, int], tuple[int, int]],
-    ) -> None:
-        sub_node = self.node if sel is None else self.node[sel]
-        if sub_node.size == 0:
-            return
-        n0 = int(sub_node[0])
-        s0 = int(sb[0])
-        if sub_node.size == 1 or (bool(np.all(sub_node == n0)) and bool(np.all(sb == s0))):
-            with self.store.lock:
-                cid, cpk = step_fn(n0, s0)
-            cpk16 = np.int16(cpk)
-            if sel is None:
-                self.node.fill(cid)
-                np.maximum(self.peak, cpk16, out=self.peak)
-            else:
-                self.node[sel] = cid
-                self.peak[sel] = np.maximum(self.peak[sel], cpk16)
-            return
-
-        keys = (sub_node << np.int64(shift)) | sb
-        uk, inv = np.unique(keys, return_inverse=True)
-        bit_mask = (1 << shift) - 1
-        new_nids = np.empty(uk.shape[0], dtype=np.int64)
-        new_pks = np.empty(uk.shape[0], dtype=np.int16)
-        with self.store.lock:
-            for i in range(uk.shape[0]):
-                kv = int(uk[i])
-                cid, cpk = step_fn(kv >> shift, kv & bit_mask)
-                new_nids[i] = cid
-                new_pks[i] = cpk
-        if sel is None:
-            self.node[:] = new_nids[inv]
-            np.maximum(self.peak, new_pks[inv], out=self.peak)
-        else:
-            self.node[sel] = new_nids[inv]
-            self.peak[sel] = np.maximum(self.peak[sel], new_pks[inv])
 
     def _compile_qturn_event(
         self,
@@ -591,21 +690,11 @@ class BranchBatch:
                 lambda: self._compile_qturn_event(canon, grp, inverse=True),
             )
             p0_x, p0_z, base_x, base_z, base_k = payload
-            k = base_k.shape[0]
-            if k > 0:
-                fx_s = self.fx[skip_mask]
-                fz_s = self.fz[skip_mask]
-                sb = np.zeros(n_skip, dtype=np.int64)
-                for j in range(k):
-                    sb |= _anti_batch(fx_s, fz_s, base_x[j], base_z[j]).astype(np.int64) << np.int64(j)
-                def _step(nid: int, s_val: int) -> tuple[int, int]:
-                    fk = np.empty(k, dtype=np.uint8)
-                    for j in range(k):
-                        fk[j] = (int(base_k[j]) + (2 if (s_val >> j) & 1 else 0)) & 3
-                    return self.store.step_qturns_unlocked(
-                        nid, eid, bk.MBR_KIND_SKIP, s_val, base_x, base_z, fk
-                    )
-                self._step_packed(skip_mask, sb, shift=k, step_fn=_step)
+            if base_k.shape[0] > 0:
+                self.store.batch_step_qturns(
+                    eid, bk.MBR_KIND_SKIP, base_x, base_z, base_k,
+                    self.fx, self.fz, self.node, self.peak, sel_mask=skip_mask,
+                )
             if p0_x is not None and p0_z is not None:
                 self.fx[skip_mask] ^= p0_x
                 self.fz[skip_mask] ^= p0_z
@@ -648,14 +737,10 @@ class BranchBatch:
             )
             if payload is not None:
                 base_x, base_z, base_k = payload
-                sb = _anti_batch(self.fx[skip_mask], self.fz[skip_mask], base_x[0], base_z[0]).astype(np.int64)
-                k0 = int(base_k[0])
-                def _step(nid: int, s_val: int) -> tuple[int, int]:
-                    fk = np.array([(k0 + (2 if s_val else 0)) & 3], dtype=np.uint8)
-                    return self.store.step_qturns_unlocked(
-                        nid, eid, bk.MBR_KIND_SKIP, s_val, base_x, base_z, fk
-                    )
-                self._step_packed(skip_mask, sb, shift=1, step_fn=_step)
+                self.store.batch_step_qturns(
+                    eid, bk.MBR_KIND_SKIP, base_x, base_z, base_k,
+                    self.fx, self.fz, self.node, self.peak, sel_mask=skip_mask,
+                )
 
         self.U.do_spp(terms_t, negate=neg_b, dag=dag_b)
         self.frame_id = self.store.advance_frame(pre_fid, ("SPP", terms_t, neg_b, dag_b))
@@ -667,8 +752,7 @@ class BranchBatch:
         mask: NDArray[np.bool_],
     ) -> None:
         m_bool = np.asarray(mask, dtype=np.bool_)
-        n_act = int(np.count_nonzero(m_bool))
-        if n_act == 0:
+        if not bool(np.any(m_bool)):
             return
         grp = tuple(int(q) for q in targets)
         eid, payload = self.store.get_or_compile_event(
@@ -680,22 +764,12 @@ class BranchBatch:
         if p0_x is not None and p0_z is not None:
             self.fx[m_bool] ^= p0_x
             self.fz[m_bool] ^= p0_z
-        k = base_k.shape[0]
-        if k == 0:
+        if base_k.shape[0] == 0:
             return
-        fx_s = self.fx[m_bool]
-        fz_s = self.fz[m_bool]
-        sb = np.zeros(n_act, dtype=np.int64)
-        for j in range(k):
-            sb |= _anti_batch(fx_s, fz_s, base_x[j], base_z[j]).astype(np.int64) << np.int64(j)
-        def _step(nid: int, s_val: int) -> tuple[int, int]:
-            fk = np.empty(k, dtype=np.uint8)
-            for j in range(k):
-                fk[j] = (int(base_k[j]) + (2 if (s_val >> j) & 1 else 0)) & 3
-            return self.store.step_qturns_unlocked(
-                nid, eid, bk.MBR_KIND_CFAULT, s_val, base_x, base_z, fk
-            )
-        self._step_packed(m_bool, sb, shift=k, step_fn=_step)
+        self.store.batch_step_qturns(
+            eid, bk.MBR_KIND_CFAULT, base_x, base_z, base_k,
+            self.fx, self.fz, self.node, self.peak, sel_mask=m_bool,
+        )
 
     # ------------------------------------------------------------------
     # Pauli Frame Updates (Faults & Feedback)
@@ -745,6 +819,106 @@ class BranchBatch:
             self.fx[sel] ^= self.U.z2x[q]
             self.fz[sel] ^= self.U.z2z[q]
 
+    def apply_pauli_words_masked(
+        self,
+        px: NDArray[np.uint64],
+        pz: NDArray[np.uint64],
+        shots: NDArray[np.intp],
+        *,
+        fault_count: int = 0,
+    ) -> None:
+        """XOR pulled-back `(px, pz)` words onto `shots` without allocating dense `(n_qubits, B)` masks."""
+        if fault_count:
+            self.faults_realized["pauli_faults"] += int(fault_count)
+        if shots.size == 0:
+            return
+        self.fx[shots] ^= px
+        self.fz[shots] ^= pz
+
+    def apply_pauli_sparse_fixed(
+        self,
+        qubits: NDArray[np.intp],
+        shots: NDArray[np.intp],
+        do_x: bool,
+        do_z: bool,
+        *,
+        is_fault: bool = True,
+    ) -> None:
+        """Sparse XOR for fixed single-qubit Pauli (`X_ERROR`/`Y_ERROR`/`Z_ERROR`) on distinct targets."""
+        if shots.size == 0:
+            return
+        if is_fault:
+            self.faults_realized["pauli_faults"] += int(shots.size)
+        U = self.U
+        if do_x and do_z:
+            np.bitwise_xor.at(self.fx, shots, U.x2x[qubits] ^ U.z2x[qubits])
+            np.bitwise_xor.at(self.fz, shots, U.x2z[qubits] ^ U.z2z[qubits])
+        elif do_x:
+            np.bitwise_xor.at(self.fx, shots, U.x2x[qubits])
+            np.bitwise_xor.at(self.fz, shots, U.x2z[qubits])
+        else:
+            np.bitwise_xor.at(self.fx, shots, U.z2x[qubits])
+            np.bitwise_xor.at(self.fz, shots, U.z2z[qubits])
+
+    def apply_pauli_sparse_1q(
+        self,
+        qubits: NDArray[np.intp],
+        shots: NDArray[np.intp],
+        x_bits: NDArray[np.bool_],
+        z_bits: NDArray[np.bool_],
+        *,
+        is_fault: bool = True,
+    ) -> None:
+        """Sparse XOR for 1Q Pauli noise (`DEPOLARIZE1`/`PAULI_CHANNEL_1`) on distinct targets."""
+        if shots.size == 0:
+            return
+        if is_fault:
+            self.faults_realized["pauli_faults"] += int(shots.size)
+        U = self.U
+        if bool(x_bits.any()):
+            qs_x = qubits[x_bits]
+            ss_x = shots[x_bits]
+            np.bitwise_xor.at(self.fx, ss_x, U.x2x[qs_x])
+            np.bitwise_xor.at(self.fz, ss_x, U.x2z[qs_x])
+        if bool(z_bits.any()):
+            qs_z = qubits[z_bits]
+            ss_z = shots[z_bits]
+            np.bitwise_xor.at(self.fx, ss_z, U.z2x[qs_z])
+            np.bitwise_xor.at(self.fz, ss_z, U.z2z[qs_z])
+
+    def apply_pauli_sparse_2q(
+        self,
+        q0s: NDArray[np.intp],
+        q1s: NDArray[np.intp],
+        shots: NDArray[np.intp],
+        x0: NDArray[np.bool_],
+        z0: NDArray[np.bool_],
+        x1: NDArray[np.bool_],
+        z1: NDArray[np.bool_],
+        *,
+        is_fault: bool = True,
+    ) -> None:
+        """Sparse XOR for 2Q Pauli noise (`DEPOLARIZE2`/`PAULI_CHANNEL_2`) on distinct targets."""
+        if shots.size == 0:
+            return
+        if is_fault:
+            self.faults_realized["pauli_faults"] += (
+                int(np.count_nonzero(x0 | z0)) + int(np.count_nonzero(x1 | z1))
+            )
+        U = self.U
+        if bool(x0.any()):
+            np.bitwise_xor.at(self.fx, shots[x0], U.x2x[q0s[x0]])
+            np.bitwise_xor.at(self.fz, shots[x0], U.x2z[q0s[x0]])
+        if bool(z0.any()):
+            np.bitwise_xor.at(self.fx, shots[z0], U.z2x[q0s[z0]])
+            np.bitwise_xor.at(self.fz, shots[z0], U.z2z[q0s[z0]])
+        if bool(x1.any()):
+            np.bitwise_xor.at(self.fx, shots[x1], U.x2x[q1s[x1]])
+            np.bitwise_xor.at(self.fz, shots[x1], U.x2z[q1s[x1]])
+        if bool(z1.any()):
+            np.bitwise_xor.at(self.fx, shots[z1], U.z2x[q1s[z1]])
+            np.bitwise_xor.at(self.fz, shots[z1], U.z2z[q1s[z1]])
+
     # ------------------------------------------------------------------
     # Magic Gates: T, T_DAG, CCZ
     # ------------------------------------------------------------------
@@ -768,23 +942,18 @@ class BranchBatch:
                         continue
                     if n_act < row.size:
                         sel = row
-                def _compile_t(qq: int = q) -> tuple[NDArray[np.uint64], NDArray[np.uint64], int]:
+                def _compile_t(qq: int = q) -> tuple[NDArray[np.uint64], NDArray[np.uint64], NDArray[np.uint8]]:
                     ax = compile_pauli_product(self.U, [(qq, "Z")])
                     return (
                         np.ascontiguousarray(ax.a_words.reshape(1, self.nw)),
                         np.ascontiguousarray(ax.b_words.reshape(1, self.nw)),
-                        int(ax.kappa) & 3,
+                        np.array([int(ax.kappa) & 3], dtype=np.uint8),
                     )
-                eid, (ax_x, ax_z, k0) = self.store.get_or_compile_event((self.frame_id, tag, q), _compile_t)
-                fx_s = self.fx if sel is None else self.fx[sel]
-                fz_s = self.fz if sel is None else self.fz[sel]
-                sb = _anti_batch(fx_s, fz_s, ax_x[0], ax_z[0]).astype(np.int64)
-                def _step(nid: int, s_val: int, _eid: int = eid, _ax_x: NDArray[np.uint64] = ax_x, _ax_z: NDArray[np.uint64] = ax_z, _k0: int = k0) -> tuple[int, int]:
-                    fk = np.array([(_k0 + (2 if s_val else 0)) & 3], dtype=np.uint8)
-                    return self.store.step_rotations_unlocked(
-                        nid, _eid, bk.MBR_KIND_T, s_val, _ax_x, _ax_z, fk, exps
-                    )
-                self._step_packed(sel, sb, shift=1, step_fn=_step)
+                eid, (ax_x, ax_z, base_k) = self.store.get_or_compile_event((self.frame_id, tag, q), _compile_t)
+                self.store.batch_step_rotations(
+                    eid, bk.MBR_KIND_T, ax_x, ax_z, ax_x, ax_z, base_k, exps, _T_FLIP_MASKS,
+                    self.fx, self.fz, self.node, self.peak, sel_mask=sel,
+                )
             return
 
         if tag != "CCZ":
@@ -830,91 +999,14 @@ class BranchBatch:
             eid, (gen_x, gen_z, base_x, base_z, base_k) = self.store.get_or_compile_event(
                 (self.frame_id, "CCZ", a, b, c), _compile_ccz
             )
-            fx_s = self.fx if sel is None else self.fx[sel]
-            fz_s = self.fz if sel is None else self.fz[sel]
-            sb = (
-                _anti_batch(fx_s, fz_s, gen_x[0], gen_z[0]).astype(np.int64)
-                | (_anti_batch(fx_s, fz_s, gen_x[1], gen_z[1]).astype(np.int64) << np.int64(1))
-                | (_anti_batch(fx_s, fz_s, gen_x[2], gen_z[2]).astype(np.int64) << np.int64(2))
+            self.store.batch_step_rotations(
+                eid, bk.MBR_KIND_CCZ, gen_x, gen_z, base_x, base_z, base_k, _CCZ_EXPS, _CCZ_FLIP_MASKS,
+                self.fx, self.fz, self.node, self.peak, sel_mask=sel,
             )
-            def _step_ccz(
-                nid: int,
-                s_val: int,
-                _eid: int = eid,
-                _bx: NDArray[np.uint64] = base_x,
-                _bz: NDArray[np.uint64] = base_z,
-                _bk: NDArray[np.uint8] = base_k,
-            ) -> tuple[int, int]:
-                fk = np.empty(7, dtype=np.uint8)
-                for i in range(7):
-                    fk[i] = (int(_bk[i]) + (2 if ((s_val & _CCZ_MASKS[i]).bit_count() & 1) else 0)) & 3
-                return self.store.step_rotations_unlocked(
-                    nid, _eid, bk.MBR_KIND_CCZ, s_val, _bx, _bz, fk, _CCZ_EXPS
-                )
-            self._step_packed(sel, sb, shift=3, step_fn=_step_ccz)
 
     # ------------------------------------------------------------------
     # Measurements, Resets, Peek, Postselect, Unmatched Noisy Reset
     # ------------------------------------------------------------------
-
-    def _query_meas_nodes(
-        self,
-        nodes: NDArray[np.int64],
-        eid: int,
-        kind: int,
-        mx: NDArray[np.uint64],
-        mz: NDArray[np.uint64],
-        mk: int,
-    ) -> tuple[
-        NDArray[np.float64],
-        NDArray[np.int64],
-        NDArray[np.int64],
-        NDArray[np.uint8],
-        NDArray[np.uint64],
-        NDArray[np.uint64],
-        NDArray[np.int16],
-        NDArray[np.int16],
-        NDArray[np.intp],
-    ]:
-        n0 = int(nodes[0])
-        if nodes.size == 1 or bool(np.all(nodes == n0)):
-            with self.store.lock:
-                p0, c0, c1, mt, ax, az, pk0, pk1 = self.store.step_meas_unlocked(n0, eid, kind, mx, mz, mk)
-            return (
-                np.array([p0], dtype=np.float64),
-                np.array([c0], dtype=np.int64),
-                np.array([c1], dtype=np.int64),
-                np.array([mt], dtype=np.uint8),
-                ax.reshape(1, self.nw),
-                az.reshape(1, self.nw),
-                np.array([pk0], dtype=np.int16),
-                np.array([pk1], dtype=np.int16),
-                np.zeros(nodes.shape[0], dtype=np.intp),
-            )
-        un, inv = np.unique(nodes, return_inverse=True)
-        nu = un.shape[0]
-        p0s = np.empty(nu, dtype=np.float64)
-        c0s = np.empty(nu, dtype=np.int64)
-        c1s = np.empty(nu, dtype=np.int64)
-        mts = np.empty(nu, dtype=np.uint8)
-        abs_x = np.zeros((nu, self.nw), dtype=np.uint64)
-        abs_z = np.zeros((nu, self.nw), dtype=np.uint64)
-        pk0s = np.empty(nu, dtype=np.int16)
-        pk1s = np.empty(nu, dtype=np.int16)
-        with self.store.lock:
-            for i in range(nu):
-                p0, c0, c1, mt, ax, az, pk0, pk1 = self.store.step_meas_unlocked(
-                    int(un[i]), eid, kind, mx, mz, mk
-                )
-                p0s[i] = p0
-                c0s[i] = c0
-                c1s[i] = c1
-                mts[i] = mt
-                abs_x[i] = ax
-                abs_z[i] = az
-                pk0s[i] = pk0
-                pk1s[i] = pk1
-        return p0s, c0s, c1s, mts, abs_x, abs_z, pk0s, pk1s, inv
 
     def measure_or_reset(
         self,
@@ -951,37 +1043,17 @@ class BranchBatch:
             )
             kx = kz = None
 
-        p0s, c0s, c1s, mts, abs_x, abs_z, pk0s, pk1s, inv = self._query_meas_nodes(
-            self.node, eid, bk.MBR_KIND_MEAS, mx, mz, mk
+        true_m = np.empty(self.batch_size, dtype=np.bool_)
+        p_chosen = np.empty(self.batch_size, dtype=np.float64) if self.trace is not None else None
+        self.store.batch_step_meas(
+            eid, bk.MBR_KIND_MEAS, mx, mz, mk, u,
+            self.fx, self.fz, self.node, self.peak,
+            log_mass=self.log_mass, update_log_mass=True,
+            kick_x=kx, kick_z=kz,
+            out_true_m=true_m, out_p_chosen=p_chosen,
         )
-        p0_arr = p0s[inv]
-        c0_arr = c0s[inv]
-        c1_arr = c1s[inv]
-        inner_m = np.where(c0_arr < 0, True, np.where(c1_arr < 0, False, u >= p0_arr))
-
-        # Caller contract #1: compute pre-kick s_bit BEFORE mutating F.
-        s_bit = _anti_batch(self.fx, self.fz, mx, mz).astype(np.bool_)
-        true_m = inner_m ^ s_bit
-
-        # Apply absorption frame kick for ABSORBED & inner_m == 1.
-        for i in range(mts.shape[0]):
-            if mts[i] == bk.MBR_MEAS_ABSORBED:
-                sel = (inv == i) & inner_m
-                if np.any(sel):
-                    self.fx[sel] ^= abs_x[i]
-                    self.fz[sel] ^= abs_z[i]
-
-        self.node[:] = np.where(inner_m, c1_arr, c0_arr)
-        np.maximum(self.peak, np.where(inner_m, pk1s[inv], pk0s[inv]), out=self.peak)
-        p_chosen = np.where(inner_m, 1.0 - p0_arr, p0_arr)
-        self.log_mass += _safe_log(p_chosen)
-
-        if is_reset and kx is not None and kz is not None:
-            if np.any(true_m):
-                self.fx[true_m] ^= kx
-                self.fz[true_m] ^= kz
-
         if self.trace is not None:
+            assert p_chosen is not None
             self.trace.record_meas_or_reset(meas_index, is_reset, true_m, p_chosen)
         return true_m
 
@@ -994,12 +1066,6 @@ class BranchBatch:
         out = np.empty((len(t_list), self.batch_size), dtype=np.float64)
         if not t_list:
             return out
-        n0 = int(self.node[0])
-        all_same = self.node.size == 1 or bool(np.all(self.node == n0))
-        if not all_same:
-            un, inv = np.unique(self.node, return_inverse=True)
-        else:
-            un = inv = None
         for row_i, q in enumerate(t_list):
             def _compile_peek(qq: int = q) -> tuple[NDArray[np.uint64], NDArray[np.uint64], int]:
                 obs = compile_pauli_product(self.U, [(qq, pauli)])
@@ -1007,20 +1073,7 @@ class BranchBatch:
             eid, (mx, mz, mk) = self.store.get_or_compile_event(
                 (self.frame_id, "PEEK", q, pauli), _compile_peek
             )
-            if all_same:
-                with self.store.lock:
-                    p0 = self.store.step_peek_unlocked(n0, eid, mx, mz, mk)
-                p0_arr = np.full(self.batch_size, p0, dtype=np.float64)
-            else:
-                assert un is not None and inv is not None
-                p0s = np.empty(un.shape[0], dtype=np.float64)
-                with self.store.lock:
-                    for i in range(un.shape[0]):
-                        p0s[i] = self.store.step_peek_unlocked(int(un[i]), eid, mx, mz, mk)
-                p0_arr = p0s[inv]
-            s_bit = _anti_batch(self.fx, self.fz, mx, mz).astype(np.bool_)
-            # Caller contract #4: p1 = p0_inner if s_bit else (1.0 - p0_inner), clamped to [0, 1].
-            out[row_i] = np.clip(np.where(s_bit, p0_arr, 1.0 - p0_arr), 0.0, 1.0)
+            self.store.batch_step_peek(eid, mx, mz, mk, self.fx, self.fz, self.node, out[row_i])
         return out
 
     def postselect_pauli_batch(
@@ -1030,14 +1083,26 @@ class BranchBatch:
         desired_bits: Any,
         pauli: Literal["X", "Y", "Z"] = "Z",
     ) -> None:
-        shots = np.flatnonzero(flip_mask)
-        if shots.size == 0:
+        m_bool = np.asarray(flip_mask, dtype=np.bool_)
+        if not bool(np.any(m_bool)):
             return
         q_int = int(q)
-        if type(desired_bits) is np.ndarray and desired_bits.dtype.kind in "biu" and desired_bits.ndim == 1:
-            desired = (desired_bits[shots] & desired_bits.dtype.type(1)).astype(np.bool_)
+        if (
+            type(desired_bits) is np.ndarray
+            and desired_bits.ndim == 1
+            and desired_bits.shape[0] == self.batch_size
+            and desired_bits.dtype in (np.bool_, np.uint8)
+            and desired_bits.flags.c_contiguous
+        ):
+            des_u8: NDArray[np.uint8] | NDArray[np.bool_] = desired_bits
         else:
-            desired = np.array([int(desired_bits[int(b)]) & 1 for b in shots], dtype=np.bool_)
+            shots = np.flatnonzero(m_bool)
+            des_arr = np.zeros(self.batch_size, dtype=np.uint8)
+            if type(desired_bits) is np.ndarray and desired_bits.dtype.kind in "biu" and desired_bits.ndim == 1:
+                des_arr[shots] = (desired_bits[shots] & desired_bits.dtype.type(1)).astype(np.uint8)
+            else:
+                des_arr[shots] = np.array([int(desired_bits[int(b)]) & 1 for b in shots], dtype=np.uint8)
+            des_u8 = des_arr
 
         def _compile_post() -> tuple[NDArray[np.uint64], NDArray[np.uint64], int]:
             obs = compile_pauli_product(self.U, [(q_int, pauli)])
@@ -1046,34 +1111,14 @@ class BranchBatch:
             (self.frame_id, "POST", q_int, pauli), _compile_post
         )
 
-        # Compute pre-kick s_bit and validate ALL active shots before any mutation.
-        s_bit = _anti_batch(self.fx[shots], self.fz[shots], mx, mz).astype(np.bool_)
-        inner_m = desired ^ s_bit
-
-        p0s, c0s, c1s, mts, abs_x, abs_z, pk0s, pk1s, inv = self._query_meas_nodes(
-            self.node[shots], eid, bk.MBR_KIND_POST, mx, mz, mk
+        fail_shot = self.store.batch_step_postselect(
+            eid, mx, mz, mk, des_u8, self.fx, self.fz, self.node, self.peak, self.log_mass,
+            sel_mask=m_bool,
         )
-        p0_arr = p0s[inv]
-        child = np.where(inner_m, c1s[inv], c0s[inv])
-        p_chosen = np.where(inner_m, 1.0 - p0_arr, p0_arr)
-        bad = (child < 0) | (p_chosen <= 1e-13)
-        if np.any(bad):
-            b0 = int(shots[int(np.flatnonzero(bad)[0])])
+        if fail_shot >= 0:
             raise ImpossiblePostselectionError(
-                f"Impossible postselection on qubit {q_int} ({pauli}) for shot {b0}"
+                f"Impossible postselection on qubit {q_int} ({pauli}) for shot {fail_shot}"
             )
-
-        # Commit mutations atomically after validation succeeds.
-        for i in range(mts.shape[0]):
-            if mts[i] == bk.MBR_MEAS_ABSORBED:
-                local_sel = (inv == i) & inner_m
-                if np.any(local_sel):
-                    sh = shots[local_sel]
-                    self.fx[sh] ^= abs_x[i]
-                    self.fz[sh] ^= abs_z[i]
-        self.node[shots] = child
-        self.peak[shots] = np.maximum(self.peak[shots], np.where(inner_m, pk1s[inv], pk0s[inv]))
-        self.log_mass[shots] += _safe_log(p_chosen)
 
     def unmatched_noisy_reset(
         self,
@@ -1096,12 +1141,11 @@ class BranchBatch:
         )
         kick_p = _RESET_KICK[pauli]
         for q in qs:
-            shots = np.flatnonzero(comb[q])
-            if shots.size == 0:
+            comb_q = np.ascontiguousarray(comb[q], dtype=np.bool_)
+            if not bool(np.any(comb_q)):
                 continue
             # F5 determinism: draw exact 1 uniform per shot of batch.
             u_all = rng.random(self.batch_size)
-            u = u_all[shots]
             def _compile_ureset(qq: int = q) -> tuple[
                 NDArray[np.uint64], NDArray[np.uint64], int, NDArray[np.uint64], NDArray[np.uint64]
             ]:
@@ -1111,32 +1155,14 @@ class BranchBatch:
             eid, (mx, mz, mk, kx, kz) = self.store.get_or_compile_event(
                 (self.frame_id, "URESET", q, pauli), _compile_ureset
             )
-            p0s, c0s, c1s, mts, abs_x, abs_z, pk0s, pk1s, inv = self._query_meas_nodes(
-                self.node[shots], eid, bk.MBR_KIND_URESET, mx, mz, mk
-            )
-            p0_arr = p0s[inv]
-            c0_arr = c0s[inv]
-            c1_arr = c1s[inv]
-            inner_m = np.where(c0_arr < 0, True, np.where(c1_arr < 0, False, u >= p0_arr))
-            s_bit = _anti_batch(self.fx[shots], self.fz[shots], mx, mz).astype(np.bool_)
-            true_m = inner_m ^ s_bit
-
-            for i in range(mts.shape[0]):
-                if mts[i] == bk.MBR_MEAS_ABSORBED:
-                    local_sel = (inv == i) & inner_m
-                    if np.any(local_sel):
-                        sh = shots[local_sel]
-                        self.fx[sh] ^= abs_x[i]
-                        self.fz[sh] ^= abs_z[i]
-
-            self.node[shots] = np.where(inner_m, c1_arr, c0_arr)
-            self.peak[shots] = np.maximum(self.peak[shots], np.where(inner_m, pk1s[inv], pk0s[inv]))
+            want_one_q = np.ascontiguousarray(one_b[q], dtype=np.bool_)
             # Trace-preserving channel: log_mass stays UNCHANGED.
-            want_one = one_b[q, shots]
-            kick_shots = shots[true_m != want_one]
-            if kick_shots.size > 0:
-                self.fx[kick_shots] ^= kx
-                self.fz[kick_shots] ^= kz
+            self.store.batch_step_meas(
+                eid, bk.MBR_KIND_URESET, mx, mz, mk, u_all,
+                self.fx, self.fz, self.node, self.peak,
+                update_log_mass=False, sel_mask=comb_q,
+                kick_x=kx, kick_z=kz, want_one_mask=want_one_q,
+            )
 
     # ------------------------------------------------------------------
     # State Inspection & Getters

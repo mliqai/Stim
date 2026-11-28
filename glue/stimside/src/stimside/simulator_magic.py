@@ -811,11 +811,11 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 cap = effective_store_max_nodes(_BRANCH_STORE_MAX_NODES)
                 old_store = self._branch_store
                 with old_store.lock:
-                    if old_store.native.node_count > cap:
+                    if old_store.node_count_unlocked() > cap:
                         if old_store.owner_count() <= 1:
                             old_store.clear_inplace()
                         else:
-                            snap = old_store.native.counters()
+                            snap = old_store.counters_unlocked()
                             assert self._branch_retired_counters is not None
                             accumulate_retired_counters(
                                 self._branch_retired_counters, snap, extra_clears=1
@@ -2107,15 +2107,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         condition_met_mask: NDArray[np.bool_] | None,
     ) -> None:
         p_c, raw_t = args[0] if args else 0.0, op.targets_copy()
-        xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
-        zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
-        if self._tab_rngs is not None:
-            assert self._tab_rngs_x is not None
-            exec_sync_correlated_error(
-                self._tab_rngs, self._tab_rngs_x, cname, raw_t, p_c, condition_met_mask, xm, zm
-            )
-        else:
-            trace = None if self._branch_batch is None else self._branch_batch.trace
+        bb = self._branch_batch
+        if bb is not None and self._tab_rngs is None:
+            trace = bb.trace
             if p_c <= 0.0:
                 if cname != "ELSE_CORRELATED_ERROR":
                     self._corr_occurred.fill(False)
@@ -2131,6 +2125,69 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._corr_occurred |= occ
             if trace is not None:
                 trace.record_noise(occ.astype(np.int32))
+            if not np.any(occ):
+                return
+            if condition_met_mask is None and trace is None:
+                seen_q: set[int] = set()
+                distinct = True
+                px = np.zeros(bb.nw, dtype=np.uint64)
+                pz = np.zeros(bb.nw, dtype=np.uint64)
+                n_nonid = 0
+                U = bb.U
+                for gt in raw_t:
+                    if gt.qubit_value is None:
+                        continue
+                    q = int(gt.qubit_value)
+                    if q in seen_q or q >= bb.n_qubits:
+                        distinct = False
+                        break
+                    is_x = gt.is_x_target or gt.is_y_target
+                    is_z = gt.is_z_target or gt.is_y_target
+                    if is_x or is_z:
+                        seen_q.add(q)
+                        n_nonid += 1
+                        if is_x:
+                            px ^= U.x2x[q]
+                            pz ^= U.x2z[q]
+                        if is_z:
+                            px ^= U.z2x[q]
+                            pz ^= U.z2z[q]
+                if distinct:
+                    shots = np.flatnonzero(occ)
+                    bb.apply_pauli_words_masked(px, pz, shots, fault_count=int(shots.size) * n_nonid)
+                    return
+            xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+            zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+            for t_idx, gt in enumerate(raw_t):
+                if gt.qubit_value is None:
+                    continue
+                hit = occ if condition_met_mask is None else (occ & condition_met_mask[t_idx])
+                if gt.is_x_target or gt.is_y_target:
+                    xm[int(gt.qubit_value)] ^= hit
+                if gt.is_z_target or gt.is_y_target:
+                    zm[int(gt.qubit_value)] ^= hit
+            self._apply_pauli_masks_xz(xm, zm)
+            return
+
+        xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+        zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
+        if self._tab_rngs is not None:
+            assert self._tab_rngs_x is not None
+            exec_sync_correlated_error(
+                self._tab_rngs, self._tab_rngs_x, cname, raw_t, p_c, condition_met_mask, xm, zm
+            )
+        else:
+            if p_c <= 0.0:
+                if cname != "ELSE_CORRELATED_ERROR":
+                    self._corr_occurred.fill(False)
+                return
+            u = self.np_rng.random(self.batch_size)
+            if cname != "ELSE_CORRELATED_ERROR":
+                occ = u < p_c
+                self._corr_occurred[:] = occ
+            else:
+                occ = (~self._corr_occurred) & (u < p_c)
+                self._corr_occurred |= occ
             if np.any(occ):
                 for t_idx, gt in enumerate(raw_t):
                     if gt.qubit_value is None:
@@ -2156,7 +2213,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         if not raw:
             return
         arity = 2 if cname in ("DEPOLARIZE2", "PAULI_CHANNEL_2") else 1
-        trace = None if self._branch_batch is None else self._branch_batch.trace
+        bb = self._branch_batch
+        trace = None if bb is None else bb.trace
         if not any(p > 0.0 for p in args):
             if trace is not None:
                 trace.record_noise_zeros(len(raw) // arity)
@@ -2177,6 +2235,13 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                     trace.record_noise(hit[g_i].astype(np.int32))
             if not np.any(hit):
                 return
+            if bb is not None and trace is None and len(set(raw)) == len(raw):
+                gs, ss = np.nonzero(hit)
+                raw_arr = np.asarray(raw, dtype=np.intp)
+                bb.apply_pauli_sparse_fixed(
+                    raw_arr[gs], ss, cname != "Z_ERROR", cname != "X_ERROR", is_fault=True
+                )
+                return
             xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
             zm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
             do_x, do_z = cname != "Z_ERROR", cname != "X_ERROR"
@@ -2188,6 +2253,26 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                     zm[q] ^= hit[g_i]
         else:
             edges = _pauli_noise_table(cname, tuple(args))
+            if bb is not None and trace is None:
+                hit_fast = u < edges[-1]
+                if not np.any(hit_fast):
+                    return
+                if len(set(raw)) == len(raw):
+                    gs, ss = np.nonzero(hit_fast)
+                    idx_s = np.searchsorted(edges, u[gs, ss], side="right")
+                    raw_arr = np.asarray(raw, dtype=np.intp)
+                    if arity == 1:
+                        bb.apply_pauli_sparse_1q(
+                            raw_arr[gs], ss, _LUT_1Q_X[idx_s], _LUT_1Q_Z[idx_s], is_fault=True
+                        )
+                    else:
+                        bb.apply_pauli_sparse_2q(
+                            raw_arr[2 * gs], raw_arr[2 * gs + 1], ss,
+                            _LUT_2Q_X0[idx_s], _LUT_2Q_Z0[idx_s],
+                            _LUT_2Q_X1[idx_s], _LUT_2Q_Z1[idx_s],
+                            is_fault=True,
+                        )
+                    return
             idx = np.searchsorted(edges, u, side="right")
             hit = idx < edges.size
             if trace is not None:

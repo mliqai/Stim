@@ -118,6 +118,30 @@ _SPECS: tuple[AbiSpec, ...] = (
     ("mbr_store_step_peek", [_VP, _I64, _U64, _VP, _VP, _U8, _VP], _I32),
     ("mbr_store_counters", [_VP, _VP], _I32),
     ("mbr_store_branches_hist", [_VP, _VP, _VP, _SZ, _VP], _I32),
+    (
+        "mbr_batch_step_rotations",
+        [_VP, _SZ, _VP, _U64, _U8, _SZ, _VP, _VP, _SZ, _VP, _VP, _VP, _VP, _VP, _VP, _VP, _VP, _VP],
+        _I32,
+    ),
+    (
+        "mbr_batch_step_qturns",
+        [_VP, _SZ, _VP, _U64, _U8, _SZ, _VP, _VP, _VP, _VP, _VP, _VP, _VP],
+        _I32,
+    ),
+    (
+        "mbr_batch_step_meas",
+        [
+            _VP, _SZ, _VP, _U64, _U8, _VP, _VP, _U8, _VP, _VP, _VP, _VP, _U8,
+            _VP, _VP, _VP, _VP, _VP, _VP, _VP,
+        ],
+        _I32,
+    ),
+    ("mbr_batch_step_peek", [_VP, _SZ, _U64, _VP, _VP, _U8, _VP, _VP, _VP, _VP], _I32),
+    (
+        "mbr_batch_step_postselect",
+        [_VP, _SZ, _VP, _U64, _VP, _VP, _U8, _VP, _VP, _VP, _VP, _VP, _VP, _VP],
+        _I32,
+    ),
 )
 
 
@@ -144,7 +168,6 @@ def _as_index(val: Any, name: str) -> int:
 
 def _as_contiguous(arr: Any, dtype: Any, shape: tuple[int, ...], name: str) -> np.ndarray:
     target = np.dtype(dtype)
-    info = np.iinfo(target)
     if isinstance(arr, np.ndarray):
         a = arr
     else:
@@ -153,6 +176,7 @@ def _as_contiguous(arr: Any, dtype: Any, shape: tuple[int, ...], name: str) -> n
         raise ValueError(f"{name} must have shape {shape}, got {a.shape}")
     if a.dtype == target and a.dtype.isnative and a.flags.c_contiguous and a.flags.aligned:
         return a
+    info = np.iinfo(target)
     if a.dtype == object:
         vals: list[int] = []
         for x in a.flat:
@@ -175,6 +199,67 @@ def _as_contiguous(arr: Any, dtype: Any, shape: tuple[int, ...], name: str) -> n
                 f"{name} values [{lo}, {hi}] out of range for {target} [{info.min}, {info.max}]"
             )
     return np.require(a, dtype=target, requirements=("C", "A"))
+
+
+def _as_rw_contiguous(arr: Any, dtype: Any, shape: tuple[int, ...], name: str) -> np.ndarray:
+    """Validate an in/out caller ndarray (zero-copy; must be native, C-contiguous, aligned, writeable)."""
+    if not isinstance(arr, np.ndarray):
+        raise TypeError(f"{name} must be a numpy.ndarray, got {type(arr).__name__}")
+    target = np.dtype(dtype)
+    if arr.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {arr.shape}")
+    if arr.dtype != target or not arr.dtype.isnative:
+        raise TypeError(f"{name} must have native dtype {target}, got {arr.dtype}")
+    if not (arr.flags.c_contiguous and arr.flags.aligned):
+        raise ValueError(f"{name} must be C-contiguous and aligned")
+    if not arr.flags.writeable:
+        raise ValueError(f"{name} must be writeable")
+    return arr
+
+
+def _as_u8_mask(arr: Any, shape: tuple[int, ...], name: str) -> np.ndarray:
+    """Convert bool or uint8 mask to contiguous uint8 (zero-copy when already contiguous bool/uint8)."""
+    if isinstance(arr, np.ndarray):
+        if arr.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {arr.shape}")
+        if arr.dtype == np.uint8:
+            if arr.flags.c_contiguous and arr.flags.aligned:
+                return arr
+            return np.require(arr, dtype=np.uint8, requirements=("C", "A"))
+        if arr.dtype == np.bool_:
+            if arr.flags.c_contiguous and arr.flags.aligned:
+                return arr.view(np.uint8)
+            return np.ascontiguousarray(arr, dtype=np.bool_).view(np.uint8)
+        raise TypeError(f"{name} must have dtype bool or uint8, got {arr.dtype}")
+    a = np.asarray(arr)
+    if a.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {a.shape}")
+    if a.dtype == np.bool_:
+        return np.ascontiguousarray(a, dtype=np.bool_).view(np.uint8)
+    if a.dtype == np.uint8:
+        return np.require(a, dtype=np.uint8, requirements=("C", "A"))
+    raise TypeError(f"{name} must have dtype bool or uint8, got {a.dtype}")
+
+
+def _as_f64_contiguous(arr: Any, shape: tuple[int, ...], name: str) -> np.ndarray:
+    if isinstance(arr, np.ndarray):
+        a = arr
+    else:
+        a = np.asarray(arr, dtype=object)
+    if a.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {a.shape}")
+    if a.dtype == np.float64 and a.dtype.isnative and a.flags.c_contiguous and a.flags.aligned:
+        return a
+    if a.dtype == object:
+        vals: list[float] = []
+        for x in a.flat:
+            if isinstance(x, (bool, np.bool_)) or not isinstance(x, (numbers.Real, np.floating, np.integer)):
+                raise TypeError(f"{name} elements must be real numbers, got {type(x).__name__}")
+            vals.append(float(x))
+        return np.array(vals, dtype=np.float64).reshape(shape)
+    if a.dtype.kind not in ("i", "u", "f"):
+        raise TypeError(f"{name} must have a real numeric dtype, got {a.dtype}")
+    return np.require(a, dtype=np.float64, requirements=("C", "A"))
 
 
 def _as_u64_words(arr: Any, nw: int, name: str) -> np.ndarray:
@@ -1011,6 +1096,265 @@ class BranchStore:
             "mbr_store_step_peek",
         )
         return float(out_p0.value)
+
+    def batch_step_rotations(
+        self,
+        event_id: int,
+        kind: int,
+        gen_x: Any,
+        gen_z: Any,
+        base_x: Any,
+        base_z: Any,
+        base_kappa: Any,
+        ax_e: Any,
+        flip_masks: Any,
+        fx: np.ndarray,
+        fz: np.ndarray,
+        nodes: np.ndarray,
+        peaks: np.ndarray,
+        *,
+        sel_mask: Any = None,
+    ) -> None:
+        h = self._require_open()
+        eid = _as_u64_scalar(event_id, "event_id")
+        kd = _as_index(kind, "kind")
+        if kd not in (MBR_KIND_T, MBR_KIND_CCZ):
+            raise ValueError(f"kind must be MBR_KIND_T or MBR_KIND_CCZ, got {kd}")
+        if not isinstance(nodes, np.ndarray) or nodes.ndim != 1:
+            raise TypeError("nodes must be a 1D numpy.ndarray")
+        bsz = int(nodes.shape[0])
+        nodes_c = _as_rw_contiguous(nodes, np.int64, (bsz,), "nodes")
+        peaks_c = _as_rw_contiguous(peaks, np.int16, (bsz,), "peaks")
+        fx_c = _as_contiguous(fx, np.uint64, (bsz, self._nw), "fx")
+        fz_c = _as_contiguous(fz, np.uint64, (bsz, self._nw), "fz")
+        sel_c = None if sel_mask is None else _as_u8_mask(sel_mask, (bsz,), "sel_mask")
+
+        gx_raw = gen_x if isinstance(gen_x, np.ndarray) else np.asarray(gen_x, dtype=object)
+        if gx_raw.ndim != 2:
+            raise ValueError(f"gen_x must be 2D, got shape {gx_raw.shape}")
+        n_gens = int(gx_raw.shape[0])
+        gx_c = _as_contiguous(gx_raw, np.uint64, (n_gens, self._nw), "gen_x")
+        gz_c = _as_contiguous(gen_z, np.uint64, (n_gens, self._nw), "gen_z")
+
+        bk_raw = base_kappa if isinstance(base_kappa, np.ndarray) else np.asarray(base_kappa, dtype=object)
+        if bk_raw.ndim != 1:
+            raise ValueError(f"base_kappa must be 1D, got shape {bk_raw.shape}")
+        n_ax = int(bk_raw.shape[0])
+        bx_c = _as_contiguous(base_x, np.uint64, (n_ax, self._nw), "base_x")
+        bz_c = _as_contiguous(base_z, np.uint64, (n_ax, self._nw), "base_z")
+        bk_c = _as_contiguous(bk_raw, np.uint8, (n_ax,), "base_kappa")
+        ae_c = _as_contiguous(ax_e, np.uint8, (n_ax,), "ax_e")
+        fm_c = _as_contiguous(flip_masks, np.uint32, (n_ax,), "flip_masks")
+
+        _check_rc(
+            self._lib.mbr_batch_step_rotations(
+                h, bsz, 0 if sel_c is None else addr(sel_c), eid, kd,
+                n_gens, addr(gx_c), addr(gz_c),
+                n_ax, addr(bx_c), addr(bz_c), addr(bk_c), addr(ae_c), addr(fm_c),
+                addr(fx_c), addr(fz_c), addr(nodes_c), addr(peaks_c),
+            ),
+            "mbr_batch_step_rotations",
+        )
+
+    def batch_step_qturns(
+        self,
+        event_id: int,
+        kind: int,
+        base_x: Any,
+        base_z: Any,
+        base_kappa: Any,
+        fx: np.ndarray,
+        fz: np.ndarray,
+        nodes: np.ndarray,
+        peaks: np.ndarray,
+        *,
+        sel_mask: Any = None,
+    ) -> None:
+        h = self._require_open()
+        eid = _as_u64_scalar(event_id, "event_id")
+        kd = _as_index(kind, "kind")
+        if kd not in (MBR_KIND_SKIP, MBR_KIND_CFAULT):
+            raise ValueError(f"kind must be MBR_KIND_SKIP or MBR_KIND_CFAULT, got {kd}")
+        if not isinstance(nodes, np.ndarray) or nodes.ndim != 1:
+            raise TypeError("nodes must be a 1D numpy.ndarray")
+        bsz = int(nodes.shape[0])
+        nodes_c = _as_rw_contiguous(nodes, np.int64, (bsz,), "nodes")
+        peaks_c = _as_rw_contiguous(peaks, np.int16, (bsz,), "peaks")
+        fx_c = _as_contiguous(fx, np.uint64, (bsz, self._nw), "fx")
+        fz_c = _as_contiguous(fz, np.uint64, (bsz, self._nw), "fz")
+        sel_c = None if sel_mask is None else _as_u8_mask(sel_mask, (bsz,), "sel_mask")
+
+        bk_raw = base_kappa if isinstance(base_kappa, np.ndarray) else np.asarray(base_kappa, dtype=object)
+        if bk_raw.ndim != 1:
+            raise ValueError(f"base_kappa must be 1D, got shape {bk_raw.shape}")
+        n_qt = int(bk_raw.shape[0])
+        bx_c = _as_contiguous(base_x, np.uint64, (n_qt, self._nw), "base_x")
+        bz_c = _as_contiguous(base_z, np.uint64, (n_qt, self._nw), "base_z")
+        bk_c = _as_contiguous(bk_raw, np.uint8, (n_qt,), "base_kappa")
+
+        _check_rc(
+            self._lib.mbr_batch_step_qturns(
+                h, bsz, 0 if sel_c is None else addr(sel_c), eid, kd,
+                n_qt, addr(bx_c), addr(bz_c), addr(bk_c),
+                addr(fx_c), addr(fz_c), addr(nodes_c), addr(peaks_c),
+            ),
+            "mbr_batch_step_qturns",
+        )
+
+    def batch_step_meas(
+        self,
+        event_id: int,
+        kind: int,
+        mx: Any,
+        mz: Any,
+        mkappa: int,
+        uniforms: Any,
+        fx: np.ndarray,
+        fz: np.ndarray,
+        nodes: np.ndarray,
+        peaks: np.ndarray,
+        *,
+        log_mass: np.ndarray | None = None,
+        update_log_mass: bool = True,
+        sel_mask: Any = None,
+        kick_x: Any = None,
+        kick_z: Any = None,
+        want_one_mask: Any = None,
+        out_true_m: np.ndarray | None = None,
+        out_p_chosen: np.ndarray | None = None,
+    ) -> None:
+        h = self._require_open()
+        eid = _as_u64_scalar(event_id, "event_id")
+        kd = _as_index(kind, "kind")
+        if kd not in (MBR_KIND_MEAS, MBR_KIND_URESET):
+            raise ValueError(f"kind must be MBR_KIND_MEAS or MBR_KIND_URESET, got {kd}")
+        if not isinstance(nodes, np.ndarray) or nodes.ndim != 1:
+            raise TypeError("nodes must be a 1D numpy.ndarray")
+        bsz = int(nodes.shape[0])
+        mx_c = _as_u64_words(mx, self._nw, "mx")
+        mz_c = _as_u64_words(mz, self._nw, "mz")
+        mk = _as_kappa(mkappa)
+        u_c = _as_f64_contiguous(uniforms, (bsz,), "uniforms")
+        fx_c = _as_rw_contiguous(fx, np.uint64, (bsz, self._nw), "fx")
+        fz_c = _as_rw_contiguous(fz, np.uint64, (bsz, self._nw), "fz")
+        nodes_c = _as_rw_contiguous(nodes, np.int64, (bsz,), "nodes")
+        peaks_c = _as_rw_contiguous(peaks, np.int16, (bsz,), "peaks")
+        sel_c = None if sel_mask is None else _as_u8_mask(sel_mask, (bsz,), "sel_mask")
+        if (kick_x is None) != (kick_z is None):
+            raise ValueError("kick_x and kick_z must either both be None or both provided")
+        kx_c = None if kick_x is None else _as_u64_words(kick_x, self._nw, "kick_x")
+        kz_c = None if kick_z is None else _as_u64_words(kick_z, self._nw, "kick_z")
+        w1_c = None if want_one_mask is None else _as_u8_mask(want_one_mask, (bsz,), "want_one_mask")
+        upd_lm = 1 if update_log_mass else 0
+        if upd_lm:
+            if log_mass is None:
+                raise ValueError("log_mass must be provided when update_log_mass is True")
+            lm_c = _as_rw_contiguous(log_mass, np.float64, (bsz,), "log_mass")
+        else:
+            lm_c = None
+        if out_true_m is None:
+            tm_c = None
+        elif isinstance(out_true_m, np.ndarray) and out_true_m.dtype == np.bool_:
+            tm_c = _as_rw_contiguous(out_true_m, np.bool_, (bsz,), "out_true_m").view(np.uint8)
+        else:
+            tm_c = _as_rw_contiguous(out_true_m, np.uint8, (bsz,), "out_true_m")
+        pc_c = (
+            None
+            if out_p_chosen is None
+            else _as_rw_contiguous(out_p_chosen, np.float64, (bsz,), "out_p_chosen")
+        )
+
+        _check_rc(
+            self._lib.mbr_batch_step_meas(
+                h, bsz, 0 if sel_c is None else addr(sel_c), eid, kd,
+                addr(mx_c), addr(mz_c), mk, addr(u_c),
+                0 if kx_c is None else addr(kx_c),
+                0 if kz_c is None else addr(kz_c),
+                0 if w1_c is None else addr(w1_c),
+                upd_lm,
+                addr(fx_c), addr(fz_c), addr(nodes_c), addr(peaks_c),
+                0 if lm_c is None else addr(lm_c),
+                0 if tm_c is None else addr(tm_c),
+                0 if pc_c is None else addr(pc_c),
+            ),
+            "mbr_batch_step_meas",
+        )
+
+    def batch_step_peek(
+        self,
+        event_id: int,
+        mx: Any,
+        mz: Any,
+        mkappa: int,
+        fx: np.ndarray,
+        fz: np.ndarray,
+        nodes: np.ndarray,
+        out_p1: np.ndarray,
+    ) -> None:
+        h = self._require_open()
+        eid = _as_u64_scalar(event_id, "event_id")
+        if not isinstance(nodes, np.ndarray) or nodes.ndim != 1:
+            raise TypeError("nodes must be a 1D numpy.ndarray")
+        bsz = int(nodes.shape[0])
+        mx_c = _as_u64_words(mx, self._nw, "mx")
+        mz_c = _as_u64_words(mz, self._nw, "mz")
+        mk = _as_kappa(mkappa)
+        fx_c = _as_contiguous(fx, np.uint64, (bsz, self._nw), "fx")
+        fz_c = _as_contiguous(fz, np.uint64, (bsz, self._nw), "fz")
+        nodes_c = _as_contiguous(nodes, np.int64, (bsz,), "nodes")
+        p1_c = _as_rw_contiguous(out_p1, np.float64, (bsz,), "out_p1")
+
+        _check_rc(
+            self._lib.mbr_batch_step_peek(
+                h, bsz, eid, addr(mx_c), addr(mz_c), mk,
+                addr(fx_c), addr(fz_c), addr(nodes_c), addr(p1_c),
+            ),
+            "mbr_batch_step_peek",
+        )
+
+    def batch_step_postselect(
+        self,
+        event_id: int,
+        mx: Any,
+        mz: Any,
+        mkappa: int,
+        desired_bits: Any,
+        fx: np.ndarray,
+        fz: np.ndarray,
+        nodes: np.ndarray,
+        peaks: np.ndarray,
+        log_mass: np.ndarray,
+        *,
+        sel_mask: Any = None,
+    ) -> int:
+        """Apply postselection across active shots atomically; returns `-1` on success or first failing shot index."""
+        h = self._require_open()
+        eid = _as_u64_scalar(event_id, "event_id")
+        if not isinstance(nodes, np.ndarray) or nodes.ndim != 1:
+            raise TypeError("nodes must be a 1D numpy.ndarray")
+        bsz = int(nodes.shape[0])
+        mx_c = _as_u64_words(mx, self._nw, "mx")
+        mz_c = _as_u64_words(mz, self._nw, "mz")
+        mk = _as_kappa(mkappa)
+        des_c = _as_u8_mask(desired_bits, (bsz,), "desired_bits")
+        fx_c = _as_rw_contiguous(fx, np.uint64, (bsz, self._nw), "fx")
+        fz_c = _as_rw_contiguous(fz, np.uint64, (bsz, self._nw), "fz")
+        nodes_c = _as_rw_contiguous(nodes, np.int64, (bsz,), "nodes")
+        peaks_c = _as_rw_contiguous(peaks, np.int16, (bsz,), "peaks")
+        lm_c = _as_rw_contiguous(log_mass, np.float64, (bsz,), "log_mass")
+        sel_c = None if sel_mask is None else _as_u8_mask(sel_mask, (bsz,), "sel_mask")
+        out_fail = ctypes.c_int64(-1)
+
+        _check_rc(
+            self._lib.mbr_batch_step_postselect(
+                h, bsz, 0 if sel_c is None else addr(sel_c), eid,
+                addr(mx_c), addr(mz_c), mk, addr(des_c),
+                addr(fx_c), addr(fz_c), addr(nodes_c), addr(peaks_c), addr(lm_c),
+                ctypes.addressof(out_fail),
+            ),
+            "mbr_batch_step_postselect",
+        )
+        return int(out_fail.value)
 
     def counters(self) -> dict[str, Any]:
         """Return Section 7 diagnostic counters owned by the native store."""

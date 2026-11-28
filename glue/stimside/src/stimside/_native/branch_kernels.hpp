@@ -1381,6 +1381,17 @@ inline SplitEntry choose_split_sorted(
 // MbrStore: sequential-ID path trie, canonical state pool, 5 sub-caches, counters
 // ---------------------------------------------------------------------------
 
+template <typename T>
+inline void reserve_geometric(std::vector<T>& v, size_t need) {
+    if (need <= v.capacity()) return;
+    if (need > kMaxElems) throw std::bad_alloc();
+    const size_t cap = v.capacity();
+    size_t next = (cap == 0U) ? 64U : (cap <= (kMaxElems >> 1U) ? cap * 2U : need);
+    if (next < need) next = need;
+    if (next > kMaxElems) next = need;
+    v.reserve(next);
+}
+
 struct MbrBranch {
     MbrComplex w{1.0, 0.0};
     uint32_t state_id = 0U;
@@ -1394,10 +1405,14 @@ struct MbrPending {
 };
 
 struct MbrNode {
-    std::vector<MbrBranch> branches;  // sorted by state_pool[state_id].key
-    std::vector<MbrPending> pend;     // insertion/update order matching mfe.py
+    size_t branch_off = 0U;
+    size_t branch_len = 0U;
+    size_t pend_off = 0U;     // item index; words live at pend_xz_pool[pend_off * 2 * nw]
+    size_t pend_len = 0U;
     uint32_t transient_peak = 1U;
 };
+
+static_assert(std::is_nothrow_move_constructible_v<MbrNode>, "MbrNode must be nothrow move-constructible");
 
 struct StateEntry {
     MbrState state;
@@ -1503,6 +1518,9 @@ struct MbrStore {
     std::vector<StateEntry> state_pool;
     std::unordered_map<std::string, uint32_t> state_intern;
     std::vector<MbrNode> nodes;
+    std::vector<MbrBranch> branch_pool;
+    std::vector<uint64_t> pend_xz_pool;  // 2 * nw words per pending item: x[0..nw-1], z[0..nw-1]
+    std::vector<uint8_t> pend_ke_pool;   // 1 byte per pending item: (e & 7) | ((kappa & 3) << 3)
     std::map<uint64_t, uint64_t> node_branches_hist;
 
     std::unordered_map<TransKey, int64_t, TransKeyHash> trans;
@@ -1542,13 +1560,52 @@ struct MbrStore {
     }
 
     inline uint64_t node_bytes(const MbrNode& nd) const noexcept {
-        uint64_t b = sizeof(MbrNode)
-            + nd.branches.capacity() * sizeof(MbrBranch)
-            + nd.pend.capacity() * sizeof(MbrPending);
-        for (const MbrPending& p : nd.pend) {
-            b += (p.x.capacity() + p.z.capacity()) * sizeof(uint64_t);
+        return sizeof(MbrNode)
+            + nd.branch_len * sizeof(MbrBranch)
+            + nd.pend_len * (2U * nw * sizeof(uint64_t) + sizeof(uint8_t));
+    }
+
+    inline int16_t node_peak_i16(int64_t nid) const noexcept {
+        if (nid < 0 || static_cast<size_t>(nid) >= nodes.size()) return 1;
+        const MbrNode& nd = nodes[static_cast<size_t>(nid)];
+        const size_t pk = std::max(nd.branch_len, static_cast<size_t>(nd.transient_peak));
+        return static_cast<int16_t>(pk > 32767U ? 32767U : pk);
+    }
+
+    inline std::vector<MbrBranch> copy_node_branches(const MbrNode& nd) const {
+        const auto* first = branch_pool.data() + nd.branch_off;
+        return std::vector<MbrBranch>(first, first + nd.branch_len);
+    }
+
+    inline std::vector<MbrPending> copy_node_pend(const MbrNode& nd) const {
+        std::vector<MbrPending> out;
+        out.reserve(nd.pend_len);
+        const size_t stride = 2U * nw;
+        const uint64_t* base_xz = pend_xz_pool.data() + nd.pend_off * stride;
+        const uint8_t* base_ke = pend_ke_pool.data() + nd.pend_off;
+        for (size_t i = 0; i < nd.pend_len; ++i) {
+            const uint64_t* row = base_xz + i * stride;
+            MbrPending p;
+            p.x.assign(row, row + nw);
+            p.z.assign(row + nw, row + stride);
+            const uint8_t ke = base_ke[i];
+            p.e = static_cast<uint8_t>(ke & 7U);
+            p.kappa = static_cast<uint8_t>((ke >> 3U) & 3U);
+            out.push_back(std::move(p));
         }
-        return b;
+        return out;
+    }
+
+    inline bool node_pend_anticommutes(
+        const MbrNode& nd, const uint64_t* mx, const uint64_t* mz
+    ) const noexcept {
+        const size_t stride = 2U * nw;
+        const uint64_t* base_xz = pend_xz_pool.data() + nd.pend_off * stride;
+        for (size_t i = 0; i < nd.pend_len; ++i) {
+            const uint64_t* row = base_xz + i * stride;
+            if (pauli_anti(row, row + nw, mx, mz, nw) != 0U) return true;
+        }
+        return false;
     }
 
     inline uint32_t intern_canonical(MbrState&& st) {
@@ -1558,7 +1615,7 @@ struct MbrStore {
         if (state_pool.size() >= static_cast<size_t>(kInvalidStateId)) {
             throw std::bad_alloc();
         }
-        state_pool.reserve(state_pool.size() + 1U);
+        reserve_geometric(state_pool, state_pool.size() + 1U);
         const uint32_t id = static_cast<uint32_t>(state_pool.size());
         const uint64_t add_bytes = state_bytes(st, key) + 64U + key.capacity();
         auto ins = state_intern.emplace(key, id);
@@ -1569,22 +1626,52 @@ struct MbrStore {
     }
 
     inline int64_t push_node(
-        std::vector<MbrBranch> branches,
-        std::vector<MbrPending> pend,
+        const std::vector<MbrBranch>& branches,
+        const std::vector<MbrPending>& pend,
         uint32_t transient_peak
     ) {
-        const uint32_t nb = static_cast<uint32_t>(branches.size());
+        const size_t nb_sz = branches.size();
+        const size_t np_sz = pend.size();
+        const uint32_t nb = static_cast<uint32_t>(nb_sz);
         if (transient_peak < nb) transient_peak = nb;
-        nodes.reserve(nodes.size() + 1U);
+
+        size_t stride = 0U, add_pwords = 0U;
+        if (!mul_within(size_t(2), nw, kMaxElems, stride)
+            || !mul_within(np_sz, stride, kMaxElems, add_pwords)) {
+            throw std::bad_alloc();
+        }
+        if (nodes.size() >= kMaxElems
+            || nb_sz > kMaxElems - branch_pool.size()
+            || np_sz > kMaxElems - pend_ke_pool.size()
+            || add_pwords > kMaxElems - pend_xz_pool.size()) {
+            throw std::bad_alloc();
+        }
+
+        // Strong OOM safety: reserve all pools and map entry BEFORE any mutation.
+        reserve_geometric(nodes, nodes.size() + 1U);
+        reserve_geometric(branch_pool, branch_pool.size() + nb_sz);
+        reserve_geometric(pend_xz_pool, pend_xz_pool.size() + add_pwords);
+        reserve_geometric(pend_ke_pool, pend_ke_pool.size() + np_sz);
         auto hist_it = node_branches_hist.find(static_cast<uint64_t>(nb));
         if (hist_it == node_branches_hist.end()) {
             hist_it = node_branches_hist.emplace(static_cast<uint64_t>(nb), 0U).first;
         }
-        // Below is noexcept: vector capacity and map slot are already allocated.
+
+        // Below is noexcept: all capacities and map slots are already allocated.
+        const size_t b_off = branch_pool.size();
+        const size_t p_off = pend_ke_pool.size();
+        for (const MbrBranch& br : branches) {
+            branch_pool.push_back(br);
+        }
+        for (const MbrPending& p : pend) {
+            for (size_t w = 0; w < nw; ++w) pend_xz_pool.push_back(p.x[w]);
+            for (size_t w = 0; w < nw; ++w) pend_xz_pool.push_back(p.z[w]);
+            pend_ke_pool.push_back(static_cast<uint8_t>((p.e & 7U) | ((p.kappa & 3U) << 3U)));
+        }
         const int64_t nid = static_cast<int64_t>(nodes.size());
-        MbrNode nd{std::move(branches), std::move(pend), transient_peak};
+        const MbrNode nd{b_off, nb_sz, p_off, np_sz, transient_peak};
         const uint64_t add_b = node_bytes(nd);
-        nodes.push_back(std::move(nd));
+        nodes.push_back(nd);
         hist_it->second += 1U;
         bytes_estimate += add_b;
         return nid;
@@ -1601,31 +1688,47 @@ struct MbrStore {
         new_intern.emplace(key, 0U);
         new_pool.push_back(StateEntry{std::move(zero), std::move(key)});
 
-        std::vector<MbrBranch> root_br;
-        root_br.reserve(1U);
-        root_br.push_back(MbrBranch{MbrComplex{1.0, 0.0}, 0U});
+        std::vector<MbrBranch> new_branch_pool;
+        new_branch_pool.reserve(1U);
+        new_branch_pool.push_back(MbrBranch{MbrComplex{1.0, 0.0}, 0U});
+        std::vector<uint64_t> new_pend_xz_pool;
+        std::vector<uint8_t> new_pend_ke_pool;
+
         std::vector<MbrNode> new_nodes;
         new_nodes.reserve(1U);
-        MbrNode root_nd{std::move(root_br), {}, 1U};
+        const MbrNode root_nd{0U, 1U, 0U, 0U, 1U};
         const uint64_t nd_bytes = node_bytes(root_nd);
-        new_nodes.push_back(std::move(root_nd));
+        new_nodes.push_back(root_nd);
 
         std::map<uint64_t, uint64_t> new_hist;
         new_hist.emplace(1U, 1U);
+
+        // Fresh empty hash maps so clear() releases old bucket arrays rather than pinning 300k buckets.
+        decltype(trans) empty_trans;
+        decltype(meas) empty_meas;
+        decltype(peek) empty_peek;
+        decltype(resolve_cache) empty_resolve;
+        decltype(project_cache) empty_project;
+        decltype(overlap_cache) empty_overlap;
+        decltype(definite_cache) empty_definite;
+        decltype(split_cache) empty_split;
 
         // Noexcept commit phase: if any allocation above threw, *this is untouched.
         state_pool.swap(new_pool);
         state_intern.swap(new_intern);
         nodes.swap(new_nodes);
+        branch_pool.swap(new_branch_pool);
+        pend_xz_pool.swap(new_pend_xz_pool);
+        pend_ke_pool.swap(new_pend_ke_pool);
         node_branches_hist.swap(new_hist);
-        trans.clear();
-        meas.clear();
-        peek.clear();
-        resolve_cache.clear();
-        project_cache.clear();
-        overlap_cache.clear();
-        definite_cache.clear();
-        split_cache.clear();
+        trans.swap(empty_trans);
+        meas.swap(empty_meas);
+        peek.swap(empty_peek);
+        resolve_cache.swap(empty_resolve);
+        project_cache.swap(empty_project);
+        overlap_cache.swap(empty_overlap);
+        definite_cache.swap(empty_definite);
+        split_cache.swap(empty_split);
         bytes_estimate = sizeof(MbrStore) + st_bytes + nd_bytes;
     }
 
@@ -1768,15 +1871,22 @@ struct MbrStore {
 
 std::atomic<size_t> g_live_stores{0};
 
-// RAII rollback guard for MbrStore::nodes, node_branches_hist, and bytes_estimate.
+// RAII rollback guard for MbrStore::nodes, pools, node_branches_hist, and bytes_estimate.
 // If destroyed before commit(), pops any nodes pushed since construction without throwing.
 struct NodeRollbackGuard {
     MbrStore& st;
     size_t orig_nodes;
+    size_t orig_branches;
+    size_t orig_pend_xz;
+    size_t orig_pend_ke;
     bool committed = false;
 
     explicit NodeRollbackGuard(MbrStore& store) noexcept
-        : st(store), orig_nodes(store.nodes.size()) {}
+        : st(store),
+          orig_nodes(store.nodes.size()),
+          orig_branches(store.branch_pool.size()),
+          orig_pend_xz(store.pend_xz_pool.size()),
+          orig_pend_ke(store.pend_ke_pool.size()) {}
 
     inline void commit() noexcept { committed = true; }
 
@@ -1784,7 +1894,7 @@ struct NodeRollbackGuard {
         if (committed) return;
         while (st.nodes.size() > orig_nodes) {
             const MbrNode& nd = st.nodes.back();
-            const uint64_t nb = static_cast<uint64_t>(nd.branches.size());
+            const uint64_t nb = static_cast<uint64_t>(nd.branch_len);
             const uint64_t b = st.node_bytes(nd);
             auto it = st.node_branches_hist.find(nb);
             if (it != st.node_branches_hist.end()) {
@@ -1797,6 +1907,9 @@ struct NodeRollbackGuard {
             st.bytes_estimate = (st.bytes_estimate >= b) ? (st.bytes_estimate - b) : 0U;
             st.nodes.pop_back();
         }
+        st.branch_pool.resize(orig_branches);
+        st.pend_xz_pool.resize(orig_pend_xz);
+        st.pend_ke_pool.resize(orig_pend_ke);
     }
 };
 
@@ -2391,22 +2504,16 @@ inline int32_t store_meas_or_peek(
     uint32_t res_peak = 0U;
     {
         const MbrNode& nd = store.nodes[static_cast<size_t>(node_id)];
-        bool anti_pend = false;
-        for (const MbrPending& it : nd.pend) {
-            if (pauli_anti(it.x.data(), it.z.data(), mx, mz, nw) != 0U) {
-                anti_pend = true;
-                break;
-            }
-        }
+        const bool anti_pend = store.node_pend_anticommutes(nd, mx, mz);
         if (anti_pend) {
-            std::vector<MbrBranch> nb = nd.branches;
-            std::vector<MbrPending> np = nd.pend;
+            std::vector<MbrBranch> nb = store.copy_node_branches(nd);
+            std::vector<MbrPending> np = store.copy_node_pend(nd);
             const int32_t rrc = resolve_branches(store, nb, np, working_branches, res_peak);
             if (rrc != kOk) return rrc;
             did_resolve = true;
         } else {
-            std::vector<MbrBranch>(nd.branches).swap(working_branches);
-            std::vector<MbrPending>(nd.pend).swap(working_pend);
+            working_branches = store.copy_node_branches(nd);
+            working_pend = store.copy_node_pend(nd);
             res_peak = static_cast<uint32_t>(working_branches.size());
         }
     }
@@ -2737,6 +2844,488 @@ inline uint32_t bitrev_u32(uint32_t x, size_t n) noexcept {
         x >>= 1U;
     }
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// Internal store step & batch-walk helpers (WP6)
+// ---------------------------------------------------------------------------
+
+// Caller must have already validated node_id, kind, and commuting turns.
+inline int32_t store_step_rotations_inner(
+    MbrStore& st,
+    int64_t node_id,
+    uint64_t event_id,
+    uint8_t kind,
+    uint32_t sign_bits,
+    size_t n_axes,
+    const uint64_t* ax_x,
+    const uint64_t* ax_z,
+    const uint8_t* ax_kappa,
+    const uint8_t* ax_e,
+    int64_t& out_child
+) {
+    const TransKey tkey{node_id, event_id, sign_bits, kind};
+    auto tit = st.trans.find(tkey);
+    if (tit != st.trans.end()) {
+        st.transitions_hit[kind] += 1U;
+        out_child = tit->second;
+        return kOk;
+    }
+
+    const size_t nw = st.nw;
+    std::vector<MbrPending> incoming;
+    uint8_t ph = 0U;
+    const int32_t nrc = normalize_commuting_turns(
+        st.n_qubits, nw, n_axes, ax_x, ax_z, ax_kappa, ax_e, incoming, ph
+    );
+    if (nrc != kOk) return nrc;
+
+    const MbrNode& src_nd = st.nodes[static_cast<size_t>(node_id)];
+    std::vector<MbrBranch> branches = st.copy_node_branches(src_nd);
+    std::vector<MbrPending> pend = st.copy_node_pend(src_nd);
+    uint32_t peak = static_cast<uint32_t>(branches.size());
+
+    if ((ph & 7U) != 0U) {
+        const MbrComplex sc = omega_pow(ph);
+        for (MbrBranch& br : branches) br.w = cmul(br.w, sc);
+    }
+
+    bool need_resolve = false;
+    if (!pend.empty() && !incoming.empty()) {
+        for (const MbrPending& inc : incoming) {
+            for (const MbrPending& cur : pend) {
+                if (pauli_anti(inc.x.data(), inc.z.data(), cur.x.data(), cur.z.data(), nw) != 0U) {
+                    need_resolve = true;
+                    break;
+                }
+            }
+            if (need_resolve) break;
+        }
+    }
+    if (need_resolve) {
+        std::vector<MbrBranch> resolved;
+        uint32_t rpeak = 0U;
+        const int32_t rrc = resolve_branches(st, branches, pend, resolved, rpeak);
+        if (rrc != kOk) return rrc;
+        branches = std::move(resolved);
+        pend.clear();
+        if (rpeak > peak) peak = rpeak;
+    }
+
+    accumulate_pending_inplace(pend, incoming, nw);
+
+    NodeRollbackGuard guard(st);
+    const int64_t cid = st.push_node(branches, pend, peak);
+    st.trans.emplace(tkey, cid);
+    st.bytes_estimate += 64U;
+    st.transitions_new[kind] += 1U;
+    guard.commit();
+    out_child = cid;
+    return kOk;
+}
+
+// Caller must have already validated node_id, kind, and Hermitian quarter-turns.
+inline int32_t store_step_qturns_inner(
+    MbrStore& st,
+    int64_t node_id,
+    uint64_t event_id,
+    uint8_t kind,
+    uint32_t sign_bits,
+    size_t n_qturns,
+    const uint64_t* qt_x,
+    const uint64_t* qt_z,
+    const uint8_t* qt_kappa,
+    int64_t& out_child
+) {
+    const TransKey tkey{node_id, event_id, sign_bits, kind};
+    auto tit = st.trans.find(tkey);
+    if (tit != st.trans.end()) {
+        st.transitions_hit[kind] += 1U;
+        out_child = tit->second;
+        return kOk;
+    }
+
+    const size_t nw = st.nw;
+    const MbrNode& src_nd = st.nodes[static_cast<size_t>(node_id)];
+    std::vector<MbrBranch> branches = st.copy_node_branches(src_nd);
+    std::vector<MbrPending> pend = st.copy_node_pend(src_nd);
+    const uint32_t peak = static_cast<uint32_t>(branches.size());
+
+    std::vector<MbrBranch> updated;
+    updated.reserve(branches.size());
+    for (const MbrBranch& br : branches) {
+        MbrState qc = st.state_pool[br.state_id].state;
+        MbrComplex f = br.w;
+        for (size_t q = 0; q < n_qturns; ++q) {
+            const MbrComplex fq = apply_qturn(
+                qc, &qt_x[q * nw], &qt_z[q * nw], static_cast<uint8_t>(qt_kappa[q] & 3U)
+            );
+            f = cmul(f, fq);
+        }
+        f = cmul(f, canon(qc));
+        const uint32_t cid_st = st.intern_canonical(std::move(qc));
+        updated.push_back({f, cid_st});
+    }
+
+    if (!pend.empty() && n_qturns > 0U) {
+        uint8_t ph = 0U;
+        for (MbrPending& p : pend) {
+            for (size_t q = 0; q < n_qturns; ++q) {
+                pauli_conj_by_qturn_inplace(
+                    p.x.data(), p.z.data(), p.kappa,
+                    &qt_x[q * nw], &qt_z[q * nw], static_cast<uint8_t>(qt_kappa[q] & 3U), nw
+                );
+            }
+            if (pauli_norm_sign_plus(p.x.data(), p.z.data(), p.kappa, nw)) {
+                ph = static_cast<uint8_t>((ph + p.e) & 7U);
+                p.e = static_cast<uint8_t>((8U - p.e) & 7U);
+            }
+        }
+        if ((ph & 7U) != 0U) {
+            const MbrComplex sc = omega_pow(ph);
+            for (MbrBranch& br : updated) br.w = cmul(br.w, sc);
+        }
+    }
+
+    std::vector<MbrBranch> merged;
+    const int32_t mrc = merge_and_sort_branches(st, updated, merged);
+    if (mrc != kOk) return mrc;
+    if (!branches.empty() && merged.empty()) return kErrFloatDrift;
+
+    NodeRollbackGuard guard(st);
+    const int64_t cid = st.push_node(merged, pend, peak);
+    st.trans.emplace(tkey, cid);
+    st.bytes_estimate += 64U;
+    st.transitions_new[kind] += 1U;
+    guard.commit();
+    out_child = cid;
+    return kOk;
+}
+
+// Fast sign-bit extraction for shot `s` against `n_gens` generators (`n_gens <= 30`).
+inline uint32_t shot_sign_bits(
+    const uint64_t* fx_s, const uint64_t* fz_s,
+    size_t n_gens, const uint64_t* gen_x, const uint64_t* gen_z,
+    size_t nw
+) noexcept {
+    uint32_t sb = 0U;
+    if (nw == 1U) {
+        const uint64_t fx0 = fx_s[0];
+        const uint64_t fz0 = fz_s[0];
+        for (size_t g = 0; g < n_gens; ++g) {
+            const uint64_t acc = (fx0 & gen_z[g]) ^ (fz0 & gen_x[g]);
+            sb |= static_cast<uint32_t>(popcount64(acc) & 1) << static_cast<uint32_t>(g);
+        }
+    } else {
+        for (size_t g = 0; g < n_gens; ++g) {
+            sb |= static_cast<uint32_t>(
+                pauli_anti(fx_s, fz_s, &gen_x[g * nw], &gen_z[g * nw], nw)
+            ) << static_cast<uint32_t>(g);
+        }
+    }
+    return sb;
+}
+
+inline uint8_t shot_pauli_anti(
+    const uint64_t* fx_s, const uint64_t* fz_s,
+    const uint64_t* mx, const uint64_t* mz, size_t nw
+) noexcept {
+    if (nw == 1U) {
+        return static_cast<uint8_t>(popcount64((fx_s[0] & mz[0]) ^ (fz_s[0] & mx[0])) & 1);
+    }
+    return pauli_anti(fx_s, fz_s, mx, mz, nw);
+}
+
+inline void xor_frame_words(
+    uint64_t* fx_s, uint64_t* fz_s,
+    const uint64_t* px, const uint64_t* pz, size_t nw
+) noexcept {
+    if (nw == 1U) {
+        fx_s[0] ^= px[0];
+        fz_s[0] ^= pz[0];
+    } else {
+        for (size_t w = 0; w < nw; ++w) {
+            fx_s[w] ^= px[w];
+            fz_s[w] ^= pz[w];
+        }
+    }
+}
+
+struct NodeSbKey {
+    int64_t nid = 0;
+    uint32_t sb = 0U;
+
+    inline bool operator==(const NodeSbKey& o) const noexcept {
+        return nid == o.nid && sb == o.sb;
+    }
+};
+
+struct NodeSbKeyHash {
+    inline size_t operator()(const NodeSbKey& k) const noexcept {
+        size_t h = static_cast<size_t>(splitmix64(static_cast<uint64_t>(k.nid)));
+        hash_combine_u64(h, k.sb);
+        return h;
+    }
+};
+
+// Stack-resident open-addressed dedup table for (nid, sb) -> result index,
+// spilling to std::unordered_map + heap vector only if > 128 distinct keys.
+template <typename Val>
+struct BatchDedupNodeSb {
+    static constexpr size_t kSlots = 256U;
+    static constexpr size_t kMask = kSlots - 1U;
+    static constexpr size_t kMaxStack = 128U;
+
+    NodeSbKey slot_keys[kSlots];
+    uint16_t slot_idx[kSlots];
+    uint8_t slot_used[kSlots];
+    Val stack_vals[kMaxStack];
+    size_t n_stack = 0U;
+
+    bool spilled = false;
+    std::unordered_map<NodeSbKey, uint32_t, NodeSbKeyHash> heap_map;
+    std::vector<Val> heap_vals;
+
+    BatchDedupNodeSb() noexcept {
+        std::memset(slot_used, 0, sizeof(slot_used));
+    }
+
+    inline size_t count() const noexcept {
+        return spilled ? heap_vals.size() : n_stack;
+    }
+
+    inline const Val& at(uint32_t idx) const noexcept {
+        return spilled ? heap_vals[idx] : stack_vals[idx];
+    }
+
+    inline int32_t find_existing(int64_t nid, uint32_t sb) const noexcept {
+        if (!spilled) {
+            size_t h = static_cast<size_t>(splitmix64(static_cast<uint64_t>(nid)));
+            hash_combine_u64(h, sb);
+            size_t pos = h & kMask;
+            while (slot_used[pos] != 0U) {
+                if (slot_keys[pos].nid == nid && slot_keys[pos].sb == sb) {
+                    return static_cast<int32_t>(slot_idx[pos]);
+                }
+                pos = (pos + 1U) & kMask;
+            }
+            return -1;
+        }
+        auto it = heap_map.find(NodeSbKey{nid, sb});
+        if (it == heap_map.end()) return -1;
+        return static_cast<int32_t>(it->second);
+    }
+
+    inline uint32_t insert_new(int64_t nid, uint32_t sb, const Val& v) {
+        if (!spilled && n_stack < kMaxStack) {
+            const uint16_t idx = static_cast<uint16_t>(n_stack);
+            stack_vals[idx] = v;
+            size_t h = static_cast<size_t>(splitmix64(static_cast<uint64_t>(nid)));
+            hash_combine_u64(h, sb);
+            size_t pos = h & kMask;
+            while (slot_used[pos] != 0U) {
+                pos = (pos + 1U) & kMask;
+            }
+            slot_used[pos] = 1U;
+            slot_keys[pos] = NodeSbKey{nid, sb};
+            slot_idx[pos] = idx;
+            n_stack += 1U;
+            return static_cast<uint32_t>(idx);
+        }
+        if (!spilled) {
+            heap_vals.assign(stack_vals, stack_vals + n_stack);
+            heap_map.reserve(n_stack * 2U + 16U);
+            for (size_t pos = 0; pos < kSlots; ++pos) {
+                if (slot_used[pos] != 0U) {
+                    heap_map.emplace(slot_keys[pos], static_cast<uint32_t>(slot_idx[pos]));
+                }
+            }
+            spilled = true;
+        }
+        const uint32_t idx = static_cast<uint32_t>(heap_vals.size());
+        heap_vals.push_back(v);
+        heap_map.emplace(NodeSbKey{nid, sb}, idx);
+        return idx;
+    }
+};
+
+// Stack-resident open-addressed dedup table for node_id -> result index,
+// spilling to std::unordered_map + heap vector only if > 128 distinct nodes.
+template <typename Val>
+struct BatchDedupNode {
+    static constexpr size_t kSlots = 256U;
+    static constexpr size_t kMask = kSlots - 1U;
+    static constexpr size_t kMaxStack = 128U;
+
+    int64_t slot_keys[kSlots];
+    uint16_t slot_idx[kSlots];
+    uint8_t slot_used[kSlots];
+    Val stack_vals[kMaxStack];
+    size_t n_stack = 0U;
+
+    bool spilled = false;
+    std::unordered_map<int64_t, uint32_t> heap_map;
+    std::vector<Val> heap_vals;
+
+    BatchDedupNode() noexcept {
+        std::memset(slot_used, 0, sizeof(slot_used));
+    }
+
+    inline const Val& at(uint32_t idx) const noexcept {
+        return spilled ? heap_vals[idx] : stack_vals[idx];
+    }
+
+    inline int32_t find_existing(int64_t nid) const noexcept {
+        if (!spilled) {
+            size_t pos = static_cast<size_t>(splitmix64(static_cast<uint64_t>(nid))) & kMask;
+            while (slot_used[pos] != 0U) {
+                if (slot_keys[pos] == nid) {
+                    return static_cast<int32_t>(slot_idx[pos]);
+                }
+                pos = (pos + 1U) & kMask;
+            }
+            return -1;
+        }
+        auto it = heap_map.find(nid);
+        if (it == heap_map.end()) return -1;
+        return static_cast<int32_t>(it->second);
+    }
+
+    inline uint32_t insert_new(int64_t nid, const Val& v) {
+        if (!spilled && n_stack < kMaxStack) {
+            const uint16_t idx = static_cast<uint16_t>(n_stack);
+            stack_vals[idx] = v;
+            size_t pos = static_cast<size_t>(splitmix64(static_cast<uint64_t>(nid))) & kMask;
+            while (slot_used[pos] != 0U) {
+                pos = (pos + 1U) & kMask;
+            }
+            slot_used[pos] = 1U;
+            slot_keys[pos] = nid;
+            slot_idx[pos] = idx;
+            n_stack += 1U;
+            return static_cast<uint32_t>(idx);
+        }
+        if (!spilled) {
+            heap_vals.assign(stack_vals, stack_vals + n_stack);
+            heap_map.reserve(n_stack * 2U + 16U);
+            for (size_t pos = 0; pos < kSlots; ++pos) {
+                if (slot_used[pos] != 0U) {
+                    heap_map.emplace(slot_keys[pos], static_cast<uint32_t>(slot_idx[pos]));
+                }
+            }
+            spilled = true;
+        }
+        const uint32_t idx = static_cast<uint32_t>(heap_vals.size());
+        heap_vals.push_back(v);
+        heap_map.emplace(nid, idx);
+        return idx;
+    }
+};
+
+// Per-shot local index buffer: stack uint16_t[4096] for B <= 4096 and <= 65535 keys,
+// transparently promoting to std::vector<uint32_t> if B > 4096 or idx > 65535.
+struct BatchShotIdx {
+    static constexpr size_t kStackCap = 4096U;
+    uint16_t stack_buf[kStackCap];
+    std::vector<uint32_t> heap_buf;
+    size_t n_shots = 0U;
+    bool use_heap = false;
+
+    inline void init(size_t batch_size) {
+        n_shots = batch_size;
+        if (batch_size > kStackCap) {
+            heap_buf.resize(batch_size, 0U);
+            use_heap = true;
+        }
+    }
+
+    inline void set(size_t s, uint32_t val) {
+        if (!use_heap) {
+            if (val <= 0xFFFFU) {
+                stack_buf[s] = static_cast<uint16_t>(val);
+                return;
+            }
+            heap_buf.resize(n_shots, 0U);
+            for (size_t i = 0; i < s; ++i) {
+                heap_buf[i] = static_cast<uint32_t>(stack_buf[i]);
+            }
+            use_heap = true;
+        }
+        heap_buf[s] = val;
+    }
+
+    inline uint32_t get(size_t s) const noexcept {
+        return use_heap ? heap_buf[s] : static_cast<uint32_t>(stack_buf[s]);
+    }
+};
+
+struct BatchChildPeak {
+    int64_t cid = 0;
+    int16_t peak = 1;
+};
+
+struct BatchMeasResolved {
+    double p0 = 0.0;
+    int64_t child0 = -1;
+    int64_t child1 = -1;
+    int16_t pk0 = 1;
+    int16_t pk1 = 1;
+    uint8_t meas_type = kMeasDefinite;
+    const uint64_t* absorb_x = nullptr;  // points into stable MeasEntry::absorb_x inside store.meas
+    const uint64_t* absorb_z = nullptr;
+};
+
+// Look up or compute MeasEntry and return pointers into the stable store.meas entry
+// plus eagerly captured pk0/pk1 (NEVER caching const MbrNode* across push_node!).
+inline int32_t store_meas_resolved(
+    MbrStore& store,
+    int64_t node_id,
+    uint64_t event_id,
+    uint8_t kind,
+    const uint64_t* mx, const uint64_t* mz, uint8_t mkappa,
+    BatchMeasResolved& out
+) {
+    const MeasKey mkey{node_id, event_id, kind};
+    auto mit = store.meas.find(mkey);
+    if (mit != store.meas.end()) {
+        store.transitions_hit[kind] += 1U;
+        const MeasEntry& me = mit->second;
+        out.p0 = me.p0;
+        out.child0 = me.child0;
+        out.child1 = me.child1;
+        out.pk0 = store.node_peak_i16(me.child0);
+        out.pk1 = (me.child1 == me.child0) ? out.pk0 : store.node_peak_i16(me.child1);
+        out.meas_type = me.meas_type;
+        out.absorb_x = (me.meas_type == kMeasAbsorbed) ? me.absorb_x.data() : nullptr;
+        out.absorb_z = (me.meas_type == kMeasAbsorbed) ? me.absorb_z.data() : nullptr;
+        return kOk;
+    }
+
+    // Cache miss: delegate to store_meas_or_peek, then fetch stable MeasEntry pointers.
+    const size_t nw = store.nw;
+    std::vector<uint64_t> tmp_ax(nw, 0ULL);
+    std::vector<uint64_t> tmp_az(nw, 0ULL);
+    double p0 = 0.0;
+    int64_t c0 = -1, c1 = -1;
+    uint8_t mt = kMeasDefinite;
+    const int32_t rc = store_meas_or_peek(
+        store, node_id, event_id, kind, false,
+        mx, mz, mkappa, p0, &c0, &c1, &mt, tmp_ax.data(), tmp_az.data()
+    );
+    if (rc != kOk) return rc;
+
+    auto mit2 = store.meas.find(mkey);
+    if (mit2 == store.meas.end()) return kErrInvalidArg;
+    const MeasEntry& me = mit2->second;
+    out.p0 = me.p0;
+    out.child0 = me.child0;
+    out.child1 = me.child1;
+    out.pk0 = store.node_peak_i16(me.child0);
+    out.pk1 = (me.child1 == me.child0) ? out.pk0 : store.node_peak_i16(me.child1);
+    out.meas_type = me.meas_type;
+    out.absorb_x = (me.meas_type == kMeasAbsorbed) ? me.absorb_x.data() : nullptr;
+    out.absorb_z = (me.meas_type == kMeasAbsorbed) ? me.absorb_z.data() : nullptr;
+    return kOk;
 }
 
 }  // namespace mbr
@@ -3332,8 +3921,8 @@ int32_t mbr_store_node_info(
             return mbr::kErrInvalidArg;
         }
         const mbr::MbrNode& nd = st->nodes[static_cast<size_t>(node_id)];
-        *out_n_branches = nd.branches.size();
-        *out_n_pend = nd.pend.size();
+        *out_n_branches = nd.branch_len;
+        *out_n_pend = nd.pend_len;
         *out_transient_peak = nd.transient_peak;
         return mbr::kOk;
     } catch (...) {
@@ -3354,8 +3943,8 @@ int32_t mbr_store_node_branch(
             return mbr::kErrInvalidArg;
         }
         const mbr::MbrNode& nd = st->nodes[static_cast<size_t>(node_id)];
-        if (branch_idx >= nd.branches.size()) return mbr::kErrInvalidArg;
-        const mbr::MbrBranch& br = nd.branches[branch_idx];
+        if (branch_idx >= nd.branch_len) return mbr::kErrInvalidArg;
+        const mbr::MbrBranch& br = st->branch_pool[nd.branch_off + branch_idx];
         mbr::MbrState* copy = new mbr::MbrState(st->state_pool[br.state_id].state);
         mbr::g_live_states.fetch_add(1U, std::memory_order_relaxed);
         out_w_ri[0] = br.w.re;
@@ -3380,17 +3969,22 @@ int32_t mbr_store_node_pending(
             return mbr::kErrInvalidArg;
         }
         const mbr::MbrNode& nd = st->nodes[static_cast<size_t>(node_id)];
-        const size_t np = nd.pend.size();
+        const size_t np = nd.pend_len;
         if (np == 0U) return mbr::kOk;
         if (out_x == nullptr || out_z == nullptr || out_kappa == nullptr || out_e == nullptr) {
             return mbr::kErrInvalidArg;
         }
         const size_t nw = st->nw;
+        const size_t stride = 2U * nw;
+        const uint64_t* base_xz = st->pend_xz_pool.data() + nd.pend_off * stride;
+        const uint8_t* base_ke = st->pend_ke_pool.data() + nd.pend_off;
         for (size_t i = 0; i < np; ++i) {
-            std::memcpy(&out_x[i * nw], nd.pend[i].x.data(), nw * sizeof(uint64_t));
-            std::memcpy(&out_z[i * nw], nd.pend[i].z.data(), nw * sizeof(uint64_t));
-            out_kappa[i] = nd.pend[i].kappa;
-            out_e[i] = nd.pend[i].e;
+            const uint64_t* row = base_xz + i * stride;
+            std::memcpy(&out_x[i * nw], row, nw * sizeof(uint64_t));
+            std::memcpy(&out_z[i * nw], row + nw, nw * sizeof(uint64_t));
+            const uint8_t ke = base_ke[i];
+            out_kappa[i] = static_cast<uint8_t>((ke >> 3U) & 3U);
+            out_e[i] = static_cast<uint8_t>(ke & 7U);
         }
         return mbr::kOk;
     } catch (...) {
@@ -3419,7 +4013,8 @@ int32_t mbr_store_node_dense(
         const mbr::MbrNode& nd = st->nodes[static_cast<size_t>(node_id)];
         std::vector<double> tmp(dim * 2U, 0.0);
         std::memset(out_psi_ri, 0, dim * 2U * sizeof(double));
-        for (const mbr::MbrBranch& br : nd.branches) {
+        for (size_t bi = 0; bi < nd.branch_len; ++bi) {
+            const mbr::MbrBranch& br = st->branch_pool[nd.branch_off + bi];
             if (!mbr::to_dense(st->state_pool[br.state_id].state, big_endian != 0, tmp.data())) {
                 return mbr::kErrInvalidArg;
             }
@@ -3431,16 +4026,24 @@ int32_t mbr_store_node_dense(
         }
 
         // Apply pending diagonal/Pauli eighth turns D = prod omega^{e(1-P)/2}.
-        for (const mbr::MbrPending& p : nd.pend) {
-            uint32_t px = static_cast<uint32_t>(p.x[0]);
-            uint32_t pz = static_cast<uint32_t>(p.z[0]);
+        const size_t nw = st->nw;
+        const size_t stride = 2U * nw;
+        const uint64_t* base_xz = st->pend_xz_pool.data() + nd.pend_off * stride;
+        const uint8_t* base_ke = st->pend_ke_pool.data() + nd.pend_off;
+        for (size_t pi = 0; pi < nd.pend_len; ++pi) {
+            const uint64_t* row = base_xz + pi * stride;
+            const uint8_t ke = base_ke[pi];
+            const uint8_t p_e = static_cast<uint8_t>(ke & 7U);
+            const uint8_t p_kappa = static_cast<uint8_t>((ke >> 3U) & 3U);
+            uint32_t px = static_cast<uint32_t>(row[0]);
+            uint32_t pz = static_cast<uint32_t>(row[nw]);
             if (big_endian != 0) {
                 px = mbr::bitrev_u32(px, n);
                 pz = mbr::bitrev_u32(pz, n);
             }
-            const mbr::MbrComplex we = mbr::omega_pow(p.e);
+            const mbr::MbrComplex we = mbr::omega_pow(p_e);
             if (px == 0U) {
-                const uint8_t sgn_base = static_cast<uint8_t>((p.kappa >> 1U) & 1U);
+                const uint8_t sgn_base = static_cast<uint8_t>((p_kappa >> 1U) & 1U);
                 for (uint32_t y = 0; y < static_cast<uint32_t>(dim); ++y) {
                     const uint8_t par = static_cast<uint8_t>(
                         (sgn_base ^ static_cast<uint8_t>(__builtin_popcount(pz & y) & 1)) & 1U
@@ -3461,10 +4064,10 @@ int32_t mbr_store_node_dense(
                     const mbr::MbrComplex c0{out_psi_ri[2U * y], out_psi_ri[2U * y + 1U]};
                     const mbr::MbrComplex c1{out_psi_ri[2U * y2], out_psi_ri[2U * y2 + 1U]};
                     const uint8_t p0 = static_cast<uint8_t>(
-                        (p.kappa + (static_cast<uint8_t>(__builtin_popcount(pz & y) & 1) << 1U)) & 3U
+                        (p_kappa + (static_cast<uint8_t>(__builtin_popcount(pz & y) & 1) << 1U)) & 3U
                     );
                     const uint8_t p1 = static_cast<uint8_t>(
-                        (p.kappa + (static_cast<uint8_t>(__builtin_popcount(pz & y2) & 1) << 1U)) & 3U
+                        (p_kappa + (static_cast<uint8_t>(__builtin_popcount(pz & y2) & 1) << 1U)) & 3U
                     );
                     const mbr::MbrComplex s0 = mbr::i_pow(p0);
                     const mbr::MbrComplex s1 = mbr::i_pow(p1);
@@ -3566,18 +4169,19 @@ int32_t mbr_store_resolve_node(void* store, int64_t node_id, int64_t* out_node_i
         if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
             return mbr::kErrInvalidArg;
         }
-        if (st->nodes[static_cast<size_t>(node_id)].pend.empty()) {
+        const mbr::MbrNode& nd = st->nodes[static_cast<size_t>(node_id)];
+        if (nd.pend_len == 0U) {
             *out_node_id = node_id;
             return mbr::kOk;
         }
-        std::vector<mbr::MbrBranch> in_b = st->nodes[static_cast<size_t>(node_id)].branches;
-        std::vector<mbr::MbrPending> in_p = st->nodes[static_cast<size_t>(node_id)].pend;
+        std::vector<mbr::MbrBranch> in_b = st->copy_node_branches(nd);
+        std::vector<mbr::MbrPending> in_p = st->copy_node_pend(nd);
         std::vector<mbr::MbrBranch> resolved;
         uint32_t peak = 0U;
         const int32_t rc = mbr::resolve_branches(*st, in_b, in_p, resolved, peak);
         if (rc != mbr::kOk) return rc;
         mbr::NodeRollbackGuard guard(*st);
-        const int64_t nid = st->push_node(std::move(resolved), {}, peak);
+        const int64_t nid = st->push_node(resolved, {}, peak);
         guard.commit();
         *out_node_id = nid;
         return mbr::kOk;
@@ -3601,68 +4205,16 @@ int32_t mbr_store_step_rotations(
         if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
             return mbr::kErrInvalidArg;
         }
-        const size_t nw = st->nw;
         const int32_t vrc = mbr::validate_commuting_turns(
-            st->n_qubits, nw, n_axes, ax_x, ax_z, ax_kappa, ax_e
+            st->n_qubits, st->nw, n_axes, ax_x, ax_z, ax_kappa, ax_e
         );
         if (vrc != mbr::kOk) return vrc;
-
-        const mbr::TransKey tkey{node_id, event_id, sign_bits, kind};
-        auto tit = st->trans.find(tkey);
-        if (tit != st->trans.end()) {
-            st->transitions_hit[kind] += 1U;
-            *out_child = tit->second;
-            return mbr::kOk;
-        }
-
-        std::vector<mbr::MbrPending> incoming;
-        uint8_t ph = 0U;
-        const int32_t nrc = mbr::normalize_commuting_turns(
-            st->n_qubits, nw, n_axes, ax_x, ax_z, ax_kappa, ax_e, incoming, ph
+        int64_t cid = 0;
+        const int32_t rc = mbr::store_step_rotations_inner(
+            *st, node_id, event_id, kind, sign_bits, n_axes, ax_x, ax_z, ax_kappa, ax_e, cid
         );
-        if (nrc != mbr::kOk) return nrc;
-
-        std::vector<mbr::MbrBranch> branches = st->nodes[static_cast<size_t>(node_id)].branches;
-        std::vector<mbr::MbrPending> pend = st->nodes[static_cast<size_t>(node_id)].pend;
-        uint32_t peak = static_cast<uint32_t>(branches.size());
-
-        if ((ph & 7U) != 0U) {
-            const mbr::MbrComplex sc = mbr::omega_pow(ph);
-            for (mbr::MbrBranch& br : branches) br.w = mbr::cmul(br.w, sc);
-        }
-
-        bool need_resolve = false;
-        if (!pend.empty() && !incoming.empty()) {
-            for (const mbr::MbrPending& inc : incoming) {
-                for (const mbr::MbrPending& cur : pend) {
-                    if (mbr::pauli_anti(inc.x.data(), inc.z.data(), cur.x.data(), cur.z.data(), nw) != 0U) {
-                        need_resolve = true;
-                        break;
-                    }
-                }
-                if (need_resolve) break;
-            }
-        }
-        if (need_resolve) {
-            std::vector<mbr::MbrBranch> resolved;
-            uint32_t rpeak = 0U;
-            const int32_t rrc = mbr::resolve_branches(*st, branches, pend, resolved, rpeak);
-            if (rrc != mbr::kOk) return rrc;
-            branches = std::move(resolved);
-            pend.clear();
-            if (rpeak > peak) peak = rpeak;
-        }
-
-        mbr::accumulate_pending_inplace(pend, incoming, nw);
-
-        mbr::NodeRollbackGuard guard(*st);
-        const int64_t cid = st->push_node(std::move(branches), std::move(pend), peak);
-        st->trans.emplace(tkey, cid);
-        st->bytes_estimate += 64U;
-        st->transitions_new[kind] += 1U;
-        guard.commit();
-        *out_child = cid;
-        return mbr::kOk;
+        if (rc == mbr::kOk) *out_child = cid;
+        return rc;
     } catch (const std::bad_alloc&) {
         return mbr::kErrOom;
     } catch (...) {
@@ -3701,68 +4253,12 @@ int32_t mbr_store_step_qturns(
             }
             if (!mbr::is_hermitian(qx, qz, qk, nw)) return mbr::kErrInvalidArg;
         }
-
-        const mbr::TransKey tkey{node_id, event_id, sign_bits, kind};
-        auto tit = st->trans.find(tkey);
-        if (tit != st->trans.end()) {
-            st->transitions_hit[kind] += 1U;
-            *out_child = tit->second;
-            return mbr::kOk;
-        }
-
-        std::vector<mbr::MbrBranch> branches = st->nodes[static_cast<size_t>(node_id)].branches;
-        std::vector<mbr::MbrPending> pend = st->nodes[static_cast<size_t>(node_id)].pend;
-        const uint32_t peak = static_cast<uint32_t>(branches.size());
-
-        std::vector<mbr::MbrBranch> updated;
-        updated.reserve(branches.size());
-        for (const mbr::MbrBranch& br : branches) {
-            mbr::MbrState qc = st->state_pool[br.state_id].state;
-            mbr::MbrComplex f = br.w;
-            for (size_t q = 0; q < n_qturns; ++q) {
-                const mbr::MbrComplex fq = mbr::apply_qturn(
-                    qc, &qt_x[q * nw], &qt_z[q * nw], static_cast<uint8_t>(qt_kappa[q] & 3U)
-                );
-                f = mbr::cmul(f, fq);
-            }
-            f = mbr::cmul(f, mbr::canon(qc));
-            const uint32_t cid_st = st->intern_canonical(std::move(qc));
-            updated.push_back({f, cid_st});
-        }
-
-        if (!pend.empty() && n_qturns > 0U) {
-            uint8_t ph = 0U;
-            for (mbr::MbrPending& p : pend) {
-                for (size_t q = 0; q < n_qturns; ++q) {
-                    mbr::pauli_conj_by_qturn_inplace(
-                        p.x.data(), p.z.data(), p.kappa,
-                        &qt_x[q * nw], &qt_z[q * nw], static_cast<uint8_t>(qt_kappa[q] & 3U), nw
-                    );
-                }
-                if (mbr::pauli_norm_sign_plus(p.x.data(), p.z.data(), p.kappa, nw)) {
-                    ph = static_cast<uint8_t>((ph + p.e) & 7U);
-                    p.e = static_cast<uint8_t>((8U - p.e) & 7U);
-                }
-            }
-            if ((ph & 7U) != 0U) {
-                const mbr::MbrComplex sc = mbr::omega_pow(ph);
-                for (mbr::MbrBranch& br : updated) br.w = mbr::cmul(br.w, sc);
-            }
-        }
-
-        std::vector<mbr::MbrBranch> merged;
-        const int32_t mrc = mbr::merge_and_sort_branches(*st, updated, merged);
-        if (mrc != mbr::kOk) return mrc;
-        if (!branches.empty() && merged.empty()) return mbr::kErrFloatDrift;
-
-        mbr::NodeRollbackGuard guard(*st);
-        const int64_t cid = st->push_node(std::move(merged), std::move(pend), peak);
-        st->trans.emplace(tkey, cid);
-        st->bytes_estimate += 64U;
-        st->transitions_new[kind] += 1U;
-        guard.commit();
-        *out_child = cid;
-        return mbr::kOk;
+        int64_t cid = 0;
+        const int32_t rc = mbr::store_step_qturns_inner(
+            *st, node_id, event_id, kind, sign_bits, n_qturns, qt_x, qt_z, qt_kappa, cid
+        );
+        if (rc == mbr::kOk) *out_child = cid;
+        return rc;
     } catch (const std::bad_alloc&) {
         return mbr::kErrOom;
     } catch (...) {
@@ -3863,6 +4359,676 @@ int32_t mbr_store_branches_hist(
             ++idx;
         }
         return mbr::kOk;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WP6 C ABI: Vectorized batch-walk primitives (41 -> 46 symbols)
+// ---------------------------------------------------------------------------
+
+int32_t mbr_batch_step_rotations(
+    void* store, size_t batch_size, const uint8_t* sel_mask,
+    uint64_t event_id, uint8_t kind,
+    size_t n_gens, const uint64_t* gen_x, const uint64_t* gen_z,
+    size_t n_axes, const uint64_t* base_x, const uint64_t* base_z,
+    const uint8_t* base_kappa, const uint8_t* ax_e, const uint32_t* flip_masks,
+    const uint64_t* fx, const uint64_t* fz,
+    int64_t* nodes, int16_t* peaks
+) {
+    try {
+        if (store == nullptr) return mbr::kErrInvalidArg;
+        if (kind != mbr::kKindT && kind != mbr::kKindCcz) return mbr::kErrInvalidArg;
+        if (n_gens > 30U) return mbr::kErrInvalidArg;
+        mbr::MbrStore* st = mbr::store_of(store);
+        const size_t n = st->n_qubits;
+        const size_t nw = st->nw;
+
+        size_t dummy = 0U;
+        if (!mul_within(n_gens, nw, kMaxElems, dummy)
+            || !mul_within(n_axes, nw, kMaxElems, dummy)
+            || !mul_within(batch_size, nw, kMaxElems, dummy)) {
+            return mbr::kErrInvalidArg;
+        }
+        if (n_gens > 0U && (gen_x == nullptr || gen_z == nullptr)) return mbr::kErrInvalidArg;
+        if (n_axes > 0U && flip_masks == nullptr) return mbr::kErrInvalidArg;
+        for (size_t g = 0; g < n_gens; ++g) {
+            if (!mbr::tail_clear(&gen_x[g * nw], n, nw)
+                || !mbr::tail_clear(&gen_z[g * nw], n, nw)) {
+                return mbr::kErrInvalidArg;
+            }
+        }
+        const int32_t vrc = mbr::validate_commuting_turns(
+            n, nw, n_axes, base_x, base_z, base_kappa, ax_e
+        );
+        if (vrc != mbr::kOk) return vrc;
+
+        if (batch_size == 0U) return mbr::kOk;
+        if (fx == nullptr || fz == nullptr || nodes == nullptr || peaks == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+
+        const size_t n_nodes_init = st->nodes.size();
+        size_t first_active = batch_size;
+        for (size_t s = 0; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            if (nodes[s] < 0 || static_cast<size_t>(nodes[s]) >= n_nodes_init) {
+                return mbr::kErrInvalidArg;
+            }
+            if (!mbr::tail_clear(&fx[s * nw], n, nw) || !mbr::tail_clear(&fz[s * nw], n, nw)) {
+                return mbr::kErrInvalidArg;
+            }
+            if (first_active == batch_size) first_active = s;
+        }
+        if (first_active == batch_size) return mbr::kOk;
+
+        auto resolve_pair = [&](int64_t nid, uint32_t sb, mbr::BatchChildPeak& out) -> int32_t {
+            const mbr::TransKey tkey{nid, event_id, sb, kind};
+            auto tit = st->trans.find(tkey);
+            if (tit != st->trans.end()) {
+                st->transitions_hit[kind] += 1U;
+                out.cid = tit->second;
+                out.peak = st->node_peak_i16(out.cid);
+                return mbr::kOk;
+            }
+            uint8_t fk_stack[32];
+            std::vector<uint8_t> fk_heap;
+            uint8_t* fk = fk_stack;
+            if (n_axes > 32U) {
+                fk_heap.resize(n_axes);
+                fk = fk_heap.data();
+            }
+            for (size_t i = 0; i < n_axes; ++i) {
+                const uint8_t flip = static_cast<uint8_t>(
+                    (popcount64(static_cast<uint64_t>(sb & flip_masks[i])) & 1) << 1U
+                );
+                fk[i] = static_cast<uint8_t>((base_kappa[i] + flip) & 3U);
+            }
+            int64_t cid = 0;
+            const int32_t rc = mbr::store_step_rotations_inner(
+                *st, nid, event_id, kind, sb, n_axes, base_x, base_z, fk, ax_e, cid
+            );
+            if (rc != mbr::kOk) return rc;
+            out.cid = cid;
+            out.peak = st->node_peak_i16(cid);
+            return mbr::kOk;
+        };
+
+        // Pass 1: hot0 fast path + stack-resident dedup on divergence.
+        const int64_t nid0 = nodes[first_active];
+        const uint32_t sb0 = mbr::shot_sign_bits(
+            &fx[first_active * nw], &fz[first_active * nw], n_gens, gen_x, gen_z, nw
+        );
+        mbr::BatchChildPeak res0;
+        const int32_t rc0 = resolve_pair(nid0, sb0, res0);
+        if (rc0 != mbr::kOk) return rc0;
+
+        bool all_same = true;
+        mbr::BatchDedupNodeSb<mbr::BatchChildPeak> dedup;
+        mbr::BatchShotIdx shot_idx;
+
+        for (size_t s = first_active + 1U; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            const int64_t nid = nodes[s];
+            const uint32_t sb = mbr::shot_sign_bits(
+                &fx[s * nw], &fz[s * nw], n_gens, gen_x, gen_z, nw
+            );
+            if (all_same) {
+                if (nid == nid0 && sb == sb0) continue;
+                all_same = false;
+                dedup.insert_new(nid0, sb0, res0);
+                shot_idx.init(batch_size);
+                for (size_t t = first_active; t < s; ++t) {
+                    if (sel_mask == nullptr || sel_mask[t] != 0U) {
+                        shot_idx.set(t, 0U);
+                    }
+                }
+            }
+            int32_t loc = dedup.find_existing(nid, sb);
+            if (loc < 0) {
+                mbr::BatchChildPeak rv;
+                const int32_t rrc = resolve_pair(nid, sb, rv);
+                if (rrc != mbr::kOk) return rrc;
+                loc = static_cast<int32_t>(dedup.insert_new(nid, sb, rv));
+            }
+            shot_idx.set(s, static_cast<uint32_t>(loc));
+        }
+
+        // Pass 2 (noexcept): commit caller arrays.
+        if (all_same) {
+            if (sel_mask == nullptr) {
+                for (size_t s = 0; s < batch_size; ++s) {
+                    nodes[s] = res0.cid;
+                    if (peaks[s] < res0.peak) peaks[s] = res0.peak;
+                }
+            } else {
+                for (size_t s = first_active; s < batch_size; ++s) {
+                    if (sel_mask[s] == 0U) continue;
+                    nodes[s] = res0.cid;
+                    if (peaks[s] < res0.peak) peaks[s] = res0.peak;
+                }
+            }
+        } else {
+            if (sel_mask == nullptr) {
+                for (size_t s = 0; s < batch_size; ++s) {
+                    const mbr::BatchChildPeak& rv = dedup.at(shot_idx.get(s));
+                    nodes[s] = rv.cid;
+                    if (peaks[s] < rv.peak) peaks[s] = rv.peak;
+                }
+            } else {
+                for (size_t s = first_active; s < batch_size; ++s) {
+                    if (sel_mask[s] == 0U) continue;
+                    const mbr::BatchChildPeak& rv = dedup.at(shot_idx.get(s));
+                    nodes[s] = rv.cid;
+                    if (peaks[s] < rv.peak) peaks[s] = rv.peak;
+                }
+            }
+        }
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_batch_step_qturns(
+    void* store, size_t batch_size, const uint8_t* sel_mask,
+    uint64_t event_id, uint8_t kind,
+    size_t n_qturns, const uint64_t* base_x, const uint64_t* base_z,
+    const uint8_t* base_kappa,
+    const uint64_t* fx, const uint64_t* fz,
+    int64_t* nodes, int16_t* peaks
+) {
+    try {
+        if (store == nullptr) return mbr::kErrInvalidArg;
+        if (kind != mbr::kKindSkip && kind != mbr::kKindCfault) return mbr::kErrInvalidArg;
+        if (n_qturns > 30U) return mbr::kErrInvalidArg;
+        mbr::MbrStore* st = mbr::store_of(store);
+        const size_t n = st->n_qubits;
+        const size_t nw = st->nw;
+
+        size_t dummy = 0U;
+        if (!mul_within(n_qturns, nw, kMaxElems, dummy)
+            || !mul_within(batch_size, nw, kMaxElems, dummy)) {
+            return mbr::kErrInvalidArg;
+        }
+        if (n_qturns > 0U && (base_x == nullptr || base_z == nullptr || base_kappa == nullptr)) {
+            return mbr::kErrInvalidArg;
+        }
+        for (size_t q = 0; q < n_qturns; ++q) {
+            const uint64_t* qx = &base_x[q * nw];
+            const uint64_t* qz = &base_z[q * nw];
+            const uint8_t qk = static_cast<uint8_t>(base_kappa[q] & 3U);
+            if (!mbr::tail_clear(qx, n, nw) || !mbr::tail_clear(qz, n, nw)) {
+                return mbr::kErrInvalidArg;
+            }
+            if (!mbr::is_hermitian(qx, qz, qk, nw)) return mbr::kErrInvalidArg;
+        }
+
+        if (batch_size == 0U) return mbr::kOk;
+        if (fx == nullptr || fz == nullptr || nodes == nullptr || peaks == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+
+        const size_t n_nodes_init = st->nodes.size();
+        size_t first_active = batch_size;
+        for (size_t s = 0; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            if (nodes[s] < 0 || static_cast<size_t>(nodes[s]) >= n_nodes_init) {
+                return mbr::kErrInvalidArg;
+            }
+            if (!mbr::tail_clear(&fx[s * nw], n, nw) || !mbr::tail_clear(&fz[s * nw], n, nw)) {
+                return mbr::kErrInvalidArg;
+            }
+            if (first_active == batch_size) first_active = s;
+        }
+        if (first_active == batch_size) return mbr::kOk;
+
+        auto resolve_pair = [&](int64_t nid, uint32_t sb, mbr::BatchChildPeak& out) -> int32_t {
+            const mbr::TransKey tkey{nid, event_id, sb, kind};
+            auto tit = st->trans.find(tkey);
+            if (tit != st->trans.end()) {
+                st->transitions_hit[kind] += 1U;
+                out.cid = tit->second;
+                out.peak = st->node_peak_i16(out.cid);
+                return mbr::kOk;
+            }
+            uint8_t fk[32];
+            for (size_t j = 0; j < n_qturns; ++j) {
+                const uint8_t flip = static_cast<uint8_t>(((sb >> j) & 1U) << 1U);
+                fk[j] = static_cast<uint8_t>((base_kappa[j] + flip) & 3U);
+            }
+            int64_t cid = 0;
+            const int32_t rc = mbr::store_step_qturns_inner(
+                *st, nid, event_id, kind, sb, n_qturns, base_x, base_z, fk, cid
+            );
+            if (rc != mbr::kOk) return rc;
+            out.cid = cid;
+            out.peak = st->node_peak_i16(cid);
+            return mbr::kOk;
+        };
+
+        const int64_t nid0 = nodes[first_active];
+        const uint32_t sb0 = mbr::shot_sign_bits(
+            &fx[first_active * nw], &fz[first_active * nw], n_qturns, base_x, base_z, nw
+        );
+        mbr::BatchChildPeak res0;
+        const int32_t rc0 = resolve_pair(nid0, sb0, res0);
+        if (rc0 != mbr::kOk) return rc0;
+
+        bool all_same = true;
+        mbr::BatchDedupNodeSb<mbr::BatchChildPeak> dedup;
+        mbr::BatchShotIdx shot_idx;
+
+        for (size_t s = first_active + 1U; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            const int64_t nid = nodes[s];
+            const uint32_t sb = mbr::shot_sign_bits(
+                &fx[s * nw], &fz[s * nw], n_qturns, base_x, base_z, nw
+            );
+            if (all_same) {
+                if (nid == nid0 && sb == sb0) continue;
+                all_same = false;
+                dedup.insert_new(nid0, sb0, res0);
+                shot_idx.init(batch_size);
+                for (size_t t = first_active; t < s; ++t) {
+                    if (sel_mask == nullptr || sel_mask[t] != 0U) {
+                        shot_idx.set(t, 0U);
+                    }
+                }
+            }
+            int32_t loc = dedup.find_existing(nid, sb);
+            if (loc < 0) {
+                mbr::BatchChildPeak rv;
+                const int32_t rrc = resolve_pair(nid, sb, rv);
+                if (rrc != mbr::kOk) return rrc;
+                loc = static_cast<int32_t>(dedup.insert_new(nid, sb, rv));
+            }
+            shot_idx.set(s, static_cast<uint32_t>(loc));
+        }
+
+        if (all_same) {
+            if (sel_mask == nullptr) {
+                for (size_t s = 0; s < batch_size; ++s) {
+                    nodes[s] = res0.cid;
+                    if (peaks[s] < res0.peak) peaks[s] = res0.peak;
+                }
+            } else {
+                for (size_t s = first_active; s < batch_size; ++s) {
+                    if (sel_mask[s] == 0U) continue;
+                    nodes[s] = res0.cid;
+                    if (peaks[s] < res0.peak) peaks[s] = res0.peak;
+                }
+            }
+        } else {
+            if (sel_mask == nullptr) {
+                for (size_t s = 0; s < batch_size; ++s) {
+                    const mbr::BatchChildPeak& rv = dedup.at(shot_idx.get(s));
+                    nodes[s] = rv.cid;
+                    if (peaks[s] < rv.peak) peaks[s] = rv.peak;
+                }
+            } else {
+                for (size_t s = first_active; s < batch_size; ++s) {
+                    if (sel_mask[s] == 0U) continue;
+                    const mbr::BatchChildPeak& rv = dedup.at(shot_idx.get(s));
+                    nodes[s] = rv.cid;
+                    if (peaks[s] < rv.peak) peaks[s] = rv.peak;
+                }
+            }
+        }
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_batch_step_meas(
+    void* store, size_t batch_size, const uint8_t* sel_mask,
+    uint64_t event_id, uint8_t kind,
+    const uint64_t* mx, const uint64_t* mz, uint8_t mkappa,
+    const double* uniforms,
+    const uint64_t* kick_x, const uint64_t* kick_z,
+    const uint8_t* want_one_mask, uint8_t update_log_mass,
+    uint64_t* fx, uint64_t* fz,
+    int64_t* nodes, int16_t* peaks, double* log_mass,
+    uint8_t* out_true_m, double* out_p_chosen
+) {
+    try {
+        if (store == nullptr || mx == nullptr || mz == nullptr) return mbr::kErrInvalidArg;
+        if (kind != mbr::kKindMeas && kind != mbr::kKindUreset) return mbr::kErrInvalidArg;
+        if (update_log_mass > 1U) return mbr::kErrInvalidArg;
+        if ((kick_x == nullptr) != (kick_z == nullptr)) return mbr::kErrInvalidArg;
+
+        mbr::MbrStore* st = mbr::store_of(store);
+        const size_t n = st->n_qubits;
+        const size_t nw = st->nw;
+        size_t dummy = 0U;
+        if (!mul_within(batch_size, nw, kMaxElems, dummy)) return mbr::kErrInvalidArg;
+        if (!mbr::tail_clear(mx, n, nw) || !mbr::tail_clear(mz, n, nw)) {
+            return mbr::kErrInvalidArg;
+        }
+        const uint8_t mk = static_cast<uint8_t>(mkappa & 3U);
+        if (!mbr::is_hermitian(mx, mz, mk, nw)) return mbr::kErrInvalidArg;
+        if (kick_x != nullptr) {
+            if (!mbr::tail_clear(kick_x, n, nw) || !mbr::tail_clear(kick_z, n, nw)) {
+                return mbr::kErrInvalidArg;
+            }
+        }
+
+        if (batch_size == 0U) return mbr::kOk;
+        if (uniforms == nullptr || fx == nullptr || fz == nullptr
+            || nodes == nullptr || peaks == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+        if (update_log_mass != 0U && log_mass == nullptr) return mbr::kErrInvalidArg;
+
+        const size_t n_nodes_init = st->nodes.size();
+        size_t first_active = batch_size;
+        for (size_t s = 0; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            if (nodes[s] < 0 || static_cast<size_t>(nodes[s]) >= n_nodes_init) {
+                return mbr::kErrInvalidArg;
+            }
+            if (!mbr::tail_clear(&fx[s * nw], n, nw) || !mbr::tail_clear(&fz[s * nw], n, nw)) {
+                return mbr::kErrInvalidArg;
+            }
+            if (first_active == batch_size) first_active = s;
+        }
+        if (first_active == batch_size) return mbr::kOk;
+
+        // Pass 1: deduplicate active nodes and resolve MeasEntries (strong atomicity).
+        const int64_t nid0 = nodes[first_active];
+        mbr::BatchMeasResolved res0;
+        const int32_t rc0 = mbr::store_meas_resolved(*st, nid0, event_id, kind, mx, mz, mk, res0);
+        if (rc0 != mbr::kOk) return rc0;
+
+        bool all_same = true;
+        mbr::BatchDedupNode<mbr::BatchMeasResolved> dedup;
+        mbr::BatchShotIdx shot_idx;
+
+        for (size_t s = first_active + 1U; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            const int64_t nid = nodes[s];
+            if (all_same) {
+                if (nid == nid0) continue;
+                all_same = false;
+                dedup.insert_new(nid0, res0);
+                shot_idx.init(batch_size);
+                for (size_t t = first_active; t < s; ++t) {
+                    if (sel_mask == nullptr || sel_mask[t] != 0U) {
+                        shot_idx.set(t, 0U);
+                    }
+                }
+            }
+            int32_t loc = dedup.find_existing(nid);
+            if (loc < 0) {
+                mbr::BatchMeasResolved rv;
+                const int32_t rrc = mbr::store_meas_resolved(
+                    *st, nid, event_id, kind, mx, mz, mk, rv
+                );
+                if (rrc != mbr::kOk) return rrc;
+                loc = static_cast<int32_t>(dedup.insert_new(nid, rv));
+            }
+            shot_idx.set(s, static_cast<uint32_t>(loc));
+        }
+
+        // Pass 2 (noexcept): apply measurements, kicks, node/peak/log_mass updates.
+        const double neg_inf = -std::numeric_limits<double>::infinity();
+        for (size_t s = first_active; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            const mbr::BatchMeasResolved& r = all_same ? res0 : dedup.at(shot_idx.get(s));
+            const bool inner_m = (r.child0 < 0)
+                ? true
+                : ((r.child1 < 0) ? false : (uniforms[s] >= r.p0));
+            uint64_t* fx_s = &fx[s * nw];
+            uint64_t* fz_s = &fz[s * nw];
+            // Pre-kick s_bit computed strictly BEFORE absorption or reset kicks.
+            const bool s_bit = (mbr::shot_pauli_anti(fx_s, fz_s, mx, mz, nw) != 0U);
+            const bool true_m = (inner_m != s_bit);
+
+            if (r.meas_type == mbr::kMeasAbsorbed && inner_m) {
+                mbr::xor_frame_words(fx_s, fz_s, r.absorb_x, r.absorb_z, nw);
+            }
+            nodes[s] = inner_m ? r.child1 : r.child0;
+            const int16_t cpk = inner_m ? r.pk1 : r.pk0;
+            if (peaks[s] < cpk) peaks[s] = cpk;
+
+            const double p_ch = inner_m ? (1.0 - r.p0) : r.p0;
+            if (out_p_chosen != nullptr) out_p_chosen[s] = p_ch;
+            if (update_log_mass != 0U) {
+                if (p_ch <= 0.0) {
+                    log_mass[s] += neg_inf;
+                } else if (p_ch != 1.0) {
+                    log_mass[s] += std::log(p_ch);
+                }
+            }
+            if (kick_x != nullptr) {
+                const bool want1 = (want_one_mask != nullptr) && (want_one_mask[s] != 0U);
+                if (true_m != want1) {
+                    mbr::xor_frame_words(fx_s, fz_s, kick_x, kick_z, nw);
+                }
+            }
+            if (out_true_m != nullptr) out_true_m[s] = true_m ? 1U : 0U;
+        }
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_batch_step_peek(
+    void* store, size_t batch_size, uint64_t event_id,
+    const uint64_t* mx, const uint64_t* mz, uint8_t mkappa,
+    const uint64_t* fx, const uint64_t* fz, const int64_t* nodes,
+    double* out_p1
+) {
+    try {
+        if (store == nullptr || mx == nullptr || mz == nullptr) return mbr::kErrInvalidArg;
+        mbr::MbrStore* st = mbr::store_of(store);
+        const size_t n = st->n_qubits;
+        const size_t nw = st->nw;
+        size_t dummy = 0U;
+        if (!mul_within(batch_size, nw, kMaxElems, dummy)) return mbr::kErrInvalidArg;
+        if (!mbr::tail_clear(mx, n, nw) || !mbr::tail_clear(mz, n, nw)) {
+            return mbr::kErrInvalidArg;
+        }
+        const uint8_t mk = static_cast<uint8_t>(mkappa & 3U);
+        if (!mbr::is_hermitian(mx, mz, mk, nw)) return mbr::kErrInvalidArg;
+
+        if (batch_size == 0U) return mbr::kOk;
+        if (fx == nullptr || fz == nullptr || nodes == nullptr || out_p1 == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+
+        const size_t n_nodes_init = st->nodes.size();
+        for (size_t s = 0; s < batch_size; ++s) {
+            if (nodes[s] < 0 || static_cast<size_t>(nodes[s]) >= n_nodes_init) {
+                return mbr::kErrInvalidArg;
+            }
+            if (!mbr::tail_clear(&fx[s * nw], n, nw) || !mbr::tail_clear(&fz[s * nw], n, nw)) {
+                return mbr::kErrInvalidArg;
+            }
+        }
+
+        const int64_t nid0 = nodes[0];
+        double p0_0 = 0.0;
+        const int32_t rc0 = mbr::store_meas_or_peek(
+            *st, nid0, event_id, mbr::kKindPeek, true,
+            mx, mz, mk, p0_0, nullptr, nullptr, nullptr, nullptr, nullptr
+        );
+        if (rc0 != mbr::kOk) return rc0;
+
+        bool all_same = true;
+        mbr::BatchDedupNode<double> dedup;
+        mbr::BatchShotIdx shot_idx;
+
+        for (size_t s = 1U; s < batch_size; ++s) {
+            const int64_t nid = nodes[s];
+            if (all_same) {
+                if (nid == nid0) continue;
+                all_same = false;
+                dedup.insert_new(nid0, p0_0);
+                shot_idx.init(batch_size);
+                for (size_t t = 0; t < s; ++t) {
+                    shot_idx.set(t, 0U);
+                }
+            }
+            int32_t loc = dedup.find_existing(nid);
+            if (loc < 0) {
+                double p0_v = 0.0;
+                const int32_t rrc = mbr::store_meas_or_peek(
+                    *st, nid, event_id, mbr::kKindPeek, true,
+                    mx, mz, mk, p0_v, nullptr, nullptr, nullptr, nullptr, nullptr
+                );
+                if (rrc != mbr::kOk) return rrc;
+                loc = static_cast<int32_t>(dedup.insert_new(nid, p0_v));
+            }
+            shot_idx.set(s, static_cast<uint32_t>(loc));
+        }
+
+        for (size_t s = 0; s < batch_size; ++s) {
+            const double p0 = all_same ? p0_0 : dedup.at(shot_idx.get(s));
+            const bool s_bit = (mbr::shot_pauli_anti(&fx[s * nw], &fz[s * nw], mx, mz, nw) != 0U);
+            out_p1[s] = std::clamp(s_bit ? p0 : (1.0 - p0), 0.0, 1.0);
+        }
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_batch_step_postselect(
+    void* store, size_t batch_size, const uint8_t* sel_mask,
+    uint64_t event_id, const uint64_t* mx, const uint64_t* mz, uint8_t mkappa,
+    const uint8_t* desired_bits,
+    uint64_t* fx, uint64_t* fz,
+    int64_t* nodes, int16_t* peaks, double* log_mass,
+    int64_t* out_fail_shot
+) {
+    try {
+        if (store == nullptr || mx == nullptr || mz == nullptr || out_fail_shot == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+        mbr::MbrStore* st = mbr::store_of(store);
+        const size_t n = st->n_qubits;
+        const size_t nw = st->nw;
+        size_t dummy = 0U;
+        if (!mul_within(batch_size, nw, kMaxElems, dummy)) return mbr::kErrInvalidArg;
+        if (!mbr::tail_clear(mx, n, nw) || !mbr::tail_clear(mz, n, nw)) {
+            return mbr::kErrInvalidArg;
+        }
+        const uint8_t mk = static_cast<uint8_t>(mkappa & 3U);
+        if (!mbr::is_hermitian(mx, mz, mk, nw)) return mbr::kErrInvalidArg;
+
+        if (batch_size == 0U) {
+            *out_fail_shot = -1;
+            return mbr::kOk;
+        }
+        if (desired_bits == nullptr || fx == nullptr || fz == nullptr
+            || nodes == nullptr || peaks == nullptr || log_mass == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+
+        const size_t n_nodes_init = st->nodes.size();
+        size_t first_active = batch_size;
+        for (size_t s = 0; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            if (nodes[s] < 0 || static_cast<size_t>(nodes[s]) >= n_nodes_init) {
+                return mbr::kErrInvalidArg;
+            }
+            if (!mbr::tail_clear(&fx[s * nw], n, nw) || !mbr::tail_clear(&fz[s * nw], n, nw)) {
+                return mbr::kErrInvalidArg;
+            }
+            if (first_active == batch_size) first_active = s;
+        }
+        if (first_active == batch_size) {
+            *out_fail_shot = -1;
+            return mbr::kOk;
+        }
+
+        // Pass 1: resolve distinct active nodes.
+        const int64_t nid0 = nodes[first_active];
+        mbr::BatchMeasResolved res0;
+        const int32_t rc0 = mbr::store_meas_resolved(
+            *st, nid0, event_id, mbr::kKindPost, mx, mz, mk, res0
+        );
+        if (rc0 != mbr::kOk) return rc0;
+
+        bool all_same = true;
+        mbr::BatchDedupNode<mbr::BatchMeasResolved> dedup;
+        mbr::BatchShotIdx shot_idx;
+
+        for (size_t s = first_active + 1U; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            const int64_t nid = nodes[s];
+            if (all_same) {
+                if (nid == nid0) continue;
+                all_same = false;
+                dedup.insert_new(nid0, res0);
+                shot_idx.init(batch_size);
+                for (size_t t = first_active; t < s; ++t) {
+                    if (sel_mask == nullptr || sel_mask[t] != 0U) {
+                        shot_idx.set(t, 0U);
+                    }
+                }
+            }
+            int32_t loc = dedup.find_existing(nid);
+            if (loc < 0) {
+                mbr::BatchMeasResolved rv;
+                const int32_t rrc = mbr::store_meas_resolved(
+                    *st, nid, event_id, mbr::kKindPost, mx, mz, mk, rv
+                );
+                if (rrc != mbr::kOk) return rrc;
+                loc = static_cast<int32_t>(dedup.insert_new(nid, rv));
+            }
+            shot_idx.set(s, static_cast<uint32_t>(loc));
+        }
+
+        // Pass 1b (read-only validation): verify ALL active shots are possible before any mutation.
+        for (size_t s = first_active; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            const mbr::BatchMeasResolved& r = all_same ? res0 : dedup.at(shot_idx.get(s));
+            const bool s_bit = (mbr::shot_pauli_anti(&fx[s * nw], &fz[s * nw], mx, mz, nw) != 0U);
+            const bool inner_m = (((desired_bits[s] & 1U) != 0U) != s_bit);
+            const int64_t child = inner_m ? r.child1 : r.child0;
+            const double p_ch = inner_m ? (1.0 - r.p0) : r.p0;
+            if (child < 0 || p_ch <= mbr::kImpossibleProb) {
+                *out_fail_shot = static_cast<int64_t>(s);
+                return mbr::kOk;
+            }
+        }
+
+        // Pass 2 (noexcept): commit absorption kick, nodes, peaks, log_mass.
+        *out_fail_shot = -1;
+        for (size_t s = first_active; s < batch_size; ++s) {
+            if (sel_mask != nullptr && sel_mask[s] == 0U) continue;
+            const mbr::BatchMeasResolved& r = all_same ? res0 : dedup.at(shot_idx.get(s));
+            uint64_t* fx_s = &fx[s * nw];
+            uint64_t* fz_s = &fz[s * nw];
+            const bool s_bit = (mbr::shot_pauli_anti(fx_s, fz_s, mx, mz, nw) != 0U);
+            const bool inner_m = (((desired_bits[s] & 1U) != 0U) != s_bit);
+            if (r.meas_type == mbr::kMeasAbsorbed && inner_m) {
+                mbr::xor_frame_words(fx_s, fz_s, r.absorb_x, r.absorb_z, nw);
+            }
+            nodes[s] = inner_m ? r.child1 : r.child0;
+            const int16_t cpk = inner_m ? r.pk1 : r.pk0;
+            if (peaks[s] < cpk) peaks[s] = cpk;
+            const double p_ch = inner_m ? (1.0 - r.p0) : r.p0;
+            if (p_ch != 1.0) {
+                log_mass[s] += std::log(p_ch);
+            }
+        }
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
     } catch (...) {
         return mbr::kErrInvalidArg;
     }

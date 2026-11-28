@@ -1500,13 +1500,13 @@ def test_t14_fallback_oracle_exercised_when_ref_absent(
 
 
 # =============================================================================================
-# Section C — T15 Hostile Inputs (All 41 Symbols), Multi-Word (130+, 193), OOM, Threads & Fork
+# Section C — T15 Hostile Inputs (All 46 Symbols), Multi-Word (130+, 193), OOM, Threads & Fork
 # =============================================================================================
 
 
-def test_t15_exhaustive_41_symbol_hostile_abi_sweep() -> None:
-    """Probe EVERY single one of the 41 `mbr_*` symbols with hostile C ABI inputs + wrapper checks."""
-    assert len(bk._SPECS) == 41
+def test_t15_exhaustive_46_symbol_hostile_abi_sweep() -> None:
+    """Probe EVERY single one of the 46 `mbr_*` symbols with hostile C ABI inputs + wrapper checks."""
+    assert len(bk._SPECS) == 46
     lib = bk.get_branch_kernels_lib()
     probed: set[str] = set()
 
@@ -1818,15 +1818,134 @@ def test_t15_exhaustive_41_symbol_hostile_abi_sweep() -> None:
     assert call("mbr_store_branches_hist", h_store, bk.addr(hk), bk.addr(hc), 1, ctypes.addressof(out_sz)) == bk.MBR_ERR_INVALID_ARG  # cap < n_entries
     assert call("mbr_store_branches_hist", h_store, 0, bk.addr(hc), int(out_sz.value), ctypes.addressof(out_sz)) == bk.MBR_ERR_INVALID_ARG
 
+    # 42-46. WP6 mbr_batch_step_* hostile checks (nulls, kinds, >30 gens/qturns, dirty tails, OOB nodes,
+    #        mismatched kick_x/z, update_log_mass>1, -3 drift, -4 budget atomicity)
+    b_fx = np.zeros((4, nw), dtype=np.uint64)
+    b_fz = np.zeros((4, nw), dtype=np.uint64)
+    b_fx_dirty = b_fx.copy()
+    b_fx_dirty[2, 0] = np.uint64(1 << n)
+    b_nodes = np.zeros(4, dtype=np.int64)
+    b_nodes_oob = np.array([0, 99999, 0, 0], dtype=np.int64)
+    b_peaks = np.ones(4, dtype=np.int16)
+    b_lm = np.zeros(4, dtype=np.float64)
+    b_u = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float64)
+    b_des = np.array([0, 1, 0, 1], dtype=np.uint8)
+    b_sel = np.array([1, 0, 1, 0], dtype=np.uint8)
+    b_p1 = np.zeros(4, dtype=np.float64)
+    b_tm = np.zeros(4, dtype=np.uint8)
+    b_pc = np.zeros(4, dtype=np.float64)
+    b_fm = np.array([1], dtype=np.uint32)
+    b_gx = np.array([[1]], dtype=np.uint64)
+    b_gz = np.array([[0]], dtype=np.uint64)
+    b_fail = ctypes.c_int64(-99)
+    ax_k_ok = np.array([0], dtype=np.uint8)
+    ax_e_ok = np.array([1], dtype=np.uint8)
+
+    # 42. mbr_batch_step_rotations
+    assert call("mbr_batch_step_rotations", 0, 4, 0, 1, bk.MBR_KIND_T, 1, bk.addr(b_gx), bk.addr(b_gz), 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(ax_e_ok), bk.addr(b_fm), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_rotations", h_store, 4, 0, 1, bk.MBR_KIND_MEAS, 1, bk.addr(b_gx), bk.addr(b_gz), 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(ax_e_ok), bk.addr(b_fm), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_rotations", h_store, 4, 0, 1, bk.MBR_KIND_T, 31, bk.addr(b_gx), bk.addr(b_gz), 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(ax_e_ok), bk.addr(b_fm), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_rotations", h_store, 4, 0, 1, bk.MBR_KIND_T, 1, bk.addr(dirty.reshape(1, 1)), bk.addr(b_gz), 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(ax_e_ok), bk.addr(b_fm), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_rotations", h_store, 4, 0, 1, bk.MBR_KIND_T, 1, bk.addr(b_gx), bk.addr(b_gz), 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(ax_e_ok), 0, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_rotations", h_store, 4, 0, 1, bk.MBR_KIND_T, 1, bk.addr(b_gx), bk.addr(b_gz), 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(ax_e_ok), bk.addr(b_fm), bk.addr(b_fx_dirty), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_rotations", h_store, 4, 0, 1, bk.MBR_KIND_T, 1, bk.addr(b_gx), bk.addr(b_gz), 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(ax_e_ok), bk.addr(b_fm), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes_oob), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_rotations", h_store, 4, 0, 1, bk.MBR_KIND_T, 1, bk.addr(b_gx), bk.addr(b_gz), 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(ax_e_ok), bk.addr(b_fm), 0, bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+
+    # 43. mbr_batch_step_qturns
+    assert call("mbr_batch_step_qturns", 0, 4, 0, 2, bk.MBR_KIND_SKIP, 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_qturns", h_store, 4, 0, 2, bk.MBR_KIND_T, 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_qturns", h_store, 4, 0, 2, bk.MBR_KIND_SKIP, 31, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_qturns", h_store, 4, 0, 2, bk.MBR_KIND_SKIP, 1, bk.addr(b_gx), bk.addr(b_gx), bk.addr(ax_k_ok), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG  # non-Hermitian
+    assert call("mbr_batch_step_qturns", h_store, 4, 0, 2, bk.MBR_KIND_SKIP, 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(b_fx_dirty), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_qturns", h_store, 4, 0, 2, bk.MBR_KIND_SKIP, 1, bk.addr(b_gx), bk.addr(b_gz), bk.addr(ax_k_ok), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes_oob), bk.addr(b_peaks)) == bk.MBR_ERR_INVALID_ARG
+
+    # 44. mbr_batch_step_meas
+    assert call("mbr_batch_step_meas", 0, 4, 0, 3, bk.MBR_KIND_MEAS, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_u), 0, 0, 0, 1, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), bk.addr(b_lm), bk.addr(b_tm), bk.addr(b_pc)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_meas", h_store, 4, 0, 3, bk.MBR_KIND_T, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_u), 0, 0, 0, 1, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), bk.addr(b_lm), 0, 0) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_meas", h_store, 4, 0, 3, bk.MBR_KIND_MEAS, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_u), bk.addr(x_q0), 0, 0, 1, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), bk.addr(b_lm), 0, 0) == bk.MBR_ERR_INVALID_ARG  # mismatched kick_x/z
+    assert call("mbr_batch_step_meas", h_store, 4, 0, 3, bk.MBR_KIND_MEAS, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_u), bk.addr(dirty), bk.addr(z0), 0, 1, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), bk.addr(b_lm), 0, 0) == bk.MBR_ERR_INVALID_ARG  # dirty kick
+    assert call("mbr_batch_step_meas", h_store, 4, 0, 3, bk.MBR_KIND_MEAS, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_u), 0, 0, 0, 2, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), bk.addr(b_lm), 0, 0) == bk.MBR_ERR_INVALID_ARG  # bad update_log_mass
+    assert call("mbr_batch_step_meas", h_store, 4, 0, 3, bk.MBR_KIND_MEAS, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_u), 0, 0, 0, 1, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), 0, 0, 0) == bk.MBR_ERR_INVALID_ARG  # null log_mass when update=1
+    assert call("mbr_batch_step_meas", h_store, 4, 0, 3, bk.MBR_KIND_MEAS, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_u), 0, 0, 0, 1, bk.addr(b_fx_dirty), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), bk.addr(b_lm), 0, 0) == bk.MBR_ERR_INVALID_ARG
+    # -3 float drift on shot 2 leaves all buffers untouched (even shot 0 which succeeded in Pass 1!)
+    b_nodes_drift = np.array([0, 0, nid_drift2, 0], dtype=np.int64)
+    b_nodes_drift_orig = b_nodes_drift.copy()
+    b_peaks_orig = b_peaks.copy()
+    b_lm_orig = b_lm.copy()
+    assert call("mbr_batch_step_meas", h_store, 4, 0, 9991, bk.MBR_KIND_MEAS, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_u), 0, 0, 0, 1, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes_drift), bk.addr(b_peaks), bk.addr(b_lm), bk.addr(b_tm), bk.addr(b_pc)) == bk.MBR_ERR_FLOAT_DRIFT
+    assert np.array_equal(b_nodes_drift, b_nodes_drift_orig)
+    assert np.array_equal(b_peaks, b_peaks_orig)
+    assert np.array_equal(b_lm, b_lm_orig)
+
+    # 45. mbr_batch_step_peek
+    assert call("mbr_batch_step_peek", 0, 4, 4, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_p1)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_peek", h_store, 4, 4, bk.addr(dirty), bk.addr(z_q0), 0, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_p1)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_peek", h_store, 4, 4, bk.addr(x_q0), bk.addr(z_q0), 0, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_p1)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_peek", h_store, 4, 4, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_fx_dirty), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_p1)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_peek", h_store, 4, 4, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes_oob), bk.addr(b_p1)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_peek", h_store, 4, 4, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), 0) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_peek", h_store, 4, 9992, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes_drift), bk.addr(b_p1)) == bk.MBR_ERR_FLOAT_DRIFT
+
+    # 46. mbr_batch_step_postselect
+    assert call("mbr_batch_step_postselect", 0, 4, bk.addr(b_sel), 5, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_des), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), bk.addr(b_lm), ctypes.addressof(b_fail)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_postselect", h_store, 4, bk.addr(b_sel), 5, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_des), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), bk.addr(b_lm), 0) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_postselect", h_store, 4, bk.addr(b_sel), 5, bk.addr(dirty), bk.addr(z_q0), 0, bk.addr(b_des), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), bk.addr(b_lm), ctypes.addressof(b_fail)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_postselect", h_store, 4, bk.addr(b_sel), 5, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_des), bk.addr(b_fx_dirty), bk.addr(b_fz), bk.addr(b_nodes), bk.addr(b_peaks), bk.addr(b_lm), ctypes.addressof(b_fail)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_postselect", h_store, 4, 0, 5, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_des), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes_oob), bk.addr(b_peaks), bk.addr(b_lm), ctypes.addressof(b_fail)) == bk.MBR_ERR_INVALID_ARG
+    assert call("mbr_batch_step_postselect", h_store, 4, 0, 9993, bk.addr(z0), bk.addr(z_q0), 0, bk.addr(b_des), bk.addr(b_fx), bk.addr(b_fz), bk.addr(b_nodes_drift), bk.addr(b_peaks), bk.addr(b_lm), ctypes.addressof(b_fail)) == bk.MBR_ERR_FLOAT_DRIFT
+
     # Clean up raw handles
     for h in (h_st, h_d1, h_n3, h_n27):
         call("mbr_state_destroy", h)
     call("mbr_store_destroy", h_store)
 
-    # Assert ALL 41 symbols were probed!
+    # Assert ALL 46 symbols were probed!
     assert probed == {name for name, _, _ in bk._SPECS}
     assert bk.BranchState.live_states() == 0
     assert bk.BranchStore.live_stores() == 0
+
+    # Python wrapper checks for read-only arrays & budget atomicity on batch_step_*
+    with bk.BranchStore(4, max_components=1) as bs_ro:
+        ro_nodes = np.zeros(2, dtype=np.int64)
+        ro_nodes.flags.writeable = False
+        ok_nodes = np.zeros(2, dtype=np.int64)
+        ok_peaks = np.ones(2, dtype=np.int16)
+        ro_peaks = ok_peaks.copy()
+        ro_peaks.flags.writeable = False
+        ok_fx = np.zeros((2, 1), dtype=np.uint64)
+        ok_fz = np.zeros((2, 1), dtype=np.uint64)
+        ro_fx = ok_fx.copy()
+        ro_fx.flags.writeable = False
+        ok_lm = np.zeros(2, dtype=np.float64)
+        ok_u = np.array([0.2, 0.7], dtype=np.float64)
+        with pytest.raises(ValueError, match="writeable"):
+            bs_ro.batch_step_rotations(
+                1, bk.MBR_KIND_T, b_gx, b_gz, b_gx, b_gz, ax_k_ok, ax_e_ok, b_fm,
+                ok_fx, ok_fz, ro_nodes, ok_peaks,
+            )
+        with pytest.raises(ValueError, match="writeable"):
+            bs_ro.batch_step_qturns(
+                2, bk.MBR_KIND_SKIP, b_gx, b_gz, ax_k_ok, ok_fx, ok_fz, ok_nodes, ro_peaks,
+            )
+        with pytest.raises(ValueError, match="writeable"):
+            bs_ro.batch_step_meas(
+                3, bk.MBR_KIND_MEAS, z0, z_q0, 0, ok_u, ro_fx, ok_fz, ok_nodes, ok_peaks,
+                log_mass=ok_lm,
+            )
+        # Budget (-4) atomicity: shot 0 succeeds (commuting), shot 1 triggers resolve (>1 branch -> -4)
+        # Both shots' nodes and peaks must remain 100% untouched!
+        n_x = bs_ro.step_rotations(
+            0, 10, bk.MBR_KIND_T, 0, b_gx, b_gz, ax_k_ok, ax_e_ok
+        )
+        bud_nodes = np.array([0, n_x], dtype=np.int64)
+        bud_peaks = np.array([1, 1], dtype=np.int16)
+        with pytest.raises(bk.BranchBudgetError):
+            bs_ro.batch_step_rotations(
+                11, bk.MBR_KIND_T, b_gz, b_gx, b_gz, b_gx, ax_k_ok, ax_e_ok, b_fm,
+                ok_fx, ok_fz, bud_nodes, bud_peaks,
+            )
+        assert np.array_equal(bud_nodes, np.array([0, n_x], dtype=np.int64))
+        assert np.array_equal(bud_peaks, np.array([1, 1], dtype=np.int16))
 
     # Python wrapper tightening checks: np.bool_ rejection & (0, 0) 2D parities rejection
     with pytest.raises(TypeError):
@@ -2363,16 +2482,157 @@ test_case(
     lambda c: c["st"].close(),
 )
 
-# --- Zero-alloc pins ---
+# --- WP6 batch_step_* allocating OOM checks (verify zero buffer mutation & zero store corruption) ---
+def _setup_batch_store():
+    st, ids = make_rich_store()
+    snap = snapshot_store(st)
+    nodes = np.array([0, ids["n1"], ids["n_gr"], ids["n_gy"]], dtype=np.int64)
+    peaks = np.array([1, 1, 1, 1], dtype=np.int16)
+    fx = np.array([[0], [1], [2], [4]], dtype=np.uint64)
+    fz = np.array([[0], [0], [1], [2]], dtype=np.uint64)
+    lm = np.zeros(4, dtype=np.float64)
+    tm = np.full(4, 7, dtype=np.uint8)
+    pc = np.full(4, -1.0, dtype=np.float64)
+    p1 = np.full(4, -1.0, dtype=np.float64)
+    return {
+        "st": st, "ids": ids, "snap": snap,
+        "nodes": nodes, "nodes0": nodes.copy(),
+        "peaks": peaks, "peaks0": peaks.copy(),
+        "fx": fx, "fx0": fx.copy(),
+        "fz": fz, "fz0": fz.copy(),
+        "lm": lm, "lm0": lm.copy(),
+        "tm": tm, "tm0": tm.copy(),
+        "pc": pc, "pc0": pc.copy(),
+        "p1": p1, "p10": p1.copy(),
+        "u": np.array([0.1, 0.9, 0.2, 0.8], dtype=np.float64),
+    }
+
+def _assert_batch_untouched(c):
+    # Pre-existing nodes must remain bit-identical, any already-committed prefix transitions
+    # must leave the store completely valid (no torn nodes/pools/hist), and caller buffers 100% untouched.
+    st = c["st"]
+    nc0, denses0, infos0, _cnt0 = c["snap"]
+    _check(st.node_count >= nc0, f"node_count shrank {st.node_count} < {nc0}")
+    cnt = st.counters()
+    _check(sum(cnt["branches_hist"].values()) == st.node_count, f"hist sum mismatch: {cnt['branches_hist']} vs {st.node_count}")
+    for nid in range(nc0):
+        _check(st.node_info(nid) == infos0[nid], f"pre-existing node {nid} info changed")
+        _check(np.array_equal(st.node_dense(nid, "big"), denses0[nid]), f"pre-existing node {nid} dense changed")
+    for nid in range(nc0, st.node_count):
+        nb, npd, tpk = st.node_info(nid)
+        _check(nb >= 1 and tpk >= nb, f"committed prefix node {nid} invalid")
+        _check(st.node_dense(nid, "big").shape == (16,), f"committed prefix node {nid} dense invalid")
+    _check(np.array_equal(c["nodes"], c["nodes0"]), "nodes mutated on OOM")
+    _check(np.array_equal(c["peaks"], c["peaks0"]), "peaks mutated on OOM")
+    _check(np.array_equal(c["fx"], c["fx0"]), "fx mutated on OOM")
+    _check(np.array_equal(c["fz"], c["fz0"]), "fz mutated on OOM")
+    _check(np.array_equal(c["lm"], c["lm0"]), "lm mutated on OOM")
+    _check(np.array_equal(c["tm"], c["tm0"]), "tm mutated on OOM")
+    _check(np.array_equal(c["pc"], c["pc0"]), "pc mutated on OOM")
+    _check(np.array_equal(c["p1"], c["p10"]), "p1 mutated on OOM")
+
+test_case(
+    "mbr_batch_step_rotations",
+    _setup_batch_store,
+    lambda c: c["st"].batch_step_rotations(
+        710, bk.MBR_KIND_T,
+        np.array([[0]], np.uint64), np.array([[1]], np.uint64),
+        np.array([[0]], np.uint64), np.array([[1]], np.uint64),
+        np.array([0], np.uint8), np.array([1], np.uint8), np.array([1], np.uint32),
+        c["fx"], c["fz"], c["nodes"], c["peaks"],
+    ),
+    _assert_batch_untouched,
+    lambda c, r: _check(not np.array_equal(c["nodes"], c["nodes0"])),
+    lambda c: c["st"].close(),
+)
+test_case(
+    "mbr_batch_step_qturns",
+    _setup_batch_store,
+    lambda c: c["st"].batch_step_qturns(
+        711, bk.MBR_KIND_SKIP,
+        np.array([[2]], np.uint64), np.array([[1]], np.uint64),
+        np.array([0], np.uint8),
+        c["fx"], c["fz"], c["nodes"], c["peaks"],
+    ),
+    _assert_batch_untouched,
+    lambda c, r: _check(not np.array_equal(c["nodes"], c["nodes0"])),
+    lambda c: c["st"].close(),
+)
+test_case(
+    "mbr_batch_step_meas",
+    _setup_batch_store,
+    lambda c: c["st"].batch_step_meas(
+        712, bk.MBR_KIND_MEAS,
+        np.array([0], np.uint64), np.array([2], np.uint64), 0,
+        c["u"], c["fx"], c["fz"], c["nodes"], c["peaks"],
+        log_mass=c["lm"], update_log_mass=True,
+        out_true_m=c["tm"], out_p_chosen=c["pc"],
+    ),
+    _assert_batch_untouched,
+    lambda c, r: _check(np.all((c["tm"] == 0) | (c["tm"] == 1))),
+    lambda c: c["st"].close(),
+)
+test_case(
+    "mbr_batch_step_peek",
+    _setup_batch_store,
+    lambda c: c["st"].batch_step_peek(
+        713,
+        np.array([0], np.uint64), np.array([2], np.uint64), 0,
+        c["fx"], c["fz"], c["nodes"], c["p1"],
+    ),
+    _assert_batch_untouched,
+    lambda c, r: _check(np.all((c["p1"] >= 0.0) & (c["p1"] <= 1.0))),
+    lambda c: c["st"].close(),
+)
+test_case(
+    "mbr_batch_step_postselect",
+    _setup_batch_store,
+    lambda c: c["st"].batch_step_postselect(
+        714,
+        np.array([0], np.uint64), np.array([2], np.uint64), 0,
+        np.array([0, 0, 0, 0], dtype=np.uint8),
+        c["fx"], c["fz"], c["nodes"], c["peaks"], c["lm"],
+    ),
+    _assert_batch_untouched,
+    lambda c, r: _check(r == -1 or (0 <= r < 4)),
+    lambda c: c["st"].close(),
+)
+
+# --- Zero-alloc pins (including WP6 warm B=4096 batch cache hits) ---
 st_z = bk.BranchState.zero(4)
 store_z, ids_z = make_rich_store()
-# Pre-warm one rotation and one qturn cache hit
+# Pre-warm scalar and batch cache hits (multi-node < 128 distinct keys, B = 4096)
 x0 = np.array([[1]], np.uint64)
 z0 = np.array([[0]], np.uint64)
 k0 = np.array([0], np.uint8)
 e1 = np.array([1], np.uint8)
+fm1 = np.array([1], np.uint32)
 store_z.step_rotations(0, 900, bk.MBR_KIND_T, 0, x0, z0, k0, e1)
 store_z.step_qturns(0, 901, bk.MBR_KIND_SKIP, 0, x0, z0, k0)
+
+B_Z = 4096
+bz_fx = np.zeros((B_Z, 1), dtype=np.uint64)
+bz_fz = np.zeros((B_Z, 1), dtype=np.uint64)
+bz_fz[1::2, 0] = 1  # two distinct sign_bits (0 and 1)
+bz_nodes_rot = np.zeros(B_Z, dtype=np.int64)
+bz_nodes_rot[2::3] = ids_z["n1"]
+bz_nodes_rot_orig = bz_nodes_rot.copy()
+bz_peaks = np.ones(B_Z, dtype=np.int16)
+bz_lm = np.zeros(B_Z, dtype=np.float64)
+bz_u = np.full(B_Z, 0.25, dtype=np.float64)
+bz_tm = np.zeros(B_Z, dtype=np.uint8)
+bz_pc = np.zeros(B_Z, dtype=np.float64)
+bz_p1 = np.zeros(B_Z, dtype=np.float64)
+bz_des = np.zeros(B_Z, dtype=np.uint8)
+bz_fail = ctypes.c_int64(-1)
+# Pre-warm batch transitions on all present (node, sb) / node keys
+store_z.batch_step_rotations(910, bk.MBR_KIND_T, x0, z0, x0, z0, k0, e1, fm1, bz_fx, bz_fz, bz_nodes_rot.copy(), bz_peaks.copy())
+store_z.batch_step_qturns(911, bk.MBR_KIND_SKIP, x0, z0, k0, bz_fx, bz_fz, bz_nodes_rot.copy(), bz_peaks.copy())
+store_z.batch_step_meas(912, bk.MBR_KIND_MEAS, z0[0], np.array([8], np.uint64), 0, bz_u, bz_fx.copy(), bz_fz.copy(), bz_nodes_rot.copy(), bz_peaks.copy(), log_mass=bz_lm.copy())
+store_z.batch_step_peek(913, z0[0], np.array([8], np.uint64), 0, bz_fx, bz_fz, bz_nodes_rot, bz_p1)
+store_z.batch_step_postselect(914, z0[0], np.array([8], np.uint64), 0, bz_des, bz_fx.copy(), bz_fz.copy(), bz_nodes_rot.copy(), bz_peaks.copy(), bz_lm.copy())
+mz8 = np.array([8], np.uint64)
+
 # Pre-allocate buffers so Python/NumPy wrappers don't skew native C++ alloc count
 out_h = np.zeros(1, np.uint64)
 out_dense = np.zeros(32, np.float64)
@@ -2405,6 +2665,26 @@ zero_calls = {
     "mbr_store_branches_hist": lambda: lib.mbr_store_branches_hist(store_z._handle, bk.addr(out_hk), bk.addr(out_hc), 4, ctypes.addressof(out_sz)),
     "mbr_store_step_rotations_cache_hit": lambda: lib.mbr_store_step_rotations(store_z._handle, 0, 900, bk.MBR_KIND_T, 0, 1, bk.addr(x0), bk.addr(z0), bk.addr(k0), bk.addr(e1), ctypes.addressof(out_i64)),
     "mbr_store_step_qturns_cache_hit": lambda: lib.mbr_store_step_qturns(store_z._handle, 0, 901, bk.MBR_KIND_SKIP, 0, 1, bk.addr(x0), bk.addr(z0), bk.addr(k0), ctypes.addressof(out_i64)),
+    "mbr_batch_step_rotations_warm_4096": lambda: (
+        bz_nodes_rot.__setitem__(slice(None), bz_nodes_rot_orig),
+        lib.mbr_batch_step_rotations(store_z._handle, B_Z, 0, 910, bk.MBR_KIND_T, 1, bk.addr(x0), bk.addr(z0), 1, bk.addr(x0), bk.addr(z0), bk.addr(k0), bk.addr(e1), bk.addr(fm1), bk.addr(bz_fx), bk.addr(bz_fz), bk.addr(bz_nodes_rot), bk.addr(bz_peaks)),
+    )[1],
+    "mbr_batch_step_qturns_warm_4096": lambda: (
+        bz_nodes_rot.__setitem__(slice(None), bz_nodes_rot_orig),
+        lib.mbr_batch_step_qturns(store_z._handle, B_Z, 0, 911, bk.MBR_KIND_SKIP, 1, bk.addr(x0), bk.addr(z0), bk.addr(k0), bk.addr(bz_fx), bk.addr(bz_fz), bk.addr(bz_nodes_rot), bk.addr(bz_peaks)),
+    )[1],
+    "mbr_batch_step_meas_warm_4096": lambda: (
+        bz_nodes_rot.__setitem__(slice(None), bz_nodes_rot_orig),
+        lib.mbr_batch_step_meas(store_z._handle, B_Z, 0, 912, bk.MBR_KIND_MEAS, bk.addr(z0), bk.addr(mz8), 0, bk.addr(bz_u), 0, 0, 0, 1, bk.addr(bz_fx), bk.addr(bz_fz), bk.addr(bz_nodes_rot), bk.addr(bz_peaks), bk.addr(bz_lm), bk.addr(bz_tm), bk.addr(bz_pc)),
+    )[1],
+    "mbr_batch_step_peek_warm_4096": lambda: (
+        bz_nodes_rot.__setitem__(slice(None), bz_nodes_rot_orig),
+        lib.mbr_batch_step_peek(store_z._handle, B_Z, 913, bk.addr(z0), bk.addr(mz8), 0, bk.addr(bz_fx), bk.addr(bz_fz), bk.addr(bz_nodes_rot), bk.addr(bz_p1)),
+    )[1],
+    "mbr_batch_step_postselect_warm_4096": lambda: (
+        bz_nodes_rot.__setitem__(slice(None), bz_nodes_rot_orig),
+        lib.mbr_batch_step_postselect(store_z._handle, B_Z, 0, 914, bk.addr(z0), bk.addr(mz8), 0, bk.addr(bz_des), bk.addr(bz_fx), bk.addr(bz_fz), bk.addr(bz_nodes_rot), bk.addr(bz_peaks), bk.addr(bz_lm), ctypes.addressof(bz_fail)),
+    )[1],
 }
 for zname, zfn in zero_calls.items():
     cnt = count_allocs(zfn)
@@ -2464,7 +2744,8 @@ def test_t15_genuine_cpp_oom_all_allocating_entrypoints(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, f"OOM child rc={proc.returncode}\n{proc.stdout}\n{proc.stderr[-3000:]}"
     rep = json.loads(proc.stdout.strip().splitlines()[-1])
-    assert len(rep["allocating"]) == 28
+    assert len(rep["allocating"]) == 33
+    assert len(rep["zero_alloc"]) == 20
     assert all(v["allocs"] >= 1 and v["tested_ks"] >= 1 for v in rep["allocating"].values())
     assert all(v == 0 for v in rep["zero_alloc"].values())
 
@@ -2922,3 +3203,595 @@ def test_t15_strict_cpp_compiler_warnings() -> None:
     )
     assert proc.returncode == 0, f"c++ strict check failed:\n{proc.stderr}"
     assert proc.stderr.strip() == ""
+
+
+# =============================================================================================
+# Section D — WP6 Batch-Walk Differential, Spill (>4096, >256 keys), Multi-Word & Concurrency
+# =============================================================================================
+
+
+def _anti_words_py(fx_row: np.ndarray, fz_row: np.ndarray, px: np.ndarray, pz: np.ndarray) -> int:
+    acc = int(0)
+    for w in range(fx_row.shape[0]):
+        acc ^= (int(fx_row[w]) & int(pz[w])) ^ (int(fz_row[w]) & int(px[w]))
+    return acc.bit_count() & 1
+
+
+def _scalar_ref_batch_rotations(
+    st: bk.BranchStore,
+    eid: int,
+    kind: int,
+    gen_x: np.ndarray,
+    gen_z: np.ndarray,
+    base_x: np.ndarray,
+    base_z: np.ndarray,
+    base_k: np.ndarray,
+    ax_e: np.ndarray,
+    flip_masks: np.ndarray,
+    fx: np.ndarray,
+    fz: np.ndarray,
+    nodes: np.ndarray,
+    peaks: np.ndarray,
+    sel_mask: np.ndarray | None = None,
+) -> None:
+    seen: dict[tuple[int, int], tuple[int, int]] = {}
+    for s in range(nodes.shape[0]):
+        if sel_mask is not None and not bool(sel_mask[s]):
+            continue
+        nid = int(nodes[s])
+        sb = 0
+        for g in range(gen_x.shape[0]):
+            sb |= _anti_words_py(fx[s], fz[s], gen_x[g], gen_z[g]) << g
+        key = (nid, sb)
+        if key not in seen:
+            fk = np.empty(base_k.shape[0], dtype=np.uint8)
+            for i in range(base_k.shape[0]):
+                fk[i] = (int(base_k[i]) + (2 if ((sb & int(flip_masks[i])).bit_count() & 1) else 0)) & 3
+            cid = st.step_rotations(nid, eid, kind, sb, base_x, base_z, fk, ax_e)
+            nb, _, tpk = st.node_info(cid)
+            seen[key] = (cid, min(32767, max(nb, tpk)))
+        cid, cpk = seen[key]
+        nodes[s] = cid
+        if peaks[s] < cpk:
+            peaks[s] = cpk
+
+
+def _scalar_ref_batch_qturns(
+    st: bk.BranchStore,
+    eid: int,
+    kind: int,
+    base_x: np.ndarray,
+    base_z: np.ndarray,
+    base_k: np.ndarray,
+    fx: np.ndarray,
+    fz: np.ndarray,
+    nodes: np.ndarray,
+    peaks: np.ndarray,
+    sel_mask: np.ndarray | None = None,
+) -> None:
+    seen: dict[tuple[int, int], tuple[int, int]] = {}
+    for s in range(nodes.shape[0]):
+        if sel_mask is not None and not bool(sel_mask[s]):
+            continue
+        nid = int(nodes[s])
+        sb = 0
+        for j in range(base_k.shape[0]):
+            sb |= _anti_words_py(fx[s], fz[s], base_x[j], base_z[j]) << j
+        key = (nid, sb)
+        if key not in seen:
+            fk = np.array(
+                [(int(base_k[j]) + (2 if (sb >> j) & 1 else 0)) & 3 for j in range(base_k.shape[0])],
+                dtype=np.uint8,
+            )
+            cid = st.step_qturns(nid, eid, kind, sb, base_x, base_z, fk)
+            nb, _, tpk = st.node_info(cid)
+            seen[key] = (cid, min(32767, max(nb, tpk)))
+        cid, cpk = seen[key]
+        nodes[s] = cid
+        if peaks[s] < cpk:
+            peaks[s] = cpk
+
+
+def _scalar_ref_batch_meas(
+    st: bk.BranchStore,
+    eid: int,
+    kind: int,
+    mx: np.ndarray,
+    mz: np.ndarray,
+    mk: int,
+    uniforms: np.ndarray,
+    fx: np.ndarray,
+    fz: np.ndarray,
+    nodes: np.ndarray,
+    peaks: np.ndarray,
+    log_mass: np.ndarray | None,
+    update_log_mass: bool,
+    sel_mask: np.ndarray | None,
+    kick_x: np.ndarray | None,
+    kick_z: np.ndarray | None,
+    want_one_mask: np.ndarray | None,
+    out_true_m: np.ndarray | None,
+    out_p_chosen: np.ndarray | None,
+) -> None:
+    seen: dict[int, tuple[float, int, int, int, np.ndarray, np.ndarray, int, int]] = {}
+    for s in range(nodes.shape[0]):
+        if sel_mask is not None and not bool(sel_mask[s]):
+            continue
+        nid = int(nodes[s])
+        if nid not in seen:
+            p0, c0, c1, mt, ax, az = st.step_meas(nid, eid, kind, mx, mz, mk)
+            pk0 = 1 if c0 < 0 else min(32767, max(st.node_info(c0)[0], st.node_info(c0)[2]))
+            pk1 = 1 if c1 < 0 else min(32767, max(st.node_info(c1)[0], st.node_info(c1)[2]))
+            seen[nid] = (p0, c0, c1, mt, ax, az, pk0, pk1)
+        p0, c0, c1, mt, ax, az, pk0, pk1 = seen[nid]
+        inner_m = True if c0 < 0 else (False if c1 < 0 else (float(uniforms[s]) >= p0))
+        s_bit = bool(_anti_words_py(fx[s], fz[s], mx, mz))
+        true_m = inner_m ^ s_bit
+        if mt == bk.MBR_MEAS_ABSORBED and inner_m:
+            fx[s] ^= ax
+            fz[s] ^= az
+        nodes[s] = c1 if inner_m else c0
+        cpk = pk1 if inner_m else pk0
+        if peaks[s] < cpk:
+            peaks[s] = cpk
+        p_ch = (1.0 - p0) if inner_m else p0
+        if out_p_chosen is not None:
+            out_p_chosen[s] = p_ch
+        if update_log_mass and log_mass is not None:
+            log_mass[s] += (-math.inf if p_ch <= 0.0 else (0.0 if p_ch == 1.0 else math.log(p_ch)))
+        if kick_x is not None and kick_z is not None:
+            want1 = (want_one_mask is not None) and bool(want_one_mask[s])
+            if true_m != want1:
+                fx[s] ^= kick_x
+                fz[s] ^= kick_z
+        if out_true_m is not None:
+            out_true_m[s] = 1 if true_m else 0
+
+
+def test_wp6_batch_walk_differential_spill_multiword_and_atomicity() -> None:
+    """WP6: Differential parity of all 5 `mbr_batch_step_*` vs scalar `step_*` across B={0,1,17,128,5000}, >256 keys, and n up to 193."""
+    rng = np.random.default_rng(20261128)
+
+    # 1. Batch sizes B in {0, 1, 17, 128, 5000} (B=5000 exercises >4096 stack-spill!) + sel_mask + kicks + trace
+    for bsz in (0, 1, 17, 128, 5000):
+        n, nw = 5, 1
+        st_b = bk.BranchStore(n)
+        st_r = bk.BranchStore(n)
+        try:
+            fx_b = rng.integers(0, 1 << n, size=(bsz, nw), dtype=np.uint64)
+            fz_b = rng.integers(0, 1 << n, size=(bsz, nw), dtype=np.uint64)
+            nodes_b = np.zeros(bsz, dtype=np.int64)
+            peaks_b = np.ones(bsz, dtype=np.int16)
+            lm_b = np.zeros(bsz, dtype=np.float64)
+
+            fx_r, fz_r = fx_b.copy(), fz_b.copy()
+            nodes_r, peaks_r, lm_r = nodes_b.copy(), peaks_b.copy(), lm_b.copy()
+
+            # Step 1: Uniform hot0 qturn (H on q0, q1)
+            q_x = np.array([[1], [2]], dtype=np.uint64)
+            q_z = np.array([[1], [2]], dtype=np.uint64)
+            q_k = np.array([1, 1], dtype=np.uint8)
+            st_b.batch_step_qturns(1, bk.MBR_KIND_SKIP, q_x, q_z, q_k, fx_b, fz_b, nodes_b, peaks_b)
+            _scalar_ref_batch_qturns(st_r, 1, bk.MBR_KIND_SKIP, q_x, q_z, q_k, fx_r, fz_r, nodes_r, peaks_r)
+            assert np.array_equal(nodes_b, nodes_r)
+            assert np.array_equal(peaks_b, peaks_r)
+
+            # Step 2: Masked 3-generator CCZ rotation (7 axes + flip_masks)
+            sel = (rng.random(bsz) < 0.7) if bsz > 0 else np.zeros(0, dtype=np.bool_)
+            g_x = np.zeros((3, 1), dtype=np.uint64)
+            g_z = np.array([[1], [2], [4]], dtype=np.uint64)
+            b_x = np.zeros((7, 1), dtype=np.uint64)
+            b_z = np.array([[1], [2], [4], [3], [5], [6], [7]], dtype=np.uint64)
+            b_k = np.zeros(7, dtype=np.uint8)
+            b_e = np.array([1, 1, 1, 7, 7, 7, 1], dtype=np.uint8)
+            fm = np.array([1, 2, 4, 3, 5, 6, 7], dtype=np.uint32)
+            st_b.batch_step_rotations(
+                2, bk.MBR_KIND_CCZ, g_x, g_z, b_x, b_z, b_k, b_e, fm,
+                fx_b, fz_b, nodes_b, peaks_b, sel_mask=sel,
+            )
+            _scalar_ref_batch_rotations(
+                st_r, 2, bk.MBR_KIND_CCZ, g_x, g_z, b_x, b_z, b_k, b_e, fm,
+                fx_r, fz_r, nodes_r, peaks_r, sel_mask=sel,
+            )
+            assert np.array_equal(nodes_b, nodes_r)
+            assert np.array_equal(peaks_b, peaks_r)
+
+            # Step 3: Anticommuting T rotation on X0 (triggers resolve!)
+            tx = np.array([[1]], dtype=np.uint64)
+            tz = np.array([[0]], dtype=np.uint64)
+            tk = np.array([0], dtype=np.uint8)
+            te = np.array([1], dtype=np.uint8)
+            tfm = np.array([1], dtype=np.uint32)
+            st_b.batch_step_rotations(3, bk.MBR_KIND_T, tx, tz, tx, tz, tk, te, tfm, fx_b, fz_b, nodes_b, peaks_b)
+            _scalar_ref_batch_rotations(st_r, 3, bk.MBR_KIND_T, tx, tz, tx, tz, tk, te, tfm, fx_r, fz_r, nodes_r, peaks_r)
+            assert np.array_equal(nodes_b, nodes_r)
+            assert np.array_equal(peaks_b, peaks_r)
+
+            # Step 4: Peek Z0
+            p1_b = np.empty(bsz, dtype=np.float64)
+            st_b.batch_step_peek(4, np.array([0], np.uint64), np.array([1], np.uint64), 0, fx_b, fz_b, nodes_b, p1_b)
+            seen_pk: dict[int, float] = {}
+            p1_r = np.empty(bsz, dtype=np.float64)
+            for s in range(bsz):
+                nid = int(nodes_r[s])
+                if nid not in seen_pk:
+                    seen_pk[nid] = st_r.step_peek(nid, 4, np.array([0], np.uint64), np.array([1], np.uint64), 0)
+                s_bit = bool(_anti_words_py(fx_r[s], fz_r[s], np.array([0], np.uint64), np.array([1], np.uint64)))
+                p1_r[s] = min(1.0, max(0.0, seen_pk[nid] if s_bit else (1.0 - seen_pk[nid])))
+            assert np.allclose(p1_b, p1_r, atol=0.0, rtol=0.0)
+
+            # Step 5: Measurement with reset kick, want_one_mask, out_true_m, out_p_chosen
+            u = rng.random(bsz)
+            want1 = (rng.random(bsz) < 0.5) if bsz > 0 else np.zeros(0, dtype=np.bool_)
+            tm_b = np.full(bsz, 9, dtype=np.uint8)
+            tm_r = tm_b.copy()
+            pc_b = np.full(bsz, -2.0, dtype=np.float64)
+            pc_r = pc_b.copy()
+            st_b.batch_step_meas(
+                5, bk.MBR_KIND_MEAS, np.array([0], np.uint64), np.array([1], np.uint64), 0, u,
+                fx_b, fz_b, nodes_b, peaks_b, log_mass=lm_b, update_log_mass=True,
+                sel_mask=sel, kick_x=np.array([1], np.uint64), kick_z=np.array([0], np.uint64),
+                want_one_mask=want1, out_true_m=tm_b, out_p_chosen=pc_b,
+            )
+            _scalar_ref_batch_meas(
+                st_r, 5, bk.MBR_KIND_MEAS, np.array([0], np.uint64), np.array([1], np.uint64), 0, u,
+                fx_r, fz_r, nodes_r, peaks_r, lm_r, True,
+                sel, np.array([1], np.uint64), np.array([0], np.uint64), want1, tm_r, pc_r,
+            )
+            assert np.array_equal(nodes_b, nodes_r)
+            assert np.array_equal(peaks_b, peaks_r)
+            assert np.array_equal(fx_b, fx_r)
+            assert np.array_equal(fz_b, fz_r)
+            assert np.array_equal(tm_b, tm_r)
+            assert np.allclose(pc_b, pc_r, atol=0.0, rtol=0.0)
+            assert np.allclose(lm_b, lm_r, atol=1e-15, rtol=0.0)
+
+            # Step 6: URESET (update_log_mass=False leaves log_mass unchanged)
+            lm_before = lm_b.copy()
+            st_b.batch_step_meas(
+                6, bk.MBR_KIND_URESET, np.array([0], np.uint64), np.array([2], np.uint64), 0, u,
+                fx_b, fz_b, nodes_b, peaks_b, update_log_mass=False,
+                sel_mask=sel, kick_x=np.array([2], np.uint64), kick_z=np.array([0], np.uint64),
+                want_one_mask=want1,
+            )
+            _scalar_ref_batch_meas(
+                st_r, 6, bk.MBR_KIND_URESET, np.array([0], np.uint64), np.array([2], np.uint64), 0, u,
+                fx_r, fz_r, nodes_r, peaks_r, None, False,
+                sel, np.array([2], np.uint64), np.array([0], np.uint64), want1, None, None,
+            )
+            assert np.array_equal(lm_b, lm_before)
+            assert np.array_equal(nodes_b, nodes_r)
+            assert np.array_equal(fx_b, fx_r) and np.array_equal(fz_b, fz_r)
+
+            # Exact counter parity (including store_nodes and transitions_new/hit)
+            cb = st_b.counters()
+            cr = st_r.counters()
+            for key in ("store_nodes", "transitions_new", "transitions_hit", "resolve_calls", "splits",
+                        "meas_definite", "meas_absorbed", "meas_forked", "branches_hist"):
+                assert cb[key] == cr[key], f"bsz={bsz} key={key}: {cb[key]} != {cr[key]}"
+        finally:
+            st_b.close()
+            st_r.close()
+
+    # 2. > 256 distinct keys (hash-spill from stack 256-slot table to std::unordered_map)
+    n_sp = 6
+    st_hb = bk.BranchStore(n_sp)
+    st_hr = bk.BranchStore(n_sp)
+    try:
+        # Create 280 distinct nodes by chaining unique single-qubit T events
+        dist_nodes = [0]
+        for idx_n in range(280):
+            ax_z = np.array([[1 << (idx_n % n_sp)]], dtype=np.uint64)
+            ax_x = np.zeros((1, 1), dtype=np.uint64)
+            nb = st_hb.step_rotations(dist_nodes[-1], 1000 + idx_n, bk.MBR_KIND_T, 0, ax_x, ax_z, np.array([0], np.uint8), np.array([1], np.uint8))
+            nr = st_hr.step_rotations(dist_nodes[-1], 1000 + idx_n, bk.MBR_KIND_T, 0, ax_x, ax_z, np.array([0], np.uint8), np.array([1], np.uint8))
+            assert nb == nr
+            dist_nodes.append(nb)
+        B_sp = 320
+        nodes_b = np.array([dist_nodes[i % 281] for i in range(B_sp)], dtype=np.int64)
+        nodes_r = nodes_b.copy()
+        peaks_b = np.ones(B_sp, dtype=np.int16)
+        peaks_r = peaks_b.copy()
+        fx_b = rng.integers(0, 1 << n_sp, size=(B_sp, 1), dtype=np.uint64)
+        fz_b = rng.integers(0, 1 << n_sp, size=(B_sp, 1), dtype=np.uint64)
+        fx_r, fz_r = fx_b.copy(), fz_b.copy()
+        lm_b = np.zeros(B_sp, dtype=np.float64)
+        lm_r = lm_b.copy()
+        u_sp = rng.random(B_sp)
+
+        # Exercises >256 distinct keys in rotations, qturns, meas, peek, and postselect
+        gx = np.array([[1]], dtype=np.uint64)
+        gz = np.array([[0]], dtype=np.uint64)
+        st_hb.batch_step_rotations(5001, bk.MBR_KIND_T, gx, gz, gx, gz, np.array([0], np.uint8), np.array([1], np.uint8), np.array([1], np.uint32), fx_b, fz_b, nodes_b, peaks_b)
+        _scalar_ref_batch_rotations(st_hr, 5001, bk.MBR_KIND_T, gx, gz, gx, gz, np.array([0], np.uint8), np.array([1], np.uint8), np.array([1], np.uint32), fx_r, fz_r, nodes_r, peaks_r)
+        assert np.array_equal(nodes_b, nodes_r) and np.array_equal(peaks_b, peaks_r)
+
+        st_hb.batch_step_qturns(5002, bk.MBR_KIND_CFAULT, gx, gz, np.array([0], np.uint8), fx_b, fz_b, nodes_b, peaks_b)
+        _scalar_ref_batch_qturns(st_hr, 5002, bk.MBR_KIND_CFAULT, gx, gz, np.array([0], np.uint8), fx_r, fz_r, nodes_r, peaks_r)
+        assert np.array_equal(nodes_b, nodes_r) and np.array_equal(peaks_b, peaks_r)
+
+        p1_b = np.empty(B_sp, dtype=np.float64)
+        st_hb.batch_step_peek(5003, np.array([0], np.uint64), np.array([2], np.uint64), 0, fx_b, fz_b, nodes_b, p1_b)
+        assert np.all((p1_b >= 0.0) & (p1_b <= 1.0))
+
+        st_hb.batch_step_meas(5004, bk.MBR_KIND_MEAS, np.array([0], np.uint64), np.array([1], np.uint64), 0, u_sp, fx_b, fz_b, nodes_b, peaks_b, log_mass=lm_b)
+        _scalar_ref_batch_meas(st_hr, 5004, bk.MBR_KIND_MEAS, np.array([0], np.uint64), np.array([1], np.uint64), 0, u_sp, fx_r, fz_r, nodes_r, peaks_r, lm_r, True, None, None, None, None, None, None)
+        assert np.array_equal(nodes_b, nodes_r) and np.array_equal(fx_b, fx_r) and np.array_equal(fz_b, fz_r)
+
+        # Postselect atomicity: shot 300 requests impossible Z_5 == 1 (on |0> state with f_x=0)
+        fx_ps = np.zeros((B_sp, 1), dtype=np.uint64)
+        fz_ps = np.zeros((B_sp, 1), dtype=np.uint64)
+        des_ps = np.zeros(B_sp, dtype=np.uint8)
+        des_ps[300] = 1
+        nodes_ps_before = nodes_b.copy()
+        peaks_ps_before = peaks_b.copy()
+        lm_ps_before = lm_b.copy()
+        fail_s = st_hb.batch_step_postselect(
+            5005, np.array([0], np.uint64), np.array([1 << 5], np.uint64), 0,
+            des_ps, fx_ps, fz_ps, nodes_b, peaks_b, lm_b,
+        )
+        assert fail_s == 300
+        assert np.array_equal(nodes_b, nodes_ps_before)
+        assert np.array_equal(peaks_b, peaks_ps_before)
+        assert np.array_equal(lm_b, lm_ps_before)
+        assert np.all(fx_ps == 0) and np.all(fz_ps == 0)
+        # With valid desired_bits (all 0), postselect succeeds atomically (returns -1)
+        des_ps[300] = 0
+        fail_ok = st_hb.batch_step_postselect(
+            5005, np.array([0], np.uint64), np.array([1 << 5], np.uint64), 0,
+            des_ps, fx_ps, fz_ps, nodes_b, peaks_b, lm_b,
+        )
+        assert fail_ok == -1
+    finally:
+        st_hb.close()
+        st_hr.close()
+
+    # 3. Multi-word batch walk for n in {1, 4, 63, 64, 65, 130, 193} (including cross-word GF(2) absorption)
+    for n in (1, 4, 63, 64, 65, 130, 193):
+        nw = _nw(n)
+        bsz = 24
+        st_b = bk.BranchStore(n)
+        st_r = bk.BranchStore(n)
+        try:
+            fx_b = np.zeros((bsz, nw), dtype=np.uint64)
+            fz_b = np.zeros((bsz, nw), dtype=np.uint64)
+            for s in range(bsz):
+                fx_b[s] = _int_to_words(_rand_mask(rng, n), nw)
+                fz_b[s] = _int_to_words(_rand_mask(rng, n), nw)
+            fx_r, fz_r = fx_b.copy(), fz_b.copy()
+            nodes_b = np.zeros(bsz, dtype=np.int64)
+            nodes_r = nodes_b.copy()
+            peaks_b = np.ones(bsz, dtype=np.int16)
+            peaks_r = peaks_b.copy()
+            lm_b = np.zeros(bsz, dtype=np.float64)
+            lm_r = lm_b.copy()
+
+            hi_bit = 1 << (n - 1)
+            lo_bit = 1
+            # Put qubit 0 and qubit n-1 into superposition via qturn on Y_0 and Y_{n-1}
+            if n >= 2:
+                pair_m = hi_bit | lo_bit
+                q_x = np.stack((_int_to_words(lo_bit, nw), _int_to_words(hi_bit, nw)), axis=0)
+                q_z = np.stack((_int_to_words(lo_bit, nw), _int_to_words(hi_bit, nw)), axis=0)
+                q_k = np.array([1, 1], dtype=np.uint8)
+            else:
+                pair_m = lo_bit
+                q_x = _int_to_words(lo_bit, nw).reshape(1, nw)
+                q_z = _int_to_words(lo_bit, nw).reshape(1, nw)
+                q_k = np.array([1], dtype=np.uint8)
+            st_b.batch_step_qturns(10, bk.MBR_KIND_SKIP, q_x, q_z, q_k, fx_b, fz_b, nodes_b, peaks_b)
+            _scalar_ref_batch_qturns(st_r, 10, bk.MBR_KIND_SKIP, q_x, q_z, q_k, fx_r, fz_r, nodes_r, peaks_r)
+            assert np.array_equal(nodes_b, nodes_r)
+
+            # Apply rotation spanning word 0 and word nw-1
+            rz = _int_to_words(pair_m, nw).reshape(1, nw)
+            rx = np.zeros((1, nw), dtype=np.uint64)
+            st_b.batch_step_rotations(
+                11, bk.MBR_KIND_T, rx, rz, rx, rz, np.array([0], np.uint8), np.array([1], np.uint8),
+                np.array([1], np.uint32), fx_b, fz_b, nodes_b, peaks_b,
+            )
+            _scalar_ref_batch_rotations(
+                st_r, 11, bk.MBR_KIND_T, rx, rz, rx, rz, np.array([0], np.uint8), np.array([1], np.uint8),
+                np.array([1], np.uint32), fx_r, fz_r, nodes_r, peaks_r,
+            )
+            assert np.array_equal(nodes_b, nodes_r) and np.array_equal(peaks_b, peaks_r)
+
+            # Measure Z_{n-1} (cross-word absorption or forked) with reset kick X_{n-1}
+            mx = np.zeros(nw, dtype=np.uint64)
+            mz = _int_to_words(hi_bit, nw)
+            kx = _int_to_words(hi_bit, nw)
+            kz = np.zeros(nw, dtype=np.uint64)
+            u_mw = rng.random(bsz)
+            tm_b = np.zeros(bsz, dtype=np.uint8)
+            tm_r = np.zeros(bsz, dtype=np.uint8)
+            st_b.batch_step_meas(
+                12, bk.MBR_KIND_MEAS, mx, mz, 0, u_mw, fx_b, fz_b, nodes_b, peaks_b,
+                log_mass=lm_b, update_log_mass=True, kick_x=kx, kick_z=kz, out_true_m=tm_b,
+            )
+            _scalar_ref_batch_meas(
+                st_r, 12, bk.MBR_KIND_MEAS, mx, mz, 0, u_mw, fx_r, fz_r, nodes_r, peaks_r,
+                lm_r, True, None, kx, kz, None, tm_r, None,
+            )
+            assert np.array_equal(nodes_b, nodes_r)
+            assert np.array_equal(peaks_b, peaks_r)
+            assert np.array_equal(fx_b, fx_r)
+            assert np.array_equal(fz_b, fz_r)
+            assert np.array_equal(tm_b, tm_r)
+            assert np.allclose(lm_b, lm_r, atol=1e-15, rtol=0.0)
+        finally:
+            st_b.close()
+            st_r.close()
+
+    gc.collect()
+    assert bk.BranchState.live_states() == 0
+    assert bk.BranchStore.live_stores() == 0
+
+
+_WP6_FORK_BATCH_CHILD = r"""
+import os, signal, sys, threading
+sys.path.insert(0, sys.argv[1])
+import numpy as np
+from stimside._native import branch_kernels as bk
+from stimside._magic.branch_backend import _FORK_POISON_MSG, _SharedBranchStore
+
+shared = _SharedBranchStore(5)
+inside, release = threading.Event(), threading.Event()
+real_lib = shared.native._lib
+
+class GateBatchLib:
+    def __init__(self, inner):
+        self._inner = inner
+    def __getattr__(self, name):
+        fn = getattr(self._inner, name)
+        if name != "mbr_batch_step_rotations":
+            return fn
+        def held(*args):
+            inside.set()
+            release.wait(15)
+            return fn(*args)
+        return held
+
+shared.native._lib = GateBatchLib(real_lib)
+gx = np.array([[1]], np.uint64)
+gz = np.array([[0]], np.uint64)
+gk = np.array([0], np.uint8)
+ge = np.array([1], np.uint8)
+fm = np.array([1], np.uint32)
+fx = np.zeros((4, 1), np.uint64)
+fz = np.zeros((4, 1), np.uint64)
+nodes = np.zeros(4, np.int64)
+peaks = np.ones(4, np.int16)
+
+t = threading.Thread(
+    target=lambda: shared.batch_step_rotations(1, bk.MBR_KIND_T, gx, gz, gx, gz, gk, ge, fm, fx, fz, nodes, peaks)
+)
+t.start()
+assert inside.wait(15)
+
+r, w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(r)
+    signal.alarm(15)
+    try:
+        for fn in (
+            lambda: shared.node_count_unlocked(),
+            lambda: shared.counters_unlocked(),
+            lambda: shared.batch_step_rotations(2, bk.MBR_KIND_T, gx, gz, gx, gz, gk, ge, fm, fx.copy(), fz.copy(), nodes.copy(), peaks.copy()),
+            lambda: shared.batch_step_qturns(3, bk.MBR_KIND_SKIP, gx, gz, gk, fx.copy(), fz.copy(), nodes.copy(), peaks.copy()),
+            lambda: shared.batch_step_meas(4, bk.MBR_KIND_MEAS, np.array([0], np.uint64), np.array([1], np.uint64), 0, np.zeros(4), fx.copy(), fz.copy(), nodes.copy(), peaks.copy(), log_mass=np.zeros(4)),
+            lambda: shared.batch_step_peek(5, np.array([0], np.uint64), np.array([1], np.uint64), 0, fx, fz, nodes, np.zeros(4)),
+            lambda: shared.batch_step_postselect(6, np.array([0], np.uint64), np.array([1], np.uint64), 0, np.zeros(4, np.uint8), fx.copy(), fz.copy(), nodes.copy(), peaks.copy(), np.zeros(4)),
+        ):
+            try:
+                fn()
+            except RuntimeError as exc:
+                assert _FORK_POISON_MSG in str(exc), exc
+            else:
+                raise AssertionError("poisoned batch_step did not raise RuntimeError")
+        fresh = _SharedBranchStore(5)
+        fnodes = np.zeros(4, np.int64)
+        fpeaks = np.ones(4, np.int16)
+        fresh.batch_step_rotations(1, bk.MBR_KIND_T, gx, gz, gx, gz, gk, ge, fm, fx, fz, fnodes, fpeaks)
+        assert np.all(fnodes == 1) and fresh.node_count_unlocked() == 2
+        fresh.native.close()
+        os.write(w, b"OK")
+    except BaseException as exc:
+        os.write(w, f"FAIL:{exc!r}".encode())
+    finally:
+        os.close(w)
+        os._exit(0)
+os.close(w)
+res = os.read(r, 4096).decode()
+os.close(r)
+_, st = os.waitpid(pid, 0)
+release.set()
+t.join(15)
+shared.native._lib = real_lib
+assert st == 0 and res == "OK", f"st={st} res={res!r}"
+assert np.all(nodes == 1)
+assert shared.node_count_unlocked() == 2
+shared.native.close()
+assert bk.BranchStore.live_stores() == 0
+print("WP6_FORK_OK")
+"""
+
+
+def test_wp6_shared_store_batch_step_threads_and_fork() -> None:
+    """WP6: Multi-threaded + os.fork() stress exercising `_SharedBranchStore.batch_step_*` wrappers."""
+    from stimside._magic.branch_backend import _SharedBranchStore
+
+    shared = _SharedBranchStore(6)
+    errors: list[BaseException] = []
+    out_sigs: list[tuple[bytes, bytes, bytes]] = []
+    res_lock = threading.Lock()
+    try:
+        def worker() -> None:
+            try:
+                fx = np.array([[0], [1], [2], [3], [4], [5], [6], [7]], dtype=np.uint64)
+                fz = np.array([[0], [0], [1], [1], [2], [2], [3], [3]], dtype=np.uint64)
+                nodes = np.zeros(8, dtype=np.int64)
+                peaks = np.ones(8, dtype=np.int16)
+                lm = np.zeros(8, dtype=np.float64)
+                p1 = np.zeros(8, dtype=np.float64)
+                tm = np.zeros(8, dtype=np.uint8)
+                u = np.linspace(0.05, 0.95, 8, dtype=np.float64)
+                qx = np.array([[1]], np.uint64)
+                qz = np.array([[1]], np.uint64)
+                qk = np.array([1], np.uint8)
+                shared.batch_step_qturns(1, bk.MBR_KIND_SKIP, qx, qz, qk, fx, fz, nodes, peaks)
+                tx = np.array([[0]], np.uint64)
+                tz = np.array([[1]], np.uint64)
+                shared.batch_step_rotations(
+                    2, bk.MBR_KIND_T, tx, tz, tx, tz, np.array([0], np.uint8), np.array([1], np.uint8),
+                    np.array([1], np.uint32), fx, fz, nodes, peaks,
+                )
+                shared.batch_step_peek(3, np.array([0], np.uint64), np.array([1], np.uint64), 0, fx, fz, nodes, p1)
+                shared.batch_step_meas(
+                    4, bk.MBR_KIND_MEAS, np.array([0], np.uint64), np.array([1], np.uint64), 0,
+                    u, fx, fz, nodes, peaks, log_mass=lm, out_true_m=tm,
+                )
+                fail = shared.batch_step_postselect(
+                    5, np.array([0], np.uint64), np.array([1 << 5], np.uint64), 0,
+                    np.zeros(8, np.uint8), fx, fz, nodes, peaks, lm,
+                )
+                assert fail == -1
+                with res_lock:
+                    out_sigs.append((nodes.tobytes(), tm.tobytes(), p1.tobytes()))
+            except BaseException as exc:
+                with res_lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+            assert not t.is_alive()
+        assert not errors, errors
+        assert len(out_sigs) == 8 and len(set(out_sigs)) == 1
+        with shared.lock:
+            assert shared.node_count_unlocked() == shared.counters_unlocked()["store_nodes"]
+    finally:
+        shared.native.close()
+
+    assert hasattr(os, "fork"), "POSIX os.fork required"
+    env = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", _WP6_FORK_BATCH_CHILD, str(_SRC_DIR)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, f"wp6 fork child rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+    assert "WP6_FORK_OK" in proc.stdout
+    gc.collect()
+    assert bk.BranchState.live_states() == 0
+    assert bk.BranchStore.live_stores() == 0

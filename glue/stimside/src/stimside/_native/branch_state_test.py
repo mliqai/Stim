@@ -229,7 +229,7 @@ def _hpp_prototypes() -> dict[str, tuple[str, list[str]]]:
 def test_abi_specs_match_hpp_prototypes_and_symbol_isolation() -> None:
     protos = _hpp_prototypes()
     assert {n for n, _, _ in bk._SPECS} == set(protos)
-    assert len(protos) == 41
+    assert len(protos) == 46
     assert all(n.startswith("mbr_") for n in protos)
     assert not any(n.startswith("mbr_") for n, _, _ in mk._SPECS)
     assert not any(n.startswith("mbr_") for n, _, _ in me._SPECS)
