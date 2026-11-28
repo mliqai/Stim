@@ -8,6 +8,7 @@ import ctypes
 import dataclasses
 import functools
 import math
+import os
 import pickle
 import struct
 import types
@@ -19,6 +20,11 @@ import numpy as np
 from numpy.typing import NDArray
 import stim  # type: ignore[import-untyped]
 
+from stimside._magic.branch_backend import (
+    BranchBatch, BranchDebugTrace, BranchStateSnapshot, _BRANCH_STORE_MAX_NODES as _BB_MAX_NODES,
+    _SharedBranchStore, _StoreOwnerToken, accumulate_retired_counters, copy_retired_counters,
+    effective_store_max_nodes, empty_faults_realized, empty_retired_counters,
+)
 from stimside._magic.channels import (
     FEEDBACK_2Q_GATES, PAULI_2Q_ORDER, CompiledCliffordFactorList, CompiledOpenBlockRecord,
     CorrelatedNoiseRecord, FrameEvent, HeraldedNoiseRecord, LeftSppEvent, LeftUnitaryEvent,
@@ -82,6 +88,22 @@ M2D_MODES: dict[str, Literal["auto", "magicside", "stim", "zero"]] = {
 # Private switch (no public flag): True keeps the live per-shot expansions in the C++
 # MagicBatchEngine behind the `_live_exps` proxy; False keeps the reference Python list.
 _LIVE_STORE_ENGINE = True
+
+
+def _parse_branch_engine_env() -> bool:
+    raw = os.environ.get("STIMSIDE_MAGICSIDE_ENGINE", "terms").strip().lower()
+    if raw in ("", "terms"):
+        return False
+    if raw == "branches":
+        return True
+    raise ValueError(
+        f"Invalid STIMSIDE_MAGICSIDE_ENGINE={raw!r}; expected 'terms' or 'branches'"
+    )
+
+
+# Private switch (no public flag): stabilizer-branch engine ("terms" default, or "branches").
+_BRANCH_ENGINE: bool = _parse_branch_engine_env()
+_BRANCH_STORE_MAX_NODES: int = _BB_MAX_NODES
 
 # Private E1 reference-tableau memo controls (per-instance bounded LRU; off for compiled engines).
 _REF_MEMO_ENABLED = True
@@ -548,11 +570,19 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         reference_sample: Sequence[int | bool] | NDArray[np.bool_] | None = None,
         record_unleaked_to_leaked: bool = False, record_leakage_events: bool = False,
         sync_tableside_rng: bool | None = False, atol: float = DEFAULT_ATOL,
+        _engine: str | None = None,
     ) -> None:
         if not isinstance(circuit, stim.Circuit):
             raise TypeError(f"Expected stim.Circuit, got {type(circuit)!r}")
         if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or int(batch_size) <= 0:
             raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+        if _engine is None:
+            self._engine_override: Literal["terms", "branches"] | None = None
+        elif isinstance(_engine, str) and _engine.strip().lower() in ("terms", "branches"):
+            norm_eng = _engine.strip().lower()
+            self._engine_override = "branches" if norm_eng == "branches" else "terms"
+        else:
+            raise ValueError(f"Unsupported _engine={_engine!r}; expected 'terms', 'branches', or None")
         self.circuit, self.batch_size = circuit, int(batch_size)
         self.fault_mode: Literal["DIRECT", "SELECTOR"] = parse_enum(fault_mode, FAULT_MODES, "fault_mode")
         self.backend: Literal["STREAM", "QUERY"] = parse_enum(backend, BACKENDS, "backend")
@@ -561,6 +591,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self.record_unleaked_to_leaked = bool(record_unleaked_to_leaked)
         self.record_leakage_events = bool(record_leakage_events)
         self.sync_tableside_rng = bool(sync_tableside_rng)
+        self._has_fault_realizations_arg = fault_realizations is not None
+        if self._want_branch_engine():
+            self._check_branch_guards()
         if seed is not None:
             derived_seed(seed, 0)
         self.seed = seed
@@ -616,7 +649,40 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._measurement_columns: list[NDArray[np.bool_]] = []
         self._unleaked_to_leaked_events: list[list[int]] = []
         self._leakage_events: list[list[LeakageEvent]] = []
+        self._branch_store_token: _StoreOwnerToken | None = None
+        self._branch_store: _SharedBranchStore | None = None
+        self._branch_batch: BranchBatch | None = None
+        self._branch_retired_counters: dict[str, Any] | None = None
+        self._branch_shot_hist: dict[int, int] | None = None
+        self._branch_faults_realized: dict[str, int] | None = None
+        self._branch_record_trace: bool = False
         self.clear()
+
+    def _want_branch_engine(self) -> bool:
+        if self._engine_override is not None:
+            return self._engine_override == "branches"
+        return bool(_BRANCH_ENGINE)
+
+    def _check_branch_guards(self) -> None:
+        if self.backend == "QUERY":
+            raise ValueError("backend='QUERY' is not supported in stabilizer-branch mode")
+        if self.fault_mode == "SELECTOR":
+            raise ValueError("fault_mode='SELECTOR' is not supported in stabilizer-branch mode")
+        if self._has_fault_realizations_arg:
+            raise ValueError("fault_realizations is not supported in stabilizer-branch mode")
+        if self.sync_tableside_rng:
+            raise ValueError("sync_tableside_rng=True is not supported in stabilizer-branch mode")
+
+    def _enable_branch_trace(self, enabled: bool = True) -> None:
+        """Enable or disable per-batch debug trace recording for T5 replay tests."""
+        self._branch_record_trace = bool(enabled)
+        if self._branch_batch is not None:
+            self._branch_batch.trace = (
+                BranchDebugTrace(self.batch_size) if self._branch_record_trace else None
+            )
+
+    def _get_branch_trace(self) -> BranchDebugTrace | None:
+        return None if self._branch_batch is None else self._branch_batch.trace
 
     def _init_fault_realizations(self, fault_realizations: Any, num_measurements: int) -> None:
         self._norm_reals: list[dict[str, Any]] | None = None
@@ -727,16 +793,72 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._leakage_events = [[] for _ in range(self.batch_size)]
         self._circuit_time = 0
         self._used_interactively = self._finished_running_circuit = self._started = False
-        self._live_ref_tab: ReferenceCHPTableau = (
+        if self._want_branch_engine():
+            self._check_branch_guards()
+            mc_cap = (
+                0
+                if (self.max_components is None or self.on_budget_exceeded != "raise")
+                else int(self.max_components)
+            )
+            if self._branch_store is None:
+                self._branch_store_token = _StoreOwnerToken()
+                self._branch_store = _SharedBranchStore(self._eff_nq, max_components=mc_cap)
+                self._branch_store.register_owner(self._branch_store_token)
+                self._branch_retired_counters = empty_retired_counters()
+                self._branch_shot_hist = {}
+                self._branch_faults_realized = empty_faults_realized()
+            else:
+                cap = effective_store_max_nodes(_BRANCH_STORE_MAX_NODES)
+                old_store = self._branch_store
+                with old_store.lock:
+                    if old_store.native.node_count > cap:
+                        if old_store.owner_count() <= 1:
+                            old_store.clear_inplace()
+                        else:
+                            snap = old_store.native.counters()
+                            assert self._branch_retired_counters is not None
+                            accumulate_retired_counters(
+                                self._branch_retired_counters, snap, extra_clears=1
+                            )
+                            self._branch_store_token = _StoreOwnerToken()
+                            self._branch_store = _SharedBranchStore(
+                                self._eff_nq, max_components=mc_cap
+                            )
+                            self._branch_store.register_owner(self._branch_store_token)
+                self._branch_store.set_max_components(mc_cap)
+            self._branch_batch = BranchBatch(
+                self._eff_nq,
+                self.batch_size,
+                self._branch_store,
+                record_trace=self._branch_record_trace,
+            )
+            self._live_ref_tab = ReferenceCHPTableau(self._eff_nq)
+            self._live_frame_events = []
+            self.__dict__.pop("_live_store", None)
+            self._live_exps = [ShotExpansion.zero(self._eff_nq, atol=self.atol)] * self.batch_size
+            self._shot_tabs = None
+            self._active_plan = None
+            self._shot_sel_bits = None
+            self._log_branch_masses = self._branch_batch.log_mass
+            self._pending_magic = []
+            self._corr_occurred = np.zeros(self.batch_size, dtype=np.bool_)
+            return
+        self._branch_batch = None
+        self._branch_store = None
+        self._branch_store_token = None
+        self._branch_retired_counters = None
+        self._branch_shot_hist = None
+        self._branch_faults_realized = None
+        self._live_ref_tab = (
             self._new_ref_tab() if _REF_MEMO_ENABLED else ReferenceCHPTableau(self._eff_nq)
         )
-        self._live_frame_events: list[FrameEvent] = []
-        self._live_exps: list[ShotExpansion] | LiveExpansions = self._fresh_live_exps()
-        self._shot_tabs: list[ReferenceCHPTableau] | None = None
-        self._active_plan: DirectPlan | SelectorPlan | None = None
-        self._shot_sel_bits: list[NDArray[np.bool_] | None] | None = None
+        self._live_frame_events = []
+        self._live_exps = self._fresh_live_exps()
+        self._shot_tabs = None
+        self._active_plan = None
+        self._shot_sel_bits = None
         self._log_branch_masses = np.zeros(self.batch_size, dtype=np.float64)
-        self._pending_magic: list[MagicTermRecord] = []
+        self._pending_magic = []
         self._corr_occurred = np.zeros(self.batch_size, dtype=np.bool_)
 
     @property
@@ -785,6 +907,17 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 for slot_idx, ch in self._prog_faults[0]:
                     self._fire_fault_channel_live(slot_idx, ch)
             self._flush_magic()
+        if self._branch_batch is not None:
+            vals, cnts = np.unique(self._branch_batch.peak, return_counts=True)
+            assert self._branch_shot_hist is not None and self._branch_faults_realized is not None
+            for v, c in zip(vals.tolist(), cnts.tolist()):
+                self._branch_shot_hist[int(v)] = self._branch_shot_hist.get(int(v), 0) + int(c)
+            for fk, fv in self._branch_batch.faults_realized.items():
+                self._branch_faults_realized[fk] = self._branch_faults_realized.get(fk, 0) + int(fv)
+            if self._branch_batch.trace is not None:
+                self._branch_batch.trace.finalize_reported(
+                    stack_measurement_columns(self._measurement_columns, self.batch_size)
+                )
         self._finished_running_circuit = True
         self._batches_completed += 1
         return self.get_unleaked_to_leaked_records() if self.record_unleaked_to_leaked else None
@@ -919,6 +1052,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             raise ValueError("MagicsideSimulator is not clean after a failed run(); call .clear().")
 
     def interactive_do(self, this: stim.Circuit | stim.CircuitInstruction | stim.CircuitRepeatBlock, /) -> None:
+        if self._branch_batch is not None:
+            raise NotImplementedError("interactive_do is not supported in stabilizer-branch mode")
         self._check_interactive_mode()
         self._reject_after_failed_run()
         if self._finished_running_circuit:
@@ -927,6 +1062,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self._do(this)
 
     def finish_interactive_run(self) -> None:
+        if self._branch_batch is not None:
+            raise NotImplementedError("finish_interactive_run is not supported in stabilizer-branch mode")
         self._check_interactive_mode()
         self._reject_after_failed_run()
         if not self._finished_running_circuit:
@@ -938,6 +1075,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._batches_completed += 1
 
     def _flush_magic(self) -> None:
+        if self._branch_batch is not None:
+            return
         if not self._pending_magic:
             return
         recs = compile_open_block(self._pending_magic, n_qubits=self._eff_nq)
@@ -972,6 +1111,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         return True
 
     def _apply_pauli_mask(self, pauli: Literal["X", "Y", "Z"], mask: NDArray[np.bool_]) -> None:
+        if self._branch_batch is not None:
+            self._branch_batch.apply_pauli_mask(pauli, mask, is_fault=True)
+            return
         affected = np.flatnonzero(np.any(mask[: self._eff_nq], axis=1))
         if len(affected) == 0:
             return
@@ -981,6 +1123,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._apply_axis_to_shots(ax, mask[int(q_np)])
 
     def _apply_pauli_masks_xz(self, xm: NDArray[np.bool_], zm: NDArray[np.bool_]) -> None:
+        if self._branch_batch is not None:
+            self._branch_batch.apply_pauli_masks_xz(xm, zm, is_fault=True)
+            return
         store = self._live_exps
         if type(store) is _ORIG_LIVE_EXP and self._use_fast_glue and not _REF_MEMO_VERIFY:
             xm_s, zm_s = xm[: self._eff_nq], zm[: self._eff_nq]
@@ -1013,7 +1158,10 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         new._circuit_snap = self._circuit_snap.copy()
         store: LiveExpansions | None = self.__dict__.get("_live_store")
         in_use = store is not None and self._live_exps is store
-        if store is not None:
+        if self._branch_batch is not None:
+            new.__dict__.pop("_live_store", None)
+            new._live_exps = [ShotExpansion.zero(self._eff_nq, atol=self.atol)] * self.batch_size
+        elif store is not None:
             new_store = (
                 store.copy() if in_use
                 else LiveExpansions(store.batch_size, store.n_qubits, store.atol)
@@ -1029,6 +1177,24 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             else (self._cached_m2d[0].copy(), self._cached_m2d[1].copy())
         )
         new._log_branch_masses = self._log_branch_masses.copy()
+        if self._branch_batch is not None:
+            assert self._branch_store is not None
+            new._branch_store = self._branch_store
+            new._branch_store_token = _StoreOwnerToken()
+            new._branch_store.register_owner(new._branch_store_token)
+            new._branch_batch = self._branch_batch.clone_for_copy()
+            new._log_branch_masses = new._branch_batch.log_mass
+            new._branch_retired_counters = (
+                None
+                if self._branch_retired_counters is None
+                else copy_retired_counters(self._branch_retired_counters)
+            )
+            new._branch_shot_hist = (
+                None if self._branch_shot_hist is None else dict(self._branch_shot_hist)
+            )
+            new._branch_faults_realized = (
+                None if self._branch_faults_realized is None else dict(self._branch_faults_realized)
+            )
         new._corr_occurred = self._corr_occurred.copy()
         new._live_ref_tab = self._live_ref_tab.copy()
         new._live_frame_events = list(self._live_frame_events)
@@ -1365,6 +1531,17 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         return f_map.get(slot_idx) if f_map is not None else None
 
     def _fire_fault_channel_live(self, slot_idx: int, ch: CliffordFaultChannel) -> None:
+        if self._branch_batch is not None:
+            probs = [b.prob for b in ch.branches]
+            choices = _categorical_batch(probs, self.np_rng, self.batch_size)
+            if self._branch_batch.trace is not None:
+                self._branch_batch.trace.record_fault(slot_idx, choices)
+            which = choices - 1
+            for b_idx, branch in enumerate(ch.branches):
+                mask_b = which == b_idx
+                if np.any(mask_b):
+                    self._branch_batch.apply_clifford_fault(branch.gate_name, branch.targets, mask_b)
+            return
         self._flush_magic()
         probs = [b.prob for b in ch.branches]
         facs = [self._compile_factors(b.gate_name, b.targets) for b in ch.branches]
@@ -1468,6 +1645,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         self, op: stim.CircuitInstruction, qs: Sequence[int] | None = None
     ) -> None:
         resolved = tuple(validate_magic_op(op)) if qs is None else tuple(int(q) for q in qs)
+        if self._branch_batch is not None:
+            self._branch_batch.apply_magic(op.tag, resolved, mask=None)
+            return
         info = self._memo_tab()
         if info is None:
             emit_magic_terms(op.tag, resolved, self._live_ref_tab, self._pending_magic)
@@ -1497,6 +1677,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         `condition_met_mask` has shape (groups, batch_size), as for `do_conditional_clifford`. A
         group is a triple for `I[CCZ]` and a single qubit for `I[T]` / `I[T_DAG]`.
         """
+        if self._branch_batch is not None:
+            self._branch_batch.apply_magic(op.tag, qs, mask=condition_met_mask)
+            return
         arity = 3 if op.tag == "CCZ" else 1
         for g_idx, off in enumerate(range(0, len(qs), arity)):
             grp, mask_g = qs[off : off + arity], condition_met_mask[g_idx]
@@ -1542,6 +1725,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             args = op.gate_args_copy()
             if raw and args and args[0] > 0.0:
                 self._apply_meas_flip_noise(float(args[0]), len(raw))
+            if self._branch_batch is not None and self._branch_batch.trace is not None:
+                self._branch_batch.trace.advance_meas_cursor(len(raw))
             return
         if name in ("HERALDED_ERASE", "HERALDED_PAULI_CHANNEL_1"):
             self._do_heralded_noise(op)
@@ -1573,21 +1758,34 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._measurement_columns.extend(cols)
         elif op.name == "HERALDED_ERASE":
             pe = float(op.gate_args_copy()[0]) if op.gate_args_copy() else 0.0
+            trace = None if self._branch_batch is None else self._branch_batch.trace
             for q in qs:
                 hk = self.np_rng.random(self.batch_size) < pe
                 pi = self.np_rng.integers(0, 4, size=self.batch_size)
                 xm[q] ^= hk & ((pi == 1) | (pi == 2))
                 zm[q] ^= hk & ((pi == 2) | (pi == 3))
                 self._measurement_columns.append(hk)
+                if trace is not None:
+                    trace.record_noise(np.where(hk, pi + 1, 0).astype(np.int32))
+                    trace.advance_meas_cursor(1)
         else:
             args = op.gate_args_copy()
             p0, px, py, pz = (float(args[i]) if i < len(args) else 0.0 for i in range(4))
             ci, cx, cy, cz = p0, p0 + px, p0 + px + py, p0 + px + py + pz
+            trace = None if self._branch_batch is None else self._branch_batch.trace
             for q in qs:
                 r = self.np_rng.random(self.batch_size)
                 xm[q] ^= (r >= ci) & (r < cy)
                 zm[q] ^= (r >= cx) & (r < cz)
                 self._measurement_columns.append(r < cz)
+                if trace is not None:
+                    ch = np.zeros(self.batch_size, dtype=np.int32)
+                    ch[r < ci] = 1
+                    ch[(r >= ci) & (r < cx)] = 2
+                    ch[(r >= cx) & (r < cy)] = 3
+                    ch[(r >= cy) & (r < cz)] = 4
+                    trace.record_noise(ch)
+                    trace.advance_meas_cursor(1)
         self._apply_pauli_masks_xz(xm, zm)
 
     def _apply_meas_flip_noise(self, p_err: float, num_m: int) -> None:
@@ -1741,41 +1939,64 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         p_err = float(args[0]) if (gd.produces_measurements and args) else 0.0
         if not (math.isfinite(p_err) and 0.0 <= p_err <= 1.0):
             raise ValueError(f"Invalid measurement flip probability {p_err!r}")
-        specs: list[tuple[set[int], Any, bool]] = []
+        specs: list[tuple[set[int], Any, bool, bool]] = []
         if cname == "MPP":
             for grp, inv in split_pauli_product_targets(op):
                 red, neg = reduce_hermitian_pauli_product(self._live_ref_tab.num_qubits, grp)
-                specs.append(({q for q, _ in red}, red, inv ^ neg))
+                specs.append(({q for q, _ in red}, red, inv, neg))
         elif cname in ("MXX", "MYY", "MZZ"):
             pch = cname[-1]
             for a, b_t in zip(raw[::2], raw[1::2]):
                 q0, q1 = int(a.qubit_value), int(b_t.qubit_value)
-                specs.append(({q0, q1}, [] if q0 == q1 else [(q0, pch), (q1, pch)], bool(a.is_inverted_result_target) ^ bool(b_t.is_inverted_result_target)))
+                specs.append(({q0, q1}, [] if q0 == q1 else [(q0, pch), (q1, pch)], bool(a.is_inverted_result_target) ^ bool(b_t.is_inverted_result_target), False))
         else:
             basis: Literal["X", "Y", "Z"] = "X" if "X" in cname else ("Y" if "Y" in cname else "Z")
             for gt in raw:
                 q, inv = int(gt.qubit_value), bool(gt.is_inverted_result_target)
-                specs.append(({q}, (q, basis) if gd.is_reset else [(q, basis)], inv))
+                specs.append(({q}, (q, basis) if gd.is_reset else [(q, basis)], inv, False))
         seen: set[int] = set()
         seg_len = 0
-        for supp, payload, inv in specs:
+        for supp, payload, inv, neg in specs:
             if gd.produces_measurements and cname in ("MPP", "MXX", "MYY", "MZZ") and seg_len > 0 and (not supp or bool(seen & supp)):
                 # Flush the previous segment's readout flips before projecting this product (Stim's draw order).
                 if p_err > 0.0:
                     self._apply_meas_flip_noise(p_err, seg_len)
                 seg_len = 0
                 seen.clear()
-            rec: MeasurementRecord | ResetRecord = (
-                self._compile_reset_ref(
-                    payload[0], payload[1], meas_index=0 if gd.produces_measurements else None,
-                    invert_result=inv, flip_prob=0.0,
+            if self._branch_batch is not None:
+                trace = self._branch_batch.trace
+                m_idx = (
+                    trace.meas_cursor if (trace is not None and gd.produces_measurements) else None
                 )
-                if gd.is_reset else
-                self._compile_meas_ref(payload, invert_result=inv, flip_prob=0.0, meas_index=0)
-            )
-            m_shots = self._project_substep_batch(rec)
+                if gd.is_reset:
+                    m_shots = self._branch_batch.measure_or_reset(
+                        (),
+                        self.np_rng,
+                        is_reset=True,
+                        reset_qubit=payload[0],
+                        reset_basis=payload[1],
+                        meas_index=m_idx,
+                    )
+                else:
+                    m_shots = self._branch_batch.measure_or_reset(
+                        payload, self.np_rng, is_reset=False, negate=neg, meas_index=m_idx
+                    )
+                if gd.produces_measurements and trace is not None:
+                    trace.advance_meas_cursor(1)
+                rep_inv = inv
+            else:
+                rep_inv = inv ^ neg
+                rec: MeasurementRecord | ResetRecord = (
+                    self._compile_reset_ref(
+                        payload[0], payload[1], meas_index=0 if gd.produces_measurements else None,
+                        invert_result=rep_inv, flip_prob=0.0,
+                    )
+                    if gd.is_reset else
+                    self._compile_meas_ref(payload, invert_result=rep_inv, flip_prob=0.0, meas_index=0)
+                )
+                m_shots = self._project_substep_batch(rec)
             if gd.produces_measurements:
-                self._measurement_columns.append(~m_shots if inv else m_shots.copy())
+                self._measurement_columns.append(~m_shots if rep_inv else m_shots.copy())
                 if cname == "MPP" and not supp:
                     if p_err > 0.0:
                         self._apply_meas_flip_noise(p_err, 1)
@@ -1807,6 +2028,10 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         mask_at = lambda i: condition_group_fn(i) if condition_group_fn is not None else (condition_met_mask[i] if condition_met_mask is not None else None)
         if name in ("SPP", "SPP_DAG"):
             dag = name == "SPP_DAG"
+            if self._branch_batch is not None:
+                for g_idx, (grp, inv) in enumerate(split_pauli_product_targets(op)):
+                    self._branch_batch.apply_spp_group(grp, inv, dag, mask_at(g_idx))
+                return
             for g_idx, (grp, inv) in enumerate(split_pauli_product_targets(op)):
                 self._apply_conditional_ref_step(
                     mask_at(g_idx),
@@ -1835,7 +2060,10 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 if mask_g is not None:
                     cond = cond & mask_g
                 if np.any(cond):
-                    self._apply_axis_to_shots(self._compile_axis([(q_t, pch)]), cond)
+                    if self._branch_batch is not None:
+                        self._branch_batch.apply_pauli_1q(q_t, pch, cond, is_fault=False)
+                    else:
+                        self._apply_axis_to_shots(self._compile_axis([(q_t, pch)]), cond)
             return
         qs = [int(t.qubit_value) for t in raw]
         for g_idx, off in enumerate(range(0, len(qs), arity)):
@@ -1844,6 +2072,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
     def _apply_unitary_group(
         self, canon: str, grp: tuple[int, ...], mask_g: NDArray[np.bool_] | None
     ) -> None:
+        if self._branch_batch is not None:
+            self._branch_batch.apply_unitary_group(canon, grp, mask_g)
+            return
         self._apply_conditional_ref_step(
             mask_g,
             lambda: self._do_unitary_ref(canon, grp),
@@ -1884,9 +2115,12 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
                 self._tab_rngs, self._tab_rngs_x, cname, raw_t, p_c, condition_met_mask, xm, zm
             )
         else:
+            trace = None if self._branch_batch is None else self._branch_batch.trace
             if p_c <= 0.0:
                 if cname != "ELSE_CORRELATED_ERROR":
                     self._corr_occurred.fill(False)
+                if trace is not None:
+                    trace.record_noise_zeros(1)
                 return
             u = self.np_rng.random(self.batch_size)
             if cname != "ELSE_CORRELATED_ERROR":
@@ -1895,6 +2129,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             else:
                 occ = (~self._corr_occurred) & (u < p_c)
                 self._corr_occurred |= occ
+            if trace is not None:
+                trace.record_noise(occ.astype(np.int32))
             if np.any(occ):
                 for t_idx, gt in enumerate(raw_t):
                     if gt.qubit_value is None:
@@ -1917,9 +2153,14 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._do_correlated_pauli_noise(cname, op, args, condition_met_mask)
             return
         raw = [int(t.qubit_value) for t in op.targets_copy()]
-        if not raw or not any(p > 0.0 for p in args):
+        if not raw:
             return
         arity = 2 if cname in ("DEPOLARIZE2", "PAULI_CHANNEL_2") else 1
+        trace = None if self._branch_batch is None else self._branch_batch.trace
+        if not any(p > 0.0 for p in args):
+            if trace is not None:
+                trace.record_noise_zeros(len(raw) // arity)
+            return
         if self._tab_rngs is not None:
             self._sample_pauli_noise_via_tab_rng(
                 cname,
@@ -1931,6 +2172,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             u = np.where(condition_met_mask, u, 2.0)
         if cname in ("X_ERROR", "Y_ERROR", "Z_ERROR"):
             hit = u < args[0]
+            if trace is not None:
+                for g_i in range(hit.shape[0]):
+                    trace.record_noise(hit[g_i].astype(np.int32))
             if not np.any(hit):
                 return
             xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
@@ -1946,6 +2190,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             edges = _pauli_noise_table(cname, tuple(args))
             idx = np.searchsorted(edges, u, side="right")
             hit = idx < edges.size
+            if trace is not None:
+                for g_i in range(hit.shape[0]):
+                    trace.record_noise(np.where(hit[g_i], idx[g_i] + 1, 0).astype(np.int32))
             if not np.any(hit):
                 return
             xm = np.zeros((self._eff_nq, self.batch_size), dtype=np.bool_)
@@ -2051,6 +2298,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             self._engine_error(res.failure, res.oom_at, "mbe_unmatched_apply")
 
     def peek_pauli_born_batch(self, targets: Sequence[int] | NDArray[np.int_], pauli: Literal["X", "Y", "Z"] = "Z") -> NDArray[np.float64]:
+        if self._branch_batch is not None:
+            return self._branch_batch.peek_pauli_born_batch(targets, pauli)
         self._flush_magic()
         t_list = [int(q) for q in targets]
         out = np.zeros((len(t_list), self.batch_size), dtype=np.float64)
@@ -2079,6 +2328,9 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         return res
 
     def postselect_z_batch(self, q: int, flip_mask: NDArray[np.bool_], desired_bits: NDArray[np.uint8], pauli: Literal["X", "Y", "Z"] = "Z") -> None:
+        if self._branch_batch is not None:
+            self._branch_batch.postselect_pauli_batch(q, flip_mask, desired_bits, pauli)
+            return
         shots = np.flatnonzero(flip_mask)
         if len(shots) == 0:
             return
@@ -2104,6 +2356,11 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         channel, not a postselection). A live `R` instruction, by contrast, does scale the mass
         by the probability of its sampled outcome.
         """
+        if self._branch_batch is not None:
+            self._branch_batch.unmatched_noisy_reset(
+                reset_zero_mask, reset_one_mask, self.np_rng, pauli=pauli, order=order
+            )
+            return
         comb = reset_zero_mask | reset_one_mask
         if not np.any(comb):
             return
@@ -2154,7 +2411,7 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
             if not needs_leak:
                 ref = run_direct(compile_direct(stripped), rng=np.random.default_rng(0), sweep_bits=sweep_row, atol=self.atol).measurements
             else:
-                sub = MagicsideSimulator(stripped, op_handler=LeakageUint8Magic(), batch_size=1, seed=0, sweep_bits=sweep_row, m2d_reference_mode="zero", atol=self.atol)
+                sub = MagicsideSimulator(stripped, op_handler=LeakageUint8Magic(), batch_size=1, seed=0, sweep_bits=sweep_row, m2d_reference_mode="zero", atol=self.atol, _engine="terms")
                 sub.run()
                 ref = sub.get_final_measurement_records()[0]
             self._ref_sample_cache[key] = ref.copy()
@@ -2232,17 +2489,68 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         return tab, exp, self._live_frame_events
 
     def get_qfe_expansion(self, shot: int = 0, *, trace_selectors: bool = True) -> tuple[stim.Tableau, ShotExpansion]:
+        if self._branch_batch is not None:
+            raise NotImplementedError(
+                "get_qfe_expansion is not supported in stabilizer-branch mode; use _get_branch_state(shot)"
+            )
         self._flush_magic()
         tab, exp, _ = self._resolve_shot_state(self._validate_shot_idx(shot), bool(trace_selectors))
         return tab.to_stim_tableau(), exp.copy()
 
     def get_state_expansions(self, *, trace_selectors: bool = True) -> list[tuple[stim.Tableau, ShotExpansion]]:
+        if self._branch_batch is not None:
+            raise NotImplementedError(
+                "get_state_expansions is not supported in stabilizer-branch mode; use _get_branch_state(shot)"
+            )
         self._flush_magic()
         return [self.get_qfe_expansion(s, trace_selectors=trace_selectors) for s in range(self.batch_size)]
 
     def get_branch_mass(self, shot: int = 0) -> float:
         self._flush_magic()
         return math.exp(float(self._log_branch_masses[self._validate_shot_idx(shot)]))
+
+    def _get_branch_state(self, shot: int = 0) -> BranchStateSnapshot:
+        if self._branch_batch is None:
+            raise RuntimeError("_get_branch_state is only available in stabilizer-branch mode")
+        return self._branch_batch.branch_state(self._validate_shot_idx(shot))
+
+    def _branch_counters(self) -> dict[str, Any]:
+        if self._branch_batch is None or self._branch_store is None:
+            raise RuntimeError("_branch_counters is only available in stabilizer-branch mode")
+        snap = self._branch_store.counters()
+        retired = self._branch_retired_counters
+        out: dict[str, Any] = {
+            "store_nodes": int(snap["store_nodes"]),
+            "store_bytes_estimate": int(snap["store_bytes_estimate"]),
+            "store_clears": int(snap["store_clears"]) + (0 if retired is None else int(retired["store_clears"])),
+            "transitions_new": {
+                k: int(v) + (0 if retired is None else int(retired["transitions_new"][k]))
+                for k, v in snap["transitions_new"].items()
+            },
+            "transitions_hit": {
+                k: int(v) + (0 if retired is None else int(retired["transitions_hit"][k]))
+                for k, v in snap["transitions_hit"].items()
+            },
+            "resolve_calls": int(snap["resolve_calls"]) + (0 if retired is None else int(retired["resolve_calls"])),
+            "splits": int(snap["splits"]) + (0 if retired is None else int(retired["splits"])),
+            "subcache_hits": int(snap["subcache_hits"]) + (0 if retired is None else int(retired["subcache_hits"])),
+            "subcache_misses": int(snap["subcache_misses"]) + (0 if retired is None else int(retired["subcache_misses"])),
+            "meas_definite": int(snap["meas_definite"]) + (0 if retired is None else int(retired["meas_definite"])),
+            "meas_absorbed": int(snap["meas_absorbed"]) + (0 if retired is None else int(retired["meas_absorbed"])),
+            "meas_forked": int(snap["meas_forked"]) + (0 if retired is None else int(retired["meas_forked"])),
+            "branches_hist": {} if self._branch_shot_hist is None else dict(self._branch_shot_hist),
+            "faults_realized": (
+                empty_faults_realized()
+                if self._branch_faults_realized is None
+                else dict(self._branch_faults_realized)
+            ),
+        }
+        return out
+
+    def _branch_peak_per_shot(self) -> NDArray[np.int16]:
+        if self._branch_batch is None:
+            raise RuntimeError("_branch_peak_per_shot is only available in stabilizer-branch mode")
+        return self._branch_batch.peak_per_shot()
 
     def state_vector(
         self, shot: int = 0, *, endian: Literal["little", "big"] = "little", trace_selectors: bool = True, normalize: bool = True,
@@ -2254,6 +2562,8 @@ class MagicsideSimulator(UnleakedToLeakedRecordsMixin, LeakageEventsRecorderMixi
         scale = 1.0 if normalize else math.exp(0.5 * float(self._log_branch_masses[s]))
         if self._logical_nq == 0:
             return np.array([complex(scale)], dtype=np.complex128)
+        if self._branch_batch is not None:
+            return self._branch_batch.state_vector(s, endian=endian, normalize=normalize)
         tab, exp, fevs = self._resolve_shot_state(s, bool(trace_selectors))
         nq = exp.n_qubits
         if nq > 26:

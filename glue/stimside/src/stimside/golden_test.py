@@ -40,6 +40,7 @@ _ALL_STD = (
     "magic_ss",
     "magic_sq",
     "magic_sync",
+    "magic_branch",
 )
 _LEAK_NO_FLIP_TAGS = (
     "tab_nosync",
@@ -48,9 +49,10 @@ _LEAK_NO_FLIP_TAGS = (
     "coset_sync",
     "magic_ds",
     "magic_sync",
+    "magic_branch",
 )
 _LEAK_SHARED_TAGS = ("flip",) + _LEAK_NO_FLIP_TAGS
-_MAGIC_ALL = ("magic_ds", "magic_dq", "magic_ss", "magic_sq")
+_MAGIC_ALL = ("magic_ds", "magic_dq", "magic_ss", "magic_sq", "magic_branch")
 
 CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
     (
@@ -109,7 +111,7 @@ CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
     ),
     (
         "c02b_spp_clifford",
-        ("flip", "tab_nosync", "tab_sync", "magic_ds", "magic_dq", "magic_ss", "magic_sq", "magic_sync"),
+        ("flip", "tab_nosync", "tab_sync", "magic_ds", "magic_dq", "magic_ss", "magic_sq", "magic_sync", "magic_branch"),
         False,
         """
         R 0 1 2
@@ -251,7 +253,7 @@ CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
     ),
     (
         "c08_magic_with_leakage",
-        ("magic_ds", "magic_sync"),
+        ("magic_ds", "magic_sync", "magic_branch"),
         True,
         """
         R 0 1 2
@@ -336,7 +338,7 @@ CORPUS: tuple[tuple[str, tuple[str, ...], bool, str], ...] = (
     ),
     (
         "c13_leaked_untagged_spp",
-        ("tab_nosync", "tab_sync", "magic_ds", "magic_sync"),
+        ("tab_nosync", "tab_sync", "magic_ds", "magic_sync", "magic_branch"),
         True,
         """
         R 0 1 2
@@ -608,11 +610,12 @@ def _run_case(
         )
 
     m_cfg = {
-        "magic_ds": ("DIRECT", "STREAM", False),
-        "magic_dq": ("DIRECT", "QUERY", False),
-        "magic_ss": ("SELECTOR", "STREAM", False),
-        "magic_sq": ("SELECTOR", "QUERY", False),
-        "magic_sync": ("DIRECT", "STREAM", True),
+        "magic_ds": ("DIRECT", "STREAM", False, None),
+        "magic_dq": ("DIRECT", "QUERY", False, None),
+        "magic_ss": ("SELECTOR", "STREAM", False, None),
+        "magic_sq": ("SELECTOR", "QUERY", False, None),
+        "magic_sync": ("DIRECT", "STREAM", True, None),
+        "magic_branch": ("DIRECT", "STREAM", False, "branches"),
     }[mode]
     op_h = LeakageUint8Magic() if has_leakage else TrivialOpHandler()
     sim_m = MagicsideSimulator(
@@ -625,6 +628,7 @@ def _run_case(
         sync_tableside_rng=m_cfg[2],
         record_unleaked_to_leaked=rec_flag,
         record_leakage_events=rec_flag,
+        _engine=m_cfg[3],
     )
     return _run_batched_sim(
         sim_m,
