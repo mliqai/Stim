@@ -19,6 +19,7 @@
 #include <map>
 #include <new>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -34,6 +35,7 @@ constexpr int32_t kErrBudget = -4;
 
 constexpr size_t kMaxQubits = static_cast<size_t>(std::numeric_limits<int32_t>::max());
 constexpr size_t kMaxDenseQubits = 26U;
+constexpr uint32_t kMaxChooseSplitDepth = 20U;
 
 struct MbrComplex {
     double re = 1.0;
@@ -50,11 +52,12 @@ inline MbrComplex i_pow(uint8_t p) noexcept {
 }
 
 inline MbrComplex omega_pow(uint8_t k) noexcept {
-    static const double kRe[8] = {
-        1.0,  kInvSqrt2, 0.0, -kInvSqrt2, -1.0, -kInvSqrt2,  0.0,  kInvSqrt2
+    constexpr double kInvSqrt2Exact = 0x1.6a09e667f3bcdp-1;  // exact IEEE-754 1/sqrt(2)
+    static constexpr double kRe[8] = {
+        1.0,  kInvSqrt2Exact, 0.0, -kInvSqrt2Exact, -1.0, -kInvSqrt2Exact,  0.0,  kInvSqrt2Exact
     };
-    static const double kIm[8] = {
-        0.0,  kInvSqrt2, 1.0,  kInvSqrt2,  0.0, -kInvSqrt2, -1.0, -kInvSqrt2
+    static constexpr double kIm[8] = {
+        0.0,  kInvSqrt2Exact, 1.0,  kInvSqrt2Exact,  0.0, -kInvSqrt2Exact, -1.0, -kInvSqrt2Exact
     };
     const uint8_t idx = k & 7U;
     return {kRe[idx], kIm[idx]};
@@ -176,6 +179,8 @@ struct MbrState {
     std::vector<uint8_t> Gamma;  // d * d, binary symmetric hollow {0, 1}
     std::vector<int32_t> piv;    // d, distinct in [0, n_qubits), A[piv[j], k] = delta_{jk}
 };
+
+static_assert(std::is_nothrow_move_constructible_v<MbrState>, "MbrState must be nothrow move-constructible");
 
 std::atomic<size_t> g_live_states{0};
 
@@ -387,6 +392,11 @@ inline MbrComplex apply_qturn(
     MbrState& s, const uint64_t* x, const uint64_t* z, uint8_t kappa
 ) {
     const size_t nw = s.nw, d0 = s.d, d1 = d0 + 1U;
+    size_t a_elems = 0U, g_elems = 0U;
+    if (d1 < d0 || !mul_within(d1, nw, kMaxElems, a_elems)
+        || !mul_within(d1, d1, kMaxElems, g_elems)) {
+        throw std::bad_alloc();
+    }
     std::vector<uint8_t> t(d0, 0U);
     if (words_any_nonzero(z, nw)) {
         for (size_t j = 0; j < d0; ++j) {
@@ -399,7 +409,7 @@ inline MbrComplex apply_qturn(
             sv[j] = get_bit(x, s.piv[j]);
         }
     }
-    std::vector<uint8_t> ng(d1 * d1, 0U);
+    std::vector<uint8_t> ng(g_elems, 0U);
     for (size_t j = 0; j < d0; ++j) {
         if (d0 > 0U) {
             std::memcpy(&ng[j * d1], &s.Gamma[j * d0], d0);
@@ -407,7 +417,7 @@ inline MbrComplex apply_qturn(
         ng[j * d1 + d0] = t[j];
         ng[d0 * d1 + j] = t[j];
     }
-    s.A.resize(d1 * nw);
+    s.A.resize(a_elems);
     std::memcpy(&s.A[d0 * nw], x, nw * sizeof(uint64_t));
     s.ell.push_back(static_cast<uint8_t>(
         (kappa + 1U + (word_dot_parity(z, s.h.data(), nw) << 1U)) & 3U
@@ -527,8 +537,12 @@ inline void generators(
     std::vector<uint8_t>& out_kappa
 ) {
     const size_t n = s.n_qubits, nw = s.nw, d = s.d;
-    out_x.assign(n * nw, 0ULL);
-    out_z.assign(n * nw, 0ULL);
+    size_t total_words = 0U;
+    if (!mul_within(n, nw, kMaxElems, total_words)) {
+        throw std::bad_alloc();
+    }
+    out_x.assign(total_words, 0ULL);
+    out_z.assign(total_words, 0ULL);
     out_kappa.assign(n, 0U);
     std::vector<uint8_t> is_piv(n, 0U);
     for (size_t j = 0; j < d; ++j) {
@@ -652,12 +666,41 @@ inline MbrComplex canon(MbrState& s) {
     return i_pow(canon_phase4(s));
 }
 
-inline size_t canonical_key_size(size_t n_qubits, size_t d) noexcept {
+inline bool checked_canonical_key_size(size_t n_qubits, size_t d, size_t& out) noexcept {
+    if (n_qubits == 0U || n_qubits > kMaxQubits || d > n_qubits) return false;
     const size_t nw = n_words_for_qubits(n_qubits);
-    // Guard against unsigned underflow when d == 0.
-    const size_t n_tri = (d >= 2U) ? ((d * (d - 1U)) / 2U) : 0U;
+    constexpr size_t kMaxBytes = static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max());
+    size_t d_plus_1 = 0U;
+    if (d == std::numeric_limits<size_t>::max()) return false;
+    d_plus_1 = d + 1U;
+    size_t word_count = 0U;
+    if (!mul_within(d_plus_1, nw, kMaxElems, word_count)) return false;
+    size_t word_bytes = 0U;
+    if (!mul_within(word_count, size_t(8), kMaxBytes, word_bytes)) return false;
+    size_t n_tri = 0U;
+    if (d >= 2U) {
+        const size_t a = ((d & 1U) == 0U) ? (d >> 1U) : d;
+        const size_t b = ((d & 1U) == 0U) ? (d - 1U) : ((d - 1U) >> 1U);
+        if (!mul_within(a, b, kMaxBytes, n_tri)) return false;
+    }
+    if (n_tri > kMaxBytes - 7U) return false;
     const size_t g_bytes = (n_tri + 7U) >> 3U;
-    return 8U + (1U + d) * nw * 8U + d + g_bytes;
+    if (8U > kMaxBytes - word_bytes) return false;
+    size_t total = 8U + word_bytes;
+    if (d > kMaxBytes - total) return false;
+    total += d;
+    if (g_bytes > kMaxBytes - total) return false;
+    total += g_bytes;
+    out = total;
+    return true;
+}
+
+inline size_t canonical_key_size(size_t n_qubits, size_t d) {
+    size_t out = 0U;
+    if (!checked_canonical_key_size(n_qubits, d, out)) {
+        throw std::bad_alloc();
+    }
+    return out;
 }
 
 inline void serialize_canonical_unchecked(const MbrState& s, uint8_t* out_buf) noexcept {
@@ -713,7 +756,8 @@ inline bool deserialize_canonical(const uint8_t* buf, size_t len, MbrState& out)
     size_t a_elems = 0U, g_elems = 0U;
     if (!mul_within(d, nw, kMaxElems, a_elems)) return false;
     if (!mul_within(d, d, kMaxElems, g_elems)) return false;
-    const size_t expected = canonical_key_size(n, d);
+    size_t expected = 0U;
+    if (!checked_canonical_key_size(n, d, expected)) return false;
     if (len != expected) return false;
 
     MbrState st;
@@ -1122,9 +1166,27 @@ inline ParityVec parity_from_words(const uint64_t* words, size_t nw) {
 }
 
 inline std::string serialize_parity_set(const std::vector<ParityVec>& O) {
+    constexpr size_t kMaxBytes = static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max());
+    if (O.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+        throw std::bad_alloc();
+    }
     size_t total_words = 0U;
-    for (const ParityVec& p : O) total_words += p.n_words();
-    std::string out(4U + O.size() * 4U + total_words * 8U, '\0');
+    for (const ParityVec& p : O) {
+        const size_t nw = p.n_words();
+        if (nw > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
+            || nw > kMaxElems - total_words) {
+            throw std::bad_alloc();
+        }
+        total_words += nw;
+    }
+    size_t hdr_bytes = 0U, word_bytes = 0U;
+    if (!mul_within(O.size(), size_t(4), kMaxBytes, hdr_bytes)
+        || !mul_within(total_words, size_t(8), kMaxBytes, word_bytes)
+        || 4U > kMaxBytes - hdr_bytes
+        || word_bytes > kMaxBytes - (4U + hdr_bytes)) {
+        throw std::bad_alloc();
+    }
+    std::string out(4U + hdr_bytes + word_bytes, '\0');
     uint8_t* dst = reinterpret_cast<uint8_t*>(&out[0]);
     write_u32_le(dst, static_cast<uint32_t>(O.size()));
     dst += 4U;
@@ -1342,6 +1404,8 @@ struct StateEntry {
     std::string key;
 };
 
+static_assert(std::is_nothrow_move_constructible_v<StateEntry>, "StateEntry must be nothrow move-constructible");
+
 struct TransKey {
     int64_t node_id = 0;
     uint64_t event_id = 0U;
@@ -1491,12 +1555,17 @@ struct MbrStore {
         std::string key = serialize_canonical_str(st);
         auto it = state_intern.find(key);
         if (it != state_intern.end()) return it->second;
+        if (state_pool.size() >= static_cast<size_t>(kInvalidStateId)) {
+            throw std::bad_alloc();
+        }
+        state_pool.reserve(state_pool.size() + 1U);
         const uint32_t id = static_cast<uint32_t>(state_pool.size());
         const uint64_t add_bytes = state_bytes(st, key) + 64U + key.capacity();
-        state_intern.emplace(key, id);
-        state_pool.push_back({std::move(st), std::move(key)});
+        auto ins = state_intern.emplace(key, id);
+        // Below is noexcept: capacity is reserved and MbrState/std::string are nothrow-movable.
+        state_pool.push_back(StateEntry{std::move(st), std::move(key)});
         bytes_estimate += add_bytes;
-        return id;
+        return ins.first->second;
     }
 
     inline int64_t push_node(
@@ -1506,19 +1575,49 @@ struct MbrStore {
     ) {
         const uint32_t nb = static_cast<uint32_t>(branches.size());
         if (transient_peak < nb) transient_peak = nb;
+        nodes.reserve(nodes.size() + 1U);
+        auto hist_it = node_branches_hist.find(static_cast<uint64_t>(nb));
+        if (hist_it == node_branches_hist.end()) {
+            hist_it = node_branches_hist.emplace(static_cast<uint64_t>(nb), 0U).first;
+        }
+        // Below is noexcept: vector capacity and map slot are already allocated.
         const int64_t nid = static_cast<int64_t>(nodes.size());
         MbrNode nd{std::move(branches), std::move(pend), transient_peak};
-        bytes_estimate += node_bytes(nd);
+        const uint64_t add_b = node_bytes(nd);
         nodes.push_back(std::move(nd));
-        node_branches_hist[static_cast<uint64_t>(nb)] += 1U;
+        hist_it->second += 1U;
+        bytes_estimate += add_b;
         return nid;
     }
 
     inline void seed_root() {
-        state_pool.clear();
-        state_intern.clear();
-        nodes.clear();
-        node_branches_hist.clear();
+        MbrState zero = make_zero(n_qubits);
+        std::string key = serialize_canonical_str(zero);
+        const uint64_t st_bytes = state_bytes(zero, key) + 64U + key.capacity();
+
+        std::vector<StateEntry> new_pool;
+        new_pool.reserve(1U);
+        std::unordered_map<std::string, uint32_t> new_intern;
+        new_intern.emplace(key, 0U);
+        new_pool.push_back(StateEntry{std::move(zero), std::move(key)});
+
+        std::vector<MbrBranch> root_br;
+        root_br.reserve(1U);
+        root_br.push_back(MbrBranch{MbrComplex{1.0, 0.0}, 0U});
+        std::vector<MbrNode> new_nodes;
+        new_nodes.reserve(1U);
+        MbrNode root_nd{std::move(root_br), {}, 1U};
+        const uint64_t nd_bytes = node_bytes(root_nd);
+        new_nodes.push_back(std::move(root_nd));
+
+        std::map<uint64_t, uint64_t> new_hist;
+        new_hist.emplace(1U, 1U);
+
+        // Noexcept commit phase: if any allocation above threw, *this is untouched.
+        state_pool.swap(new_pool);
+        state_intern.swap(new_intern);
+        nodes.swap(new_nodes);
+        node_branches_hist.swap(new_hist);
         trans.clear();
         meas.clear();
         peek.clear();
@@ -1527,9 +1626,7 @@ struct MbrStore {
         overlap_cache.clear();
         definite_cache.clear();
         split_cache.clear();
-        bytes_estimate = sizeof(MbrStore);
-        const uint32_t z0 = intern_canonical(make_zero(n_qubits));
-        push_node({{MbrComplex{1.0, 0.0}, z0}}, {}, 1U);
+        bytes_estimate = sizeof(MbrStore) + st_bytes + nd_bytes;
     }
 
     inline std::string serialize_pauli_key(
@@ -1568,7 +1665,16 @@ struct MbrStore {
     }
 
     inline std::string serialize_pending_key(const std::vector<MbrPending>& pend) const {
-        std::string out(4U + pend.size() * (nw * 16U + 2U), '\0');
+        constexpr size_t kMaxBytes = static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max());
+        if (pend.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::bad_alloc();
+        }
+        size_t word_bytes = 0U, body_bytes = 0U;
+        if (!mul_within(nw, size_t(16), kMaxBytes - 2U, word_bytes)
+            || !mul_within(pend.size(), word_bytes + 2U, kMaxBytes - 4U, body_bytes)) {
+            throw std::bad_alloc();
+        }
+        std::string out(4U + body_bytes, '\0');
         uint8_t* p = reinterpret_cast<uint8_t*>(&out[0]);
         write_u32_le(p, static_cast<uint32_t>(pend.size()));
         p += 4U;
@@ -1662,6 +1768,38 @@ struct MbrStore {
 
 std::atomic<size_t> g_live_stores{0};
 
+// RAII rollback guard for MbrStore::nodes, node_branches_hist, and bytes_estimate.
+// If destroyed before commit(), pops any nodes pushed since construction without throwing.
+struct NodeRollbackGuard {
+    MbrStore& st;
+    size_t orig_nodes;
+    bool committed = false;
+
+    explicit NodeRollbackGuard(MbrStore& store) noexcept
+        : st(store), orig_nodes(store.nodes.size()) {}
+
+    inline void commit() noexcept { committed = true; }
+
+    ~NodeRollbackGuard() noexcept {
+        if (committed) return;
+        while (st.nodes.size() > orig_nodes) {
+            const MbrNode& nd = st.nodes.back();
+            const uint64_t nb = static_cast<uint64_t>(nd.branches.size());
+            const uint64_t b = st.node_bytes(nd);
+            auto it = st.node_branches_hist.find(nb);
+            if (it != st.node_branches_hist.end()) {
+                if (it->second <= 1U) {
+                    st.node_branches_hist.erase(it);
+                } else {
+                    it->second -= 1U;
+                }
+            }
+            st.bytes_estimate = (st.bytes_estimate >= b) ? (st.bytes_estimate - b) : 0U;
+            st.nodes.pop_back();
+        }
+    }
+};
+
 inline MbrStore* store_of(void* handle) noexcept {
     return static_cast<MbrStore*>(handle);
 }
@@ -1753,13 +1891,19 @@ inline int32_t resolve_one(
 ) {
     const size_t n = store.n_qubits;
     const size_t nw = store.nw;
+    size_t n_nw = 0U, three_n = 0U, three_nw = 0U;
+    if (!mul_within(n, nw, kMaxElems, n_nw)
+        || !mul_within(size_t(3), n, kMaxElems, three_n)
+        || !mul_within(size_t(3), nw, kMaxElems, three_nw)) {
+        throw std::bad_alloc();
+    }
 
     std::vector<uint64_t> gx, gz;
     std::vector<uint8_t> gk;
     generators(store.state_pool[state_id].state, gx, gz, gk);
 
-    std::vector<uint64_t> GX(n * nw, 0ULL);
-    std::vector<uint64_t> GZ(n * nw, 0ULL);
+    std::vector<uint64_t> GX(n_nw, 0ULL);
+    std::vector<uint64_t> GZ(n_nw, 0ULL);
     for (size_t i = 0; i < n; ++i) {
         const size_t iw = i >> 6U;
         const uint64_t ibit = uint64_t(1) << (i & 63U);
@@ -1787,14 +1931,14 @@ inline int32_t resolve_one(
         int32_t var_idx = -1;
         uint8_t val = 0U;
     };
-    std::vector<int32_t> basis_at(3U * n, -1);
+    std::vector<int32_t> basis_at(three_n, -1);
     std::vector<BasisRow> basis_rows;
     basis_rows.reserve(pend.size());
     std::vector<MbrPauli> indef;
     std::unordered_map<ParityVec, uint8_t, ParityVecHash> coef;
     uint8_t const_ph = 0U;
 
-    std::vector<uint64_t> v(3U * nw, 0ULL);
+    std::vector<uint64_t> v(three_nw, 0ULL);
     for (const MbrPending& item : pend) {
         std::fill(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(nw), 0ULL);
         for (size_t w = 0; w < nw; ++w) {
@@ -2287,6 +2431,7 @@ inline int32_t store_meas_or_peek(
             out_p0 = p0;
             return kOk;
         }
+        NodeRollbackGuard guard(store);
         const int64_t target_nid = did_resolve
             ? store.push_node(std::move(working_branches), {}, res_peak)
             : node_id;
@@ -2295,13 +2440,14 @@ inline int32_t store_meas_or_peek(
         me.child0 = all_pos ? target_nid : -1;
         me.child1 = all_pos ? -1 : target_nid;
         me.meas_type = kMeasDefinite;
+        store.meas.emplace(MeasKey{node_id, event_id, kind}, std::move(me));
         store.meas_definite += 1U;
         store.transitions_new[kind] += 1U;
-        store.meas.emplace(MeasKey{node_id, event_id, kind}, me);
         store.bytes_estimate += 64U + sizeof(MeasEntry);
-        out_p0 = me.p0;
-        *out_child0 = me.child0;
-        *out_child1 = me.child1;
+        guard.commit();
+        out_p0 = p0;
+        *out_child0 = all_pos ? target_nid : -1;
+        *out_child1 = all_pos ? -1 : target_nid;
         *out_meas_type = kMeasDefinite;
         std::memset(out_absorb_x, 0, nw * sizeof(uint64_t));
         std::memset(out_absorb_z, 0, nw * sizeof(uint64_t));
@@ -2340,25 +2486,27 @@ inline int32_t store_meas_or_peek(
             return kErrBudget;
         }
         const uint32_t peak0 = std::max(res_peak, static_cast<uint32_t>(b0.size()));
+        NodeRollbackGuard guard(store);
         const int64_t c0 = store.push_node(std::move(b0), std::move(working_pend), peak0);
         MeasEntry me;
         me.p0 = 0.5;
         me.child0 = c0;
         me.child1 = c0;
         me.meas_type = kMeasAbsorbed;
-        me.absorb_x = qx;
-        me.absorb_z = qz;
+        me.absorb_x = std::move(qx);
+        me.absorb_z = std::move(qz);
+        const uint64_t add_bytes = 64U + sizeof(MeasEntry) + 2U * nw * sizeof(uint64_t);
+        auto ins = store.meas.emplace(MeasKey{node_id, event_id, kind}, std::move(me));
         store.meas_absorbed += 1U;
         store.transitions_new[kind] += 1U;
-        const uint64_t add_bytes = 64U + sizeof(MeasEntry) + 2U * nw * sizeof(uint64_t);
-        store.meas.emplace(MeasKey{node_id, event_id, kind}, std::move(me));
         store.bytes_estimate += add_bytes;
+        guard.commit();
         out_p0 = 0.5;
         *out_child0 = c0;
         *out_child1 = c0;
         *out_meas_type = kMeasAbsorbed;
-        std::memcpy(out_absorb_x, qx.data(), nw * sizeof(uint64_t));
-        std::memcpy(out_absorb_z, qz.data(), nw * sizeof(uint64_t));
+        std::memcpy(out_absorb_x, ins.first->second.absorb_x.data(), nw * sizeof(uint64_t));
+        std::memcpy(out_absorb_z, ins.first->second.absorb_z.data(), nw * sizeof(uint64_t));
         return kOk;
     }
 
@@ -2427,6 +2575,7 @@ inline int32_t store_meas_or_peek(
     if (has0 && has1) {
         pend0 = working_pend;
     }
+    NodeRollbackGuard guard(store);
     const int64_t c0 = has0
         ? store.push_node(
               std::move(b0),
@@ -2447,16 +2596,59 @@ inline int32_t store_meas_or_peek(
     me.child0 = c0;
     me.child1 = c1;
     me.meas_type = kMeasForked;
+    store.meas.emplace(MeasKey{node_id, event_id, kind}, std::move(me));
     store.meas_forked += 1U;
     store.transitions_new[kind] += 1U;
-    store.meas.emplace(MeasKey{node_id, event_id, kind}, me);
     store.bytes_estimate += 64U + sizeof(MeasEntry);
+    guard.commit();
     out_p0 = p0_out;
     *out_child0 = c0;
     *out_child1 = c1;
     *out_meas_type = kMeasForked;
     std::memset(out_absorb_x, 0, nw * sizeof(uint64_t));
     std::memset(out_absorb_z, 0, nw * sizeof(uint64_t));
+    return kOk;
+}
+
+// Zero-allocation validation of commuting turn arrays (used before cache lookup).
+inline int32_t validate_commuting_turns(
+    size_t n_qubits, size_t nw,
+    size_t n_axes,
+    const uint64_t* ax_x, const uint64_t* ax_z,
+    const uint8_t* ax_kappa, const uint8_t* ax_e
+) noexcept {
+    if (n_axes == 0U) return kOk;
+    if (ax_x == nullptr || ax_z == nullptr || ax_kappa == nullptr || ax_e == nullptr) {
+        return kErrInvalidArg;
+    }
+    size_t total_words = 0U;
+    if (!mul_within(n_axes, nw, kMaxElems, total_words)) {
+        return kErrInvalidArg;
+    }
+    for (size_t i = 0; i < n_axes; ++i) {
+        const uint64_t* xi = &ax_x[i * nw];
+        const uint64_t* zi = &ax_z[i * nw];
+        const uint8_t ki = static_cast<uint8_t>(ax_kappa[i] & 3U);
+        if (!tail_clear(xi, n_qubits, nw) || !tail_clear(zi, n_qubits, nw)) {
+            return kErrInvalidArg;
+        }
+        if (!is_hermitian(xi, zi, ki, nw)) return kErrInvalidArg;
+    }
+    for (size_t i = 0; i < n_axes; ++i) {
+        if ((ax_e[i] & 7U) == 0U) continue;
+        const uint64_t* xi = &ax_x[i * nw];
+        const uint64_t* zi = &ax_z[i * nw];
+        if (pauli_is_identity(xi, zi, nw)) continue;
+        for (size_t j = i + 1U; j < n_axes; ++j) {
+            if ((ax_e[j] & 7U) == 0U) continue;
+            const uint64_t* xj = &ax_x[j * nw];
+            const uint64_t* zj = &ax_z[j * nw];
+            if (pauli_is_identity(xj, zj, nw)) continue;
+            if (pauli_anti(xi, zi, xj, zj, nw) != 0U) {
+                return kErrInvalidArg;
+            }
+        }
+    }
     return kOk;
 }
 
@@ -2976,7 +3168,8 @@ int32_t mbr_is_clifford(
     int32_t* out_is_clifford
 ) {
     try {
-        if (out_is_clifford == nullptr || n_words_per_parity == 0U) {
+        if (out_is_clifford == nullptr || n_words_per_parity == 0U
+            || n_words_per_parity > kMaxElems) {
             return mbr::kErrInvalidArg;
         }
         if (n_parities == 0U) {
@@ -3014,6 +3207,7 @@ int32_t mbr_choose_split(
 ) {
     try {
         if (parities == nullptr || n_parities == 0U || n_words_per_parity == 0U
+            || n_words_per_parity > kMaxElems || max_depth > mbr::kMaxChooseSplitDepth
             || out_lam_words == nullptr || out_depth == nullptr) {
             return mbr::kErrInvalidArg;
         }
@@ -3223,8 +3417,8 @@ int32_t mbr_store_node_dense(
         if (out_complex_len != dim) return mbr::kErrInvalidArg;
 
         const mbr::MbrNode& nd = st->nodes[static_cast<size_t>(node_id)];
-        std::memset(out_psi_ri, 0, dim * 2U * sizeof(double));
         std::vector<double> tmp(dim * 2U, 0.0);
+        std::memset(out_psi_ri, 0, dim * 2U * sizeof(double));
         for (const mbr::MbrBranch& br : nd.branches) {
             if (!mbr::to_dense(st->state_pool[br.state_id].state, big_endian != 0, tmp.data())) {
                 return mbr::kErrInvalidArg;
@@ -3353,7 +3547,10 @@ int32_t mbr_store_node_from_branches(
             return mbr::kErrBudget;
         }
         const uint32_t peak = static_cast<uint32_t>(merged.size());
-        *out_node_id = st->push_node(std::move(merged), std::move(pend), peak);
+        mbr::NodeRollbackGuard guard(*st);
+        const int64_t nid = st->push_node(std::move(merged), std::move(pend), peak);
+        guard.commit();
+        *out_node_id = nid;
         return mbr::kOk;
     } catch (const std::bad_alloc&) {
         return mbr::kErrOom;
@@ -3379,7 +3576,10 @@ int32_t mbr_store_resolve_node(void* store, int64_t node_id, int64_t* out_node_i
         uint32_t peak = 0U;
         const int32_t rc = mbr::resolve_branches(*st, in_b, in_p, resolved, peak);
         if (rc != mbr::kOk) return rc;
-        *out_node_id = st->push_node(std::move(resolved), {}, peak);
+        mbr::NodeRollbackGuard guard(*st);
+        const int64_t nid = st->push_node(std::move(resolved), {}, peak);
+        guard.commit();
+        *out_node_id = nid;
         return mbr::kOk;
     } catch (const std::bad_alloc&) {
         return mbr::kErrOom;
@@ -3401,6 +3601,12 @@ int32_t mbr_store_step_rotations(
         if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
             return mbr::kErrInvalidArg;
         }
+        const size_t nw = st->nw;
+        const int32_t vrc = mbr::validate_commuting_turns(
+            st->n_qubits, nw, n_axes, ax_x, ax_z, ax_kappa, ax_e
+        );
+        if (vrc != mbr::kOk) return vrc;
+
         const mbr::TransKey tkey{node_id, event_id, sign_bits, kind};
         auto tit = st->trans.find(tkey);
         if (tit != st->trans.end()) {
@@ -3409,7 +3615,6 @@ int32_t mbr_store_step_rotations(
             return mbr::kOk;
         }
 
-        const size_t nw = st->nw;
         std::vector<mbr::MbrPending> incoming;
         uint8_t ph = 0U;
         const int32_t nrc = mbr::normalize_commuting_turns(
@@ -3450,10 +3655,12 @@ int32_t mbr_store_step_rotations(
 
         mbr::accumulate_pending_inplace(pend, incoming, nw);
 
+        mbr::NodeRollbackGuard guard(*st);
         const int64_t cid = st->push_node(std::move(branches), std::move(pend), peak);
         st->trans.emplace(tkey, cid);
         st->bytes_estimate += 64U;
         st->transitions_new[kind] += 1U;
+        guard.commit();
         *out_child = cid;
         return mbr::kOk;
     } catch (const std::bad_alloc&) {
@@ -3475,13 +3682,6 @@ int32_t mbr_store_step_qturns(
         if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
             return mbr::kErrInvalidArg;
         }
-        const mbr::TransKey tkey{node_id, event_id, sign_bits, kind};
-        auto tit = st->trans.find(tkey);
-        if (tit != st->trans.end()) {
-            st->transitions_hit[kind] += 1U;
-            *out_child = tit->second;
-            return mbr::kOk;
-        }
 
         const size_t n = st->n_qubits;
         const size_t nw = st->nw;
@@ -3500,6 +3700,14 @@ int32_t mbr_store_step_qturns(
                 return mbr::kErrInvalidArg;
             }
             if (!mbr::is_hermitian(qx, qz, qk, nw)) return mbr::kErrInvalidArg;
+        }
+
+        const mbr::TransKey tkey{node_id, event_id, sign_bits, kind};
+        auto tit = st->trans.find(tkey);
+        if (tit != st->trans.end()) {
+            st->transitions_hit[kind] += 1U;
+            *out_child = tit->second;
+            return mbr::kOk;
         }
 
         std::vector<mbr::MbrBranch> branches = st->nodes[static_cast<size_t>(node_id)].branches;
@@ -3547,10 +3755,12 @@ int32_t mbr_store_step_qturns(
         if (mrc != mbr::kOk) return mrc;
         if (!branches.empty() && merged.empty()) return mbr::kErrFloatDrift;
 
+        mbr::NodeRollbackGuard guard(*st);
         const int64_t cid = st->push_node(std::move(merged), std::move(pend), peak);
         st->trans.emplace(tkey, cid);
         st->bytes_estimate += 64U;
         st->transitions_new[kind] += 1U;
+        guard.commit();
         *out_child = cid;
         return mbr::kOk;
     } catch (const std::bad_alloc&) {

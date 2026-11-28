@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 import threading
 from typing import Any, Callable, Literal, Sequence
 import weakref
@@ -110,11 +111,39 @@ class _StoreOwnerToken:
     """Weakly-referenced ownership token held by each `MagicsideSimulator`."""
 
 
+_FORK_POISON_MSG = "BranchStore was forked while busy in another thread"
+
+
+class _PoisonedNativeStore:
+    """Sentinel replacing `native` in a forked child when another thread was inside C++ at fork."""
+
+    def __getattr__(self, _name: str) -> Any:
+        raise RuntimeError(_FORK_POISON_MSG)
+
+    def close(self) -> None:
+        return None
+
+
+_FORK_STORES: weakref.WeakSet[_SharedBranchStore] = weakref.WeakSet()
+
+
+def _reinit_branch_stores_in_child() -> None:
+    for store in list(_FORK_STORES):
+        store._reinit_after_fork()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reinit_branch_stores_in_child)
+
+
 class _SharedBranchStore:
     """Thread-safe shared wrapper over `bk.BranchStore` with hash-consed frames and event cache."""
 
     def __init__(self, n_qubits: int, max_components: int = 0) -> None:
         self.lock = threading.RLock()
+        self._busy: bool = False
+        self._busy_tid: int = 0
+        self._fork_poisoned: bool = False
         self.n_qubits = int(n_qubits)
         self.nw = n_words_for_qubits(self.n_qubits)
         self.max_components = int(max_components)
@@ -126,6 +155,25 @@ class _SharedBranchStore:
         self.event_data: dict[int, Any] = {}
         self._next_event_id: int = 1
         self.node_peak_cache: dict[int, int] = {0: 1}
+        _FORK_STORES.add(self)
+
+    def _reinit_after_fork(self) -> None:
+        """Run in a forked child: renew `lock` and poison stores mid-native-call in another thread."""
+        self.lock = threading.RLock()
+        if self._busy and self._busy_tid != threading.get_ident():
+            self._fork_poisoned = True
+            self._busy = False
+            self._busy_tid = 0
+            if isinstance(self.native, bk.BranchStore):
+                # Drop C handle without calling mbr_store_destroy on potentially torn memory.
+                self.native._handle = 0
+            self.native = _PoisonedNativeStore()  # type: ignore[assignment]
+        elif not self._busy:
+            self._busy_tid = 0
+
+    def _check_not_poisoned(self) -> None:
+        if self._fork_poisoned:
+            raise RuntimeError(_FORK_POISON_MSG)
 
     def register_owner(self, token: _StoreOwnerToken) -> None:
         with self.lock:
@@ -138,25 +186,38 @@ class _SharedBranchStore:
     def set_max_components(self, max_components: int) -> None:
         mc = int(max_components)
         with self.lock:
+            self._check_not_poisoned()
             if mc != self.max_components:
-                self.native.set_max_components(mc)
-                self.max_components = mc
+                prev_busy, prev_tid = self._busy, self._busy_tid
+                self._busy, self._busy_tid = True, threading.get_ident()
+                try:
+                    self.native.set_max_components(mc)
+                    self.max_components = mc
+                finally:
+                    self._busy, self._busy_tid = prev_busy, prev_tid
 
     def clear_inplace(self) -> None:
         """Reset trie and Python caches in-place (caller must verify sole ownership at batch start)."""
         with self.lock:
-            self.native.clear()
-            self.frame_trie.clear()
-            self._next_frame_id = 1
-            self.event_ids.clear()
-            self.event_data.clear()
-            self._next_event_id = 1
-            self.node_peak_cache.clear()
-            self.node_peak_cache[0] = 1
+            self._check_not_poisoned()
+            prev_busy, prev_tid = self._busy, self._busy_tid
+            self._busy, self._busy_tid = True, threading.get_ident()
+            try:
+                self.native.clear()
+                self.frame_trie.clear()
+                self._next_frame_id = 1
+                self.event_ids.clear()
+                self.event_data.clear()
+                self._next_event_id = 1
+                self.node_peak_cache.clear()
+                self.node_peak_cache[0] = 1
+            finally:
+                self._busy, self._busy_tid = prev_busy, prev_tid
 
     def advance_frame(self, frame_id: int, step_key: Any) -> int:
         edge = (frame_id, step_key)
         with self.lock:
+            self._check_not_poisoned()
             nxt = self.frame_trie.get(edge)
             if nxt is None:
                 nxt = self._next_frame_id
@@ -166,22 +227,29 @@ class _SharedBranchStore:
 
     def get_or_compile_event(self, event_key: Any, compile_fn: Callable[[], Any]) -> tuple[int, Any]:
         with self.lock:
+            self._check_not_poisoned()
             eid = self.event_ids.get(event_key)
             if eid is not None:
                 return eid, self.event_data[eid]
             payload = compile_fn()
             eid = self._next_event_id
             self._next_event_id += 1
-            self.event_ids[event_key] = eid
             self.event_data[eid] = payload
+            self.event_ids[event_key] = eid
             return eid, payload
 
     def node_peak_unlocked(self, nid: int) -> int:
+        self._check_not_poisoned()
         if nid < 0:
             return 1
         pk = self.node_peak_cache.get(nid)
         if pk is None:
-            nb, _, tpk = self.native.node_info(nid)
+            prev_busy, prev_tid = self._busy, self._busy_tid
+            self._busy, self._busy_tid = True, threading.get_ident()
+            try:
+                nb, _, tpk = self.native.node_info(nid)
+            finally:
+                self._busy, self._busy_tid = prev_busy, prev_tid
             pk = min(32767, max(nb, tpk))
             self.node_peak_cache[nid] = pk
         return pk
@@ -197,10 +265,15 @@ class _SharedBranchStore:
         ax_k: NDArray[np.uint8],
         ax_e: NDArray[np.uint8],
     ) -> tuple[int, int]:
+        self._check_not_poisoned()
+        prev_busy, prev_tid = self._busy, self._busy_tid
+        self._busy, self._busy_tid = True, threading.get_ident()
         try:
             cid = self.native.step_rotations(nid, eid, kind, sign_bits, ax_x, ax_z, ax_k, ax_e)
         except bk.BranchBudgetError as exc:
             raise QueryBudgetExceededError(str(exc)) from exc
+        finally:
+            self._busy, self._busy_tid = prev_busy, prev_tid
         return cid, self.node_peak_unlocked(cid)
 
     def step_qturns_unlocked(
@@ -213,10 +286,15 @@ class _SharedBranchStore:
         qt_z: NDArray[np.uint64],
         qt_k: NDArray[np.uint8],
     ) -> tuple[int, int]:
+        self._check_not_poisoned()
+        prev_busy, prev_tid = self._busy, self._busy_tid
+        self._busy, self._busy_tid = True, threading.get_ident()
         try:
             cid = self.native.step_qturns(nid, eid, kind, sign_bits, qt_x, qt_z, qt_k)
         except bk.BranchBudgetError as exc:
             raise QueryBudgetExceededError(str(exc)) from exc
+        finally:
+            self._busy, self._busy_tid = prev_busy, prev_tid
         return cid, self.node_peak_unlocked(cid)
 
     def step_meas_unlocked(
@@ -228,10 +306,15 @@ class _SharedBranchStore:
         mz: NDArray[np.uint64],
         mk: int,
     ) -> tuple[float, int, int, int, NDArray[np.uint64], NDArray[np.uint64], int, int]:
+        self._check_not_poisoned()
+        prev_busy, prev_tid = self._busy, self._busy_tid
+        self._busy, self._busy_tid = True, threading.get_ident()
         try:
             p0, c0, c1, mt, abs_x, abs_z = self.native.step_meas(nid, eid, kind, mx, mz, mk)
         except bk.BranchBudgetError as exc:
             raise QueryBudgetExceededError(str(exc)) from exc
+        finally:
+            self._busy, self._busy_tid = prev_busy, prev_tid
         pk0 = self.node_peak_unlocked(c0)
         pk1 = pk0 if c1 == c0 else self.node_peak_unlocked(c1)
         return p0, c0, c1, mt, abs_x, abs_z, pk0, pk1
@@ -244,14 +327,35 @@ class _SharedBranchStore:
         mz: NDArray[np.uint64],
         mk: int,
     ) -> float:
+        self._check_not_poisoned()
+        prev_busy, prev_tid = self._busy, self._busy_tid
+        self._busy, self._busy_tid = True, threading.get_ident()
         try:
             return self.native.step_peek(nid, eid, mx, mz, mk)
         except bk.BranchBudgetError as exc:
             raise QueryBudgetExceededError(str(exc)) from exc
+        finally:
+            self._busy, self._busy_tid = prev_busy, prev_tid
+
+    def node_dense(self, nid: int, *, endian: Literal["little", "big"] = "little") -> NDArray[np.complex128]:
+        with self.lock:
+            self._check_not_poisoned()
+            prev_busy, prev_tid = self._busy, self._busy_tid
+            self._busy, self._busy_tid = True, threading.get_ident()
+            try:
+                return self.native.node_dense(nid, endian=endian)
+            finally:
+                self._busy, self._busy_tid = prev_busy, prev_tid
 
     def counters(self) -> dict[str, Any]:
         with self.lock:
-            return self.native.counters()
+            self._check_not_poisoned()
+            prev_busy, prev_tid = self._busy, self._busy_tid
+            self._busy, self._busy_tid = True, threading.get_ident()
+            try:
+                return self.native.counters()
+            finally:
+                self._busy, self._busy_tid = prev_busy, prev_tid
 
 
 @dataclass(frozen=True)
@@ -1049,8 +1153,7 @@ class BranchBatch:
             raise ValueError(f"state_vector requires num_qubits <= 26, got {self.n_qubits}")
         s = int(shot)
         nid = int(self.node[s])
-        with self.store.lock:
-            psi = self.store.native.node_dense(nid, endian="little")
+        psi = self.store.node_dense(nid, endian="little")
         fx_s = self.fx[s]
         fz_s = self.fz[s]
         if int(fx_s[0]) != 0 or int(fz_s[0]) != 0:
@@ -1072,16 +1175,22 @@ class BranchBatch:
         s = int(shot)
         nid = int(self.node[s])
         with self.store.lock:
-            nb, npd, tpk = self.store.native.node_info(nid)
-            raw_branches = self.store.native.node_branches(nid)
+            self.store._check_not_poisoned()
+            prev_busy, prev_tid = self.store._busy, self.store._busy_tid
+            self.store._busy, self.store._busy_tid = True, threading.get_ident()
             try:
-                converted = tuple(
-                    (w, st.to_phase_qfe(PhaseQFEComponent)) for w, st in raw_branches
-                )
+                nb, npd, tpk = self.store.native.node_info(nid)
+                raw_branches = self.store.native.node_branches(nid)
+                try:
+                    converted = tuple(
+                        (w, st.to_phase_qfe(PhaseQFEComponent)) for w, st in raw_branches
+                    )
+                finally:
+                    for _, st in raw_branches:
+                        st.close()
+                pending = self.store.native.node_pending(nid)
             finally:
-                for _, st in raw_branches:
-                    st.close()
-            pending = self.store.native.node_pending(nid)
+                self.store._busy, self.store._busy_tid = prev_busy, prev_tid
         return BranchStateSnapshot(
             node_id=nid,
             n_branches=nb,

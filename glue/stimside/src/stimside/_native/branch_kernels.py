@@ -137,7 +137,7 @@ def get_branch_kernels_lib(force_recompile: bool = False) -> ctypes.CDLL:
 
 
 def _as_index(val: Any, name: str) -> int:
-    if isinstance(val, bool):
+    if isinstance(val, (bool, np.bool_)):
         raise TypeError(f"{name} must be an integer, got bool")
     return operator.index(val)
 
@@ -156,7 +156,7 @@ def _as_contiguous(arr: Any, dtype: Any, shape: tuple[int, ...], name: str) -> n
     if a.dtype == object:
         vals: list[int] = []
         for x in a.flat:
-            if isinstance(x, bool):
+            if isinstance(x, (bool, np.bool_)):
                 raise TypeError(f"{name} elements must be integers, got bool")
             v = operator.index(x)
             if v < info.min or v > info.max:
@@ -258,8 +258,10 @@ def _pack_parities(parities: Any, n_words: int | None) -> tuple[np.ndarray, int,
     if isinstance(parities, np.ndarray) and parities.ndim == 2:
         n_par = int(parities.shape[0])
         in_nw = int(parities.shape[1])
+        if in_nw < 1:
+            raise ValueError(f"parities 2D array must have shape[1] >= 1, got {parities.shape}")
         if nw == 0:
-            nw = max(1, in_nw)
+            nw = in_nw
         elif in_nw != nw:
             raise ValueError(f"parities must have shape ({n_par}, {nw}), got {parities.shape}")
         if n_par == 0:
@@ -276,7 +278,7 @@ def _pack_parities(parities: Any, n_words: int | None) -> tuple[np.ndarray, int,
     ints: list[int] = []
     max_bits = 0
     for x in items:
-        if isinstance(x, bool):
+        if isinstance(x, (bool, np.bool_)):
             raise TypeError("parities elements must be integers, got bool")
         v = operator.index(x)
         if v <= 0:
