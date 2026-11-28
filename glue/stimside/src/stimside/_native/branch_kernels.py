@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import functools
 import math
+import numbers
 import operator
 import sys
 from pathlib import Path
@@ -25,7 +26,10 @@ _LIB_INSTANCE: ctypes.CDLL | None = None
 _VP = ctypes.c_void_p
 _SZ = ctypes.c_size_t
 _I32 = ctypes.c_int32
+_I64 = ctypes.c_int64
 _U8 = ctypes.c_uint8
+_U32 = ctypes.c_uint32
+_U64 = ctypes.c_uint64
 
 MBR_OK = 0
 MBR_ERR_INVALID_ARG = -1
@@ -33,7 +37,25 @@ MBR_ERR_OOM = -2
 MBR_ERR_FLOAT_DRIFT = -3
 MBR_ERR_BUDGET = -4
 
+MBR_KIND_T = 0
+MBR_KIND_CCZ = 1
+MBR_KIND_SKIP = 2
+MBR_KIND_CFAULT = 3
+MBR_KIND_MEAS = 4
+MBR_KIND_PEEK = 5
+MBR_KIND_POST = 6
+MBR_KIND_URESET = 7
+MBR_KIND_NAMES: tuple[str, ...] = (
+    "T", "CCZ", "SKIP", "CFAULT", "MEAS", "PEEK", "POST", "URESET"
+)
+
+MBR_MEAS_DEFINITE = 0
+MBR_MEAS_ABSORBED = 1
+MBR_MEAS_FORKED = 2
+
+_BRANCH_STORE_MAX_NODES = 300_000
 _MAX_QUBITS = 0x7FFFFFFF
+_SIZE_MAX = (1 << (8 * ctypes.sizeof(ctypes.c_size_t))) - 1
 
 
 class BranchBudgetError(RuntimeError):
@@ -76,6 +98,26 @@ _SPECS: tuple[AbiSpec, ...] = (
     ("mbr_state_overlap", [_VP, _VP, _VP], _I32),
     ("mbr_state_same_phase", [_VP, _VP, _VP, _VP], _I32),
     ("mbr_state_to_dense", [_VP, _I32, _VP, _SZ], _I32),
+    ("mbr_is_clifford", [_VP, _SZ, _SZ, _VP], _I32),
+    ("mbr_choose_split", [_VP, _SZ, _SZ, _U32, _VP, _VP], _I32),
+    ("mbr_live_stores", [], _SZ),
+    ("mbr_store_create", [_SZ, _SZ, _VP], _I32),
+    ("mbr_store_destroy", [_VP], None),
+    ("mbr_store_clear", [_VP], _I32),
+    ("mbr_store_set_max_components", [_VP, _SZ], _I32),
+    ("mbr_store_node_count", [_VP, _VP], _I32),
+    ("mbr_store_node_info", [_VP, _I64, _VP, _VP, _VP], _I32),
+    ("mbr_store_node_branch", [_VP, _I64, _SZ, _VP, _VP], _I32),
+    ("mbr_store_node_pending", [_VP, _I64, _VP, _VP, _VP, _VP], _I32),
+    ("mbr_store_node_dense", [_VP, _I64, _I32, _VP, _SZ], _I32),
+    ("mbr_store_node_from_branches", [_VP, _SZ, _VP, _VP, _SZ, _VP, _VP, _VP, _VP, _VP], _I32),
+    ("mbr_store_resolve_node", [_VP, _I64, _VP], _I32),
+    ("mbr_store_step_rotations", [_VP, _I64, _U64, _U8, _U32, _SZ, _VP, _VP, _VP, _VP, _VP], _I32),
+    ("mbr_store_step_qturns", [_VP, _I64, _U64, _U8, _U32, _SZ, _VP, _VP, _VP, _VP], _I32),
+    ("mbr_store_step_meas", [_VP, _I64, _U64, _U8, _VP, _VP, _U8, _VP, _VP, _VP, _VP, _VP, _VP], _I32),
+    ("mbr_store_step_peek", [_VP, _I64, _U64, _VP, _VP, _U8, _VP], _I32),
+    ("mbr_store_counters", [_VP, _VP], _I32),
+    ("mbr_store_branches_hist", [_VP, _VP, _VP, _SZ, _VP], _I32),
 )
 
 
@@ -149,6 +191,149 @@ def _as_u8_flag(val: Any, name: str) -> int:
 def _as_kappa(val: Any) -> int:
     v = _as_index(val, "kappa")
     return v & 3
+
+
+def _as_u64_scalar(val: Any, name: str) -> int:
+    v = _as_index(val, name)
+    if v < 0 or v > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(f"{name} out of uint64 range: {v}")
+    return v
+
+
+def _as_u32_scalar(val: Any, name: str) -> int:
+    v = _as_index(val, name)
+    if v < 0 or v > 0xFFFFFFFF:
+        raise ValueError(f"{name} out of uint32 range: {v}")
+    return v
+
+
+def _as_i64_scalar(val: Any, name: str) -> int:
+    v = _as_index(val, name)
+    if v < -(1 << 63) or v > (1 << 63) - 1:
+        raise ValueError(f"{name} out of int64 range: {v}")
+    return v
+
+
+def _as_size_t_scalar(val: Any, name: str) -> int:
+    v = _as_index(val, name)
+    if v < 0 or v > _SIZE_MAX:
+        raise ValueError(f"{name} out of size_t range [0, {_SIZE_MAX}]: {v}")
+    return v
+
+
+def _as_complex128_1d(arr: Any, length: int, name: str) -> np.ndarray:
+    raw = arr if isinstance(arr, np.ndarray) else np.asarray(arr, dtype=object)
+    if raw.shape != (length,):
+        raise ValueError(f"{name} must have shape ({length},), got {raw.shape}")
+    if (
+        raw.dtype == np.complex128
+        and raw.dtype.isnative
+        and raw.flags.c_contiguous
+        and raw.flags.aligned
+    ):
+        return raw
+    if raw.dtype == object:
+        vals: list[complex] = []
+        for x in raw.flat:
+            if isinstance(x, (bool, np.bool_)) or not isinstance(x, (numbers.Number, np.number)):
+                raise TypeError(
+                    f"{name} elements must be numeric (not bool/str), got {type(x).__name__}"
+                )
+            vals.append(complex(x))
+        return np.array(vals, dtype=np.complex128)
+    if raw.dtype.kind == "b" or raw.dtype.kind not in ("i", "u", "f", "c"):
+        raise TypeError(f"{name} must have a numeric dtype, got {raw.dtype}")
+    return np.require(raw, dtype=np.complex128, requirements=("C", "A"))
+
+
+def _pack_parities(parities: Any, n_words: int | None) -> tuple[np.ndarray, int, int]:
+    """Pack integer or word-matrix parities into contiguous `(n_parities, nw) uint64`."""
+    if n_words is not None:
+        nw = _as_index(n_words, "n_words")
+        if nw < 1:
+            raise ValueError(f"n_words must be >= 1, got {nw}")
+    else:
+        nw = 0
+
+    if isinstance(parities, np.ndarray) and parities.ndim == 2:
+        n_par = int(parities.shape[0])
+        in_nw = int(parities.shape[1])
+        if nw == 0:
+            nw = max(1, in_nw)
+        elif in_nw != nw:
+            raise ValueError(f"parities must have shape ({n_par}, {nw}), got {parities.shape}")
+        if n_par == 0:
+            return np.empty((0, nw), dtype=np.uint64), 0, nw
+        arr = _as_contiguous(parities, np.uint64, (n_par, nw), "parities")
+        return arr, n_par, nw
+
+    items = list(parities)
+    n_par = len(items)
+    if n_par == 0:
+        eff_nw = nw if nw > 0 else 1
+        return np.empty((0, eff_nw), dtype=np.uint64), 0, eff_nw
+
+    ints: list[int] = []
+    max_bits = 0
+    for x in items:
+        if isinstance(x, bool):
+            raise TypeError("parities elements must be integers, got bool")
+        v = operator.index(x)
+        if v <= 0:
+            raise ValueError(f"parity bitmask must be > 0, got {v}")
+        ints.append(v)
+        bl = v.bit_length()
+        if bl > max_bits:
+            max_bits = bl
+    needed_nw = max(1, (max_bits + 63) // 64)
+    if nw == 0:
+        nw = needed_nw
+    elif needed_nw > nw:
+        raise ValueError(f"parity requires {needed_nw} uint64 words, exceeds n_words={nw}")
+
+    out = np.zeros((n_par, nw), dtype=np.uint64)
+    mask64 = (1 << 64) - 1
+    for i, v in enumerate(ints):
+        cur = v
+        for w in range(nw):
+            out[i, w] = cur & mask64
+            cur >>= 64
+    return out, n_par, nw
+
+
+def is_clifford(parities: Any, n_words: int | None = None) -> bool:
+    """Native Mobius Clifford test (`r <= 20`; returns `False` for `r > 20`)."""
+    arr, n_par, nw = _pack_parities(parities, n_words)
+    lib = get_branch_kernels_lib()
+    out = ctypes.c_int32()
+    _check_rc(
+        lib.mbr_is_clifford(addr(arr), n_par, nw, ctypes.addressof(out)),
+        "mbr_is_clifford",
+    )
+    return bool(out.value)
+
+
+def choose_split(
+    parities: Any, max_depth: int = 5, n_words: int | None = None
+) -> tuple[int, int]:
+    """Native iterative-deepening split choice returning `(lam_int, depth)`."""
+    md = _as_u32_scalar(max_depth, "max_depth")
+    arr, n_par, nw = _pack_parities(parities, n_words)
+    if n_par == 0:
+        raise ValueError("parities must be non-empty for choose_split")
+    lib = get_branch_kernels_lib()
+    out_lam = np.zeros(nw, dtype=np.uint64)
+    out_depth = ctypes.c_int32()
+    _check_rc(
+        lib.mbr_choose_split(
+            addr(arr), n_par, nw, md, addr(out_lam), ctypes.addressof(out_depth)
+        ),
+        "mbr_choose_split",
+    )
+    lam_int = 0
+    for w in range(nw - 1, -1, -1):
+        lam_int = (lam_int << 64) | int(out_lam[w])
+    return lam_int, int(out_depth.value)
 
 
 class BranchState:
@@ -472,6 +657,401 @@ class BranchState:
             "mbr_state_to_dense",
         )
         return out
+
+
+class BranchStore:
+    """Thin RAII handle owning a native `MbrStore` trie, sub-caches, and Section 7 counters."""
+
+    __slots__ = ("_lib", "_handle", "_n_qubits", "_nw")
+
+    def __init__(self, n_qubits: int, max_components: int = 0) -> None:
+        n = _as_index(n_qubits, "n_qubits")
+        if n < 1 or n > _MAX_QUBITS:
+            raise ValueError(f"n_qubits must be in [1, {_MAX_QUBITS}], got {n}")
+        mc = _as_size_t_scalar(max_components, "max_components")
+        lib = get_branch_kernels_lib()
+        out = ctypes.c_void_p()
+        _check_rc(lib.mbr_store_create(n, mc, ctypes.addressof(out)), "mbr_store_create")
+        self._lib = lib
+        self._handle = int(out.value)
+        self._n_qubits = n
+        self._nw = (n + 63) // 64
+
+    @staticmethod
+    def live_stores() -> int:
+        return int(get_branch_kernels_lib().mbr_live_stores())
+
+    def _require_open(self) -> int:
+        if self._handle == 0:
+            raise ValueError("BranchStore handle is closed")
+        return self._handle
+
+    @property
+    def closed(self) -> bool:
+        return self._handle == 0
+
+    @property
+    def n_qubits(self) -> int:
+        return self._n_qubits
+
+    @property
+    def n_words(self) -> int:
+        return self._nw
+
+    def close(self) -> None:
+        h = self._handle
+        if h != 0:
+            self._handle = 0
+            self._lib.mbr_store_destroy(h)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> BranchStore:
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def clear(self) -> None:
+        h = self._require_open()
+        _check_rc(self._lib.mbr_store_clear(h), "mbr_store_clear")
+
+    def set_max_components(self, max_components: int) -> None:
+        h = self._require_open()
+        mc = _as_size_t_scalar(max_components, "max_components")
+        _check_rc(self._lib.mbr_store_set_max_components(h, mc), "mbr_store_set_max_components")
+
+    @property
+    def node_count(self) -> int:
+        h = self._require_open()
+        cnt = ctypes.c_size_t()
+        _check_rc(self._lib.mbr_store_node_count(h, ctypes.addressof(cnt)), "mbr_store_node_count")
+        return int(cnt.value)
+
+    def node_info(self, node_id: int) -> tuple[int, int, int]:
+        """Return `(n_branches, n_pend, transient_peak)` for `node_id`."""
+        h = self._require_open()
+        nid = _as_i64_scalar(node_id, "node_id")
+        nb = ctypes.c_size_t()
+        npd = ctypes.c_size_t()
+        pk = ctypes.c_uint32()
+        _check_rc(
+            self._lib.mbr_store_node_info(
+                h, nid, ctypes.addressof(nb), ctypes.addressof(npd), ctypes.addressof(pk)
+            ),
+            "mbr_store_node_info",
+        )
+        return int(nb.value), int(npd.value), int(pk.value)
+
+    def node_branches(self, node_id: int) -> list[tuple[complex, BranchState]]:
+        """Return a fresh list of `(weight, BranchState)` copies for `node_id`."""
+        h = self._require_open()
+        nid = _as_i64_scalar(node_id, "node_id")
+        n_branches, _, _ = self.node_info(nid)
+        out: list[tuple[complex, BranchState]] = []
+        w_buf = (ctypes.c_double * 2)()
+        st_ptr = ctypes.c_void_p()
+        try:
+            for i in range(n_branches):
+                _check_rc(
+                    self._lib.mbr_store_node_branch(
+                        h, nid, i, ctypes.addressof(w_buf), ctypes.addressof(st_ptr)
+                    ),
+                    "mbr_store_node_branch",
+                )
+                st = BranchState(self._lib, int(st_ptr.value), self._n_qubits, self._nw)
+                out.append((complex(w_buf[0], w_buf[1]), st))
+        except Exception:
+            for _, st in out:
+                st.close()
+            raise
+        return out
+
+    def node_pending(self, node_id: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return `(x, z, kappa, e)` arrays of pending turns on `node_id`."""
+        h = self._require_open()
+        nid = _as_i64_scalar(node_id, "node_id")
+        _, n_pend, _ = self.node_info(nid)
+        px = np.empty((n_pend, self._nw), dtype=np.uint64)
+        pz = np.empty((n_pend, self._nw), dtype=np.uint64)
+        pk = np.empty(n_pend, dtype=np.uint8)
+        pe = np.empty(n_pend, dtype=np.uint8)
+        if n_pend > 0:
+            _check_rc(
+                self._lib.mbr_store_node_pending(h, nid, addr(px), addr(pz), addr(pk), addr(pe)),
+                "mbr_store_node_pending",
+            )
+        return px, pz, pk, pe
+
+    def node_dense(self, node_id: int, endian: str = "little") -> np.ndarray:
+        """Compute exact `D sum_b w_b |S_b>` dense vector for `n_qubits <= 26`."""
+        h = self._require_open()
+        nid = _as_i64_scalar(node_id, "node_id")
+        if endian == "little":
+            big = 0
+        elif endian == "big":
+            big = 1
+        else:
+            raise ValueError(f"endian must be 'little' or 'big', got {endian!r}")
+        if self._n_qubits > 26:
+            raise ValueError(f"node_dense requires n_qubits <= 26, got {self._n_qubits}")
+        dim = 1 << self._n_qubits
+        out = np.empty(dim, dtype=np.complex128)
+        _check_rc(
+            self._lib.mbr_store_node_dense(h, nid, big, addr(out), dim),
+            "mbr_store_node_dense",
+        )
+        return out
+
+    def node_from_branches(
+        self,
+        weights: Any,
+        states: Any,
+        pend_x: Any = None,
+        pend_z: Any = None,
+        pend_kappa: Any = None,
+        pend_e: Any = None,
+    ) -> int:
+        """Create a node from explicit `(weights, states)` and optional pending turns."""
+        h = self._require_open()
+        st_list = list(states)
+        n_b = len(st_list)
+        if n_b == 0:
+            raise ValueError("states must be non-empty")
+        w_c = _as_complex128_1d(weights, n_b, "weights")
+        ptrs = np.empty(n_b, dtype=np.uintp)
+        for i, st in enumerate(st_list):
+            if not isinstance(st, BranchState):
+                raise TypeError(f"states[{i}] must be BranchState, got {type(st).__name__}")
+            ptrs[i] = st._require_open()
+
+        if pend_x is None and pend_z is None and pend_kappa is None and pend_e is None:
+            n_p = 0
+            px_c = np.empty((0, self._nw), dtype=np.uint64)
+            pz_c = np.empty((0, self._nw), dtype=np.uint64)
+            pk_c = np.empty(0, dtype=np.uint8)
+            pe_c = np.empty(0, dtype=np.uint8)
+        else:
+            if pend_x is None or pend_z is None or pend_kappa is None or pend_e is None:
+                raise ValueError("pend_x, pend_z, pend_kappa, pend_e must all be provided together")
+            pk_raw = pend_kappa if isinstance(pend_kappa, np.ndarray) else np.asarray(pend_kappa, dtype=object)
+            if pk_raw.ndim != 1:
+                raise ValueError(f"pend_kappa must be 1D, got shape {pk_raw.shape}")
+            n_p = int(pk_raw.shape[0])
+            px_c = _as_contiguous(pend_x, np.uint64, (n_p, self._nw), "pend_x")
+            pz_c = _as_contiguous(pend_z, np.uint64, (n_p, self._nw), "pend_z")
+            pk_c = _as_contiguous(pk_raw, np.uint8, (n_p,), "pend_kappa")
+            pe_c = _as_contiguous(pend_e, np.uint8, (n_p,), "pend_e")
+
+        out_nid = ctypes.c_int64()
+        _check_rc(
+            self._lib.mbr_store_node_from_branches(
+                h, n_b, addr(w_c), addr(ptrs),
+                n_p, addr(px_c), addr(pz_c), addr(pk_c), addr(pe_c),
+                ctypes.addressof(out_nid),
+            ),
+            "mbr_store_node_from_branches",
+        )
+        return int(out_nid.value)
+
+    def resolve_node(self, node_id: int) -> int:
+        h = self._require_open()
+        nid = _as_i64_scalar(node_id, "node_id")
+        out_nid = ctypes.c_int64()
+        _check_rc(
+            self._lib.mbr_store_resolve_node(h, nid, ctypes.addressof(out_nid)),
+            "mbr_store_resolve_node",
+        )
+        return int(out_nid.value)
+
+    def step_rotations(
+        self,
+        node_id: int,
+        event_id: int,
+        kind: int,
+        sign_bits: int,
+        ax_x: Any,
+        ax_z: Any,
+        ax_kappa: Any,
+        ax_e: Any,
+    ) -> int:
+        h = self._require_open()
+        nid = _as_i64_scalar(node_id, "node_id")
+        eid = _as_u64_scalar(event_id, "event_id")
+        kd = _as_index(kind, "kind")
+        if kd not in (MBR_KIND_T, MBR_KIND_CCZ):
+            raise ValueError(f"kind must be MBR_KIND_T or MBR_KIND_CCZ, got {kd}")
+        sb = _as_u32_scalar(sign_bits, "sign_bits")
+        ak_raw = ax_kappa if isinstance(ax_kappa, np.ndarray) else np.asarray(ax_kappa, dtype=object)
+        if ak_raw.ndim != 1:
+            raise ValueError(f"ax_kappa must be 1D, got shape {ak_raw.shape}")
+        n_ax = int(ak_raw.shape[0])
+        x_c = _as_contiguous(ax_x, np.uint64, (n_ax, self._nw), "ax_x")
+        z_c = _as_contiguous(ax_z, np.uint64, (n_ax, self._nw), "ax_z")
+        k_c = _as_contiguous(ak_raw, np.uint8, (n_ax,), "ax_kappa")
+        e_c = _as_contiguous(ax_e, np.uint8, (n_ax,), "ax_e")
+        out_child = ctypes.c_int64()
+        _check_rc(
+            self._lib.mbr_store_step_rotations(
+                h, nid, eid, kd, sb, n_ax, addr(x_c), addr(z_c), addr(k_c), addr(e_c),
+                ctypes.addressof(out_child),
+            ),
+            "mbr_store_step_rotations",
+        )
+        return int(out_child.value)
+
+    def step_qturns(
+        self,
+        node_id: int,
+        event_id: int,
+        kind: int,
+        sign_bits: int,
+        qt_x: Any,
+        qt_z: Any,
+        qt_kappa: Any,
+    ) -> int:
+        h = self._require_open()
+        nid = _as_i64_scalar(node_id, "node_id")
+        eid = _as_u64_scalar(event_id, "event_id")
+        kd = _as_index(kind, "kind")
+        if kd not in (MBR_KIND_SKIP, MBR_KIND_CFAULT):
+            raise ValueError(f"kind must be MBR_KIND_SKIP or MBR_KIND_CFAULT, got {kd}")
+        sb = _as_u32_scalar(sign_bits, "sign_bits")
+        qk_raw = qt_kappa if isinstance(qt_kappa, np.ndarray) else np.asarray(qt_kappa, dtype=object)
+        if qk_raw.ndim != 1:
+            raise ValueError(f"qt_kappa must be 1D, got shape {qk_raw.shape}")
+        n_qt = int(qk_raw.shape[0])
+        x_c = _as_contiguous(qt_x, np.uint64, (n_qt, self._nw), "qt_x")
+        z_c = _as_contiguous(qt_z, np.uint64, (n_qt, self._nw), "qt_z")
+        k_c = _as_contiguous(qk_raw, np.uint8, (n_qt,), "qt_kappa")
+        out_child = ctypes.c_int64()
+        _check_rc(
+            self._lib.mbr_store_step_qturns(
+                h, nid, eid, kd, sb, n_qt, addr(x_c), addr(z_c), addr(k_c),
+                ctypes.addressof(out_child),
+            ),
+            "mbr_store_step_qturns",
+        )
+        return int(out_child.value)
+
+    def step_meas(
+        self,
+        node_id: int,
+        event_id: int,
+        kind: int,
+        mx: Any,
+        mz: Any,
+        mkappa: int,
+    ) -> tuple[float, int, int, int, np.ndarray, np.ndarray]:
+        """Step measurement/postselect/ureset.
+
+        Returns `(p0, child0, child1, meas_type, absorb_x, absorb_z)`.
+        """
+        h = self._require_open()
+        nid = _as_i64_scalar(node_id, "node_id")
+        eid = _as_u64_scalar(event_id, "event_id")
+        kd = _as_index(kind, "kind")
+        if kd not in (MBR_KIND_MEAS, MBR_KIND_POST, MBR_KIND_URESET):
+            raise ValueError(
+                f"kind must be MBR_KIND_MEAS, MBR_KIND_POST, or MBR_KIND_URESET, got {kd}"
+            )
+        mx_c = _as_u64_words(mx, self._nw, "mx")
+        mz_c = _as_u64_words(mz, self._nw, "mz")
+        mk = _as_kappa(mkappa)
+        out_p0 = ctypes.c_double()
+        out_c0 = ctypes.c_int64()
+        out_c1 = ctypes.c_int64()
+        out_mt = ctypes.c_uint8()
+        abs_x = np.zeros(self._nw, dtype=np.uint64)
+        abs_z = np.zeros(self._nw, dtype=np.uint64)
+        _check_rc(
+            self._lib.mbr_store_step_meas(
+                h, nid, eid, kd, addr(mx_c), addr(mz_c), mk,
+                ctypes.addressof(out_p0), ctypes.addressof(out_c0), ctypes.addressof(out_c1),
+                ctypes.addressof(out_mt), addr(abs_x), addr(abs_z),
+            ),
+            "mbr_store_step_meas",
+        )
+        return (
+            float(out_p0.value),
+            int(out_c0.value),
+            int(out_c1.value),
+            int(out_mt.value),
+            abs_x,
+            abs_z,
+        )
+
+    def step_peek(
+        self,
+        node_id: int,
+        event_id: int,
+        mx: Any,
+        mz: Any,
+        mkappa: int,
+    ) -> float:
+        """Read-only Born probability `p0` for inner outcome 0 (`+1` eigenvalue)."""
+        h = self._require_open()
+        nid = _as_i64_scalar(node_id, "node_id")
+        eid = _as_u64_scalar(event_id, "event_id")
+        mx_c = _as_u64_words(mx, self._nw, "mx")
+        mz_c = _as_u64_words(mz, self._nw, "mz")
+        mk = _as_kappa(mkappa)
+        out_p0 = ctypes.c_double()
+        _check_rc(
+            self._lib.mbr_store_step_peek(
+                h, nid, eid, addr(mx_c), addr(mz_c), mk, ctypes.addressof(out_p0)
+            ),
+            "mbr_store_step_peek",
+        )
+        return float(out_p0.value)
+
+    def counters(self) -> dict[str, Any]:
+        """Return Section 7 diagnostic counters owned by the native store."""
+        h = self._require_open()
+        raw = np.empty(26, dtype=np.uint64)
+        _check_rc(self._lib.mbr_store_counters(h, addr(raw)), "mbr_store_counters")
+
+        n_hist = ctypes.c_size_t()
+        _check_rc(
+            self._lib.mbr_store_branches_hist(h, 0, 0, 0, ctypes.addressof(n_hist)),
+            "mbr_store_branches_hist",
+        )
+        nh = int(n_hist.value)
+        hist: dict[int, int] = {}
+        if nh > 0:
+            hk = np.empty(nh, dtype=np.uint64)
+            hc = np.empty(nh, dtype=np.uint64)
+            _check_rc(
+                self._lib.mbr_store_branches_hist(h, addr(hk), addr(hc), nh, ctypes.addressof(n_hist)),
+                "mbr_store_branches_hist",
+            )
+            for i in range(int(n_hist.value)):
+                hist[int(hk[i])] = int(hc[i])
+
+        return {
+            "store_nodes": int(raw[0]),
+            "store_bytes_estimate": int(raw[1]),
+            "store_clears": int(raw[2]),
+            "transitions_new": {
+                name: int(raw[3 + i]) for i, name in enumerate(MBR_KIND_NAMES)
+            },
+            "transitions_hit": {
+                name: int(raw[11 + i]) for i, name in enumerate(MBR_KIND_NAMES)
+            },
+            "resolve_calls": int(raw[19]),
+            "splits": int(raw[20]),
+            "subcache_hits": int(raw[21]),
+            "subcache_misses": int(raw[22]),
+            "meas_definite": int(raw[23]),
+            "meas_absorbed": int(raw[24]),
+            "meas_forked": int(raw[25]),
+            "branches_hist": hist,
+        }
 
 
 @functools.cache

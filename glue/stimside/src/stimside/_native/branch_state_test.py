@@ -45,6 +45,8 @@ _BQFE_REF_PATH = Path(
 _SCALARS = {
     "size_t": ctypes.c_size_t,
     "uint8_t": ctypes.c_uint8,
+    "uint32_t": ctypes.c_uint32,
+    "uint64_t": ctypes.c_uint64,
     "int": ctypes.c_int,
     "double": ctypes.c_double,
     "int32_t": ctypes.c_int32,
@@ -227,7 +229,7 @@ def _hpp_prototypes() -> dict[str, tuple[str, list[str]]]:
 def test_abi_specs_match_hpp_prototypes_and_symbol_isolation() -> None:
     protos = _hpp_prototypes()
     assert {n for n, _, _ in bk._SPECS} == set(protos)
-    assert len(protos) == 21
+    assert len(protos) == 41
     assert all(n.startswith("mbr_") for n in protos)
     assert not any(n.startswith("mbr_") for n, _, _ in mk._SPECS)
     assert not any(n.startswith("mbr_") for n, _, _ in me._SPECS)

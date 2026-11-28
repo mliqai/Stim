@@ -16,8 +16,10 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <new>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -917,6 +919,1634 @@ inline const MbrState* state_of(const void* handle) noexcept {
     return static_cast<const MbrState*>(handle);
 }
 
+// ---------------------------------------------------------------------------
+// WP3: Resolve step, Mobius is_clifford, choose_split, MbrStore & GF(2) absorption
+// ---------------------------------------------------------------------------
+
+constexpr uint8_t kKindT = 0U;
+constexpr uint8_t kKindCcz = 1U;
+constexpr uint8_t kKindSkip = 2U;
+constexpr uint8_t kKindCfault = 3U;
+constexpr uint8_t kKindMeas = 4U;
+constexpr uint8_t kKindPeek = 5U;
+constexpr uint8_t kKindPost = 6U;
+constexpr uint8_t kKindUreset = 7U;
+constexpr size_t kNumKinds = 8U;
+
+constexpr uint8_t kMeasDefinite = 0U;
+constexpr uint8_t kMeasAbsorbed = 1U;
+constexpr uint8_t kMeasForked = 2U;
+
+constexpr uint32_t kInvalidStateId = std::numeric_limits<uint32_t>::max();
+constexpr double kPruneRelTol = 1e-13;
+constexpr double kImpossibleProb = 1e-13;
+constexpr double kDriftTol = 1e-8;
+constexpr size_t kOver20SearchCap = 10000U;
+
+inline uint32_t clz64(uint64_t x) noexcept {
+    return static_cast<uint32_t>(__builtin_clzll(x));
+}
+
+inline MbrComplex cadd(MbrComplex a, MbrComplex b) noexcept {
+    return {a.re + b.re, a.im + b.im};
+}
+
+inline MbrComplex csub(MbrComplex a, MbrComplex b) noexcept {
+    return {a.re - b.re, a.im - b.im};
+}
+
+inline MbrComplex cconj(MbrComplex a) noexcept {
+    return {a.re, -a.im};
+}
+
+inline double cabs2(MbrComplex a) noexcept {
+    return a.re * a.re + a.im * a.im;
+}
+
+inline double cabs(MbrComplex a) noexcept {
+    return std::hypot(a.re, a.im);
+}
+
+inline bool cfinite(MbrComplex a) noexcept {
+    return std::isfinite(a.re) && std::isfinite(a.im);
+}
+
+inline uint8_t pauli_neg_kappa(uint8_t kappa) noexcept {
+    return static_cast<uint8_t>((kappa + 2U) & 3U);
+}
+
+inline bool pauli_is_identity(const uint64_t* x, const uint64_t* z, size_t nw) noexcept {
+    return !words_any_nonzero(x, nw) && !words_any_nonzero(z, nw);
+}
+
+inline bool pauli_xz_equal(
+    const uint64_t* x1, const uint64_t* z1,
+    const uint64_t* x2, const uint64_t* z2, size_t nw
+) noexcept {
+    return std::memcmp(x1, x2, nw * sizeof(uint64_t)) == 0
+        && std::memcmp(z1, z2, nw * sizeof(uint64_t)) == 0;
+}
+
+// Left-multiplying quarter-turn conjugation: R(A) P R(A)^dag = i * A * P when anti(A, P) == 1.
+inline void pauli_conj_by_qturn_inplace(
+    uint64_t* px, uint64_t* pz, uint8_t& pk,
+    const uint64_t* ax, const uint64_t* az, uint8_t ak, size_t nw
+) noexcept {
+    if (pauli_anti(ax, az, px, pz, nw) == 0U) return;
+    const uint8_t s = word_dot_parity(az, px, nw);
+    pk = static_cast<uint8_t>((ak + pk + (s << 1U) + 1U) & 3U);
+    xor_words_inplace(px, ax, nw);
+    xor_words_inplace(pz, az, nw);
+}
+
+inline void hash_combine_u64(size_t& h, uint64_t v) noexcept {
+    h ^= static_cast<size_t>(splitmix64(v + 0x9e3779b97f4a7c15ULL + static_cast<uint64_t>(h)));
+}
+
+// Arbitrary-width non-negative bitmask with canonical trimmed storage and big-endian ordering
+// matching Python `int` comparisons identically.
+struct ParityVec {
+    uint64_t w0 = 0ULL;
+    std::vector<uint64_t> extra;  // words 1.., trimmed (no trailing zeros)
+
+    inline bool is_zero() const noexcept {
+        return w0 == 0ULL && extra.empty();
+    }
+
+    inline void trim() noexcept {
+        while (!extra.empty() && extra.back() == 0ULL) {
+            extra.pop_back();
+        }
+    }
+
+    inline uint64_t word(size_t i) const noexcept {
+        if (i == 0U) return w0;
+        const size_t ei = i - 1U;
+        return (ei < extra.size()) ? extra[ei] : 0ULL;
+    }
+
+    inline size_t n_words() const noexcept {
+        return 1U + extra.size();
+    }
+
+    inline uint8_t get_bit(size_t b) const noexcept {
+        return static_cast<uint8_t>((word(b >> 6U) >> (b & 63U)) & 1ULL);
+    }
+
+    inline void xor_bit(size_t b) {
+        const size_t wi = b >> 6U;
+        const uint64_t mask = uint64_t(1) << (b & 63U);
+        if (wi == 0U) {
+            w0 ^= mask;
+            return;
+        }
+        if (wi > extra.size()) {
+            extra.resize(wi, 0ULL);
+        }
+        extra[wi - 1U] ^= mask;
+        trim();
+    }
+
+    inline void xor_with(const ParityVec& o) {
+        w0 ^= o.w0;
+        if (o.extra.size() > extra.size()) {
+            extra.resize(o.extra.size(), 0ULL);
+        }
+        for (size_t i = 0; i < o.extra.size(); ++i) {
+            extra[i] ^= o.extra[i];
+        }
+        trim();
+    }
+
+    inline size_t bit_length() const noexcept {
+        if (!extra.empty()) {
+            return 64U * extra.size() + static_cast<size_t>(64U - clz64(extra.back()));
+        }
+        if (w0 != 0ULL) {
+            return static_cast<size_t>(64U - clz64(w0));
+        }
+        return 0U;
+    }
+
+    inline size_t lowest_bit() const noexcept {
+        if (w0 != 0ULL) {
+            return static_cast<size_t>(ctz64(w0));
+        }
+        for (size_t i = 0; i < extra.size(); ++i) {
+            if (extra[i] != 0ULL) {
+                return 64U * (i + 1U) + static_cast<size_t>(ctz64(extra[i]));
+            }
+        }
+        return 0U;
+    }
+
+    inline bool operator==(const ParityVec& o) const noexcept {
+        return w0 == o.w0 && extra == o.extra;
+    }
+
+    inline bool operator!=(const ParityVec& o) const noexcept {
+        return !(*this == o);
+    }
+
+    inline bool operator<(const ParityVec& o) const noexcept {
+        if (extra.size() != o.extra.size()) return extra.size() < o.extra.size();
+        for (size_t i = extra.size(); i > 0U; --i) {
+            if (extra[i - 1U] != o.extra[i - 1U]) return extra[i - 1U] < o.extra[i - 1U];
+        }
+        return w0 < o.w0;
+    }
+};
+
+struct ParityVecHash {
+    inline size_t operator()(const ParityVec& p) const noexcept {
+        size_t h = static_cast<size_t>(splitmix64(p.w0));
+        for (uint64_t w : p.extra) {
+            hash_combine_u64(h, w);
+        }
+        return h;
+    }
+};
+
+inline ParityVec parity_from_words(const uint64_t* words, size_t nw) {
+    ParityVec p;
+    if (nw == 0U) return p;
+    p.w0 = words[0];
+    if (nw > 1U) {
+        size_t last = nw;
+        while (last > 1U && words[last - 1U] == 0ULL) --last;
+        if (last > 1U) {
+            p.extra.assign(words + 1U, words + last);
+        }
+    }
+    return p;
+}
+
+inline std::string serialize_parity_set(const std::vector<ParityVec>& O) {
+    size_t total_words = 0U;
+    for (const ParityVec& p : O) total_words += p.n_words();
+    std::string out(4U + O.size() * 4U + total_words * 8U, '\0');
+    uint8_t* dst = reinterpret_cast<uint8_t*>(&out[0]);
+    write_u32_le(dst, static_cast<uint32_t>(O.size()));
+    dst += 4U;
+    for (const ParityVec& p : O) {
+        const size_t nw = p.n_words();
+        write_u32_le(dst, static_cast<uint32_t>(nw));
+        dst += 4U;
+        write_u64_le(dst, p.w0);
+        dst += 8U;
+        for (uint64_t w : p.extra) {
+            write_u64_le(dst, w);
+            dst += 8U;
+        }
+    }
+    return out;
+}
+
+// Precondition: O is sorted ascending (big-endian ParityVec order), deduplicated, nonzero.
+inline bool is_clifford_sorted(const std::vector<ParityVec>& O) {
+    if (O.empty()) return true;
+    if (O.size() < 15U) return false;
+    const size_t r_eff = O.back().bit_length();
+    if (r_eff > 20U) return false;
+
+    const size_t nw_f = (r_eff <= 6U) ? 1U : (size_t(1) << (r_eff - 6U));
+    uint64_t f_stack[16] = {};
+    std::vector<uint64_t> f_heap;
+    uint64_t* F = f_stack;
+    if (nw_f > 16U) {
+        f_heap.assign(nw_f, 0ULL);
+        F = f_heap.data();
+    }
+    for (const ParityVec& x : O) {
+        const uint32_t idx = static_cast<uint32_t>(x.w0);
+        F[idx >> 6U] |= (uint64_t(1) << (idx & 63U));
+    }
+
+    static constexpr uint64_t kIntraMask[6] = {
+        0x5555555555555555ULL,
+        0x3333333333333333ULL,
+        0x0F0F0F0F0F0F0F0FULL,
+        0x00FF00FF00FF00FFULL,
+        0x0000FFFF0000FFFFULL,
+        0x00000000FFFFFFFFULL,
+    };
+    const size_t intra_end = std::min<size_t>(r_eff, 6U);
+    for (size_t j = 0; j < intra_end; ++j) {
+        const uint32_t shift = uint32_t(1) << j;
+        const uint64_t mask = kIntraMask[j];
+        for (size_t w = 0; w < nw_f; ++w) {
+            F[w] ^= (F[w] >> shift) & mask;
+        }
+    }
+    for (size_t j = 6U; j < r_eff; ++j) {
+        const size_t step = size_t(1) << (j - 6U);
+        const size_t stride = step << 1U;
+        for (size_t base = 0; base < nw_f; base += stride) {
+            for (size_t k = 0; k < step; ++k) {
+                F[base + k] ^= F[base + k + step];
+            }
+        }
+    }
+
+    auto test_bit = [F](uint32_t idx) noexcept -> bool {
+        return ((F[idx >> 6U] >> (idx & 63U)) & 1ULL) != 0ULL;
+    };
+    for (size_t a = 0; a < r_eff; ++a) {
+        const uint32_t ba = uint32_t(1) << a;
+        if (test_bit(ba)) return false;
+        for (size_t b = a + 1U; b < r_eff; ++b) {
+            const uint32_t bab = ba | (uint32_t(1) << b);
+            if (test_bit(bab)) return false;
+            for (size_t c = b + 1U; c < r_eff; ++c) {
+                if (test_bit(bab | (uint32_t(1) << c))) return false;
+            }
+        }
+    }
+    return true;
+}
+
+inline std::vector<ParityVec> quotient_parity_set(
+    const std::vector<ParityVec>& O, const ParityVec& lam
+) {
+    const size_t low = lam.lowest_bit();
+    std::vector<ParityVec> tmp;
+    tmp.reserve(O.size());
+    for (const ParityVec& x : O) {
+        ParityVec y = x;
+        if (y.get_bit(low) != 0U) {
+            y.xor_with(lam);
+        }
+        if (!y.is_zero()) {
+            tmp.push_back(std::move(y));
+        }
+    }
+    std::sort(tmp.begin(), tmp.end());
+    std::vector<ParityVec> out;
+    out.reserve(tmp.size());
+    size_t i = 0U;
+    while (i < tmp.size()) {
+        size_t j = i + 1U;
+        while (j < tmp.size() && tmp[j] == tmp[i]) ++j;
+        if (((j - i) & 1U) != 0U) {
+            out.push_back(std::move(tmp[i]));
+        }
+        i = j;
+    }
+    return out;
+}
+
+struct SplitEntry {
+    ParityVec lam;
+    int32_t depth = 0;
+};
+
+inline bool split_chain_dfs(
+    const std::vector<ParityVec>& O,
+    uint32_t depth,
+    size_t& budget,
+    std::unordered_map<std::string, uint32_t>& max_failed,
+    ParityVec* out_first_lam
+) {
+    if (is_clifford_sorted(O)) return true;
+    if (depth == 0U || budget == 0U) return false;
+    --budget;
+    const std::string key = serialize_parity_set(O);
+    auto it = max_failed.find(key);
+    if (it != max_failed.end() && it->second >= depth) return false;
+
+    const ParityVec& x0 = O[0];
+    const size_t m = O.size();
+    for (size_t idx = 0; idx < m; ++idx) {
+        ParityVec lam = x0;
+        if (idx > 0U) {
+            lam.xor_with(O[idx]);
+        }
+        std::vector<ParityVec> qO = quotient_parity_set(O, lam);
+        if (split_chain_dfs(qO, depth - 1U, budget, max_failed, nullptr)) {
+            if (out_first_lam != nullptr) *out_first_lam = std::move(lam);
+            return true;
+        }
+        if (budget == 0U) return false;
+    }
+    max_failed[key] = depth;
+    return false;
+}
+
+// Precondition: O is non-empty, sorted ascending, deduplicated, nonzero, and !is_clifford_sorted(O).
+inline SplitEntry choose_split_sorted(
+    const std::vector<ParityVec>& O,
+    uint32_t max_depth,
+    std::unordered_map<std::string, SplitEntry>* cache,
+    uint64_t* subcache_hits,
+    uint64_t* subcache_misses,
+    uint64_t* bytes_estimate
+) {
+    std::string cache_key;
+    if (cache != nullptr) {
+        cache_key = serialize_parity_set(O);
+        auto it = cache->find(cache_key);
+        if (it != cache->end()) {
+            if (subcache_hits != nullptr) *subcache_hits += 1U;
+            return it->second;
+        }
+        if (subcache_misses != nullptr) *subcache_misses += 1U;
+    }
+
+    const bool over_20 = (O.back().bit_length() > 20U);
+    size_t budget = over_20 ? kOver20SearchCap : std::numeric_limits<size_t>::max();
+    std::unordered_map<std::string, uint32_t> max_failed;
+    SplitEntry res{O[0], 0};
+    for (uint32_t d = 1U; d <= max_depth; ++d) {
+        ParityVec chosen;
+        if (split_chain_dfs(O, d, budget, max_failed, &chosen)) {
+            res.lam = std::move(chosen);
+            res.depth = static_cast<int32_t>(d);
+            break;
+        }
+        if (budget == 0U) break;
+    }
+
+    if (cache != nullptr) {
+        const size_t entry_bytes = 64U + cache_key.capacity()
+            + sizeof(SplitEntry) + res.lam.extra.capacity() * sizeof(uint64_t);
+        cache->emplace(std::move(cache_key), res);
+        if (bytes_estimate != nullptr) *bytes_estimate += entry_bytes;
+    }
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// MbrStore: sequential-ID path trie, canonical state pool, 5 sub-caches, counters
+// ---------------------------------------------------------------------------
+
+struct MbrBranch {
+    MbrComplex w{1.0, 0.0};
+    uint32_t state_id = 0U;
+};
+
+struct MbrPending {
+    std::vector<uint64_t> x;
+    std::vector<uint64_t> z;
+    uint8_t kappa = 0U;  // normalized to sign +1
+    uint8_t e = 0U;      // in {1..7}
+};
+
+struct MbrNode {
+    std::vector<MbrBranch> branches;  // sorted by state_pool[state_id].key
+    std::vector<MbrPending> pend;     // insertion/update order matching mfe.py
+    uint32_t transient_peak = 1U;
+};
+
+struct StateEntry {
+    MbrState state;
+    std::string key;
+};
+
+struct TransKey {
+    int64_t node_id = 0;
+    uint64_t event_id = 0U;
+    uint32_t sign_bits = 0U;
+    uint8_t kind = 0U;
+
+    inline bool operator==(const TransKey& o) const noexcept {
+        return node_id == o.node_id && event_id == o.event_id
+            && sign_bits == o.sign_bits && kind == o.kind;
+    }
+};
+
+struct TransKeyHash {
+    inline size_t operator()(const TransKey& k) const noexcept {
+        size_t h = static_cast<size_t>(splitmix64(static_cast<uint64_t>(k.node_id)));
+        hash_combine_u64(h, k.event_id);
+        hash_combine_u64(h, (static_cast<uint64_t>(k.sign_bits) << 8U) | k.kind);
+        return h;
+    }
+};
+
+struct MeasKey {
+    int64_t node_id = 0;
+    uint64_t event_id = 0U;
+    uint8_t kind = 0U;
+
+    inline bool operator==(const MeasKey& o) const noexcept {
+        return node_id == o.node_id && event_id == o.event_id && kind == o.kind;
+    }
+};
+
+struct MeasKeyHash {
+    inline size_t operator()(const MeasKey& k) const noexcept {
+        size_t h = static_cast<size_t>(splitmix64(static_cast<uint64_t>(k.node_id)));
+        hash_combine_u64(h, k.event_id);
+        hash_combine_u64(h, k.kind);
+        return h;
+    }
+};
+
+struct MeasEntry {
+    double p0 = 0.0;
+    int64_t child0 = -1;
+    int64_t child1 = -1;
+    uint8_t meas_type = kMeasDefinite;
+    std::vector<uint64_t> absorb_x;
+    std::vector<uint64_t> absorb_z;
+};
+
+struct PeekKey {
+    int64_t node_id = 0;
+    uint64_t event_id = 0U;
+
+    inline bool operator==(const PeekKey& o) const noexcept {
+        return node_id == o.node_id && event_id == o.event_id;
+    }
+};
+
+struct PeekKeyHash {
+    inline size_t operator()(const PeekKey& k) const noexcept {
+        size_t h = static_cast<size_t>(splitmix64(static_cast<uint64_t>(k.node_id)));
+        hash_combine_u64(h, k.event_id);
+        return h;
+    }
+};
+
+struct StateStrKey {
+    uint32_t state_id = 0U;
+    std::string aux;
+
+    inline bool operator==(const StateStrKey& o) const noexcept {
+        return state_id == o.state_id && aux == o.aux;
+    }
+};
+
+struct StateStrKeyHash {
+    inline size_t operator()(const StateStrKey& k) const noexcept {
+        size_t h = static_cast<size_t>(splitmix64(k.state_id));
+        hash_combine_u64(h, std::hash<std::string>{}(k.aux));
+        return h;
+    }
+};
+
+struct ProjEntry {
+    MbrComplex f{0.0, 0.0};
+    uint32_t state_id = kInvalidStateId;
+    bool valid = false;
+};
+
+struct MbrStore {
+    size_t n_qubits = 0U;
+    size_t nw = 0U;
+    size_t max_components = 0U;  // 0 = unlimited
+
+    std::vector<StateEntry> state_pool;
+    std::unordered_map<std::string, uint32_t> state_intern;
+    std::vector<MbrNode> nodes;
+    std::map<uint64_t, uint64_t> node_branches_hist;
+
+    std::unordered_map<TransKey, int64_t, TransKeyHash> trans;
+    std::unordered_map<MeasKey, MeasEntry, MeasKeyHash> meas;
+    std::unordered_map<PeekKey, double, PeekKeyHash> peek;
+
+    // Five exact-key sub-caches
+    std::unordered_map<StateStrKey, std::vector<MbrBranch>, StateStrKeyHash> resolve_cache;
+    std::unordered_map<StateStrKey, ProjEntry, StateStrKeyHash> project_cache;
+    std::unordered_map<uint64_t, MbrComplex> overlap_cache;
+    std::unordered_map<StateStrKey, int8_t, StateStrKeyHash> definite_cache;
+    std::unordered_map<std::string, SplitEntry> split_cache;
+
+    // Cumulative counters (preserved across clear())
+    uint64_t store_clears = 0U;
+    uint64_t transitions_new[kNumKinds] = {};
+    uint64_t transitions_hit[kNumKinds] = {};
+    uint64_t resolve_calls = 0U;
+    uint64_t splits = 0U;
+    uint64_t subcache_hits = 0U;
+    uint64_t subcache_misses = 0U;
+    uint64_t meas_definite = 0U;
+    uint64_t meas_absorbed = 0U;
+    uint64_t meas_forked = 0U;
+
+    // Current heap estimate (recomputed on clear())
+    uint64_t bytes_estimate = 0U;
+
+    inline uint64_t state_bytes(const MbrState& s, const std::string& key) const noexcept {
+        return sizeof(StateEntry)
+            + s.h.capacity() * sizeof(uint64_t)
+            + s.A.capacity() * sizeof(uint64_t)
+            + s.ell.capacity() * sizeof(uint8_t)
+            + s.Gamma.capacity() * sizeof(uint8_t)
+            + s.piv.capacity() * sizeof(int32_t)
+            + key.capacity();
+    }
+
+    inline uint64_t node_bytes(const MbrNode& nd) const noexcept {
+        uint64_t b = sizeof(MbrNode)
+            + nd.branches.capacity() * sizeof(MbrBranch)
+            + nd.pend.capacity() * sizeof(MbrPending);
+        for (const MbrPending& p : nd.pend) {
+            b += (p.x.capacity() + p.z.capacity()) * sizeof(uint64_t);
+        }
+        return b;
+    }
+
+    inline uint32_t intern_canonical(MbrState&& st) {
+        std::string key = serialize_canonical_str(st);
+        auto it = state_intern.find(key);
+        if (it != state_intern.end()) return it->second;
+        const uint32_t id = static_cast<uint32_t>(state_pool.size());
+        const uint64_t add_bytes = state_bytes(st, key) + 64U + key.capacity();
+        state_intern.emplace(key, id);
+        state_pool.push_back({std::move(st), std::move(key)});
+        bytes_estimate += add_bytes;
+        return id;
+    }
+
+    inline int64_t push_node(
+        std::vector<MbrBranch> branches,
+        std::vector<MbrPending> pend,
+        uint32_t transient_peak
+    ) {
+        const uint32_t nb = static_cast<uint32_t>(branches.size());
+        if (transient_peak < nb) transient_peak = nb;
+        const int64_t nid = static_cast<int64_t>(nodes.size());
+        MbrNode nd{std::move(branches), std::move(pend), transient_peak};
+        bytes_estimate += node_bytes(nd);
+        nodes.push_back(std::move(nd));
+        node_branches_hist[static_cast<uint64_t>(nb)] += 1U;
+        return nid;
+    }
+
+    inline void seed_root() {
+        state_pool.clear();
+        state_intern.clear();
+        nodes.clear();
+        node_branches_hist.clear();
+        trans.clear();
+        meas.clear();
+        peek.clear();
+        resolve_cache.clear();
+        project_cache.clear();
+        overlap_cache.clear();
+        definite_cache.clear();
+        split_cache.clear();
+        bytes_estimate = sizeof(MbrStore);
+        const uint32_t z0 = intern_canonical(make_zero(n_qubits));
+        push_node({{MbrComplex{1.0, 0.0}, z0}}, {}, 1U);
+    }
+
+    inline std::string serialize_pauli_key(
+        const uint64_t* x, const uint64_t* z, uint8_t kappa
+    ) const {
+        std::string out(nw * 16U + 1U, '\0');
+        uint8_t* p = reinterpret_cast<uint8_t*>(&out[0]);
+        for (size_t w = 0; w < nw; ++w) {
+            write_u64_le(p, x[w]);
+            p += 8U;
+        }
+        for (size_t w = 0; w < nw; ++w) {
+            write_u64_le(p, z[w]);
+            p += 8U;
+        }
+        *p = static_cast<uint8_t>(kappa & 3U);
+        return out;
+    }
+
+    inline std::string serialize_pauli_m_key(
+        const uint64_t* x, const uint64_t* z, uint8_t kappa, uint8_t m
+    ) const {
+        std::string out(nw * 16U + 2U, '\0');
+        uint8_t* p = reinterpret_cast<uint8_t*>(&out[0]);
+        for (size_t w = 0; w < nw; ++w) {
+            write_u64_le(p, x[w]);
+            p += 8U;
+        }
+        for (size_t w = 0; w < nw; ++w) {
+            write_u64_le(p, z[w]);
+            p += 8U;
+        }
+        p[0] = static_cast<uint8_t>(kappa & 3U);
+        p[1] = static_cast<uint8_t>(m & 1U);
+        return out;
+    }
+
+    inline std::string serialize_pending_key(const std::vector<MbrPending>& pend) const {
+        std::string out(4U + pend.size() * (nw * 16U + 2U), '\0');
+        uint8_t* p = reinterpret_cast<uint8_t*>(&out[0]);
+        write_u32_le(p, static_cast<uint32_t>(pend.size()));
+        p += 4U;
+        for (const MbrPending& it : pend) {
+            for (size_t w = 0; w < nw; ++w) {
+                write_u64_le(p, it.x[w]);
+                p += 8U;
+            }
+            for (size_t w = 0; w < nw; ++w) {
+                write_u64_le(p, it.z[w]);
+                p += 8U;
+            }
+            p[0] = static_cast<uint8_t>(it.kappa & 3U);
+            p[1] = static_cast<uint8_t>(it.e & 7U);
+            p += 2U;
+        }
+        return out;
+    }
+
+    inline int8_t cached_definite(
+        uint32_t state_id, const uint64_t* x, const uint64_t* z, uint8_t kappa
+    ) {
+        StateStrKey key{state_id, serialize_pauli_key(x, z, kappa)};
+        auto it = definite_cache.find(key);
+        if (it != definite_cache.end()) {
+            subcache_hits += 1U;
+            return it->second;
+        }
+        subcache_misses += 1U;
+        const int8_t ev = definite(state_pool[state_id].state, x, z, static_cast<uint8_t>(kappa & 3U));
+        const uint64_t add_bytes = 64U + key.aux.capacity();
+        definite_cache.emplace(std::move(key), ev);
+        bytes_estimate += add_bytes;
+        return ev;
+    }
+
+    inline ProjEntry cached_project(
+        uint32_t state_id, const uint64_t* x, const uint64_t* z, uint8_t kappa, uint8_t m
+    ) {
+        StateStrKey key{state_id, serialize_pauli_m_key(x, z, kappa, m)};
+        auto it = project_cache.find(key);
+        if (it != project_cache.end()) {
+            subcache_hits += 1U;
+            return it->second;
+        }
+        subcache_misses += 1U;
+        MbrState qc = state_pool[state_id].state;
+        const MbrComplex f = apply_project(qc, x, z, static_cast<uint8_t>(kappa & 3U), m);
+        ProjEntry entry;
+        if (f.re != 0.0 || f.im != 0.0) {
+            const MbrComplex fc = cmul(f, canon(qc));
+            const uint32_t cid = intern_canonical(std::move(qc));
+            entry = {fc, cid, true};
+        }
+        const uint64_t add_bytes = 64U + key.aux.capacity() + sizeof(ProjEntry);
+        project_cache.emplace(std::move(key), entry);
+        bytes_estimate += add_bytes;
+        return entry;
+    }
+
+    inline MbrComplex cached_overlap(uint32_t id_a, uint32_t id_b) {
+        if (id_a == id_b) return {1.0, 0.0};
+        const StateEntry& ea = state_pool[id_a];
+        const StateEntry& eb = state_pool[id_b];
+        // Both states in state_pool are canonical, so equal d & A with distinct h guarantees
+        // disjoint affine cosets without needing cache lookup or generator projection.
+        if (ea.state.d == eb.state.d && ea.state.A == eb.state.A && ea.state.h != eb.state.h) {
+            return {0.0, 0.0};
+        }
+        bool swapped = false;
+        uint32_t lo = id_a;
+        uint32_t hi = id_b;
+        if (eb.key < ea.key) {
+            lo = id_b;
+            hi = id_a;
+            swapped = true;
+        }
+        const uint64_t okey = (static_cast<uint64_t>(lo) << 32U) | static_cast<uint64_t>(hi);
+        auto it = overlap_cache.find(okey);
+        if (it != overlap_cache.end()) {
+            subcache_hits += 1U;
+            return swapped ? cconj(it->second) : it->second;
+        }
+        subcache_misses += 1U;
+        const MbrComplex ov = overlap(state_pool[lo].state, state_pool[hi].state);
+        overlap_cache.emplace(okey, ov);
+        bytes_estimate += 64U + sizeof(MbrComplex);
+        return swapped ? cconj(ov) : ov;
+    }
+};
+
+std::atomic<size_t> g_live_stores{0};
+
+inline MbrStore* store_of(void* handle) noexcept {
+    return static_cast<MbrStore*>(handle);
+}
+
+inline const MbrStore* store_of(const void* handle) noexcept {
+    return static_cast<const MbrStore*>(handle);
+}
+
+// Merge branches by state_id, prune at K1 threshold 1e-13 * min(1.0, w_max), and sort by
+// canonical byte key (unsigned-byte lexicographic order, NEVER by state_id).
+inline int32_t merge_and_sort_branches(
+    const MbrStore& store,
+    const std::vector<MbrBranch>& raw,
+    std::vector<MbrBranch>& out
+) {
+    out.clear();
+    if (raw.empty()) return kOk;
+    double w_max = 0.0;
+    for (const MbrBranch& b : raw) {
+        if (!cfinite(b.w)) return kErrFloatDrift;
+        const double mag = cabs(b.w);
+        if (mag > w_max) w_max = mag;
+    }
+    const double thresh = kPruneRelTol * std::min(1.0, w_max);
+    std::unordered_map<uint32_t, MbrComplex> groups;
+    groups.reserve(raw.size());
+    for (const MbrBranch& b : raw) {
+        auto it = groups.find(b.state_id);
+        if (it == groups.end()) {
+            groups.emplace(b.state_id, b.w);
+        } else {
+            it->second = cadd(it->second, b.w);
+        }
+    }
+    out.reserve(groups.size());
+    for (const auto& kv : groups) {
+        if (!cfinite(kv.second)) return kErrFloatDrift;
+        if (cabs(kv.second) > thresh) {
+            out.push_back({kv.second, kv.first});
+        }
+    }
+    std::sort(out.begin(), out.end(), [&store](const MbrBranch& a, const MbrBranch& b) {
+        return store.state_pool[a.state_id].key < store.state_pool[b.state_id].key;
+    });
+    return kOk;
+}
+
+inline int32_t first_slot_in_3nw(const uint64_t* v, size_t n, size_t nw) noexcept {
+    for (size_t seg = 0; seg < 3U; ++seg) {
+        const uint64_t* s = v + seg * nw;
+        for (size_t w = 0; w < nw; ++w) {
+            if (s[w] != 0ULL) {
+                return static_cast<int32_t>(seg * n + (w << 6U) + static_cast<size_t>(ctz64(s[w])));
+            }
+        }
+    }
+    return -1;
+}
+
+inline MbrComplex apply_spow(MbrState& s, const MbrPauli& B, uint8_t k) {
+    switch (k & 3U) {
+        case 0U:
+            return {1.0, 0.0};
+        case 1U:
+            return cmul(
+                omega_pow(1U),
+                apply_qturn(s, B.x.data(), B.z.data(), pauli_neg_kappa(B.kappa))
+            );
+        case 2U:
+            return apply_pauli(s, B.x.data(), B.z.data(), B.kappa);
+        default:
+            return cmul(
+                omega_pow(7U),
+                apply_qturn(s, B.x.data(), B.z.data(), B.kappa)
+            );
+    }
+}
+
+// Resolve a single canonical stabilizer state against `pend` (preserving input `pend` order).
+// Never inserts aborted subtrees into `store.resolve_cache`.
+inline int32_t resolve_one(
+    MbrStore& store,
+    uint32_t state_id,
+    const std::vector<MbrPending>& pend,
+    const std::string& pk,
+    size_t leaf_limit,
+    std::vector<MbrBranch>& out_branches,
+    size_t& out_peak
+) {
+    const size_t n = store.n_qubits;
+    const size_t nw = store.nw;
+
+    std::vector<uint64_t> gx, gz;
+    std::vector<uint8_t> gk;
+    generators(store.state_pool[state_id].state, gx, gz, gk);
+
+    std::vector<uint64_t> GX(n * nw, 0ULL);
+    std::vector<uint64_t> GZ(n * nw, 0ULL);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t iw = i >> 6U;
+        const uint64_t ibit = uint64_t(1) << (i & 63U);
+        const uint64_t* gxi = &gx[i * nw];
+        const uint64_t* gzi = &gz[i * nw];
+        for (size_t w = 0; w < nw; ++w) {
+            uint64_t m = gxi[w];
+            while (m != 0ULL) {
+                const size_t qb = (w << 6U) + static_cast<size_t>(ctz64(m));
+                GX[qb * nw + iw] |= ibit;
+                m &= (m - 1ULL);
+            }
+            m = gzi[w];
+            while (m != 0ULL) {
+                const size_t qb = (w << 6U) + static_cast<size_t>(ctz64(m));
+                GZ[qb * nw + iw] |= ibit;
+                m &= (m - 1ULL);
+            }
+        }
+    }
+
+    struct BasisRow {
+        std::vector<uint64_t> v;  // 3 * nw
+        MbrPauli R;
+        int32_t var_idx = -1;
+        uint8_t val = 0U;
+    };
+    std::vector<int32_t> basis_at(3U * n, -1);
+    std::vector<BasisRow> basis_rows;
+    basis_rows.reserve(pend.size());
+    std::vector<MbrPauli> indef;
+    std::unordered_map<ParityVec, uint8_t, ParityVecHash> coef;
+    uint8_t const_ph = 0U;
+
+    std::vector<uint64_t> v(3U * nw, 0ULL);
+    for (const MbrPending& item : pend) {
+        std::fill(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(nw), 0ULL);
+        for (size_t w = 0; w < nw; ++w) {
+            uint64_t m = item.x[w];
+            while (m != 0ULL) {
+                const size_t qb = (w << 6U) + static_cast<size_t>(ctz64(m));
+                xor_words_inplace(v.data(), &GZ[qb * nw], nw);
+                m &= (m - 1ULL);
+            }
+            m = item.z[w];
+            while (m != 0ULL) {
+                const size_t qb = (w << 6U) + static_cast<size_t>(ctz64(m));
+                xor_words_inplace(v.data(), &GX[qb * nw], nw);
+                m &= (m - 1ULL);
+            }
+        }
+        std::memcpy(&v[nw], item.x.data(), nw * sizeof(uint64_t));
+        std::memcpy(&v[2U * nw], item.z.data(), nw * sizeof(uint64_t));
+
+        MbrPauli R{item.x, item.z, item.kappa};
+        ParityVec xx;
+        uint8_t kap = 0U;
+        while (true) {
+            const int32_t slot = first_slot_in_3nw(v.data(), n, nw);
+            if (slot < 0) break;
+            const int32_t bi = basis_at[static_cast<size_t>(slot)];
+            if (bi < 0) break;
+            const BasisRow& hit = basis_rows[static_cast<size_t>(bi)];
+            xor_words_inplace(v.data(), hit.v.data(), 3U * nw);
+            pauli_mul_inplace(
+                R.x.data(), R.z.data(), R.kappa,
+                hit.R.x.data(), hit.R.z.data(), hit.R.kappa, nw
+            );
+            if (hit.var_idx < 0) {
+                kap ^= hit.val;
+            } else {
+                xx.xor_bit(static_cast<size_t>(hit.var_idx));
+            }
+        }
+        const int32_t slot = first_slot_in_3nw(v.data(), n, nw);
+        if (slot >= 0) {
+            if (static_cast<size_t>(slot) < n) {
+                const int32_t r_idx = static_cast<int32_t>(indef.size());
+                basis_at[static_cast<size_t>(slot)] = static_cast<int32_t>(basis_rows.size());
+                basis_rows.push_back({v, R, r_idx, 0U});
+                xx.xor_bit(static_cast<size_t>(r_idx));
+                indef.push_back(std::move(R));
+            } else {
+                const int8_t ev = store.cached_definite(state_id, R.x.data(), R.z.data(), R.kappa);
+                if (ev == 0) return kErrInvalidArg;
+                const uint8_t val = (ev < 0) ? 1U : 0U;
+                basis_at[static_cast<size_t>(slot)] = static_cast<int32_t>(basis_rows.size());
+                basis_rows.push_back({v, std::move(R), -1, val});
+                kap ^= val;
+            }
+        } else {
+            if (!pauli_is_identity(R.x.data(), R.z.data(), nw) || ((R.kappa & 1U) != 0U)) {
+                return kErrInvalidArg;
+            }
+            kap ^= static_cast<uint8_t>((R.kappa >> 1U) & 1U);
+        }
+        const uint8_t e = static_cast<uint8_t>(item.e & 7U);
+        const_ph = static_cast<uint8_t>((const_ph + (kap ? e : 0U)) & 7U);
+        if (!xx.is_zero()) {
+            const uint8_t delta = kap ? static_cast<uint8_t>((8U - e) & 7U) : e;
+            uint8_t& c = coef[xx];
+            c = static_cast<uint8_t>((c + delta) & 7U);
+        }
+    }
+
+    std::vector<ParityVec> O;
+    O.reserve(coef.size());
+    for (const auto& kv : coef) {
+        if ((kv.second & 1U) != 0U) {
+            O.push_back(kv.first);
+        }
+    }
+    std::sort(O.begin(), O.end());
+
+    if (!is_clifford_sorted(O)) {
+        store.splits += 1U;
+        const SplitEntry sp = choose_split_sorted(
+            O, 5U, &store.split_cache,
+            &store.subcache_hits, &store.subcache_misses, &store.bytes_estimate
+        );
+        MbrPauli A;
+        bool has_A = false;
+        for (size_t j = 0; j < indef.size(); ++j) {
+            if (sp.lam.get_bit(j) != 0U) {
+                if (!has_A) {
+                    A = indef[j];
+                    has_A = true;
+                } else {
+                    pauli_mul_inplace(
+                        A.x.data(), A.z.data(), A.kappa,
+                        indef[j].x.data(), indef[j].z.data(), indef[j].kappa, nw
+                    );
+                }
+            }
+        }
+        if (!has_A) return kErrInvalidArg;
+
+        std::vector<MbrBranch> res;
+        size_t peak = 0U;
+        for (uint8_t mm = 0U; mm < 2U; ++mm) {
+            if (leaf_limit > 0U && res.size() >= leaf_limit) return kErrBudget;
+            MbrState qc = store.state_pool[state_id].state;
+            MbrComplex f = apply_project(qc, A.x.data(), A.z.data(), A.kappa, mm);
+            if (std::fabs(cabs(f) * kSqrt2 - 1.0) >= 1e-9) {
+                return kErrFloatDrift;
+            }
+            f = cmul(f, canon(qc));
+            const uint32_t qc_id = store.intern_canonical(std::move(qc));
+            StateStrKey rkey{qc_id, pk};
+            auto it = store.resolve_cache.find(rkey);
+            if (it != store.resolve_cache.end()) {
+                store.subcache_hits += 1U;
+                const std::vector<MbrBranch>& sub = it->second;
+                if (leaf_limit > 0U && res.size() + sub.size() > leaf_limit) {
+                    return kErrBudget;
+                }
+                for (const MbrBranch& b : sub) {
+                    res.push_back({cmul(f, b.w), b.state_id});
+                }
+                if (sub.size() > peak) peak = sub.size();
+            } else {
+                store.subcache_misses += 1U;
+                const size_t rem = (leaf_limit == 0U) ? 0U : (leaf_limit - res.size());
+                std::vector<MbrBranch> sub;
+                size_t sub_peak = 0U;
+                const int32_t rc = resolve_one(store, qc_id, pend, pk, rem, sub, sub_peak);
+                if (rc != kOk) return rc;
+                if (leaf_limit > 0U && res.size() + sub.size() > leaf_limit) {
+                    return kErrBudget;
+                }
+                const uint64_t add_bytes = 64U + rkey.aux.capacity()
+                    + sub.capacity() * sizeof(MbrBranch);
+                auto ins = store.resolve_cache.emplace(std::move(rkey), std::move(sub));
+                store.bytes_estimate += add_bytes;
+                const std::vector<MbrBranch>& cached_sub = ins.first->second;
+                for (const MbrBranch& b : cached_sub) {
+                    res.push_back({cmul(f, b.w), b.state_id});
+                }
+                if (sub_peak > peak) peak = sub_peak;
+            }
+        }
+        if (res.size() > peak) peak = res.size();
+        out_branches = std::move(res);
+        out_peak = peak;
+        return kOk;
+    }
+
+    // Clifford base case
+    const size_t r = indef.size();
+    std::vector<uint8_t> mu1(r, 0U);
+    std::map<std::pair<size_t, size_t>, uint8_t> mu2;
+    std::vector<size_t> bits;
+    for (const auto& kv : coef) {
+        const uint8_t c = static_cast<uint8_t>(kv.second & 7U);
+        if (c == 0U) continue;
+        bits.clear();
+        const ParityVec& xv = kv.first;
+        const size_t nw_x = xv.n_words();
+        for (size_t wi = 0; wi < nw_x; ++wi) {
+            uint64_t m = xv.word(wi);
+            while (m != 0ULL) {
+                bits.push_back((wi << 6U) + static_cast<size_t>(ctz64(m)));
+                m &= (m - 1ULL);
+            }
+        }
+        for (size_t j : bits) {
+            mu1[j] = static_cast<uint8_t>((mu1[j] + c) & 7U);
+        }
+        for (size_t a = 0; a < bits.size(); ++a) {
+            for (size_t b = a + 1U; b < bits.size(); ++b) {
+                uint8_t& m2 = mu2[{bits[a], bits[b]}];
+                m2 = static_cast<uint8_t>((m2 + 6U * c) & 7U);
+            }
+        }
+    }
+
+    MbrState st = store.state_pool[state_id].state;
+    MbrComplex f = omega_pow(const_ph);
+    for (size_t j = 0; j < r; ++j) {
+        if ((mu1[j] & 1U) != 0U) return kErrFloatDrift;
+        if (mu1[j] != 0U) {
+            f = cmul(f, apply_spow(st, indef[j], static_cast<uint8_t>(mu1[j] >> 1U)));
+        }
+    }
+    for (const auto& kv : mu2) {
+        if ((kv.second & 3U) != 0U) return kErrFloatDrift;
+        if (kv.second != 0U) {
+            const MbrPauli& pi = indef[kv.first.first];
+            const MbrPauli& pj = indef[kv.first.second];
+            MbrPauli pij = pi;
+            pauli_mul_inplace(
+                pij.x.data(), pij.z.data(), pij.kappa,
+                pj.x.data(), pj.z.data(), pj.kappa, nw
+            );
+            f = cmul(f, apply_spow(st, pi, 1U));
+            f = cmul(f, apply_spow(st, pj, 1U));
+            f = cmul(f, apply_spow(st, pij, 3U));
+        }
+    }
+    f = cmul(f, canon(st));
+    const uint32_t out_id = store.intern_canonical(std::move(st));
+    out_branches.clear();
+    out_branches.push_back({f, out_id});
+    out_peak = 1U;
+    return kOk;
+}
+
+inline int32_t resolve_branches(
+    MbrStore& store,
+    const std::vector<MbrBranch>& in_branches,
+    const std::vector<MbrPending>& in_pend,
+    std::vector<MbrBranch>& out_merged,
+    uint32_t& out_peak
+) {
+    if (in_pend.empty()) {
+        std::vector<MbrBranch>(in_branches).swap(out_merged);
+        out_peak = static_cast<uint32_t>(in_branches.size());
+        return kOk;
+    }
+    store.resolve_calls += 1U;
+    const std::string pk = store.serialize_pending_key(in_pend);
+
+    size_t leaf_limit = 0U;
+    if (store.max_components > 0U) {
+        if (in_branches.size() <= 1U) {
+            leaf_limit = store.max_components;
+        } else {
+            leaf_limit = std::min<size_t>(
+                std::numeric_limits<size_t>::max() / 4U, store.max_components
+            ) * 4U;
+        }
+    }
+
+    std::vector<MbrBranch> raw_out;
+    size_t peak = in_branches.size();
+    for (const MbrBranch& br : in_branches) {
+        StateStrKey rkey{br.state_id, pk};
+        auto it = store.resolve_cache.find(rkey);
+        if (it != store.resolve_cache.end()) {
+            store.subcache_hits += 1U;
+            const std::vector<MbrBranch>& sub = it->second;
+            for (const MbrBranch& sb : sub) {
+                raw_out.push_back({cmul(br.w, sb.w), sb.state_id});
+            }
+            if (sub.size() > peak) peak = sub.size();
+        } else {
+            store.subcache_misses += 1U;
+            std::vector<MbrBranch> sub;
+            size_t sub_peak = 0U;
+            const int32_t rc = resolve_one(store, br.state_id, in_pend, pk, leaf_limit, sub, sub_peak);
+            if (rc != kOk) return rc;
+            const uint64_t add_bytes = 64U + rkey.aux.capacity()
+                + sub.capacity() * sizeof(MbrBranch);
+            auto ins = store.resolve_cache.emplace(std::move(rkey), std::move(sub));
+            store.bytes_estimate += add_bytes;
+            const std::vector<MbrBranch>& cached_sub = ins.first->second;
+            for (const MbrBranch& sb : cached_sub) {
+                raw_out.push_back({cmul(br.w, sb.w), sb.state_id});
+            }
+            if (sub_peak > peak) peak = sub_peak;
+        }
+    }
+    if (raw_out.size() > peak) peak = raw_out.size();
+    const int32_t mrc = merge_and_sort_branches(store, raw_out, out_merged);
+    if (mrc != kOk) return mrc;
+    if (!in_branches.empty() && out_merged.empty()) return kErrFloatDrift;
+    if (store.max_components > 0U && out_merged.size() > store.max_components) {
+        return kErrBudget;
+    }
+    out_peak = static_cast<uint32_t>(std::min<size_t>(peak, std::numeric_limits<uint32_t>::max()));
+    return kOk;
+}
+
+// Multi-branch GF(2) measurement absorption search:
+// Finds Hermitian Q_bar stabilizing every branch S_b with ONE common sign (+1 on S_0..S_{K-1}),
+// commuting with all remaining working_pend axes, and anticommuting with M_bar.
+inline bool find_absorb_pauli(
+    MbrStore& store,
+    const std::vector<MbrBranch>& branches,
+    const std::vector<MbrPending>& working_pend,
+    const uint64_t* mx, const uint64_t* mz,
+    std::vector<uint64_t>& out_qx, std::vector<uint64_t>& out_qz
+) {
+    if (branches.empty()) return false;
+    const size_t n = store.n_qubits;
+    const size_t nw = store.nw;
+
+    std::vector<uint64_t> gx, gz;
+    std::vector<uint8_t> gk;
+    generators(store.state_pool[branches[0].state_id].state, gx, gz, gk);
+
+    std::vector<MbrPauli> basis;
+    basis.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        MbrPauli p;
+        p.x.assign(&gx[i * nw], &gx[(i + 1U) * nw]);
+        p.z.assign(&gz[i * nw], &gz[(i + 1U) * nw]);
+        p.kappa = gk[i];
+        basis.push_back(std::move(p));
+    }
+
+    auto intersect_commuting = [&](const uint64_t* ax, const uint64_t* az) {
+        size_t piv = basis.size();
+        for (size_t i = 0; i < basis.size(); ++i) {
+            if (pauli_anti(basis[i].x.data(), basis[i].z.data(), ax, az, nw) != 0U) {
+                piv = i;
+                break;
+            }
+        }
+        if (piv == basis.size()) return;
+        for (size_t i = piv + 1U; i < basis.size(); ++i) {
+            if (pauli_anti(basis[i].x.data(), basis[i].z.data(), ax, az, nw) != 0U) {
+                pauli_mul_inplace(
+                    basis[i].x.data(), basis[i].z.data(), basis[i].kappa,
+                    basis[piv].x.data(), basis[piv].z.data(), basis[piv].kappa, nw
+                );
+            }
+        }
+        basis.erase(basis.begin() + static_cast<std::ptrdiff_t>(piv));
+    };
+
+    // 1. Intersect with commutation kernel of remaining pending turns.
+    for (const MbrPending& item : working_pend) {
+        intersect_commuting(item.x.data(), item.z.data());
+        if (basis.empty()) return false;
+    }
+
+    // 2. Intersect with each subsequent branch S_b (commutation nullspace FIRST, then +1 sign kernel).
+    for (size_t b = 1U; b < branches.size(); ++b) {
+        const uint32_t st_id = branches[b].state_id;
+        generators(store.state_pool[st_id].state, gx, gz, gk);
+        for (size_t r = 0; r < n; ++r) {
+            intersect_commuting(&gx[r * nw], &gz[r * nw]);
+            if (basis.empty()) return false;
+        }
+        // Now every g in basis commutes with S_b, so definite(S_b, g) in {+1, -1}.
+        size_t neg_piv = basis.size();
+        std::vector<int8_t> evs(basis.size(), 0);
+        for (size_t i = 0; i < basis.size(); ++i) {
+            evs[i] = store.cached_definite(st_id, basis[i].x.data(), basis[i].z.data(), basis[i].kappa);
+            if (evs[i] < 0 && neg_piv == basis.size()) {
+                neg_piv = i;
+            }
+        }
+        if (neg_piv < basis.size()) {
+            for (size_t i = neg_piv + 1U; i < basis.size(); ++i) {
+                if (evs[i] < 0) {
+                    pauli_mul_inplace(
+                        basis[i].x.data(), basis[i].z.data(), basis[i].kappa,
+                        basis[neg_piv].x.data(), basis[neg_piv].z.data(), basis[neg_piv].kappa, nw
+                    );
+                }
+            }
+            basis.erase(basis.begin() + static_cast<std::ptrdiff_t>(neg_piv));
+            if (basis.empty()) return false;
+        }
+    }
+
+    // 3. Pick first surviving common stabilizer anticommuting with M_bar.
+    for (const MbrPauli& g : basis) {
+        if (pauli_anti(g.x.data(), g.z.data(), mx, mz, nw) != 0U) {
+            out_qx = g.x;
+            out_qz = g.z;
+            return true;
+        }
+    }
+    return false;
+}
+
+inline double branches_norm2(MbrStore& store, const std::vector<MbrBranch>& lst) {
+    double tot = 0.0;
+    for (const MbrBranch& b : lst) {
+        tot += cabs2(b.w);
+    }
+    const size_t k = lst.size();
+    for (size_t i = 0; i < k; ++i) {
+        const MbrComplex wi_conj = cconj(lst[i].w);
+        for (size_t j = i + 1U; j < k; ++j) {
+            const MbrComplex ov = store.cached_overlap(lst[i].state_id, lst[j].state_id);
+            if (ov.re != 0.0 || ov.im != 0.0) {
+                const MbrComplex prod = cmul(cmul(wi_conj, lst[j].w), ov);
+                tot += 2.0 * prod.re;
+            }
+        }
+    }
+    return tot;
+}
+
+inline int32_t store_meas_or_peek(
+    MbrStore& store,
+    int64_t node_id,
+    uint64_t event_id,
+    uint8_t kind,
+    bool is_peek,
+    const uint64_t* mx, const uint64_t* mz, uint8_t mkappa,
+    double& out_p0,
+    int64_t* out_child0, int64_t* out_child1,
+    uint8_t* out_meas_type,
+    uint64_t* out_absorb_x, uint64_t* out_absorb_z
+) {
+    const size_t nw = store.nw;
+    if (node_id < 0 || static_cast<size_t>(node_id) >= store.nodes.size()) {
+        return kErrInvalidArg;
+    }
+    if (mx == nullptr || mz == nullptr) return kErrInvalidArg;
+    if (!tail_clear(mx, store.n_qubits, nw) || !tail_clear(mz, store.n_qubits, nw)) {
+        return kErrInvalidArg;
+    }
+    const uint8_t mk = static_cast<uint8_t>(mkappa & 3U);
+    if (!is_hermitian(mx, mz, mk, nw)) return kErrInvalidArg;
+
+    if (is_peek) {
+        PeekKey pkey{node_id, event_id};
+        auto pit = store.peek.find(pkey);
+        if (pit != store.peek.end()) {
+            store.transitions_hit[kKindPeek] += 1U;
+            out_p0 = pit->second;
+            return kOk;
+        }
+    } else {
+        MeasKey mkey{node_id, event_id, kind};
+        auto mit = store.meas.find(mkey);
+        if (mit != store.meas.end()) {
+            store.transitions_hit[kind] += 1U;
+            const MeasEntry& me = mit->second;
+            out_p0 = me.p0;
+            *out_child0 = me.child0;
+            *out_child1 = me.child1;
+            *out_meas_type = me.meas_type;
+            if (me.meas_type == kMeasAbsorbed) {
+                std::memcpy(out_absorb_x, me.absorb_x.data(), nw * sizeof(uint64_t));
+                std::memcpy(out_absorb_z, me.absorb_z.data(), nw * sizeof(uint64_t));
+            } else {
+                std::memset(out_absorb_x, 0, nw * sizeof(uint64_t));
+                std::memset(out_absorb_z, 0, nw * sizeof(uint64_t));
+            }
+            return kOk;
+        }
+    }
+
+    // Step 1: Resolve if M_bar anticommutes with any pending turn.
+    std::vector<MbrBranch> working_branches;
+    std::vector<MbrPending> working_pend;
+    bool did_resolve = false;
+    uint32_t res_peak = 0U;
+    {
+        const MbrNode& nd = store.nodes[static_cast<size_t>(node_id)];
+        bool anti_pend = false;
+        for (const MbrPending& it : nd.pend) {
+            if (pauli_anti(it.x.data(), it.z.data(), mx, mz, nw) != 0U) {
+                anti_pend = true;
+                break;
+            }
+        }
+        if (anti_pend) {
+            std::vector<MbrBranch> nb = nd.branches;
+            std::vector<MbrPending> np = nd.pend;
+            const int32_t rrc = resolve_branches(store, nb, np, working_branches, res_peak);
+            if (rrc != kOk) return rrc;
+            did_resolve = true;
+        } else {
+            std::vector<MbrBranch>(nd.branches).swap(working_branches);
+            std::vector<MbrPending>(nd.pend).swap(working_pend);
+            res_peak = static_cast<uint32_t>(working_branches.size());
+        }
+    }
+    if (working_branches.empty()) return kErrFloatDrift;
+
+    // Step 2: Definite check across all branches.
+    const size_t K = working_branches.size();
+    std::vector<int8_t> evs(K, 0);
+    bool all_pos = true;
+    bool all_neg = true;
+    for (size_t b = 0; b < K; ++b) {
+        evs[b] = store.cached_definite(working_branches[b].state_id, mx, mz, mk);
+        if (evs[b] != 1) all_pos = false;
+        if (evs[b] != -1) all_neg = false;
+    }
+    if (all_pos || all_neg) {
+        const double p0 = all_pos ? 1.0 : 0.0;
+        if (is_peek) {
+            store.peek.emplace(PeekKey{node_id, event_id}, p0);
+            store.bytes_estimate += 64U;
+            store.transitions_new[kKindPeek] += 1U;
+            out_p0 = p0;
+            return kOk;
+        }
+        const int64_t target_nid = did_resolve
+            ? store.push_node(std::move(working_branches), {}, res_peak)
+            : node_id;
+        MeasEntry me;
+        me.p0 = p0;
+        me.child0 = all_pos ? target_nid : -1;
+        me.child1 = all_pos ? -1 : target_nid;
+        me.meas_type = kMeasDefinite;
+        store.meas_definite += 1U;
+        store.transitions_new[kind] += 1U;
+        store.meas.emplace(MeasKey{node_id, event_id, kind}, me);
+        store.bytes_estimate += 64U + sizeof(MeasEntry);
+        out_p0 = me.p0;
+        *out_child0 = me.child0;
+        *out_child1 = me.child1;
+        *out_meas_type = kMeasDefinite;
+        std::memset(out_absorb_x, 0, nw * sizeof(uint64_t));
+        std::memset(out_absorb_z, 0, nw * sizeof(uint64_t));
+        return kOk;
+    }
+
+    // Step 3: Multi-branch GF(2) absorption check.
+    std::vector<uint64_t> qx, qz;
+    if (find_absorb_pauli(store, working_branches, working_pend, mx, mz, qx, qz)) {
+        if (is_peek) {
+            store.peek.emplace(PeekKey{node_id, event_id}, 0.5);
+            store.bytes_estimate += 64U;
+            store.transitions_new[kKindPeek] += 1U;
+            out_p0 = 0.5;
+            return kOk;
+        }
+        std::vector<MbrBranch> raw0;
+        raw0.reserve(K);
+        for (size_t b = 0; b < K; ++b) {
+            if (evs[b] == 0) {
+                const ProjEntry pr = store.cached_project(
+                    working_branches[b].state_id, mx, mz, mk, 0U
+                );
+                if (pr.valid) {
+                    raw0.push_back({cscale(cmul(working_branches[b].w, pr.f), kSqrt2), pr.state_id});
+                }
+            } else if (evs[b] == 1) {
+                raw0.push_back({cscale(working_branches[b].w, kSqrt2), working_branches[b].state_id});
+            }
+        }
+        std::vector<MbrBranch> b0;
+        const int32_t mrc = merge_and_sort_branches(store, raw0, b0);
+        if (mrc != kOk) return mrc;
+        if (b0.empty()) return kErrFloatDrift;
+        if (store.max_components > 0U && b0.size() > store.max_components) {
+            return kErrBudget;
+        }
+        const uint32_t peak0 = std::max(res_peak, static_cast<uint32_t>(b0.size()));
+        const int64_t c0 = store.push_node(std::move(b0), std::move(working_pend), peak0);
+        MeasEntry me;
+        me.p0 = 0.5;
+        me.child0 = c0;
+        me.child1 = c0;
+        me.meas_type = kMeasAbsorbed;
+        me.absorb_x = qx;
+        me.absorb_z = qz;
+        store.meas_absorbed += 1U;
+        store.transitions_new[kind] += 1U;
+        const uint64_t add_bytes = 64U + sizeof(MeasEntry) + 2U * nw * sizeof(uint64_t);
+        store.meas.emplace(MeasKey{node_id, event_id, kind}, std::move(me));
+        store.bytes_estimate += add_bytes;
+        out_p0 = 0.5;
+        *out_child0 = c0;
+        *out_child1 = c0;
+        *out_meas_type = kMeasAbsorbed;
+        std::memcpy(out_absorb_x, qx.data(), nw * sizeof(uint64_t));
+        std::memcpy(out_absorb_z, qz.data(), nw * sizeof(uint64_t));
+        return kOk;
+    }
+
+    // Step 4: Forked measurement (project m = 0, 1; overlap norm2; drift & impossible guards).
+    std::vector<MbrBranch> b0, b1;
+    for (uint8_t m = 0U; m < 2U; ++m) {
+        std::vector<MbrBranch> raw_m;
+        raw_m.reserve(K);
+        for (size_t b = 0; b < K; ++b) {
+            if (evs[b] == 0) {
+                const ProjEntry pr = store.cached_project(
+                    working_branches[b].state_id, mx, mz, mk, m
+                );
+                if (pr.valid) {
+                    raw_m.push_back({cmul(working_branches[b].w, pr.f), pr.state_id});
+                }
+            } else if ((evs[b] == 1) == (m == 0U)) {
+                raw_m.push_back(working_branches[b]);
+            }
+        }
+        const int32_t mrc = merge_and_sort_branches(store, raw_m, (m == 0U) ? b0 : b1);
+        if (mrc != kOk) return mrc;
+    }
+
+    const double p0 = branches_norm2(store, b0);
+    const double p1 = branches_norm2(store, b1);
+    if (!std::isfinite(p0) || !std::isfinite(p1) || std::fabs(p0 + p1 - 1.0) > kDriftTol) {
+        return kErrFloatDrift;
+    }
+    if (p0 <= kImpossibleProb && p1 <= kImpossibleProb) {
+        return kErrFloatDrift;
+    }
+
+    const bool has0 = (p0 > kImpossibleProb);
+    const bool has1 = (p1 > kImpossibleProb);
+    const double p0_out = !has0 ? 0.0 : (!has1 ? 1.0 : std::clamp(p0, 0.0, 1.0));
+
+    if (is_peek) {
+        store.peek.emplace(PeekKey{node_id, event_id}, p0_out);
+        store.bytes_estimate += 64U;
+        store.transitions_new[kKindPeek] += 1U;
+        out_p0 = p0_out;
+        return kOk;
+    }
+
+    if ((has0 && b0.empty()) || (has1 && b1.empty())) return kErrFloatDrift;
+    if (store.max_components > 0U) {
+        if ((has0 && b0.size() > store.max_components)
+            || (has1 && b1.size() > store.max_components)) {
+            return kErrBudget;
+        }
+    }
+
+    if (has0) {
+        const double inv0 = 1.0 / std::sqrt(p0);
+        for (MbrBranch& br : b0) br.w = cscale(br.w, inv0);
+    }
+    if (has1) {
+        const double inv1 = 1.0 / std::sqrt(p1);
+        for (MbrBranch& br : b1) br.w = cscale(br.w, inv1);
+    }
+
+    const uint32_t peak0 = std::max(res_peak, static_cast<uint32_t>(b0.size()));
+    const uint32_t peak1 = std::max(res_peak, static_cast<uint32_t>(b1.size()));
+    std::vector<MbrPending> pend0;
+    if (has0 && has1) {
+        pend0 = working_pend;
+    }
+    const int64_t c0 = has0
+        ? store.push_node(
+              std::move(b0),
+              has1 ? std::move(pend0) : std::move(working_pend),
+              peak0
+          )
+        : -1;
+    const int64_t c1 = has1
+        ? store.push_node(
+              std::move(b1),
+              std::move(working_pend),
+              peak1
+          )
+        : -1;
+
+    MeasEntry me;
+    me.p0 = p0_out;
+    me.child0 = c0;
+    me.child1 = c1;
+    me.meas_type = kMeasForked;
+    store.meas_forked += 1U;
+    store.transitions_new[kind] += 1U;
+    store.meas.emplace(MeasKey{node_id, event_id, kind}, me);
+    store.bytes_estimate += 64U + sizeof(MeasEntry);
+    out_p0 = p0_out;
+    *out_child0 = c0;
+    *out_child1 = c1;
+    *out_meas_type = kMeasForked;
+    std::memset(out_absorb_x, 0, nw * sizeof(uint64_t));
+    std::memset(out_absorb_z, 0, nw * sizeof(uint64_t));
+    return kOk;
+}
+
+inline int32_t normalize_commuting_turns(
+    size_t n_qubits, size_t nw,
+    size_t n_axes,
+    const uint64_t* ax_x, const uint64_t* ax_z,
+    const uint8_t* ax_kappa, const uint8_t* ax_e,
+    std::vector<MbrPending>& out_turns,
+    uint8_t& out_ph
+) {
+    out_turns.clear();
+    out_ph = 0U;
+    if (n_axes == 0U) return kOk;
+    if (ax_x == nullptr || ax_z == nullptr || ax_kappa == nullptr || ax_e == nullptr) {
+        return kErrInvalidArg;
+    }
+    size_t total_words = 0U;
+    if (!mul_within(n_axes, nw, kMaxElems, total_words)) {
+        return kErrInvalidArg;
+    }
+    out_turns.reserve(n_axes);
+    for (size_t i = 0; i < n_axes; ++i) {
+        const uint64_t* xi = &ax_x[i * nw];
+        const uint64_t* zi = &ax_z[i * nw];
+        uint8_t ki = static_cast<uint8_t>(ax_kappa[i] & 3U);
+        if (!tail_clear(xi, n_qubits, nw) || !tail_clear(zi, n_qubits, nw)) {
+            return kErrInvalidArg;
+        }
+        if (!is_hermitian(xi, zi, ki, nw)) return kErrInvalidArg;
+        uint8_t e = static_cast<uint8_t>(ax_e[i] & 7U);
+        if (e == 0U) continue;
+        if (pauli_norm_sign_plus(xi, zi, ki, nw)) {
+            out_ph = static_cast<uint8_t>((out_ph + e) & 7U);
+            e = static_cast<uint8_t>((8U - e) & 7U);
+        }
+        if (pauli_is_identity(xi, zi, nw)) continue;
+        MbrPending t;
+        t.x.assign(xi, xi + nw);
+        t.z.assign(zi, zi + nw);
+        t.kappa = ki;
+        t.e = e;
+        out_turns.push_back(std::move(t));
+    }
+    for (size_t i = 0; i < out_turns.size(); ++i) {
+        for (size_t j = i + 1U; j < out_turns.size(); ++j) {
+            if (pauli_anti(
+                    out_turns[i].x.data(), out_turns[i].z.data(),
+                    out_turns[j].x.data(), out_turns[j].z.data(), nw
+                ) != 0U) {
+                return kErrInvalidArg;
+            }
+        }
+    }
+    return kOk;
+}
+
+inline void accumulate_pending_inplace(
+    std::vector<MbrPending>& pend,
+    const std::vector<MbrPending>& incoming,
+    size_t nw
+) {
+    for (const MbrPending& t : incoming) {
+        bool merged = false;
+        for (MbrPending& p : pend) {
+            if (pauli_xz_equal(p.x.data(), p.z.data(), t.x.data(), t.z.data(), nw)) {
+                p.e = static_cast<uint8_t>((p.e + t.e) & 7U);
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            pend.push_back(t);
+        }
+    }
+    pend.erase(
+        std::remove_if(pend.begin(), pend.end(), [](const MbrPending& p) { return p.e == 0U; }),
+        pend.end()
+    );
+}
+
+inline uint32_t bitrev_u32(uint32_t x, size_t n) noexcept {
+    uint32_t r = 0U;
+    for (size_t b = 0; b < n; ++b) {
+        r = (r << 1U) | (x & 1U);
+        x >>= 1U;
+    }
+    return r;
+}
+
 }  // namespace mbr
 }  // namespace
 
@@ -1332,6 +2962,697 @@ int32_t mbr_state_to_dense(
         return mbr::kOk;
     } catch (const std::bad_alloc&) {
         return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WP3 C ABI: is_clifford, choose_split, MbrStore trie, transitions & counters
+// ---------------------------------------------------------------------------
+
+int32_t mbr_is_clifford(
+    const uint64_t* parities, size_t n_parities, size_t n_words_per_parity,
+    int32_t* out_is_clifford
+) {
+    try {
+        if (out_is_clifford == nullptr || n_words_per_parity == 0U) {
+            return mbr::kErrInvalidArg;
+        }
+        if (n_parities == 0U) {
+            *out_is_clifford = 1;
+            return mbr::kOk;
+        }
+        if (parities == nullptr) return mbr::kErrInvalidArg;
+        size_t total_words = 0U;
+        if (!mul_within(n_parities, n_words_per_parity, kMaxElems, total_words)) {
+            return mbr::kErrInvalidArg;
+        }
+        std::vector<mbr::ParityVec> O;
+        O.reserve(n_parities);
+        for (size_t i = 0; i < n_parities; ++i) {
+            mbr::ParityVec p = mbr::parity_from_words(
+                &parities[i * n_words_per_parity], n_words_per_parity
+            );
+            if (p.is_zero()) return mbr::kErrInvalidArg;
+            O.push_back(std::move(p));
+        }
+        std::sort(O.begin(), O.end());
+        O.erase(std::unique(O.begin(), O.end()), O.end());
+        *out_is_clifford = mbr::is_clifford_sorted(O) ? 1 : 0;
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_choose_split(
+    const uint64_t* parities, size_t n_parities, size_t n_words_per_parity,
+    uint32_t max_depth, uint64_t* out_lam_words, int32_t* out_depth
+) {
+    try {
+        if (parities == nullptr || n_parities == 0U || n_words_per_parity == 0U
+            || out_lam_words == nullptr || out_depth == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+        size_t total_words = 0U;
+        if (!mul_within(n_parities, n_words_per_parity, kMaxElems, total_words)) {
+            return mbr::kErrInvalidArg;
+        }
+        std::vector<mbr::ParityVec> O;
+        O.reserve(n_parities);
+        for (size_t i = 0; i < n_parities; ++i) {
+            mbr::ParityVec p = mbr::parity_from_words(
+                &parities[i * n_words_per_parity], n_words_per_parity
+            );
+            if (p.is_zero()) return mbr::kErrInvalidArg;
+            O.push_back(std::move(p));
+        }
+        std::sort(O.begin(), O.end());
+        O.erase(std::unique(O.begin(), O.end()), O.end());
+        if (mbr::is_clifford_sorted(O)) {
+            std::memset(out_lam_words, 0, n_words_per_parity * sizeof(uint64_t));
+            *out_depth = 0;
+            return mbr::kOk;
+        }
+        const mbr::SplitEntry sp = mbr::choose_split_sorted(
+            O, max_depth, nullptr, nullptr, nullptr, nullptr
+        );
+        for (size_t w = 0; w < n_words_per_parity; ++w) {
+            out_lam_words[w] = sp.lam.word(w);
+        }
+        *out_depth = sp.depth;
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+size_t mbr_live_stores(void) {
+    return mbr::g_live_stores.load(std::memory_order_relaxed);
+}
+
+int32_t mbr_store_create(size_t n_qubits, size_t max_components, void** out_store) {
+    try {
+        if (out_store == nullptr || n_qubits == 0U || n_qubits > mbr::kMaxQubits) {
+            return mbr::kErrInvalidArg;
+        }
+        const size_t nw = mbr::n_words_for_qubits(n_qubits);
+        if (nw > kMaxElems) return mbr::kErrInvalidArg;
+        mbr::MbrStore* st = new mbr::MbrStore();
+        st->n_qubits = n_qubits;
+        st->nw = nw;
+        st->max_components = max_components;
+        try {
+            st->seed_root();
+        } catch (...) {
+            delete st;
+            throw;
+        }
+        mbr::g_live_stores.fetch_add(1U, std::memory_order_relaxed);
+        *out_store = st;
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+void mbr_store_destroy(void* store) {
+    if (store != nullptr) {
+        delete mbr::store_of(store);
+        mbr::g_live_stores.fetch_sub(1U, std::memory_order_relaxed);
+    }
+}
+
+int32_t mbr_store_clear(void* store) {
+    try {
+        if (store == nullptr) return mbr::kErrInvalidArg;
+        mbr::MbrStore* st = mbr::store_of(store);
+        st->seed_root();
+        st->store_clears += 1U;
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_set_max_components(void* store, size_t max_components) {
+    try {
+        if (store == nullptr) return mbr::kErrInvalidArg;
+        mbr::store_of(store)->max_components = max_components;
+        return mbr::kOk;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_node_count(const void* store, size_t* out_count) {
+    try {
+        if (store == nullptr || out_count == nullptr) return mbr::kErrInvalidArg;
+        *out_count = mbr::store_of(store)->nodes.size();
+        return mbr::kOk;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_node_info(
+    const void* store, int64_t node_id,
+    size_t* out_n_branches, size_t* out_n_pend, uint32_t* out_transient_peak
+) {
+    try {
+        if (store == nullptr || out_n_branches == nullptr || out_n_pend == nullptr
+            || out_transient_peak == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+        const mbr::MbrStore* st = mbr::store_of(store);
+        if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
+            return mbr::kErrInvalidArg;
+        }
+        const mbr::MbrNode& nd = st->nodes[static_cast<size_t>(node_id)];
+        *out_n_branches = nd.branches.size();
+        *out_n_pend = nd.pend.size();
+        *out_transient_peak = nd.transient_peak;
+        return mbr::kOk;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_node_branch(
+    const void* store, int64_t node_id, size_t branch_idx,
+    double* out_w_ri, void** out_state_handle
+) {
+    try {
+        if (store == nullptr || out_w_ri == nullptr || out_state_handle == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+        const mbr::MbrStore* st = mbr::store_of(store);
+        if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
+            return mbr::kErrInvalidArg;
+        }
+        const mbr::MbrNode& nd = st->nodes[static_cast<size_t>(node_id)];
+        if (branch_idx >= nd.branches.size()) return mbr::kErrInvalidArg;
+        const mbr::MbrBranch& br = nd.branches[branch_idx];
+        mbr::MbrState* copy = new mbr::MbrState(st->state_pool[br.state_id].state);
+        mbr::g_live_states.fetch_add(1U, std::memory_order_relaxed);
+        out_w_ri[0] = br.w.re;
+        out_w_ri[1] = br.w.im;
+        *out_state_handle = copy;
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_node_pending(
+    const void* store, int64_t node_id,
+    uint64_t* out_x, uint64_t* out_z, uint8_t* out_kappa, uint8_t* out_e
+) {
+    try {
+        if (store == nullptr) return mbr::kErrInvalidArg;
+        const mbr::MbrStore* st = mbr::store_of(store);
+        if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
+            return mbr::kErrInvalidArg;
+        }
+        const mbr::MbrNode& nd = st->nodes[static_cast<size_t>(node_id)];
+        const size_t np = nd.pend.size();
+        if (np == 0U) return mbr::kOk;
+        if (out_x == nullptr || out_z == nullptr || out_kappa == nullptr || out_e == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+        const size_t nw = st->nw;
+        for (size_t i = 0; i < np; ++i) {
+            std::memcpy(&out_x[i * nw], nd.pend[i].x.data(), nw * sizeof(uint64_t));
+            std::memcpy(&out_z[i * nw], nd.pend[i].z.data(), nw * sizeof(uint64_t));
+            out_kappa[i] = nd.pend[i].kappa;
+            out_e[i] = nd.pend[i].e;
+        }
+        return mbr::kOk;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_node_dense(
+    const void* store, int64_t node_id, int32_t big_endian,
+    double* out_psi_ri, size_t out_complex_len
+) {
+    try {
+        if (store == nullptr || out_psi_ri == nullptr
+            || (big_endian != 0 && big_endian != 1)) {
+            return mbr::kErrInvalidArg;
+        }
+        const mbr::MbrStore* st = mbr::store_of(store);
+        if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
+            return mbr::kErrInvalidArg;
+        }
+        const size_t n = st->n_qubits;
+        if (n > mbr::kMaxDenseQubits) return mbr::kErrInvalidArg;
+        const size_t dim = size_t(1) << n;
+        if (out_complex_len != dim) return mbr::kErrInvalidArg;
+
+        const mbr::MbrNode& nd = st->nodes[static_cast<size_t>(node_id)];
+        std::memset(out_psi_ri, 0, dim * 2U * sizeof(double));
+        std::vector<double> tmp(dim * 2U, 0.0);
+        for (const mbr::MbrBranch& br : nd.branches) {
+            if (!mbr::to_dense(st->state_pool[br.state_id].state, big_endian != 0, tmp.data())) {
+                return mbr::kErrInvalidArg;
+            }
+            for (size_t x = 0; x < dim; ++x) {
+                const mbr::MbrComplex c = mbr::cmul(br.w, {tmp[2U * x], tmp[2U * x + 1U]});
+                out_psi_ri[2U * x] += c.re;
+                out_psi_ri[2U * x + 1U] += c.im;
+            }
+        }
+
+        // Apply pending diagonal/Pauli eighth turns D = prod omega^{e(1-P)/2}.
+        for (const mbr::MbrPending& p : nd.pend) {
+            uint32_t px = static_cast<uint32_t>(p.x[0]);
+            uint32_t pz = static_cast<uint32_t>(p.z[0]);
+            if (big_endian != 0) {
+                px = mbr::bitrev_u32(px, n);
+                pz = mbr::bitrev_u32(pz, n);
+            }
+            const mbr::MbrComplex we = mbr::omega_pow(p.e);
+            if (px == 0U) {
+                const uint8_t sgn_base = static_cast<uint8_t>((p.kappa >> 1U) & 1U);
+                for (uint32_t y = 0; y < static_cast<uint32_t>(dim); ++y) {
+                    const uint8_t par = static_cast<uint8_t>(
+                        (sgn_base ^ static_cast<uint8_t>(__builtin_popcount(pz & y) & 1)) & 1U
+                    );
+                    if (par != 0U) {
+                        const mbr::MbrComplex v{out_psi_ri[2U * y], out_psi_ri[2U * y + 1U]};
+                        const mbr::MbrComplex nv = mbr::cmul(we, v);
+                        out_psi_ri[2U * y] = nv.re;
+                        out_psi_ri[2U * y + 1U] = nv.im;
+                    }
+                }
+            } else {
+                const mbr::MbrComplex a = mbr::cscale(mbr::cadd({1.0, 0.0}, we), 0.5);
+                const mbr::MbrComplex b = mbr::cscale(mbr::csub({1.0, 0.0}, we), 0.5);
+                for (uint32_t y = 0; y < static_cast<uint32_t>(dim); ++y) {
+                    const uint32_t y2 = y ^ px;
+                    if (y >= y2) continue;
+                    const mbr::MbrComplex c0{out_psi_ri[2U * y], out_psi_ri[2U * y + 1U]};
+                    const mbr::MbrComplex c1{out_psi_ri[2U * y2], out_psi_ri[2U * y2 + 1U]};
+                    const uint8_t p0 = static_cast<uint8_t>(
+                        (p.kappa + (static_cast<uint8_t>(__builtin_popcount(pz & y) & 1) << 1U)) & 3U
+                    );
+                    const uint8_t p1 = static_cast<uint8_t>(
+                        (p.kappa + (static_cast<uint8_t>(__builtin_popcount(pz & y2) & 1) << 1U)) & 3U
+                    );
+                    const mbr::MbrComplex s0 = mbr::i_pow(p0);
+                    const mbr::MbrComplex s1 = mbr::i_pow(p1);
+                    const mbr::MbrComplex n0 = mbr::cadd(
+                        mbr::cmul(a, c0), mbr::cmul(b, mbr::cmul(s1, c1))
+                    );
+                    const mbr::MbrComplex n1 = mbr::cadd(
+                        mbr::cmul(a, c1), mbr::cmul(b, mbr::cmul(s0, c0))
+                    );
+                    out_psi_ri[2U * y] = n0.re;
+                    out_psi_ri[2U * y + 1U] = n0.im;
+                    out_psi_ri[2U * y2] = n1.re;
+                    out_psi_ri[2U * y2 + 1U] = n1.im;
+                }
+            }
+        }
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_node_from_branches(
+    void* store,
+    size_t n_branches, const double* w_ri, const void* const* state_handles,
+    size_t n_pend, const uint64_t* pend_x, const uint64_t* pend_z,
+    const uint8_t* pend_kappa, const uint8_t* pend_e,
+    int64_t* out_node_id
+) {
+    try {
+        if (store == nullptr || out_node_id == nullptr || n_branches == 0U
+            || w_ri == nullptr || state_handles == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+        mbr::MbrStore* st = mbr::store_of(store);
+        const size_t n = st->n_qubits;
+        const size_t nw = st->nw;
+        size_t total_w = 0U;
+        if (!mul_within(n_branches, size_t(2), kMaxElems, total_w)) {
+            return mbr::kErrInvalidArg;
+        }
+
+        std::vector<mbr::MbrPending> norm_pend;
+        uint8_t ph = 0U;
+        const int32_t prc = mbr::normalize_commuting_turns(
+            n, nw, n_pend, pend_x, pend_z, pend_kappa, pend_e, norm_pend, ph
+        );
+        if (prc != mbr::kOk) return prc;
+
+        std::vector<mbr::MbrPending> pend;
+        mbr::accumulate_pending_inplace(pend, norm_pend, nw);
+
+        for (size_t i = 0; i < n_branches; ++i) {
+            if (state_handles[i] == nullptr) return mbr::kErrInvalidArg;
+            const mbr::MbrState* s = mbr::state_of(state_handles[i]);
+            if (s->n_qubits != n) return mbr::kErrInvalidArg;
+            if (!mbr::cfinite({w_ri[2U * i], w_ri[2U * i + 1U]})) return mbr::kErrInvalidArg;
+        }
+
+        const mbr::MbrComplex ph_c = mbr::omega_pow(ph);
+        std::vector<mbr::MbrBranch> raw;
+        raw.reserve(n_branches);
+        for (size_t i = 0; i < n_branches; ++i) {
+            mbr::MbrState sc = *mbr::state_of(state_handles[i]);
+            const mbr::MbrComplex fc = mbr::canon(sc);
+            const mbr::MbrComplex w = mbr::cmul(
+                mbr::cmul({w_ri[2U * i], w_ri[2U * i + 1U]}, fc), ph_c
+            );
+            const uint32_t sid = st->intern_canonical(std::move(sc));
+            raw.push_back({w, sid});
+        }
+
+        std::vector<mbr::MbrBranch> merged;
+        const int32_t mrc = mbr::merge_and_sort_branches(*st, raw, merged);
+        if (mrc != mbr::kOk) return mrc;
+        if (merged.empty()) return mbr::kErrInvalidArg;
+        if (st->max_components > 0U && merged.size() > st->max_components) {
+            return mbr::kErrBudget;
+        }
+        const uint32_t peak = static_cast<uint32_t>(merged.size());
+        *out_node_id = st->push_node(std::move(merged), std::move(pend), peak);
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_resolve_node(void* store, int64_t node_id, int64_t* out_node_id) {
+    try {
+        if (store == nullptr || out_node_id == nullptr) return mbr::kErrInvalidArg;
+        mbr::MbrStore* st = mbr::store_of(store);
+        if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
+            return mbr::kErrInvalidArg;
+        }
+        if (st->nodes[static_cast<size_t>(node_id)].pend.empty()) {
+            *out_node_id = node_id;
+            return mbr::kOk;
+        }
+        std::vector<mbr::MbrBranch> in_b = st->nodes[static_cast<size_t>(node_id)].branches;
+        std::vector<mbr::MbrPending> in_p = st->nodes[static_cast<size_t>(node_id)].pend;
+        std::vector<mbr::MbrBranch> resolved;
+        uint32_t peak = 0U;
+        const int32_t rc = mbr::resolve_branches(*st, in_b, in_p, resolved, peak);
+        if (rc != mbr::kOk) return rc;
+        *out_node_id = st->push_node(std::move(resolved), {}, peak);
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_step_rotations(
+    void* store, int64_t node_id, uint64_t event_id, uint8_t kind, uint32_t sign_bits,
+    size_t n_axes, const uint64_t* ax_x, const uint64_t* ax_z,
+    const uint8_t* ax_kappa, const uint8_t* ax_e,
+    int64_t* out_child
+) {
+    try {
+        if (store == nullptr || out_child == nullptr) return mbr::kErrInvalidArg;
+        if (kind != mbr::kKindT && kind != mbr::kKindCcz) return mbr::kErrInvalidArg;
+        mbr::MbrStore* st = mbr::store_of(store);
+        if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
+            return mbr::kErrInvalidArg;
+        }
+        const mbr::TransKey tkey{node_id, event_id, sign_bits, kind};
+        auto tit = st->trans.find(tkey);
+        if (tit != st->trans.end()) {
+            st->transitions_hit[kind] += 1U;
+            *out_child = tit->second;
+            return mbr::kOk;
+        }
+
+        const size_t nw = st->nw;
+        std::vector<mbr::MbrPending> incoming;
+        uint8_t ph = 0U;
+        const int32_t nrc = mbr::normalize_commuting_turns(
+            st->n_qubits, nw, n_axes, ax_x, ax_z, ax_kappa, ax_e, incoming, ph
+        );
+        if (nrc != mbr::kOk) return nrc;
+
+        std::vector<mbr::MbrBranch> branches = st->nodes[static_cast<size_t>(node_id)].branches;
+        std::vector<mbr::MbrPending> pend = st->nodes[static_cast<size_t>(node_id)].pend;
+        uint32_t peak = static_cast<uint32_t>(branches.size());
+
+        if ((ph & 7U) != 0U) {
+            const mbr::MbrComplex sc = mbr::omega_pow(ph);
+            for (mbr::MbrBranch& br : branches) br.w = mbr::cmul(br.w, sc);
+        }
+
+        bool need_resolve = false;
+        if (!pend.empty() && !incoming.empty()) {
+            for (const mbr::MbrPending& inc : incoming) {
+                for (const mbr::MbrPending& cur : pend) {
+                    if (mbr::pauli_anti(inc.x.data(), inc.z.data(), cur.x.data(), cur.z.data(), nw) != 0U) {
+                        need_resolve = true;
+                        break;
+                    }
+                }
+                if (need_resolve) break;
+            }
+        }
+        if (need_resolve) {
+            std::vector<mbr::MbrBranch> resolved;
+            uint32_t rpeak = 0U;
+            const int32_t rrc = mbr::resolve_branches(*st, branches, pend, resolved, rpeak);
+            if (rrc != mbr::kOk) return rrc;
+            branches = std::move(resolved);
+            pend.clear();
+            if (rpeak > peak) peak = rpeak;
+        }
+
+        mbr::accumulate_pending_inplace(pend, incoming, nw);
+
+        const int64_t cid = st->push_node(std::move(branches), std::move(pend), peak);
+        st->trans.emplace(tkey, cid);
+        st->bytes_estimate += 64U;
+        st->transitions_new[kind] += 1U;
+        *out_child = cid;
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_step_qturns(
+    void* store, int64_t node_id, uint64_t event_id, uint8_t kind, uint32_t sign_bits,
+    size_t n_qturns, const uint64_t* qt_x, const uint64_t* qt_z, const uint8_t* qt_kappa,
+    int64_t* out_child
+) {
+    try {
+        if (store == nullptr || out_child == nullptr) return mbr::kErrInvalidArg;
+        if (kind != mbr::kKindSkip && kind != mbr::kKindCfault) return mbr::kErrInvalidArg;
+        mbr::MbrStore* st = mbr::store_of(store);
+        if (node_id < 0 || static_cast<size_t>(node_id) >= st->nodes.size()) {
+            return mbr::kErrInvalidArg;
+        }
+        const mbr::TransKey tkey{node_id, event_id, sign_bits, kind};
+        auto tit = st->trans.find(tkey);
+        if (tit != st->trans.end()) {
+            st->transitions_hit[kind] += 1U;
+            *out_child = tit->second;
+            return mbr::kOk;
+        }
+
+        const size_t n = st->n_qubits;
+        const size_t nw = st->nw;
+        if (n_qturns > 0U && (qt_x == nullptr || qt_z == nullptr || qt_kappa == nullptr)) {
+            return mbr::kErrInvalidArg;
+        }
+        size_t total_qwords = 0U;
+        if (!mul_within(n_qturns, nw, kMaxElems, total_qwords)) {
+            return mbr::kErrInvalidArg;
+        }
+        for (size_t q = 0; q < n_qturns; ++q) {
+            const uint64_t* qx = &qt_x[q * nw];
+            const uint64_t* qz = &qt_z[q * nw];
+            const uint8_t qk = static_cast<uint8_t>(qt_kappa[q] & 3U);
+            if (!mbr::tail_clear(qx, n, nw) || !mbr::tail_clear(qz, n, nw)) {
+                return mbr::kErrInvalidArg;
+            }
+            if (!mbr::is_hermitian(qx, qz, qk, nw)) return mbr::kErrInvalidArg;
+        }
+
+        std::vector<mbr::MbrBranch> branches = st->nodes[static_cast<size_t>(node_id)].branches;
+        std::vector<mbr::MbrPending> pend = st->nodes[static_cast<size_t>(node_id)].pend;
+        const uint32_t peak = static_cast<uint32_t>(branches.size());
+
+        std::vector<mbr::MbrBranch> updated;
+        updated.reserve(branches.size());
+        for (const mbr::MbrBranch& br : branches) {
+            mbr::MbrState qc = st->state_pool[br.state_id].state;
+            mbr::MbrComplex f = br.w;
+            for (size_t q = 0; q < n_qturns; ++q) {
+                const mbr::MbrComplex fq = mbr::apply_qturn(
+                    qc, &qt_x[q * nw], &qt_z[q * nw], static_cast<uint8_t>(qt_kappa[q] & 3U)
+                );
+                f = mbr::cmul(f, fq);
+            }
+            f = mbr::cmul(f, mbr::canon(qc));
+            const uint32_t cid_st = st->intern_canonical(std::move(qc));
+            updated.push_back({f, cid_st});
+        }
+
+        if (!pend.empty() && n_qturns > 0U) {
+            uint8_t ph = 0U;
+            for (mbr::MbrPending& p : pend) {
+                for (size_t q = 0; q < n_qturns; ++q) {
+                    mbr::pauli_conj_by_qturn_inplace(
+                        p.x.data(), p.z.data(), p.kappa,
+                        &qt_x[q * nw], &qt_z[q * nw], static_cast<uint8_t>(qt_kappa[q] & 3U), nw
+                    );
+                }
+                if (mbr::pauli_norm_sign_plus(p.x.data(), p.z.data(), p.kappa, nw)) {
+                    ph = static_cast<uint8_t>((ph + p.e) & 7U);
+                    p.e = static_cast<uint8_t>((8U - p.e) & 7U);
+                }
+            }
+            if ((ph & 7U) != 0U) {
+                const mbr::MbrComplex sc = mbr::omega_pow(ph);
+                for (mbr::MbrBranch& br : updated) br.w = mbr::cmul(br.w, sc);
+            }
+        }
+
+        std::vector<mbr::MbrBranch> merged;
+        const int32_t mrc = mbr::merge_and_sort_branches(*st, updated, merged);
+        if (mrc != mbr::kOk) return mrc;
+        if (!branches.empty() && merged.empty()) return mbr::kErrFloatDrift;
+
+        const int64_t cid = st->push_node(std::move(merged), std::move(pend), peak);
+        st->trans.emplace(tkey, cid);
+        st->bytes_estimate += 64U;
+        st->transitions_new[kind] += 1U;
+        *out_child = cid;
+        return mbr::kOk;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_step_meas(
+    void* store, int64_t node_id, uint64_t event_id, uint8_t kind,
+    const uint64_t* mx, const uint64_t* mz, uint8_t mkappa,
+    double* out_p0, int64_t* out_child0, int64_t* out_child1,
+    uint8_t* out_meas_type, uint64_t* out_absorb_x, uint64_t* out_absorb_z
+) {
+    try {
+        if (store == nullptr || out_p0 == nullptr || out_child0 == nullptr
+            || out_child1 == nullptr || out_meas_type == nullptr
+            || out_absorb_x == nullptr || out_absorb_z == nullptr) {
+            return mbr::kErrInvalidArg;
+        }
+        if (kind != mbr::kKindMeas && kind != mbr::kKindPost && kind != mbr::kKindUreset) {
+            return mbr::kErrInvalidArg;
+        }
+        double p0 = 0.0;
+        const int32_t rc = mbr::store_meas_or_peek(
+            *mbr::store_of(store), node_id, event_id, kind, false,
+            mx, mz, mkappa, p0, out_child0, out_child1, out_meas_type, out_absorb_x, out_absorb_z
+        );
+        if (rc == mbr::kOk) *out_p0 = p0;
+        return rc;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_step_peek(
+    void* store, int64_t node_id, uint64_t event_id,
+    const uint64_t* mx, const uint64_t* mz, uint8_t mkappa,
+    double* out_p0
+) {
+    try {
+        if (store == nullptr || out_p0 == nullptr) return mbr::kErrInvalidArg;
+        double p0 = 0.0;
+        const int32_t rc = mbr::store_meas_or_peek(
+            *mbr::store_of(store), node_id, event_id, mbr::kKindPeek, true,
+            mx, mz, mkappa, p0, nullptr, nullptr, nullptr, nullptr, nullptr
+        );
+        if (rc == mbr::kOk) *out_p0 = p0;
+        return rc;
+    } catch (const std::bad_alloc&) {
+        return mbr::kErrOom;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_counters(const void* store, uint64_t* out_counters_26) {
+    try {
+        if (store == nullptr || out_counters_26 == nullptr) return mbr::kErrInvalidArg;
+        const mbr::MbrStore* st = mbr::store_of(store);
+        out_counters_26[0] = static_cast<uint64_t>(st->nodes.size());
+        out_counters_26[1] = st->bytes_estimate;
+        out_counters_26[2] = st->store_clears;
+        for (size_t k = 0; k < mbr::kNumKinds; ++k) {
+            out_counters_26[3U + k] = st->transitions_new[k];
+            out_counters_26[11U + k] = st->transitions_hit[k];
+        }
+        out_counters_26[19] = st->resolve_calls;
+        out_counters_26[20] = st->splits;
+        out_counters_26[21] = st->subcache_hits;
+        out_counters_26[22] = st->subcache_misses;
+        out_counters_26[23] = st->meas_definite;
+        out_counters_26[24] = st->meas_absorbed;
+        out_counters_26[25] = st->meas_forked;
+        return mbr::kOk;
+    } catch (...) {
+        return mbr::kErrInvalidArg;
+    }
+}
+
+int32_t mbr_store_branches_hist(
+    const void* store, uint64_t* out_keys, uint64_t* out_counts, size_t cap, size_t* out_len
+) {
+    try {
+        if (store == nullptr || out_len == nullptr) return mbr::kErrInvalidArg;
+        const mbr::MbrStore* st = mbr::store_of(store);
+        const size_t n_entries = st->node_branches_hist.size();
+        *out_len = n_entries;
+        if (cap == 0U) return mbr::kOk;
+        if (out_keys == nullptr || out_counts == nullptr || cap < n_entries) {
+            return mbr::kErrInvalidArg;
+        }
+        size_t idx = 0U;
+        for (const auto& kv : st->node_branches_hist) {
+            out_keys[idx] = kv.first;
+            out_counts[idx] = kv.second;
+            ++idx;
+        }
+        return mbr::kOk;
     } catch (...) {
         return mbr::kErrInvalidArg;
     }
