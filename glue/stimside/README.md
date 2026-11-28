@@ -324,6 +324,60 @@ print(res_fault.diagnostics.peak_terms, res_fault.diagnostics.cache_hits)
     copies of that simulator—raise `ValueError` until `clear()` resets it; failed
     `interactive_do()` calls are not guarded and leave partial state.
 
+### Stabilizer-Branch Engine (Method C)
+
+- **Private switch & API stability:** `MagicsideSimulator` includes an opt-in stabilizer-branch
+  engine (Method C) for `fault_mode="DIRECT"`, `backend="STREAM"`. The default remains the term
+  engine (`"terms"`), keeping `stimside.__all__` (38 top-level exports), `MagicsideSampler` public
+  keyword arguments, and pre-existing golden digests unchanged. Enable it process-wide via
+  `STIMSIDE_MAGICSIDE_ENGINE="branches"` (initialized into
+  `stimside.simulator_magic._BRANCH_ENGINE`, default `False`; `""` or `"terms"` selects `False`,
+  `"branches"` selects `True`, and invalid values raise `ValueError`) or per instance via private
+  keyword-only `MagicsideSimulator(..., _engine="branches")` (`"terms"`, `"branches"`, or `None`;
+  re-checked on every `clear()`).
+- **Architecture & C++17 kernel:** Core state evolution runs in a minimal-bloat C++17 engine in
+  `_native/branch_kernels.hpp` compiled into `libmagic_kernels.so` (`mbr_*` symbols, ABI sentinel
+  `mbr_abi_v1`, `-ffp-contract=off`), combining a moving unitary-only Clifford frame, per-shot
+  multi-word Pauli frames, a trie transition store with exact-key sub-caches, and multi-branch
+  GF(2) measurement absorption (with no permanent duplicate pure-Python fallback engine shipped in
+  `src/stimside`).
+- **Loss semantics (`LeakageUint8Magic`):** Under `unconditional_condition_on_U=True` (default),
+  `I[CCZ]` triples with any leaked qubit (`state >= 2`) are skipped whole per shot without warning,
+  while `I[T]` and `I[T_DAG]` apply unconditionally across all shots to the frozen computational
+  state with a `UserWarning`. Under `unconditional_condition_on_U=False`, `I[T]`, `I[T_DAG]`, and
+  `I[CCZ]` all apply unconditionally with a `UserWarning`.
+- **Unsupported combinations & limits:** Construction raises `ValueError` for `backend="QUERY"`,
+  `fault_mode="SELECTOR"`, non-`None` `fault_realizations`, or `sync_tableside_rng=True`. Calling
+  `interactive_do`, `finish_interactive_run`, `get_qfe_expansion`, or `get_state_expansions` raises
+  `NotImplementedError` (private `_get_branch_state(shot)` provides branch-state inspection).
+  `state_vector` (`get_statevector`) supports `num_qubits <= 26` and raises `ValueError` when
+  `n > 26`. `max_components` caps branch count per node and raises `QueryBudgetExceededError` under
+  `on_budget_exceeded="raise"` (default; uncapped when `max_components is None` or
+  `on_budget_exceeded != "raise"`).
+- **Numerics, store cap, determinism & copying:** Branch weights use `complex128` renormalized
+  after every measurement, with `1e-13` relative branch pruning and impossible-outcome threshold,
+  probability conservation check `|p0 + p1 - 1| <= 1e-8` raising `FloatingPointError`, and
+  `-ffp-contract=off`. The trie cap `_BRANCH_STORE_MAX_NODES = 300_000` (300,000 nodes) is checked
+  only at batch start (`clear()`), never mid-batch, with no pre-filling. Fixed per-batch outcome
+  RNG draws guarantee bit-identical outputs for identical seeds across warm, cold
+  (`_BRANCH_STORE_MAX_NODES = 0`), and small-cap stores (statistically equivalent to, not
+  bit-identical with, the term engine; `m2d_reference_mode` is unchanged). `copy.copy(sim)`
+  deep-copies per-batch state and shares the `threading.RLock`-guarded store safely: a sole owner
+  clears in-place on cap overflow, while a shared owner detaches into a fresh store so sibling
+  copies' node IDs never dangle; stores active on another thread across `os.fork()` are poisoned in
+  the child and raise `RuntimeError`.
+- **Diagnostic counters & benchmarks:** `sim._branch_counters()` returns a `dict` with 14 keys:
+  `store_nodes`, `store_bytes_estimate`, `store_clears`, `transitions_new` and `transitions_hit`
+  (each keyed by `T`, `CCZ`, `SKIP`, `CFAULT`, `MEAS`, `PEEK`, `POST`, `URESET`), `resolve_calls`,
+  `splits`, `subcache_hits`, `subcache_misses`, `meas_definite`, `meas_absorbed`, `meas_forked`,
+  `branches_hist`, and `faults_realized` (keyed by `pauli_faults`, `skipped_gates`,
+  `skipped_cczs`). `sim._branch_peak_per_shot()` returns the last batch's per-shot peak branch
+  count as an `int16` array of shape `(batch_size,)` (both raise `RuntimeError` outside branch
+  mode). See `benchmarks/README.md` for pinned-core P1–P4 results (`6.89×` warm / `4.16×` cold on
+  W2m Pauli `1e-3`, `0.50 GiB` max peak RSS with loss `1e-3`, `0.998×` default-engine P4),
+  `benchmarks/compare_magic_engines.py`, and `benchmarks/bench_magic_suite.py` (`branch` mode and
+  `--jsonl` `stimside-paper-results/1` output).
+
 ### Detector & Observable Conversion (`m2d_reference_mode`)
 
 Because Stim ignores `I[T]`/`I[T_DAG]`/`I[CCZ]` tags when computing a Clifford reference sample, `MagicsideSimulator(..., m2d_reference_mode=...)` supports four reference modes for `get_reference_sample()`, `get_detector_flips()`, and `get_observable_flips()`:

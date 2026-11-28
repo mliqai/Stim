@@ -29,6 +29,16 @@ All notable user-visible changes to `stimside` are documented in this file.
   (all three gates act in all shots). Seeded outputs change only for circuits with an `I[CCZ]` on
   a leaked qubit; the golden digest `c08_magic_with_leakage` / `magic_sync` was regenerated.
   Added `MagicsideSimulator.do_conditional_magic(op, qs, condition_met_mask)`.
+- **Opt-in stabilizer-branch engine (Method C) for `MagicsideSimulator`:** Added a private-switch
+  stabilizer-branch engine (`STIMSIDE_MAGICSIDE_ENGINE="branches"`, `_BRANCH_ENGINE`, or
+  keyword-only `_engine="branches"`; default remains `"terms"` with all 38 `stimside.__all__`
+  exports and pre-existing golden digests unchanged), implemented in C++17
+  (`_native/branch_kernels.hpp` in `libmagic_kernels.so`, `-ffp-contract=off`) with multi-branch
+  GF(2) measurement absorption, a C++ batch walk, and a bounded trie store
+  (`_BRANCH_STORE_MAX_NODES = 300_000`). Added the `magic_branch` golden mode, private diagnostic
+  counters (`_branch_counters()`, `_branch_peak_per_shot()`),
+  `benchmarks/compare_magic_engines.py`, `branch` mode and `--jsonl` (`stimside-paper-results/1`)
+  in `benchmarks/bench_magic_suite.py`, and pinned-core P1–P4 results in `benchmarks/README.md`.
 - **`TablesideSimulator` and circuit IR:**
   - Untagged `SPP`, `SPP_DAG`, `E`, and `ELSE_CORRELATED_ERROR` instructions whose targets are all
     inverted single Paulis (such as `SPP !X0 !X1`) are now handled identically to their
